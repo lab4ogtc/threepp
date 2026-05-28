@@ -27,8 +27,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas{"Camera helper"};
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas{"Camera helper"};
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
 
     auto scene = Scene::create();

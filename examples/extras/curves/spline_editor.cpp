@@ -15,8 +15,8 @@ using namespace threepp;
 int main() {
 
     // Renderer & canvas
-    Canvas canvas("Spline Editor", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Spline Editor", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     // Scene

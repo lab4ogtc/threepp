@@ -3,6 +3,8 @@
 
 #include "threepp/renderers/GLRenderTarget.hpp"
 
+#include "threepp/canvas/Window.hpp"
+
 #include "threepp/renderers/gl/GLAttributes.hpp"
 #include "threepp/renderers/gl/GLBackground.hpp"
 #include "threepp/renderers/gl/GLBindingStates.hpp"
@@ -143,6 +145,12 @@ struct GLRenderer::Impl {
     std::unique_ptr<gl::GLIndexedBufferRenderer> indexedBufferRenderer;
 
     gl::GLShadowMap shadowMap;
+
+    Impl(GLRenderer& scope, Window& window, const Parameters& parameters)
+        : Impl(scope, window.size(), parameters) {
+
+        window.makeContextCurrent();
+    }
 
     Impl(GLRenderer& scope, const std::pair<int, int>& size, const Parameters& parameters)
         : scope(scope), _size(size),
@@ -1288,6 +1296,15 @@ struct GLRenderer::Impl {
 };
 
 
+GLRenderer::GLRenderer(Window& window, const Parameters& parameters) {
+
+#ifndef __EMSCRIPTEN__
+    loadGlad();// if Glad has yet to be loaded, do it now
+#endif
+
+    pimpl_ = std::make_unique<Impl>(*this, window, parameters);
+}
+
 GLRenderer::GLRenderer(std::pair<int, int> size, const Parameters& parameters) {
 
 #ifndef __EMSCRIPTEN__
@@ -1333,7 +1350,7 @@ WindowSize GLRenderer::size() const {
     return pimpl_->_size;
 }
 
-void GLRenderer::setSize(const std::pair<int, int>& size) {
+void GLRenderer::setSize(std::pair<int, int> size) {
 
     pimpl_->setSize(size);
 }
@@ -1451,6 +1468,11 @@ void GLRenderer::dispose() {
     pimpl_->dispose();
 }
 
+void GLRenderer::render(Scene& scene, Camera& camera) {
+
+    pimpl_->render(&scene, &camera);
+}
+
 void GLRenderer::render(Object3D& scene, Camera& camera) {
 
     pimpl_->render(&scene, &camera);
@@ -1464,6 +1486,22 @@ void GLRenderer::renderBufferDirect(Camera* camera, Scene* scene, BufferGeometry
 void GLRenderer::setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel) {
 
     pimpl_->setRenderTarget(renderTarget, activeCubeFace, activeMipmapLevel);
+}
+
+void GLRenderer::setRenderTarget(RenderTarget* renderTarget) {
+
+    auto* glRT = dynamic_cast<GLRenderTarget*>(renderTarget);
+
+    if (renderTarget && !glRT) {
+        throw std::invalid_argument("GLRenderer only accepts GLRenderTarget");
+    }
+
+    pimpl_->setRenderTarget(glRT, 0, 0);
+}
+
+[[nodiscard]] GLRenderTarget* GLRenderer::getRenderTarget() {
+
+    return pimpl_->_currentRenderTarget;
 }
 
 void GLRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
@@ -1504,11 +1542,6 @@ int GLRenderer::getActiveCubeFace() const {
 int GLRenderer::getActiveMipmapLevel() const {
 
     return pimpl_->_currentActiveMipmapLevel;
-}
-
-GLRenderTarget* GLRenderer::getRenderTarget() {
-
-    return pimpl_->_currentRenderTarget;
 }
 
 std::optional<unsigned int> GLRenderer::getGlTextureId(Texture& texture) const {

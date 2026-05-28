@@ -14,8 +14,8 @@ void initFirework(ParticleSystem::Settings& settings);
 
 int main() {
 
-    Canvas canvas("Particle system", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Particle system", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
 
     Scene scene;

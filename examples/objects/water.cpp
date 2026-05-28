@@ -11,8 +11,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Water", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Water", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
     renderer.toneMapping = ToneMapping::ACESFilmic;
 

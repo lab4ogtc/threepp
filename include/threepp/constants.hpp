@@ -138,6 +138,13 @@ namespace threepp {
         UnsignedInt248 = 1020
     };
 
+    enum class TextureType {
+        Texture2D,
+        Texture2DArray,
+        Texture3D,
+        CubeMap
+    };
+
     enum class Format {
         Alpha,
         RGB,

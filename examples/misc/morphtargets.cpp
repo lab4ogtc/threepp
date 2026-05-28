@@ -44,8 +44,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Morphtargets");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Morphtargets");
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
 
     auto scene = Scene::create();

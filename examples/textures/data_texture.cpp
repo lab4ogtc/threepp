@@ -37,9 +37,9 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Data texture", {{"aa", 4}});
+    GlfwWindow canvas("Data texture", {{"aa", 4}});
     auto size = canvas.size();
-    GLRenderer renderer{size};
+    GLRenderer renderer{canvas};
     renderer.autoClear = false;
     renderer.setClearColor(Color::aliceblue);
 

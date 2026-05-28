@@ -148,8 +148,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Lut", {{"aa", 6}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Lut", {{"aa", 6}});
+    GLRenderer renderer(canvas);
 
     Scene scene;
     scene.background = Color::aliceblue;

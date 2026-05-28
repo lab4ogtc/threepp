@@ -52,8 +52,8 @@ namespace {
 }// namespace
 
 int main() {
-    Canvas canvas("Audio demo");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Audio demo");
+    GLRenderer renderer(canvas);
 
     Scene scene;
 

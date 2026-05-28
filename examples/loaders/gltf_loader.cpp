@@ -8,8 +8,8 @@
 using namespace threepp;
 
 int main() {
-    Canvas canvas("GLTF Demo");
-    GLRenderer renderer{canvas.size()};
+    GlfwWindow canvas("GLTF Demo");
+    GLRenderer renderer{canvas};
     renderer.outputEncoding = Encoding::sRGB;
     renderer.shadowMap().enabled = true;
 

@@ -33,7 +33,7 @@ namespace {
     public:
         Vector2 mouse{-Infinity<float>, -Infinity<float>};
 
-        explicit MyMouseListener(Canvas& canvas): canvas(canvas) {}
+        explicit MyMouseListener(GlfwWindow& canvas): canvas(canvas) {}
 
         bool mouseClick() {
             if (mouseDown) {
@@ -55,7 +55,7 @@ namespace {
         }
 
     private:
-        Canvas& canvas;
+        GlfwWindow& canvas;
         bool mouseDown = false;
 
         void updateMousePos(Vector2 pos) {
@@ -69,7 +69,7 @@ namespace {
 
         bool clear = false;
 
-        explicit MyGui(const Canvas& canvas): ImguiContext(canvas) {}
+        explicit MyGui(const GlfwWindow& canvas): ImguiContext(canvas) {}
 
         void onRender() override {
 
@@ -101,8 +101,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas{"Decals", {{"aa", 8}}};
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas{"Decals", {{"aa", 8}}};
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 100);

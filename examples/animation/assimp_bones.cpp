@@ -8,8 +8,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Assimp bones / simple animation", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Assimp bones / simple animation", {{"aa", 8}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
     renderer.shadowMap().type = ShadowMap::PFCSoft;
 

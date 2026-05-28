@@ -10,8 +10,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Helpers");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Helpers");
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000);

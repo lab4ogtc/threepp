@@ -27,7 +27,7 @@ public:
         setFontScale(threepp::monitor::contentScale().first);
     }
 
-    explicit ImguiContext(const threepp::Canvas& canvas): ImguiContext(canvas.windowPtr()) {
+    explicit ImguiContext(const threepp::GlfwWindow& canvas): ImguiContext(canvas.windowPtr()) {
         canvas.onMonitorChange([this](int monitor) {
             setFontScale(threepp::monitor::contentScale(monitor).first);
         });
@@ -93,7 +93,7 @@ public:
         : ImguiContext(window),
           f_(std::move(f)) {}
 
-    explicit ImguiFunctionalContext(const threepp::Canvas& canvas, std::function<void()> f)
+    explicit ImguiFunctionalContext(const threepp::GlfwWindow& canvas, std::function<void()> f)
         : ImguiContext(canvas),
           f_(std::move(f)) {}
 

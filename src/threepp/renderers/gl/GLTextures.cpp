@@ -431,7 +431,13 @@ void gl::GLTextures::setupFrameBufferTexture(
     }
 
     state->bindFramebuffer(GL_FRAMEBUFFER, framebuffer);
-    glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, textureTarget, *properties->textureProperties.get(&texture)->glTexture, 0);
+
+    if (textureTarget == GL_TEXTURE_3D || textureTarget == GL_TEXTURE_2D_ARRAY) {
+        glFramebufferTexture(GL_FRAMEBUFFER, attachment, *properties->textureProperties.get(&texture)->glTexture, 0);
+    } else {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, textureTarget, *properties->textureProperties.get(&texture)->glTexture, 0);
+    }
+
     state->bindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -562,7 +568,7 @@ void gl::GLTextures::setupRenderTarget(GLRenderTarget* renderTarget) {
 
     // Setup color buffer
 
-    auto glTextureType = GL_TEXTURE_2D;
+    auto glTextureType = (renderTarget->depth > 1) ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
 
     state->bindTexture(glTextureType, textureProperties->glTexture);
     setTextureParameters(glTextureType, *texture);
@@ -570,10 +576,10 @@ void gl::GLTextures::setupRenderTarget(GLRenderTarget* renderTarget) {
 
     if (textureNeedsGenerateMipmaps(*texture)) {
 
-        generateMipmap(GL_TEXTURE_2D, *texture, renderTarget->width, renderTarget->height);
+        generateMipmap(glTextureType, *texture, renderTarget->width, renderTarget->height);
     }
 
-    state->bindTexture(GL_TEXTURE_2D, 0);
+    state->bindTexture(glTextureType, 0);
 
 
     // Setup depth and stencil buffers
@@ -590,7 +596,7 @@ void gl::GLTextures::updateRenderTargetMipmap(GLRenderTarget* renderTarget) {
 
     if (textureNeedsGenerateMipmaps(*texture)) {
 
-        const auto target = GL_TEXTURE_2D;
+        const auto target = (renderTarget->depth > 1) ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
         const auto glTexture = properties->textureProperties.get(texture.get())->glTexture;
 
         state->bindTexture(target, *glTexture);

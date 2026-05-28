@@ -6,8 +6,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Texture2D", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Texture2D", {{"aa", 8}});
+    GLRenderer renderer(canvas);
     renderer.setClearColor(Color::aliceblue);
 
     Scene scene;

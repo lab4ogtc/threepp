@@ -27,7 +27,7 @@ struct CraneUI: ImguiContext {
     std::vector<KineLimit> limits;
     std::vector<float> values;
 
-    explicit CraneUI(const Canvas& canvas, Kine& kine)
+    explicit CraneUI(const GlfwWindow& canvas, Kine& kine)
         : ImguiContext(canvas),
           limits(kine.limits()),
           values(kine.meanAngles()) {
@@ -84,8 +84,8 @@ auto createGrid() {
 
 int main() {
 
-    Canvas canvas{"Crane3R", {{"size", WindowSize{1280, 720}}, {"antialiasing", 8}}};
-    GLRenderer renderer{canvas.size()};
+    GlfwWindow canvas{"Crane3R", {{"size", WindowSize{1280, 720}}, {"antialiasing", 8}}};
+    GLRenderer renderer{canvas};
     renderer.autoClear = false;
     renderer.shadowMap().enabled = true;
     renderer.setClearColor(Color::aliceblue);

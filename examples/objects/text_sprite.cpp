@@ -7,8 +7,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("TextSprite");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("TextSprite");
+    GLRenderer renderer(canvas);
 
     Scene scene;
     PerspectiveCamera camera(75, canvas.aspect(), 0.1f, 100);

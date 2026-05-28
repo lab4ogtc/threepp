@@ -75,8 +75,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("PointLight", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("PointLight", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     auto scene = Scene::create();

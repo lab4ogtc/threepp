@@ -28,8 +28,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("PlaneGeometry - dynamic", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("PlaneGeometry - dynamic", {{"aa", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color::aliceblue;

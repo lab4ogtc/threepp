@@ -8,8 +8,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Drag controls");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Drag controls");
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
     renderer.shadowMap().type = ShadowMap::PFC;
 

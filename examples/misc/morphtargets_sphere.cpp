@@ -7,8 +7,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Morphtargets - sphere", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Morphtargets - sphere", {{"aa", 4}});
+    GLRenderer renderer(canvas);
 
     Scene scene;
 

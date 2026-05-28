@@ -73,8 +73,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Depth sensor", {{"antialiasing", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Depth sensor", {{"antialiasing", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color(0x111122);

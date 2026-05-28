@@ -62,8 +62,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("TubeGeometry", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("TubeGeometry", {{"aa", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000);

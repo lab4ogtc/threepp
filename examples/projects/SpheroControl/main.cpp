@@ -57,9 +57,9 @@ int main() {
 
     constexpr unsigned int textureSize = 256;
 
-    Canvas canvas("Sphero simulator", {{"aa", 8}});
+    GlfwWindow canvas("Sphero simulator", {{"aa", 8}});
     auto size = canvas.size();
-    GLRenderer renderer(size);
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
 
     Scene scene;

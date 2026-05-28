@@ -54,8 +54,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas{"Assimp loader", {{"aa", 4}}};
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas{"Assimp loader", {{"aa", 4}}};
+    GLRenderer renderer(canvas);
     renderer.setClearColor(Color::aliceblue);
 
     auto scene = Scene::create();

@@ -130,8 +130,8 @@ int main() {
     constexpr float radius = 6731.f;
     constexpr float moonScale = 0.23f;
 
-    Canvas canvas{"FlyControls", {{"aa", 6}}};
-    GLRenderer renderer{canvas.size()};
+    GlfwWindow canvas{"FlyControls", {{"aa", 6}}};
+    GLRenderer renderer{canvas};
 
     Scene scene;
     scene.fog = FogExp2(0x000000, 0.00000025f);

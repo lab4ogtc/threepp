@@ -110,8 +110,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Geometries", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Geometries", {{"aa", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(60, canvas.aspect(), 0.1f, 100);

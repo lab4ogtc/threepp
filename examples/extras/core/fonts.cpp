@@ -27,7 +27,7 @@ namespace {
     class MyUI: public ImguiContext {
 
     public:
-        explicit MyUI(const Canvas& canvas): ImguiContext(canvas) {}
+        explicit MyUI(const GlfwWindow& canvas): ImguiContext(canvas) {}
 
         [[nodiscard]] bool newSelection() const {
             return lastSelectedIndex != selectedIndex;
@@ -102,8 +102,8 @@ int main() {
     std::string displayText = "threepp!";
 
 
-    Canvas canvas("Fonts", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Fonts", {{"aa", 8}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
     renderer.shadowMap().type = ShadowMap::PFCSoft;
 

@@ -24,10 +24,10 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Transform controls");
+    GlfwWindow canvas("Transform controls");
     canvas.exitOnKeyEscape(false);
 
-    GLRenderer renderer(canvas.size());
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
     renderer.shadowMap().type = ShadowMap::PFC;
     renderer.autoClear = false;

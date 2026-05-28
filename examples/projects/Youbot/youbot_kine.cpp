@@ -24,7 +24,7 @@ namespace {
         std::vector<KineLimit> limits;
         std::vector<float> values;
 
-        explicit YoubotUI(const Canvas& canvas, Kine& kine)
+        explicit YoubotUI(const GlfwWindow& canvas, Kine& kine)
             : ImguiContext(canvas),
               limits(kine.limits()),
               values(kine.meanAngles()) {
@@ -79,8 +79,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas{Canvas::Parameters().title("Youbot-kine").size({1280, 720}).antialiasing(8)};
-    GLRenderer renderer{canvas.size()};
+    GlfwWindow canvas{GlfwWindow::Parameters().title("Youbot-kine").size({1280, 720}).antialiasing(8)};
+    GLRenderer renderer{canvas};
     renderer.autoClear = false;
     renderer.setClearColor(Color::aliceblue);
 

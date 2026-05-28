@@ -3,6 +3,9 @@
 #ifndef THREEPP_GLRENDERER_HPP
 #define THREEPP_GLRENDERER_HPP
 
+#include "threepp/renderers/Renderer.hpp"
+
+#include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
 
 #include "threepp/math/Color.hpp"
@@ -10,13 +13,15 @@
 #include "threepp/math/Vector2.hpp"
 #include "threepp/math/Vector4.hpp"
 
-#include "threepp/canvas/Canvas.hpp"
 #include "threepp/core/misc.hpp"
 
+#include "threepp/renderers/GLRenderTarget.hpp"
 #include "threepp/renderers/gl/GLInfo.hpp"
 #include "threepp/renderers/gl/GLShadowMap.hpp"
 #include "threepp/renderers/gl/GLState.hpp"
 
+#include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -29,10 +34,10 @@ namespace threepp {
     class Object3D;
     class Material;
     class Texture;
-    class GLRenderTarget;
     class BufferAttribute;
+    class Window;
 
-    class GLRenderer {
+    class GLRenderer: public Renderer {
 
     public:
         struct Parameters {
@@ -44,7 +49,6 @@ namespace threepp {
 
         // clearing
 
-        bool autoClear = true;
         bool autoClearColor = true;
         bool autoClearDepth = true;
         bool autoClearStencil = true;
@@ -74,7 +78,9 @@ namespace threepp {
 
         bool checkShaderErrors = false;
 
-        explicit GLRenderer(std::pair<int, int> size = {}, const Parameters& parameters = {});
+        explicit GLRenderer(Window& window, const Parameters& parameters = {});
+
+        explicit GLRenderer(std::pair<int, int> size, const Parameters& parameters = {});
 
         GLRenderer(GLRenderer&&) = delete;
         GLRenderer(const GLRenderer&) = delete;
@@ -95,7 +101,7 @@ namespace threepp {
 
         [[nodiscard]] WindowSize size() const;
 
-        void setSize(const std::pair<int, int>& size);
+        void setSize(std::pair<int, int> size) override;
 
         void getDrawingBufferSize(Vector2& target) const;
 
@@ -127,19 +133,21 @@ namespace threepp {
 
         void getClearColor(Color& target) const;
 
-        void setClearColor(const Color& color, float alpha = 1);
+        void setClearColor(const Color& color, float alpha = 1) override;
 
         [[nodiscard]] float getClearAlpha() const;
 
         void setClearAlpha(float clearAlpha);
 
-        void clear(bool color = true, bool depth = true, bool stencil = true);
+        void clear(bool color = true, bool depth = true, bool stencil = true) override;
 
         void clearColor();
         void clearDepth();
         void clearStencil();
 
         void dispose();
+
+        void render(Scene& scene, Camera& camera) override;
 
         void render(Object3D& scene, Camera& camera);
 
@@ -149,9 +157,13 @@ namespace threepp {
 
         [[nodiscard]] int getActiveMipmapLevel() const;
 
-        GLRenderTarget* getRenderTarget();
+        [[nodiscard]] GLRenderTarget* getRenderTarget() override;
 
         void setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace = 0, int activeMipmapLevel = 0);
+
+        void setRenderTarget(RenderTarget* renderTarget) override;
+
+        void setRenderTarget(std::nullptr_t) { setRenderTarget(static_cast<RenderTarget*>(nullptr)); }
 
         void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0);
 

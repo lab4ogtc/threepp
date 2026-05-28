@@ -59,8 +59,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("DataTexture3D", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("DataTexture3D", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
 
     Scene scene;

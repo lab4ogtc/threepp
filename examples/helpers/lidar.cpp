@@ -72,8 +72,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Lidar", {{"antialiasing", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Lidar", {{"antialiasing", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color(0x111122);

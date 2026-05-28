@@ -8,8 +8,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("LOD", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("LOD", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
 
     Scene scene;

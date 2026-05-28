@@ -57,8 +57,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("DirectionalLight", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("DirectionalLight", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
     renderer.shadowMap().type = ShadowMap::PFCSoft;
     renderer.toneMapping = ToneMapping::ACESFilmic;

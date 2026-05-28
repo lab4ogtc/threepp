@@ -7,8 +7,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Cubemap");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Cubemap");
+    GLRenderer renderer(canvas);
 
     PerspectiveCamera camera(50, canvas.aspect(), 0.1, 1000);
     camera.position.z = 10;

@@ -42,8 +42,8 @@ int main() {
     int amount = 10;
     constexpr int maxAmount = 25;
 
-    Canvas canvas("Instancing", {{"aa", 4}, {"vsync", false}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Instancing", {{"aa", 4}, {"vsync", false}});
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
     renderer.setClearColor(Color::aliceblue);
 

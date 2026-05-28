@@ -11,8 +11,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Clipping", {{"aa", 6}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Clipping", {{"aa", 6}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     auto scene = Scene::create();

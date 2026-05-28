@@ -41,8 +41,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("LatheGeometry", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("LatheGeometry", {{"aa", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color::gray;

@@ -11,7 +11,7 @@ struct MyGui final: ImguiContext {
 
     bool colorChanged = false;
 
-    explicit MyGui(const Canvas& canvas, const MeshBasicMaterial& m)
+    explicit MyGui(const GlfwWindow& canvas, const MeshBasicMaterial& m)
         : ImguiContext(canvas) {
         colorBuf_[0] = m.color.r;
         colorBuf_[1] = m.color.g;
@@ -100,8 +100,8 @@ auto createPlane() {
 
 int main() {
 
-    Canvas canvas("threepp demo", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("threepp demo", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
 
     auto scene = Scene::create();

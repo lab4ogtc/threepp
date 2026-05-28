@@ -5,8 +5,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas{"STL loader", {{"aa", 4}}};
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas{"STL loader", {{"aa", 4}}};
+    GLRenderer renderer(canvas);
     renderer.setClearColor(Color::aliceblue);
 
     auto scene = Scene::create();

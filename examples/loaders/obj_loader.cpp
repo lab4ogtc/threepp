@@ -19,8 +19,8 @@ void createAndAddLights(Scene& scene) {
 
 int main() {
 
-    Canvas canvas{"OBJ loader", {{"aa", 8}}};
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas{"OBJ loader", {{"aa", 8}}};
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000);

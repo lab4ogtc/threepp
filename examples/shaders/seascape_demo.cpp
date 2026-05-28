@@ -12,9 +12,9 @@ std::string fragmentSource();
 
 int main() {
 
-    Canvas canvas("Seascape demo", {{"antialiasing", 4}});
+    GlfwWindow canvas("Seascape demo", {{"antialiasing", 4}});
 
-    GLRenderer renderer(canvas.size());
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
 
     auto scene = Scene::create();

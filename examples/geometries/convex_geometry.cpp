@@ -29,8 +29,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("ConvexGeometry", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("ConvexGeometry", {{"aa", 4}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color::blue;

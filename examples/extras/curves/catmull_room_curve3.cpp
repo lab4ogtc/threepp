@@ -73,8 +73,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("CatmullRoomCurve", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("CatmullRoomCurve", {{"aa", 8}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     auto scene = Scene::create();

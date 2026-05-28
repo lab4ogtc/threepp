@@ -134,8 +134,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Bones");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Bones");
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     Scene scene;

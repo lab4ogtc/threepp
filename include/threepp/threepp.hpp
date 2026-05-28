@@ -7,6 +7,7 @@
 
 #if __has_include("threepp/canvas/Canvas.hpp")
 #include "threepp/canvas/Canvas.hpp"
+#include "threepp/canvas/Window.hpp"
 #endif
 
 #include "threepp/lights/lights.hpp"
@@ -39,6 +40,8 @@
 #include "threepp/cameras/PerspectiveCamera.hpp"
 
 #include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/Renderer.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 
 #include "threepp/loaders/loaders.hpp"
 

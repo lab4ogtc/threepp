@@ -9,8 +9,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Imgui framebuffer");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Imgui framebuffer");
+    GLRenderer renderer(canvas);
 
     Scene scene;
     PerspectiveCamera camera(60, canvas.aspect());

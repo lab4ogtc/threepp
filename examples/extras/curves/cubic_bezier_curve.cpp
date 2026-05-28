@@ -80,8 +80,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("CubicBezierCurve", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("CubicBezierCurve", {{"aa", 8}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     auto scene = Scene::create();

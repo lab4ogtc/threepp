@@ -15,7 +15,9 @@ set(publicHeaders
         "threepp/animation/tracks/QuaternionKeyframeTrack.hpp"
 
         "threepp/canvas/Canvas.hpp"
+        "threepp/canvas/GlfwWindow.hpp"
         "threepp/canvas/Monitor.hpp"
+        "threepp/canvas/Window.hpp"
         "threepp/canvas/WindowSize.hpp"
 
         "threepp/controls/DragControls.hpp"
@@ -210,6 +212,8 @@ set(publicHeaders
 
         "threepp/renderers/GLRenderer.hpp"
         "threepp/renderers/GLRenderTarget.hpp"
+        "threepp/renderers/RenderTarget.hpp"
+        "threepp/renderers/Renderer.hpp"
 
         "threepp/renderers/gl/GLInfo.hpp"
         "threepp/renderers/gl/GLShadowMap.hpp"
@@ -438,6 +442,8 @@ set(sources
 
         "threepp/renderers/GLRenderer.cpp"
         "threepp/renderers/GLRenderTarget.cpp"
+        "threepp/renderers/RenderTarget.cpp"
+        "threepp/renderers/RendererFactory.cpp"
 
         "threepp/renderers/gl/GLAttributes.cpp"
         "threepp/renderers/gl/GLBackground.cpp"
@@ -490,7 +496,7 @@ if (THREEPP_WITH_GLFW)
     )
 
     list(APPEND sources
-            "threepp/canvas/Canvas.cpp"
+            "threepp/canvas/GlfwWindow.cpp"
     )
     if (NOT EMSCRIPTEN AND NOT THREEPP_USE_EXTERNAL_GLFW)
 

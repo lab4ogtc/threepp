@@ -1,7 +1,9 @@
 .idea
 .vscode
 .cache
+.codegraph
 
 build
 cmake-build-*
 compile_commands.json
+CMakeUserPresets.json

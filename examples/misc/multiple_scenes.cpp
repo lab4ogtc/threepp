@@ -7,7 +7,7 @@ using namespace threepp;
 
 struct MyMouseListener: MouseListener {
 
-    MyMouseListener(bool& d, int& slider, Canvas& c, OrbitControls& oc)
+    MyMouseListener(bool& d, int& slider, GlfwWindow& c, OrbitControls& oc)
         : dragging(d), sliderPos(slider), canvas(c), controls(oc) {}
 
     void onMouseDown(int button, const Vector2& pos) override {
@@ -39,13 +39,13 @@ struct MyMouseListener: MouseListener {
 private:
     bool& dragging;
     int& sliderPos;
-    Canvas& canvas;
+    GlfwWindow& canvas;
     OrbitControls& controls;
 };
 
 int main() {
 
-    Canvas canvas("Multiple Scenes", {{"aa", 4}});
+    GlfwWindow canvas("Multiple Scenes", {{"aa", 4}});
 
     Scene sceneLeft;
     sceneLeft.background = Color(0xBCD48F);
@@ -76,7 +76,7 @@ int main() {
 
     OrbitControls controls(*camera, canvas);
 
-    GLRenderer renderer(canvas.size());
+    GLRenderer renderer(canvas);
     renderer.setScissorTest(true);
     renderer.setClearAlpha(0);
     renderer.setClearColor(0);

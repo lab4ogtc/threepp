@@ -74,8 +74,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Heightmap");
-    GLRenderer renderer{canvas.size()};
+    GlfwWindow canvas("Heightmap");
+    GLRenderer renderer{canvas};
     renderer.autoClear = false;
     renderer.toneMapping = ToneMapping::ACESFilmic;
 

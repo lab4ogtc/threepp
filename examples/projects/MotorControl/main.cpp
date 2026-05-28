@@ -84,9 +84,9 @@ namespace {
 
 int main() {
 
-    Canvas canvas("MotorController", {{"aa", 6}});
+    GlfwWindow canvas("MotorController", {{"aa", 6}});
     const auto size = canvas.size();
-    GLRenderer renderer(size);
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
 
     Scene scene;

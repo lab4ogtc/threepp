@@ -39,8 +39,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("SpotLight", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("SpotLight", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
 
     auto scene = Scene::create();

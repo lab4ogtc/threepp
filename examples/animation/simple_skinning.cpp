@@ -8,8 +8,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Simple skinning", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Simple skinning", {{"aa", 8}});
+    GLRenderer renderer(canvas);
     renderer.shadowMap().enabled = true;
     renderer.shadowMap().type = ShadowMap::PFCSoft;
 

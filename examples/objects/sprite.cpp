@@ -61,9 +61,9 @@ namespace {
 
 int main() {
 
-    Canvas canvas{"Sprite", {{"aa", 4}, {"favicon", std::string(DATA_FOLDER) + "/textures/three.png"s}}};
+    GlfwWindow canvas{"Sprite", {{"aa", 4}, {"favicon", std::string(DATA_FOLDER) + "/textures/three.png"s}}};
     auto size = canvas.size();
-    GLRenderer renderer(size);
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
     renderer.setClearColor(Color::aliceblue);
 

@@ -9,10 +9,10 @@ int main() {
 
     SnakeGame game(10);
 
-    Canvas canvas("Snake");
+    GlfwWindow canvas("Snake");
     int height = monitor::monitorSize().height() / 2;
     canvas.setSize({height, height});
-    GLRenderer renderer(canvas.size());
+    GLRenderer renderer(canvas);
     renderer.autoClear = false;
 
     auto scene = SnakeScene(game);

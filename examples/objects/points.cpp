@@ -7,8 +7,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Points", {{"aa", 8}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Points", {{"aa", 8}});
+    GLRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = 0x050505;

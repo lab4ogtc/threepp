@@ -55,7 +55,7 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Mouse and Key Listeners Demo");
+    GlfwWindow canvas("Mouse and Key Listeners Demo");
     Clock clock;
 
     MyMouseListener ml{clock.elapsedTime};

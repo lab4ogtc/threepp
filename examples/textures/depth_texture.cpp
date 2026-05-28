@@ -38,8 +38,8 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Depth texture");
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Depth texture");
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
 
     PerspectiveCamera camera(70, canvas.aspect(), 0.01f, 50.f);

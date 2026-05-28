@@ -7,8 +7,8 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Raycast", {{"aa", 4}});
-    GLRenderer renderer(canvas.size());
+    GlfwWindow canvas("Raycast", {{"aa", 4}});
+    GLRenderer renderer(canvas);
     renderer.setClearColor(Color::aliceblue);
 
     Scene scene;

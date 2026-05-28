@@ -11,9 +11,9 @@ std::string fragmentSource();
 
 int main() {
 
-    Canvas canvas("Raw Shader demo");
+    GlfwWindow canvas("Raw Shader demo");
 
-    GLRenderer renderer(canvas.size());
+    GLRenderer renderer(canvas);
     renderer.checkShaderErrors = true;
 
     auto scene = Scene::create();
