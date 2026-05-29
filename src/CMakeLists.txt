@@ -238,6 +238,8 @@ set(privateHeaders
         "threepp/animation/PropertyMixer.hpp"
 
         "threepp/renderers/metal/MetalShaders.hpp"
+        "threepp/renderers/metal/MetalCameraUtils.hpp"
+        "threepp/renderers/metal/MetalRenderStateUtils.hpp"
         "threepp/renderers/metal/MetalPipelineCache.hpp"
         "threepp/renderers/metal/MetalBufferManager.hpp"
         "threepp/renderers/metal/MetalShaderManager.hpp"

@@ -1,7 +1,9 @@
 #import "threepp/renderers/metal/MetalRenderer.hpp"
 
 #import "MetalBufferManager.hpp"
+#import "MetalCameraUtils.hpp"
 #import "MetalPipelineCache.hpp"
+#import "MetalRenderStateUtils.hpp"
 #import "MetalShaderManager.hpp"
 #import "MetalTextureManager.hpp"
 
@@ -40,7 +42,7 @@ using namespace threepp;
 namespace {
 
     void computeMVP(const Camera& camera, const Object3D& object, Matrix4& out) {
-        out.copy(camera.projectionMatrix);
+        out.copy(metal::convertProjectionToMetalClipSpace(camera.projectionMatrix));
         out.multiply(camera.matrixWorldInverse);
         out.multiply(*object.matrixWorld);
     }
@@ -255,8 +257,7 @@ struct MetalRenderer::Impl {
         lastRenderTime = now;
 
         scene.updateMatrixWorld(false);
-        camera.updateProjectionMatrix();
-        camera.matrixWorldInverse.copy(*camera.matrixWorld).invert();
+        metal::prepareCameraForRender(camera);
 
         Color effectiveClearColor = clearColor;
         float effectiveClearAlpha = clearAlpha;
@@ -302,11 +303,12 @@ struct MetalRenderer::Impl {
             Material* material = nullptr;
             bool isLine = false;
             bool isWireframe = false;
-            bool doubleSided = false;
             bool transparent = false;
             Color materialColor{0xffffff};
+            bool isMesh = false;
 
             if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
+                isMesh = true;
                 geometry = mesh->geometry().get();
                 material = mesh->material().get();
 
@@ -316,7 +318,6 @@ struct MetalRenderer::Impl {
                 if (auto* wf = dynamic_cast<MaterialWithWireframe*>(material)) {
                     isWireframe = wf->wireframe;
                 }
-                doubleSided = material->side == Side::Double;
                 transparent = material->transparent;
 
             } else if (auto* lines = dynamic_cast<LineSegments*>(obj)) {
@@ -326,7 +327,6 @@ struct MetalRenderer::Impl {
                 if (auto* lbc = dynamic_cast<MaterialWithColor*>(material)) {
                     materialColor.copy(lbc->color);
                 }
-                doubleSided = false;
                 transparent = material->transparent;
                 isLine = true;
             }
@@ -362,7 +362,10 @@ struct MetalRenderer::Impl {
 
             id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>)pipelineCache->getOrCreatePipelineState(pipelineKey);
             [encoder setRenderPipelineState:pso];
-            [encoder setCullMode:doubleSided ? MTLCullModeNone : MTLCullModeBack];
+            const auto frontFaceCW = isMesh && obj->matrixWorld->determinant() < 0;
+            const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW);
+            [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+            [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
             auto* posBuf = (__bridge id<MTLBuffer>)bufferManager->getBuffer(

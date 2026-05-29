@@ -3,6 +3,7 @@
 #define THREEPP_RENDERER_HPP
 
 #include <memory>
+#include <utility>
 
 namespace threepp {
 
@@ -35,6 +36,12 @@ namespace threepp {
         virtual void setClearColor(const Color& color, float alpha = 1) = 0;
 
         virtual void clear(bool color = true, bool depth = true, bool stencil = true) = 0;
+
+        virtual void setViewport(int x, int y, int width, int height) = 0;
+
+        virtual void setScissor(int x, int y, int width, int height) = 0;
+
+        virtual void setScissorTest(bool enable) = 0;
 
         virtual void setRenderTarget(RenderTarget* renderTarget) = 0;
 

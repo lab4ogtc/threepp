@@ -27,17 +27,17 @@ namespace threepp {
 
         void setViewport(const Vector4& v);
 
-        void setViewport(int x, int y, int width, int height);
+        void setViewport(int x, int y, int width, int height) override;
 
         void setViewport(const std::pair<int, int>& pos, const std::pair<int, int>& size);
 
         void setScissor(const Vector4& v);
 
-        void setScissor(int x, int y, int width, int height);
+        void setScissor(int x, int y, int width, int height) override;
 
         void setScissor(const std::pair<int, int>& pos, const std::pair<int, int>& size);
 
-        void setScissorTest(bool boolean);
+        void setScissorTest(bool boolean) override;
 
         void setRenderTarget(RenderTarget* renderTarget) override;
 

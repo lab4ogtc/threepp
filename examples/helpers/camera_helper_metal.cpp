@@ -1,5 +1,5 @@
 #include "threepp/helpers/CameraHelper.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
+#include "threepp/renderers/Renderer.hpp"
 #include <threepp/threepp.hpp>
 
 #include <cmath>
@@ -28,8 +28,8 @@ namespace {
 int main() {
 
     GlfwWindow canvas{"Camera helper (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}}};
-    MetalRenderer renderer(canvas);
-    renderer.autoClear = false;
+    auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->autoClear = false;
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(60, 0.5f * canvas.aspect(), 1, 10);
@@ -52,24 +52,24 @@ int main() {
         camera->updateProjectionMatrix();
         camera2->aspect = 0.5f * size.aspect();
         camera2->updateProjectionMatrix();
-        renderer.setSize(size);
+        renderer->setSize(size);
     });
 
     Clock clock;
     canvas.animate([&]() {
         const auto size = canvas.size();
 
-        renderer.clear();
+        renderer->clear();
 
         helper->visible = false;
 
-        renderer.setViewport({size.width() / 2, 0, size.width() / 2, size.height()});
-        renderer.render(*scene, *camera);
+        renderer->setViewport(size.width() / 2, 0, size.width() / 2, size.height());
+        renderer->render(*scene, *camera);
 
         helper->visible = true;
 
-        renderer.setViewport({0, 0, size.width() / 2, size.height()});
-        renderer.render(*scene, *camera2);
+        renderer->setViewport(0, 0, size.width() / 2, size.height());
+        renderer->render(*scene, *camera2);
 
         camera->position.z = 4 * std::sin(math::TWO_PI * 0.1f * clock.getElapsedTime());
     });

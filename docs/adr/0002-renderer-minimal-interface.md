@@ -1,7 +1,7 @@
 # ADR-002: Renderer 基类最小接口路线
 
 ## 状态
-已确认
+已被 ADR-0005 部分取代
 
 ## 背景
 `GLRenderer` 现有超过 50 个公开方法，包括通用（`render`、`setSize`）和 GL 特有（`setViewport`、`shadowMap`、`copyFramebufferToTexture`）。引入 Metal 后端时需要共同基类。
