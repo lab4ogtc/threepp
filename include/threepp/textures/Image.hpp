@@ -34,6 +34,12 @@ namespace threepp {
             return std::get<std::vector<T>>(data_);
         }
 
+        template<class T = unsigned char>
+        [[nodiscard]] const std::vector<T>& data() const {
+
+            return std::get<std::vector<T>>(data_);
+        }
+
     private:
         ImageData data_;
     };

@@ -240,6 +240,8 @@ set(privateHeaders
         "threepp/renderers/metal/MetalShaders.hpp"
         "threepp/renderers/metal/MetalPipelineCache.hpp"
         "threepp/renderers/metal/MetalBufferManager.hpp"
+        "threepp/renderers/metal/MetalShaderManager.hpp"
+        "threepp/renderers/metal/MetalTextureManager.hpp"
 
         "threepp/materials/MeshDistanceMaterial.hpp"
 
@@ -561,6 +563,8 @@ if (APPLE)
             "threepp/renderers/metal/MetalRenderer.mm"
             "threepp/renderers/metal/MetalPipelineCache.mm"
             "threepp/renderers/metal/MetalBufferManager.mm"
+            "threepp/renderers/metal/MetalShaderManager.mm"
+            "threepp/renderers/metal/MetalTextureManager.mm"
     )
 endif ()
 

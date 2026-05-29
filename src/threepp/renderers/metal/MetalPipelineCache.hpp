@@ -2,6 +2,8 @@
 #ifndef THREEPP_METAL_PIPELINE_CACHE_HPP
 #define THREEPP_METAL_PIPELINE_CACHE_HPP
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 
 namespace threepp::metal {
@@ -10,6 +12,7 @@ namespace threepp::metal {
         void* vertexFunction = nullptr;
         void* fragmentFunction = nullptr;
         bool alphaBlending = false;
+        std::uint8_t vertexLayoutBitmask = 0b0001;
 
         bool operator==(const PipelineKey& other) const;
     };
@@ -25,7 +28,7 @@ namespace threepp::metal {
 
         ~MetalPipelineCache();
 
-        void* getOrCreatePipelineState(const PipelineKey& key, void* vertexDescriptor);
+        void* getOrCreatePipelineState(const PipelineKey& key);
 
         void* getOrCreateDepthStencilState();
 

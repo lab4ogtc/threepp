@@ -266,7 +266,10 @@ Quaternion& Quaternion::slerp(const Quaternion& qb, float t) {
 
     // http://www.euclideanspace.com/maths/algebra/realNormedAlgebra/quaternions/slerp/
 
-    float cosHalfTheta = w * qb.w.value_ + x * qb.x.value_ + y * qb.y.value_ + z * qb.z.value_;
+    double cosHalfTheta = static_cast<double>(w) * qb.w.value_
+                        + static_cast<double>(x) * qb.x.value_
+                        + static_cast<double>(y) * qb.y.value_
+                        + static_cast<double>(z) * qb.z.value_;
 
     if (cosHalfTheta < 0) {
 
@@ -292,7 +295,7 @@ Quaternion& Quaternion::slerp(const Quaternion& qb, float t) {
         return *this;
     }
 
-    const float sqrSinHalfTheta = 1.f - cosHalfTheta * cosHalfTheta;
+    const double sqrSinHalfTheta = 1.0 - cosHalfTheta * cosHalfTheta;
 
     if (sqrSinHalfTheta <= std::numeric_limits<float>::epsilon()) {
 
@@ -308,10 +311,10 @@ Quaternion& Quaternion::slerp(const Quaternion& qb, float t) {
         return *this;
     }
 
-    const float sinHalfTheta = std::sqrt(sqrSinHalfTheta);
-    const float halfTheta = std::atan2(sinHalfTheta, cosHalfTheta);
-    const float ratioA = std::sin((1 - t) * halfTheta) / sinHalfTheta,
-                ratioB = std::sin(t * halfTheta) / sinHalfTheta;
+    const double sinHalfTheta = std::sqrt(sqrSinHalfTheta);
+    const double halfTheta = std::atan2(sinHalfTheta, cosHalfTheta);
+    const double ratioA = std::sin((1 - t) * halfTheta) / sinHalfTheta;
+    const double ratioB = std::sin(t * halfTheta) / sinHalfTheta;
 
     this->w = (w * ratioA + this->w.value_ * ratioB);
     this->x = (x * ratioA + this->x.value_ * ratioB);

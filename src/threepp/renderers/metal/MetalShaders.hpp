@@ -10,14 +10,25 @@ using namespace metal;
 
 struct VertexInput {
     float3 position [[attribute(0)]];
+#if USE_NORMAL
     float3 normal   [[attribute(1)]];
+#endif
+#if USE_MAP
     float2 uv       [[attribute(2)]];
+#endif
+#if USE_VERTEX_COLORS
     float3 color    [[attribute(3)]];
+#endif
 };
 
 struct VertexOutput {
     float4 position [[position]];
+#if USE_MAP
+    float2 uv;
+#endif
+#if USE_VERTEX_COLORS
     float4 color;
+#endif
 };
 
 vertex VertexOutput basic_vertex(
@@ -26,7 +37,15 @@ vertex VertexOutput basic_vertex(
 {
     VertexOutput out;
     out.position = mvp * float4(in.position, 1.0);
+#if USE_NORMAL
+    out.position += float4(in.normal * 0.0, 0.0);
+#endif
+#if USE_MAP
+    out.uv = in.uv;
+#endif
+#if USE_VERTEX_COLORS
     out.color = float4(in.color, 1.0);
+#endif
     return out;
 }
 )metal";
@@ -37,17 +56,25 @@ using namespace metal;
 
 struct FragmentParams {
     float4 color;
-    int useVertexColors;
 };
 
 fragment float4 basic_fragment(
     VertexOutput in [[stage_in]],
-    constant FragmentParams& params [[buffer(0)]])
+    constant FragmentParams& params [[buffer(0)]]
+#if USE_MAP
+    , texture2d<float> map [[texture(0)]]
+    , sampler mapSampler [[sampler(0)]]
+#endif
+)
 {
-    if (params.useVertexColors != 0) {
-        return in.color;
-    }
-    return params.color;
+    float4 color = params.color;
+#if USE_VERTEX_COLORS
+    color *= in.color;
+#endif
+#if USE_MAP
+    color *= map.sample(mapSampler, in.uv);
+#endif
+    return color;
 }
 )metal";
 

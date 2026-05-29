@@ -1,0 +1,1 @@
+add_test_executable(MetalP1_test)

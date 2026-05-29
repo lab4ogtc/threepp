@@ -2,9 +2,11 @@
 #ifndef THREEPP_METAL_RENDERER_HPP
 #define THREEPP_METAL_RENDERER_HPP
 
+#include "threepp/math/Vector4.hpp"
 #include "threepp/renderers/Renderer.hpp"
 
 #include <memory>
+#include <utility>
 
 namespace threepp {
 
@@ -22,6 +24,20 @@ namespace threepp {
         void setClearColor(const Color& color, float alpha = 1) override;
 
         void clear(bool color = true, bool depth = true, bool stencil = true) override;
+
+        void setViewport(const Vector4& v);
+
+        void setViewport(int x, int y, int width, int height);
+
+        void setViewport(const std::pair<int, int>& pos, const std::pair<int, int>& size);
+
+        void setScissor(const Vector4& v);
+
+        void setScissor(int x, int y, int width, int height);
+
+        void setScissor(const std::pair<int, int>& pos, const std::pair<int, int>& size);
+
+        void setScissorTest(bool boolean);
 
         void setRenderTarget(RenderTarget* renderTarget) override;
 

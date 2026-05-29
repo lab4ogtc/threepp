@@ -1,9 +1,9 @@
-
 #import "threepp/renderers/metal/MetalRenderer.hpp"
 
 #import "MetalBufferManager.hpp"
 #import "MetalPipelineCache.hpp"
-#import "MetalShaders.hpp"
+#import "MetalShaderManager.hpp"
+#import "MetalTextureManager.hpp"
 
 #import "threepp/cameras/Camera.hpp"
 #import "threepp/canvas/Window.hpp"
@@ -18,6 +18,7 @@
 #import "threepp/objects/Mesh.hpp"
 #import "threepp/renderers/RenderTarget.hpp"
 #import "threepp/scenes/Scene.hpp"
+#import "threepp/textures/Texture.hpp"
 
 #define GLFW_EXPOSE_NATIVE_COCOA
 #import <GLFW/glfw3.h>
@@ -26,7 +27,13 @@
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
-#include <stack>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <stdexcept>
+#include <vector>
 
 using namespace threepp;
 
@@ -56,6 +63,11 @@ namespace {
         return attr->typed<float>();
     }
 
+    NSUInteger clampToSize(float value, NSUInteger maxValue) {
+        const auto rounded = static_cast<long>(std::floor(value));
+        return static_cast<NSUInteger>(std::clamp<long>(rounded, 0, static_cast<long>(maxValue)));
+    }
+
 }// namespace
 
 struct MetalRenderer::Impl {
@@ -65,24 +77,32 @@ struct MetalRenderer::Impl {
     id<MTLCommandQueue> commandQueue = nil;
     CAMetalLayer* metalLayer = nil;
     id<MTLDepthStencilState> depthStencilState = nil;
-    id<MTLLibrary> library = nil;
-    id<MTLFunction> vertexFunction = nil;
-    id<MTLFunction> fragmentFunction = nil;
     id<MTLTexture> depthTexture = nil;
-    id<MTLBuffer> defaultColorBuffer = nil;
-    MTLVertexDescriptor* vertexDescriptor = nil;
+    id<CAMetalDrawable> currentDrawable = nil;
+    id<MTLCommandBuffer> currentCommandBuffer = nil;
     MTLPixelFormat depthPixelFormat = MTLPixelFormatDepth32Float;
 
     std::unique_ptr<metal::MetalPipelineCache> pipelineCache;
     std::unique_ptr<metal::MetalBufferManager> bufferManager;
+    std::unique_ptr<metal::MetalShaderManager> shaderManager;
+    std::unique_ptr<metal::MetalTextureManager> textureManager;
 
     Color clearColor{0, 0, 0};
     float clearAlpha = 1;
     bool clearColorFlag = true;
     bool clearDepthFlag = true;
+    bool clearRequested = false;
+    bool explicitFrameInProgress = false;
 
     int fbWidth = 0;
     int fbHeight = 0;
+    float pixelRatio = 1;
+    Vector4 viewport;
+    Vector4 scissor;
+    bool scissorTest = false;
+    std::chrono::steady_clock::time_point lastRenderTime{};
+
+    RenderTarget* renderTarget = nullptr;
 
     explicit Impl(Window& w)
         : window(w) {
@@ -111,63 +131,42 @@ struct MetalRenderer::Impl {
         [contentView setLayer:metalLayer];
 
         glfwGetFramebufferSize(glfwWin, &fbWidth, &fbHeight);
+        updatePixelRatio(window.size());
         metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
-        metalLayer.contentsScale = (double)fbWidth / metalLayer.bounds.size.width;
+        metalLayer.contentsScale = pixelRatio;
 
         createDepthTexture();
 
-        vertexDescriptor = [[MTLVertexDescriptor alloc] init];
-
-        vertexDescriptor.attributes[0].format = MTLVertexFormatFloat3;
-        vertexDescriptor.attributes[0].offset = 0;
-        vertexDescriptor.attributes[0].bufferIndex = 0;
-        vertexDescriptor.layouts[0].stride = sizeof(float) * 3;
-        vertexDescriptor.layouts[0].stepFunction = MTLVertexStepFunctionPerVertex;
-
-        vertexDescriptor.attributes[1].format = MTLVertexFormatFloat3;
-        vertexDescriptor.attributes[1].offset = 0;
-        vertexDescriptor.attributes[1].bufferIndex = 1;
-        vertexDescriptor.layouts[1].stride = sizeof(float) * 3;
-        vertexDescriptor.layouts[1].stepFunction = MTLVertexStepFunctionPerVertex;
-
-        vertexDescriptor.attributes[2].format = MTLVertexFormatFloat2;
-        vertexDescriptor.attributes[2].offset = 0;
-        vertexDescriptor.attributes[2].bufferIndex = 2;
-        vertexDescriptor.layouts[2].stride = sizeof(float) * 2;
-        vertexDescriptor.layouts[2].stepFunction = MTLVertexStepFunctionPerVertex;
-
-        vertexDescriptor.attributes[3].format = MTLVertexFormatFloat3;
-        vertexDescriptor.attributes[3].offset = 0;
-        vertexDescriptor.attributes[3].bufferIndex = 3;
-        vertexDescriptor.layouts[3].stride = sizeof(float) * 3;
-        vertexDescriptor.layouts[3].stepFunction = MTLVertexStepFunctionPerVertex;
-
-        compileShaders();
-
         pipelineCache = std::make_unique<metal::MetalPipelineCache>((__bridge void*)device);
         bufferManager = std::make_unique<metal::MetalBufferManager>((__bridge void*)device);
+        shaderManager = std::make_unique<metal::MetalShaderManager>((__bridge void*)device);
+        textureManager = std::make_unique<metal::MetalTextureManager>((__bridge void*)device, (__bridge void*)commandQueue);
 
         depthStencilState = (__bridge id<MTLDepthStencilState>)pipelineCache->getOrCreateDepthStencilState();
 
-        float defaultColor[3] = {1.0f, 1.0f, 1.0f};
-        defaultColorBuffer = [device newBufferWithBytes:defaultColor length:sizeof(defaultColor) options:MTLResourceStorageModeShared];
+        setViewport(0, 0, window.size().width(), window.size().height());
+        setScissor(0, 0, window.size().width(), window.size().height());
     }
 
-    void compileShaders() {
-        NSString* source = [NSString stringWithUTF8String:metal::basic_vertex];
-        source = [source stringByAppendingString:[NSString stringWithUTF8String:metal::basic_fragment]];
+    ~Impl() {
+        commitPendingFrame();
+    }
 
-        NSError* error = nil;
-        library = [device newLibraryWithSource:source options:nil error:&error];
-        if (!library) {
-            NSString* msg = [NSString stringWithFormat:@"MSL compilation failed: %@", error.localizedDescription];
-            throw std::runtime_error([msg UTF8String]);
-        }
+    void commitPendingFrame() {
+        if (!currentCommandBuffer) return;
 
-        vertexFunction = [library newFunctionWithName:@"basic_vertex"];
-        fragmentFunction = [library newFunctionWithName:@"basic_fragment"];
-        if (!vertexFunction || !fragmentFunction) {
-            throw std::runtime_error("Failed to find MSL shader functions");
+        [currentCommandBuffer presentDrawable:currentDrawable];
+        [currentCommandBuffer commit];
+        currentCommandBuffer = nil;
+        currentDrawable = nil;
+        explicitFrameInProgress = false;
+    }
+
+    void updatePixelRatio(const WindowSize& size) {
+        if (size.width() > 0) {
+            pixelRatio = static_cast<float>(fbWidth) / static_cast<float>(size.width());
+        } else {
+            pixelRatio = 1;
         }
     }
 
@@ -177,8 +176,8 @@ struct MetalRenderer::Impl {
         }
 
         MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:depthPixelFormat
-                                                                                        width:fbWidth
-                                                                                       height:fbHeight
+                                                                                        width:std::max(fbWidth, 1)
+                                                                                       height:std::max(fbHeight, 1)
                                                                                     mipmapped:NO];
         desc.usage = MTLTextureUsageRenderTarget;
         desc.storageMode = MTLStorageModePrivate;
@@ -186,11 +185,16 @@ struct MetalRenderer::Impl {
     }
 
     void setSize(std::pair<int, int> size) {
+        commitPendingFrame();
+
         GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window.nativeHandle());
         glfwGetFramebufferSize(glfwWin, &fbWidth, &fbHeight);
+        updatePixelRatio(WindowSize{size});
         metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
-        metalLayer.contentsScale = (double)fbWidth / size.first;
+        metalLayer.contentsScale = pixelRatio;
         createDepthTexture();
+        setViewport(0, 0, size.first, size.second);
+        setScissor(0, 0, size.first, size.second);
     }
 
     void setClearColor(const Color& color, float alpha) {
@@ -198,12 +202,58 @@ struct MetalRenderer::Impl {
         clearAlpha = alpha;
     }
 
-    void clear(bool color, bool depth, bool stencil) {
+    void clear(bool color, bool depth, bool /*stencil*/) {
+        commitPendingFrame();
+
         clearColorFlag = color;
         clearDepthFlag = depth;
+        clearRequested = true;
+        explicitFrameInProgress = true;
     }
 
-    void render(Scene& scene, Camera& camera) {
+    void setViewport(int x, int y, int width, int height) {
+        viewport.set(static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height));
+    }
+
+    void setScissor(int x, int y, int width, int height) {
+        scissor.set(static_cast<float>(x), static_cast<float>(y), static_cast<float>(width), static_cast<float>(height));
+    }
+
+    void applyViewport(id<MTLRenderCommandEncoder> encoder) const {
+        const MTLViewport mtlViewport{
+            viewport.x * pixelRatio,
+            viewport.y * pixelRatio,
+            viewport.z * pixelRatio,
+            viewport.w * pixelRatio,
+            0.0,
+            1.0};
+        [encoder setViewport:mtlViewport];
+    }
+
+    void applyScissor(id<MTLRenderCommandEncoder> encoder) const {
+        if (!scissorTest) return;
+
+        const auto maxWidth = static_cast<NSUInteger>(std::max(fbWidth, 0));
+        const auto maxHeight = static_cast<NSUInteger>(std::max(fbHeight, 0));
+        const auto x = clampToSize(scissor.x * pixelRatio, maxWidth);
+        const auto y = clampToSize(scissor.y * pixelRatio, maxHeight);
+        const auto maxX = clampToSize((scissor.x + scissor.z) * pixelRatio, maxWidth);
+        const auto maxY = clampToSize((scissor.y + scissor.w) * pixelRatio, maxHeight);
+
+        const MTLScissorRect rect{x, y, maxX > x ? maxX - x : 0, maxY > y ? maxY - y : 0};
+        [encoder setScissorRect:rect];
+    }
+
+    void render(Scene& scene, Camera& camera, bool autoClear) {
+        const auto now = std::chrono::steady_clock::now();
+        if (currentCommandBuffer && !explicitFrameInProgress && lastRenderTime.time_since_epoch().count() != 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRenderTime);
+            if (elapsed.count() > 5) {
+                commitPendingFrame();
+            }
+        }
+        lastRenderTime = now;
+
         scene.updateMatrixWorld(false);
         camera.updateProjectionMatrix();
         camera.matrixWorldInverse.copy(*camera.matrixWorld).invert();
@@ -214,24 +264,32 @@ struct MetalRenderer::Impl {
             effectiveClearColor.copy(scene.background.color());
         }
 
-        id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
-        if (!drawable) return;
+        bool isFirstPassOfFrame = false;
+        if (!currentCommandBuffer) {
+            currentDrawable = [metalLayer nextDrawable];
+            if (!currentDrawable) return;
 
-        id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+            currentCommandBuffer = [commandQueue commandBuffer];
+            isFirstPassOfFrame = true;
+        }
+
+        const auto shouldClear = (autoClear && isFirstPassOfFrame) || clearRequested;
 
         MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-        passDesc.colorAttachments[0].texture = drawable.texture;
-        passDesc.colorAttachments[0].loadAction = clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
+        passDesc.colorAttachments[0].texture = currentDrawable.texture;
+        passDesc.colorAttachments[0].loadAction = shouldClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
         passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
         passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
 
         passDesc.depthAttachment.texture = depthTexture;
-        passDesc.depthAttachment.loadAction = clearDepthFlag ? MTLLoadActionClear : MTLLoadActionLoad;
+        passDesc.depthAttachment.loadAction = shouldClear && clearDepthFlag ? MTLLoadActionClear : MTLLoadActionLoad;
         passDesc.depthAttachment.clearDepth = 1.0;
-        passDesc.depthAttachment.storeAction = MTLStoreActionDontCare;
+        passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
-        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:passDesc];
+        id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
         [encoder setDepthStencilState:depthStencilState];
+        applyViewport(encoder);
+        applyScissor(encoder);
 
         std::vector<Object3D*> renderables;
         collectRenderables(scene, renderables);
@@ -260,7 +318,6 @@ struct MetalRenderer::Impl {
                 }
                 doubleSided = material->side == Side::Double;
                 transparent = material->transparent;
-                isLine = false;
 
             } else if (auto* lines = dynamic_cast<LineSegments*>(obj)) {
                 geometry = lines->geometry().get();
@@ -276,28 +333,45 @@ struct MetalRenderer::Impl {
 
             if (!geometry || !material || !material->visible) continue;
 
+            auto* posAttr = getFloatAttribute(*geometry, "position");
+            if (!posAttr) continue;
+            auto* normAttr = getFloatAttribute(*geometry, "normal");
+            auto* uvAttr = getFloatAttribute(*geometry, "uv");
+            auto* colorAttr = getFloatAttribute(*geometry, "color");
+            auto* mapMaterial = dynamic_cast<MaterialWithMap*>(material);
+
+            const bool useMap = mapMaterial && mapMaterial->map && uvAttr;
+            const bool useVertexColors = material->vertexColors && colorAttr;
+            const bool useNormal = normAttr != nullptr;
+
+            metal::ShaderProgramKey shaderKey;
+            shaderKey.useMap = useMap;
+            shaderKey.useVertexColors = useVertexColors;
+            shaderKey.useNormal = useNormal;
+
+            std::uint8_t vertexLayoutBitmask = 0b0001;
+            if (useNormal) vertexLayoutBitmask |= 0b0010;
+            if (useMap) vertexLayoutBitmask |= 0b0100;
+            if (useVertexColors) vertexLayoutBitmask |= 0b1000;
+
+            metal::PipelineKey pipelineKey;
+            pipelineKey.vertexFunction = shaderManager->getOrCreateVertexFunction(shaderKey);
+            pipelineKey.fragmentFunction = shaderManager->getOrCreateFragmentFunction(shaderKey);
+            pipelineKey.alphaBlending = transparent;
+            pipelineKey.vertexLayoutBitmask = vertexLayoutBitmask;
+
+            id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>)pipelineCache->getOrCreatePipelineState(pipelineKey);
+            [encoder setRenderPipelineState:pso];
             [encoder setCullMode:doubleSided ? MTLCullModeNone : MTLCullModeBack];
             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
-            metal::PipelineKey key;
-            key.vertexFunction = (__bridge void*)vertexFunction;
-            key.fragmentFunction = (__bridge void*)fragmentFunction;
-            key.alphaBlending = transparent;
+            auto* posBuf = (__bridge id<MTLBuffer>)bufferManager->getBuffer(
+                *posAttr,
+                posAttr->count() * posAttr->itemSize() * sizeof(float),
+                posAttr->array().data());
+            [encoder setVertexBuffer:posBuf offset:0 atIndex:0];
 
-            id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>)
-                pipelineCache->getOrCreatePipelineState(key, (__bridge void*)vertexDescriptor);
-            [encoder setRenderPipelineState:pso];
-
-            // bind vertex attributes
-            if (auto* posAttr = getFloatAttribute(*geometry, "position")) {
-                auto* buf = (__bridge id<MTLBuffer>)bufferManager->getBuffer(
-                    *posAttr,
-                    posAttr->count() * posAttr->itemSize() * sizeof(float),
-                    posAttr->array().data());
-                [encoder setVertexBuffer:buf offset:0 atIndex:0];
-            }
-
-            if (auto* normAttr = getFloatAttribute(*geometry, "normal")) {
+            if (useNormal) {
                 auto* buf = (__bridge id<MTLBuffer>)bufferManager->getBuffer(
                     *normAttr,
                     normAttr->count() * normAttr->itemSize() * sizeof(float),
@@ -305,7 +379,7 @@ struct MetalRenderer::Impl {
                 [encoder setVertexBuffer:buf offset:0 atIndex:1];
             }
 
-            if (auto* uvAttr = getFloatAttribute(*geometry, "uv")) {
+            if (useMap) {
                 auto* buf = (__bridge id<MTLBuffer>)bufferManager->getBuffer(
                     *uvAttr,
                     uvAttr->count() * uvAttr->itemSize() * sizeof(float),
@@ -313,28 +387,28 @@ struct MetalRenderer::Impl {
                 [encoder setVertexBuffer:buf offset:0 atIndex:2];
             }
 
-            if (auto* colorAttr = getFloatAttribute(*geometry, "color")) {
+            if (useVertexColors) {
                 auto* buf = (__bridge id<MTLBuffer>)bufferManager->getBuffer(
                     *colorAttr,
                     colorAttr->count() * colorAttr->itemSize() * sizeof(float),
                     colorAttr->array().data());
                 [encoder setVertexBuffer:buf offset:0 atIndex:3];
-            } else {
-                [encoder setVertexBuffer:defaultColorBuffer offset:0 atIndex:3];
             }
 
             [encoder setVertexBytes:mvp.elements.data() length:sizeof(float) * 16 atIndex:4];
 
-            // set material color
             struct alignas(16) FragmentParams {
                 float color[4];
-                int useVertexColors;
             };
-            FragmentParams params{
-                {materialColor.r, materialColor.g, materialColor.b, material->opacity},
-                material->vertexColors ? 1 : 0
-            };
+            FragmentParams params{{materialColor.r, materialColor.g, materialColor.b, material->opacity}};
             [encoder setFragmentBytes:&params length:sizeof(params) atIndex:0];
+
+            if (useMap) {
+                auto* texture = (__bridge id<MTLTexture>)textureManager->getOrCreateTexture(*mapMaterial->map);
+                auto* sampler = (__bridge id<MTLSamplerState>)textureManager->getOrCreateSampler(*mapMaterial->map);
+                [encoder setFragmentTexture:texture atIndex:0];
+                [encoder setFragmentSamplerState:sampler atIndex:0];
+            }
 
             if (geometry->hasIndex()) {
                 auto* indexAttr = geometry->getIndex();
@@ -356,8 +430,7 @@ struct MetalRenderer::Impl {
             } else {
                 NSUInteger vertexCount = geometry->drawRange.count;
                 if (vertexCount == std::numeric_limits<int>::max() / 2) {
-                    auto* posAttr = getFloatAttribute(*geometry, "position");
-                    if (posAttr) vertexCount = posAttr->count();
+                    vertexCount = posAttr->count();
                 }
 
                 [encoder drawPrimitives:isLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle
@@ -367,21 +440,22 @@ struct MetalRenderer::Impl {
         }
 
         [encoder endEncoding];
-        [commandBuffer presentDrawable:drawable];
-        [commandBuffer commit];
 
+        clearRequested = false;
         clearColorFlag = true;
         clearDepthFlag = true;
-    }
 
-    RenderTarget* renderTarget = nullptr;
+        if (autoClear) {
+            commitPendingFrame();
+        }
+    }
 };
 
 MetalRenderer::MetalRenderer(Window& window)
     : pimpl_(std::make_unique<Impl>(window)) {}
 
 void MetalRenderer::render(Scene& scene, Camera& camera) {
-    pimpl_->render(scene, camera);
+    pimpl_->render(scene, camera, autoClear);
 }
 
 void MetalRenderer::setSize(std::pair<int, int> size) {
@@ -394,6 +468,34 @@ void MetalRenderer::setClearColor(const Color& color, float alpha) {
 
 void MetalRenderer::clear(bool color, bool depth, bool stencil) {
     pimpl_->clear(color, depth, stencil);
+}
+
+void MetalRenderer::setViewport(const Vector4& v) {
+    pimpl_->setViewport(static_cast<int>(v.x), static_cast<int>(v.y), static_cast<int>(v.z), static_cast<int>(v.w));
+}
+
+void MetalRenderer::setViewport(int x, int y, int width, int height) {
+    pimpl_->setViewport(x, y, width, height);
+}
+
+void MetalRenderer::setViewport(const std::pair<int, int>& pos, const std::pair<int, int>& size) {
+    pimpl_->setViewport(pos.first, pos.second, size.first, size.second);
+}
+
+void MetalRenderer::setScissor(const Vector4& v) {
+    pimpl_->setScissor(static_cast<int>(v.x), static_cast<int>(v.y), static_cast<int>(v.z), static_cast<int>(v.w));
+}
+
+void MetalRenderer::setScissor(int x, int y, int width, int height) {
+    pimpl_->setScissor(x, y, width, height);
+}
+
+void MetalRenderer::setScissor(const std::pair<int, int>& pos, const std::pair<int, int>& size) {
+    pimpl_->setScissor(pos.first, pos.second, size.first, size.second);
+}
+
+void MetalRenderer::setScissorTest(bool boolean) {
+    pimpl_->scissorTest = boolean;
 }
 
 void MetalRenderer::setRenderTarget(RenderTarget* renderTarget) {
