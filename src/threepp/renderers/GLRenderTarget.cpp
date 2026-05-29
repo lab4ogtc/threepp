@@ -40,4 +40,7 @@ void GLRenderTarget::dispose() {
     }
 }
 
-GLRenderTarget::~GLRenderTarget() = default;
+GLRenderTarget::~GLRenderTarget() {
+
+    dispose();
+}
