@@ -145,3 +145,14 @@ TEST_CASE("Metal face culling state matches OpenGL material side semantics") {
     auto doubleSided = metal::computeFaceCullingState(Side::Double, false);
     REQUIRE(doubleSided.cullMode == metal::CullMode::None);
 }
+
+TEST_CASE("Metal wireframe rendering disables triangle culling like GL line wireframes") {
+
+    auto frontWireframe = metal::computeFaceCullingState(Side::Front, false, true);
+    REQUIRE(frontWireframe.frontFaceWinding == metal::FrontFaceWinding::CounterClockwise);
+    REQUIRE(frontWireframe.cullMode == metal::CullMode::None);
+
+    auto backWireframe = metal::computeFaceCullingState(Side::Back, false, true);
+    REQUIRE(backWireframe.frontFaceWinding == metal::FrontFaceWinding::Clockwise);
+    REQUIRE(backWireframe.cullMode == metal::CullMode::None);
+}

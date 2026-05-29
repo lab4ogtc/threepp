@@ -363,7 +363,7 @@ struct MetalRenderer::Impl {
             id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>)pipelineCache->getOrCreatePipelineState(pipelineKey);
             [encoder setRenderPipelineState:pso];
             const auto frontFaceCW = isMesh && obj->matrixWorld->determinant() < 0;
-            const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW);
+            const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, isWireframe);
             [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];

@@ -20,7 +20,7 @@ namespace threepp::metal {
         CullMode cullMode;
     };
 
-    inline FaceCullingState computeFaceCullingState(Side side, bool frontFaceCW) {
+    inline FaceCullingState computeFaceCullingState(Side side, bool frontFaceCW, bool wireframe = false) {
 
         auto flipSided = side == Side::Back;
         if (frontFaceCW) {
@@ -29,7 +29,7 @@ namespace threepp::metal {
 
         return {
             flipSided ? FrontFaceWinding::Clockwise : FrontFaceWinding::CounterClockwise,
-            side == Side::Double ? CullMode::None : CullMode::Back};
+            (wireframe || side == Side::Double) ? CullMode::None : CullMode::Back};
     }
 
 }// namespace threepp::metal
