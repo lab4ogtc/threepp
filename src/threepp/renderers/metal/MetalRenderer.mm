@@ -69,6 +69,7 @@ struct MetalRenderer::Impl {
     id<MTLFunction> vertexFunction = nil;
     id<MTLFunction> fragmentFunction = nil;
     id<MTLTexture> depthTexture = nil;
+    id<MTLBuffer> defaultColorBuffer = nil;
     MTLVertexDescriptor* vertexDescriptor = nil;
     MTLPixelFormat depthPixelFormat = MTLPixelFormatDepth32Float;
 
@@ -147,6 +148,9 @@ struct MetalRenderer::Impl {
         bufferManager = std::make_unique<metal::MetalBufferManager>((__bridge void*)device);
 
         depthStencilState = (__bridge id<MTLDepthStencilState>)pipelineCache->getOrCreateDepthStencilState();
+
+        float defaultColor[3] = {1.0f, 1.0f, 1.0f};
+        defaultColorBuffer = [device newBufferWithBytes:defaultColor length:sizeof(defaultColor) options:MTLResourceStorageModeShared];
     }
 
     void compileShaders() {
@@ -315,6 +319,8 @@ struct MetalRenderer::Impl {
                     colorAttr->count() * colorAttr->itemSize() * sizeof(float),
                     colorAttr->array().data());
                 [encoder setVertexBuffer:buf offset:0 atIndex:3];
+            } else {
+                [encoder setVertexBuffer:defaultColorBuffer offset:0 atIndex:3];
             }
 
             [encoder setVertexBytes:mvp.elements.data() length:sizeof(float) * 16 atIndex:4];
