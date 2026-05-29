@@ -3,7 +3,7 @@
 #include "threepp/renderers/GLRenderer.hpp"
 
 #ifdef __APPLE__
-//#include "threepp/renderers/metal/MetalRenderer.hpp"
+#include "threepp/renderers/metal/MetalRenderer.hpp"
 #endif
 
 using namespace threepp;
@@ -20,8 +20,7 @@ std::unique_ptr<Renderer> Renderer::create(
 
         case Backend::Metal:
 #ifdef __APPLE__
-            // return std::make_unique<MetalRenderer>(window);
-            throw std::runtime_error("Metal backend not yet implemented in P0");
+            return std::make_unique<MetalRenderer>(window);
 #else
             throw std::runtime_error("Metal backend not supported on this platform");
 #endif

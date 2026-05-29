@@ -28,6 +28,10 @@ cmake_dependent_option(THREEPP_FETCH_ASSIMP "Make assimp available for examples"
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
+if (APPLE)
+    enable_language(OBJCXX)
+endif ()
+
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 

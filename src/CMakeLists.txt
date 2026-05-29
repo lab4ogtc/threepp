@@ -215,6 +215,8 @@ set(publicHeaders
         "threepp/renderers/RenderTarget.hpp"
         "threepp/renderers/Renderer.hpp"
 
+        "threepp/renderers/metal/MetalRenderer.hpp"
+
         "threepp/renderers/gl/GLInfo.hpp"
         "threepp/renderers/gl/GLShadowMap.hpp"
         "threepp/renderers/gl/GLState.hpp"
@@ -234,6 +236,10 @@ set(privateHeaders
 
         "threepp/animation/PropertyBinding.hpp"
         "threepp/animation/PropertyMixer.hpp"
+
+        "threepp/renderers/metal/MetalShaders.hpp"
+        "threepp/renderers/metal/MetalPipelineCache.hpp"
+        "threepp/renderers/metal/MetalBufferManager.hpp"
 
         "threepp/materials/MeshDistanceMaterial.hpp"
 
@@ -550,6 +556,14 @@ if (NOT DEFINED EMSCRIPTEN)
     )
 endif ()
 
+if (APPLE)
+    list(APPEND sources
+            "threepp/renderers/metal/MetalRenderer.mm"
+            "threepp/renderers/metal/MetalPipelineCache.mm"
+            "threepp/renderers/metal/MetalBufferManager.mm"
+    )
+endif ()
+
 include("${PROJECT_SOURCE_DIR}/cmake/embed.cmake")
 
 list(APPEND sources
@@ -598,9 +612,13 @@ if (NOT DEFINED EMSCRIPTEN)
     else ()
         target_include_directories(threepp PRIVATE BEFORE SYSTEM "external/glfw/include")
         if (APPLE)
-            target_link_libraries(threepp PRIVATE "-framework IOKit")
-            target_link_libraries(threepp PRIVATE "-framework Cocoa")
-            target_link_libraries(threepp PRIVATE "-framework OpenGL")
+            target_link_libraries(threepp PUBLIC "-framework IOKit")
+            target_link_libraries(threepp PUBLIC "-framework Cocoa")
+            target_link_libraries(threepp PUBLIC "-framework OpenGL")
+            target_link_libraries(threepp PUBLIC "-framework Metal")
+            target_link_libraries(threepp PUBLIC "-framework MetalKit")
+            target_link_libraries(threepp PUBLIC "-framework QuartzCore")
+            target_link_libraries(threepp PUBLIC "-framework AppKit")
         endif ()
     endif ()
 

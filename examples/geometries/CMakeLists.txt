@@ -11,4 +11,8 @@ add_example(NAME "heightmap")
 
 add_example(NAME "basic_geometries" LINK_IMGUI WEB)
 
+if (APPLE)
+    add_example(NAME "dynamic_metal")
+endif ()
+
 target_link_libraries(tube_geometry PRIVATE bvh)

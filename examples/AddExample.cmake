@@ -32,6 +32,18 @@ function(add_example)
         target_link_libraries("${arg_NAME}" PRIVATE assimp::assimp)
     endif ()
 
+    if (APPLE AND NOT DEFINED EMSCRIPTEN)
+        target_link_libraries("${arg_NAME}" PRIVATE
+            "-framework IOKit"
+            "-framework Cocoa"
+            "-framework OpenGL"
+            "-framework Metal"
+            "-framework MetalKit"
+            "-framework QuartzCore"
+            "-framework AppKit"
+        )
+    endif ()
+
 
     if (DEFINED EMSCRIPTEN)
 
