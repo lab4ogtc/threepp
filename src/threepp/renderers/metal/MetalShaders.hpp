@@ -684,6 +684,183 @@ fragment PointDepthFragmentOutput point_depth_fragment(
 }
 )metal";
 
+    constexpr auto line_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct LineVertexInput {
+    float3 position [[attribute(0)]];
+#if USE_VERTEX_COLORS
+    float3 color [[attribute(3)]];
+#endif
+};
+
+struct LineUniforms {
+    float4x4 mvp;
+    float4 color;
+};
+
+struct LineVertexOutput {
+    float4 position [[position]];
+    float4 color;
+};
+
+vertex LineVertexOutput line_vertex(
+    LineVertexInput in [[stage_in]],
+    constant LineUniforms& uniforms [[buffer(4)]]
+)
+{
+    LineVertexOutput out;
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+#if USE_VERTEX_COLORS
+    out.color = float4(in.color, 1.0) * uniforms.color;
+#else
+    out.color = uniforms.color;
+#endif
+    return out;
+}
+)metal";
+
+    constexpr auto line_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct LineFragmentInput {
+    float4 position [[position]];
+    float4 color;
+};
+
+fragment float4 line_fragment(LineFragmentInput in [[stage_in]])
+{
+    return in.color;
+}
+)metal";
+
+    constexpr auto points_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct PointVertexInput {
+    float3 position [[attribute(0)]];
+#if USE_VERTEX_COLORS
+    float3 color [[attribute(3)]];
+#endif
+};
+
+struct PointUniforms {
+    float4x4 mvp;
+    float4 color;
+    float pointSize;
+    float scale;
+    uint sizeAttenuation;
+    uint padding;
+};
+
+struct PointVertexOutput {
+    float4 position [[position]];
+    float4 color;
+    float pointSize [[point_size]];
+};
+
+vertex PointVertexOutput points_vertex(
+    PointVertexInput in [[stage_in]],
+    constant PointUniforms& uniforms [[buffer(4)]]
+)
+{
+    PointVertexOutput out;
+    float4 projected = uniforms.mvp * float4(in.position, 1.0);
+    out.position = projected;
+    out.pointSize = uniforms.pointSize;
+    if (uniforms.sizeAttenuation != 0) {
+        // 对齐透视点大小衰减，同时钳制裁剪空间 w，避免贴近相机平面时除零。
+        out.pointSize *= uniforms.scale / max(projected.w, 0.0001);
+    }
+#if USE_VERTEX_COLORS
+    out.color = float4(in.color, 1.0) * uniforms.color;
+#else
+    out.color = uniforms.color;
+#endif
+    return out;
+}
+)metal";
+
+    constexpr auto points_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct PointFragmentInput {
+    float4 position [[position]];
+    float4 color;
+    float pointSize [[point_size]];
+};
+
+fragment float4 points_fragment(PointFragmentInput in [[stage_in]])
+{
+    return in.color;
+}
+)metal";
+
+    constexpr auto raw_shader_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RawShaderVertexInput {
+    float3 position [[attribute(0)]];
+    float4 color [[attribute(3)]];
+};
+
+struct RawShaderUniforms {
+    float4x4 mvp;
+    float time;
+    float3 padding;
+};
+
+struct RawShaderVertexOutput {
+    float4 position [[position]];
+    float3 localPosition;
+    float4 color;
+};
+
+vertex RawShaderVertexOutput raw_shader_vertex(
+    RawShaderVertexInput in [[stage_in]],
+    constant RawShaderUniforms& uniforms [[buffer(4)]]
+)
+{
+    RawShaderVertexOutput out;
+    out.localPosition = in.position;
+    out.color = in.color;
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    return out;
+}
+)metal";
+
+    constexpr auto raw_shader_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct RawShaderFragmentInput {
+    float4 position [[position]];
+    float3 localPosition;
+    float4 color;
+};
+
+struct RawShaderUniforms {
+    float4x4 mvp;
+    float time;
+    float3 padding;
+};
+
+fragment float4 raw_shader_fragment(
+    RawShaderFragmentInput in [[stage_in]],
+    constant RawShaderUniforms& uniforms [[buffer(4)]]
+)
+{
+    float4 color = in.color;
+    color.r += sin(in.localPosition.x * 10.0 + uniforms.time) * 0.5;
+    return color;
+}
+)metal";
+
     constexpr auto sprite_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;

@@ -15,6 +15,7 @@ namespace threepp::metal {
         constexpr std::uint8_t VertexLayoutColor = 1u << 3u;
         constexpr std::uint8_t VertexLayoutTangent = 1u << 4u;
         constexpr std::uint8_t VertexLayoutSkinning = 1u << 5u;
+        constexpr std::uint8_t VertexLayoutColor4 = 1u << 6u;
 
     }// namespace
 
@@ -125,7 +126,9 @@ namespace threepp::metal {
                 enableAttribute(descriptor, 2, MTLVertexFormatFloat2, sizeof(float) * 2);
             }
 
-            if ((bitmask & VertexLayoutColor) != 0) {
+            if ((bitmask & VertexLayoutColor4) != 0) {
+                enableAttribute(descriptor, 3, MTLVertexFormatFloat4, sizeof(float) * 4);
+            } else if ((bitmask & VertexLayoutColor) != 0) {
                 enableAttribute(descriptor, 3, MTLVertexFormatFloat3, sizeof(float) * 3);
             }
 

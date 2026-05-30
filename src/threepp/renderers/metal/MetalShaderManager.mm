@@ -63,6 +63,24 @@ namespace threepp::metal {
             return source;
         }
 
+        std::string buildLineShaderSource(bool useVertexColors) {
+            std::string source;
+            source += "#define USE_VERTEX_COLORS ";
+            source += useVertexColors ? "1\n" : "0\n";
+            source += line_vertex;
+            source += line_fragment;
+            return source;
+        }
+
+        std::string buildPointsShaderSource(bool useVertexColors) {
+            std::string source;
+            source += "#define USE_VERTEX_COLORS ";
+            source += useVertexColors ? "1\n" : "0\n";
+            source += points_vertex;
+            source += points_fragment;
+            return source;
+        }
+
     }// namespace
 
     struct MetalShaderManager::Impl {
@@ -216,6 +234,33 @@ namespace threepp::metal {
             builtInFunctions.emplace(cacheKey, function);
             return function;
         }
+
+        id<MTLFunction> getOrCreateBuiltInFunction(const std::string& cacheKey, const std::string& sourceText, const char* functionName) {
+            auto functionIt = builtInFunctions.find(cacheKey);
+            if (functionIt != builtInFunctions.end()) {
+                return functionIt->second;
+            }
+
+            NSString* source = [NSString stringWithUTF8String:sourceText.c_str()];
+            NSError* error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) {
+                std::cerr << "=== MSL Built-in Compilation Failed (" << cacheKey << ") ===\n"
+                          << sourceText
+                          << "\n================================================\n";
+                NSString* msg = [NSString stringWithFormat:@"MSL built-in compilation failed: %@", error.localizedDescription];
+                throw std::runtime_error([msg UTF8String]);
+            }
+
+            id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:functionName]];
+            if (!function) {
+                throw std::runtime_error("Failed to find MSL built-in shader function: " + cacheKey);
+            }
+
+            builtInLibraries.emplace(cacheKey, library);
+            builtInFunctions.emplace(cacheKey, function);
+            return function;
+        }
     };
 
     MetalShaderManager::MetalShaderManager(void* device)
@@ -249,6 +294,34 @@ namespace threepp::metal {
 
     void* MetalShaderManager::getOrCreateSpriteFragmentFunction() {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_fragment", sprite_fragment, "sprite_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreateLineVertexFunction(bool useVertexColors) {
+        const auto cacheKey = useVertexColors ? "line_vertex_color" : "line_vertex";
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildLineShaderSource(useVertexColors), "line_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateLineFragmentFunction(bool useVertexColors) {
+        const auto cacheKey = useVertexColors ? "line_fragment_color" : "line_fragment";
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildLineShaderSource(useVertexColors), "line_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreatePointsVertexFunction(bool useVertexColors) {
+        const auto cacheKey = useVertexColors ? "points_vertex_color" : "points_vertex";
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors), "points_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreatePointsFragmentFunction(bool useVertexColors) {
+        const auto cacheKey = useVertexColors ? "points_fragment_color" : "points_fragment";
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors), "points_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreateRawShaderVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("raw_shader_vertex", raw_shader_vertex, "raw_shader_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateRawShaderFragmentFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("raw_shader_fragment", raw_shader_fragment, "raw_shader_fragment");
     }
 
     void* MetalShaderManager::getOrCreateSkyVertexFunction() {

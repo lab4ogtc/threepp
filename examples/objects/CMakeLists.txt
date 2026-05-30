@@ -25,6 +25,14 @@ add_example(NAME "text_sprite" LINK_IMGUI WEB WEB_EMBED
 )
 
 if (APPLE)
+    add_example(NAME "instancing_metal" LINK_IMGUI WEB WEB_EMBED
+            "${PROJECT_SOURCE_DIR}/data/fonts@data/fonts"
+    )
+    if (TARGET "instancing_metal")
+        target_include_directories("instancing_metal" PRIVATE "${PROJECT_SOURCE_DIR}/examples/libs")
+    endif ()
+
+    add_example(NAME "points_metal" LINK_IMGUI WEB)
     add_example(NAME "lod_metal")
     add_example(NAME "bones_metal")
     add_example(NAME "water_metal" LINK_IMGUI WEB WEB_EMBED

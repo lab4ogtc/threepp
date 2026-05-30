@@ -8,6 +8,7 @@
 #import "MetalTextureManager.hpp"
 
 #import "threepp/cameras/Camera.hpp"
+#import "threepp/cameras/PerspectiveCamera.hpp"
 #import "threepp/canvas/Window.hpp"
 #import "threepp/core/BufferAttribute.hpp"
 #import "threepp/core/BufferGeometry.hpp"
@@ -25,6 +26,8 @@
 #import "threepp/materials/MeshLambertMaterial.hpp"
 #import "threepp/materials/MeshPhongMaterial.hpp"
 #import "threepp/materials/MeshStandardMaterial.hpp"
+#import "threepp/materials/PointsMaterial.hpp"
+#import "threepp/materials/RawShaderMaterial.hpp"
 #import "threepp/materials/ShaderMaterial.hpp"
 #import "threepp/materials/SpriteMaterial.hpp"
 #import "threepp/materials/interfaces.hpp"
@@ -32,8 +35,11 @@
 #import "threepp/math/Matrix4.hpp"
 #import "threepp/objects/InstancedMesh.hpp"
 #import "threepp/objects/LOD.hpp"
+#import "threepp/objects/Line.hpp"
+#import "threepp/objects/LineLoop.hpp"
 #import "threepp/objects/LineSegments.hpp"
 #import "threepp/objects/Mesh.hpp"
+#import "threepp/objects/Points.hpp"
 #import "threepp/objects/Sky.hpp"
 #import "threepp/objects/SkinnedMesh.hpp"
 #import "threepp/objects/Sprite.hpp"
@@ -80,6 +86,7 @@ namespace {
     constexpr std::uint8_t vertexLayoutColor = 1u << 3u;
     constexpr std::uint8_t vertexLayoutTangent = 1u << 4u;
     constexpr std::uint8_t vertexLayoutSkinning = 1u << 5u;
+    constexpr std::uint8_t vertexLayoutColor4 = 1u << 6u;
 
     struct alignas(16) TransformUniforms {
         float mvp[16];
@@ -121,6 +128,26 @@ namespace {
         float center[2];
         float rotation;
         float scaleAttenuation;
+    };
+
+    struct alignas(16) LineUniforms {
+        float mvp[16];
+        float color[4];
+    };
+
+    struct alignas(16) PointUniforms {
+        float mvp[16];
+        float color[4];
+        float pointSize;
+        float scale;
+        std::uint32_t sizeAttenuation;
+        std::uint32_t padding;
+    };
+
+    struct alignas(16) RawShaderUniforms {
+        float mvp[16];
+        float time;
+        float padding[3];
     };
 
     struct alignas(16) SkyUniforms {
@@ -269,6 +296,40 @@ namespace {
         out.scaleAttenuation = material.sizeAttenuation ? 1.f : 0.f;
     }
 
+    void computeLineUniforms(const Camera& camera, const Line& line, const LineBasicMaterial& material, LineUniforms& out) {
+        Matrix4 mvp;
+        computeMVP(camera, line, mvp);
+        copyMatrix(mvp, out.mvp);
+        out.color[0] = material.color.r;
+        out.color[1] = material.color.g;
+        out.color[2] = material.color.b;
+        out.color[3] = material.opacity;
+    }
+
+    void computePointUniforms(const Camera& camera, const Points& points, const PointsMaterial& material, float scale, bool sizeAttenuation, PointUniforms& out) {
+        Matrix4 mvp;
+        computeMVP(camera, points, mvp);
+        copyMatrix(mvp, out.mvp);
+        out.color[0] = material.color.r;
+        out.color[1] = material.color.g;
+        out.color[2] = material.color.b;
+        out.color[3] = material.opacity;
+        out.pointSize = material.size;
+        out.scale = scale;
+        out.sizeAttenuation = sizeAttenuation ? 1u : 0u;
+        out.padding = 0u;
+    }
+
+    void computeRawShaderUniforms(const Camera& camera, const Mesh& mesh, float time, RawShaderUniforms& out) {
+        Matrix4 mvp;
+        computeMVP(camera, mesh, mvp);
+        copyMatrix(mvp, out.mvp);
+        out.time = time;
+        out.padding[0] = 0.f;
+        out.padding[1] = 0.f;
+        out.padding[2] = 0.f;
+    }
+
     void computeShadowMVP(const Camera& shadowCamera, const Object3D& object, Matrix4& out) {
         out.copy(metal::convertProjectionToMetalClipSpace(shadowCamera.projectionMatrix));
         out.multiply(shadowCamera.matrixWorldInverse);
@@ -329,7 +390,10 @@ namespace {
     void collectRenderables(Object3D& object, std::vector<Object3D*>& out) {
         if (!object.visible) return;
 
-        if (dynamic_cast<Mesh*>(&object) || dynamic_cast<LineSegments*>(&object) || dynamic_cast<Sprite*>(&object)) {
+        if (dynamic_cast<Mesh*>(&object) ||
+            dynamic_cast<Line*>(&object) ||
+            dynamic_cast<Points*>(&object) ||
+            dynamic_cast<Sprite*>(&object)) {
             out.push_back(&object);
         }
 
@@ -612,6 +676,7 @@ struct MetalRenderer::Impl {
         std::vector<float> values;
     };
     std::unordered_map<BufferAttribute*, ConvertedSkinIndexBuffer> convertedSkinIndexBuffers;
+    std::vector<unsigned int> lineLoopIndices;
 
     struct MetalRenderTargetResources {
         id<MTLTexture> colorTexture = nil;
@@ -1297,7 +1362,11 @@ struct MetalRenderer::Impl {
         [encoder setVertexBuffer:colorBuffer offset:0 atIndex:10];
     }
 
-    void drawGeometry(id<MTLRenderCommandEncoder> encoder, BufferGeometry& geometry, FloatBufferAttribute& position, bool isLine, NSUInteger instanceCount = 1) {
+    void drawGeometry(id<MTLRenderCommandEncoder> encoder,
+                      BufferGeometry& geometry,
+                      FloatBufferAttribute& position,
+                      MTLPrimitiveType primitiveType,
+                      NSUInteger instanceCount = 1) {
         if (geometry.hasIndex()) {
             auto* indexAttr = geometry.getIndex();
             auto* indexBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
@@ -1310,7 +1379,7 @@ struct MetalRenderer::Impl {
                 indexCount = indexAttr->count();
             }
 
-            [encoder drawIndexedPrimitives:isLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle
+            [encoder drawIndexedPrimitives:primitiveType
                                 indexCount:indexCount
                                  indexType:MTLIndexTypeUInt32
                                indexBuffer:indexBuf
@@ -1322,11 +1391,195 @@ struct MetalRenderer::Impl {
                 vertexCount = position.count();
             }
 
-            [encoder drawPrimitives:isLine ? MTLPrimitiveTypeLine : MTLPrimitiveTypeTriangle
+            [encoder drawPrimitives:primitiveType
                         vertexStart:geometry.drawRange.start
                         vertexCount:vertexCount
                       instanceCount:instanceCount];
         }
+    }
+
+    void drawLineLoopGeometry(id<MTLRenderCommandEncoder> encoder, BufferGeometry& geometry, FloatBufferAttribute& position) {
+        lineLoopIndices.clear();
+
+        if (geometry.hasIndex()) {
+            auto* indexAttr = geometry.getIndex();
+            const auto& source = indexAttr->array();
+            const auto start = static_cast<NSUInteger>(std::max(0, geometry.drawRange.start));
+            NSUInteger indexCount = geometry.drawRange.count;
+            if (indexCount == std::numeric_limits<int>::max() / 2) {
+                indexCount = indexAttr->count();
+            }
+            if (start >= static_cast<NSUInteger>(indexAttr->count())) return;
+            indexCount = std::min<NSUInteger>(indexCount, static_cast<NSUInteger>(indexAttr->count()) - start);
+            if (indexCount == 0) return;
+
+            lineLoopIndices.reserve(static_cast<std::size_t>(indexCount) + 1u);
+            for (NSUInteger i = 0; i < indexCount; ++i) {
+                lineLoopIndices.push_back(source[static_cast<std::size_t>(start + i)]);
+            }
+        } else {
+            const auto start = static_cast<NSUInteger>(std::max(0, geometry.drawRange.start));
+            NSUInteger vertexCount = geometry.drawRange.count;
+            if (vertexCount == std::numeric_limits<int>::max() / 2) {
+                vertexCount = position.count();
+            }
+            if (start >= static_cast<NSUInteger>(position.count())) return;
+            vertexCount = std::min<NSUInteger>(vertexCount, static_cast<NSUInteger>(position.count()) - start);
+            if (vertexCount == 0) return;
+
+            lineLoopIndices.reserve(static_cast<std::size_t>(vertexCount) + 1u);
+            for (NSUInteger i = 0; i < vertexCount; ++i) {
+                lineLoopIndices.push_back(static_cast<unsigned int>(start + i));
+            }
+        }
+
+        lineLoopIndices.push_back(lineLoopIndices.front());
+        id<MTLBuffer> indexBuffer = (__bridge id<MTLBuffer>) bufferManager->getTransientBuffer(
+                lineLoopIndices.size() * sizeof(unsigned int),
+                lineLoopIndices.data());
+        [encoder drawIndexedPrimitives:MTLPrimitiveTypeLineStrip
+                            indexCount:static_cast<NSUInteger>(lineLoopIndices.size())
+                             indexType:MTLIndexTypeUInt32
+                           indexBuffer:indexBuffer
+                     indexBufferOffset:0];
+    }
+
+    void renderLine(id<MTLRenderCommandEncoder> encoder, Line& line, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto materialPtr = line.material();
+        auto* material = materialPtr ? materialPtr->as<LineBasicMaterial>() : nullptr;
+        auto geometry = line.geometry();
+        if (!material || !geometry || !material->visible) return;
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        if (!posAttr) return;
+
+        auto* colorAttr = getFloatAttribute(*geometry, "color");
+        const bool useVertexColors = material->vertexColors && colorAttr && colorAttr->itemSize() == 3;
+
+        static bool linewidthWarningPrinted = false;
+        if (material->linewidth > 1.f && !linewidthWarningPrinted) {
+            std::cerr << "MetalRenderer: LineBasicMaterial linewidth > 1 is not supported by Metal and will be ignored.\n";
+            linewidthWarningPrinted = true;
+        }
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateLineVertexFunction(useVertexColors);
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateLineFragmentFunction(useVertexColors);
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+        if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+        [encoder setCullMode:MTLCullModeNone];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+        bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
+
+        LineUniforms uniforms{};
+        computeLineUniforms(camera, line, *material, uniforms);
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+        if (dynamic_cast<LineLoop*>(&line)) {
+            drawLineLoopGeometry(encoder, *geometry, *posAttr);
+        } else {
+            const auto primitiveType = dynamic_cast<LineSegments*>(&line) ? MTLPrimitiveTypeLine : MTLPrimitiveTypeLineStrip;
+            drawGeometry(encoder, *geometry, *posAttr, primitiveType);
+        }
+    }
+
+    float pointScale() const {
+        const auto viewportHeight = renderTarget ? renderTarget->viewport.w : viewport.w * pixelRatio;
+        return std::max(viewportHeight, 1.f) * 0.5f;
+    }
+
+    void renderPoints(id<MTLRenderCommandEncoder> encoder, Points& points, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto materialPtr = points.material();
+        auto* material = materialPtr ? materialPtr->as<PointsMaterial>() : nullptr;
+        auto geometry = points.geometry();
+        if (!material || !geometry || !material->visible) return;
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        if (!posAttr) return;
+
+        auto* colorAttr = getFloatAttribute(*geometry, "color");
+        const bool useVertexColors = material->vertexColors && colorAttr && colorAttr->itemSize() == 3;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreatePointsVertexFunction(useVertexColors);
+        pipelineKey.fragmentFunction = shaderManager->getOrCreatePointsFragmentFunction(useVertexColors);
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+        if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+        [encoder setCullMode:MTLCullModeNone];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+        bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
+
+        PointUniforms uniforms{};
+        const bool useSizeAttenuation = material->sizeAttenuation && dynamic_cast<PerspectiveCamera*>(&camera) != nullptr;
+        computePointUniforms(camera, points, *material, pointScale(), useSizeAttenuation, uniforms);
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypePoint);
+    }
+
+    void renderRawShader(id<MTLRenderCommandEncoder> encoder, Mesh& mesh, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto materialPtr = mesh.material();
+        auto* material = materialPtr ? materialPtr->as<RawShaderMaterial>() : nullptr;
+        auto geometry = mesh.geometry();
+        if (!material || !geometry || !material->visible) return;
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        auto* colorAttr = getFloatAttribute(*geometry, "color");
+        if (!posAttr || !colorAttr || colorAttr->itemSize() != 4) return;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateRawShaderVertexFunction();
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateRawShaderFragmentFunction();
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutColor4;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+
+        const auto frontFaceCW = mesh.matrixWorld->determinant() < 0;
+        const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, false);
+        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+        bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, true, false);
+
+        RawShaderUniforms uniforms{};
+        computeRawShaderUniforms(camera, mesh, uniformFloat(material->uniforms, "time", 0.f), uniforms);
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
     }
 
     void renderSprite(id<MTLRenderCommandEncoder> encoder, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat) {
@@ -1424,7 +1677,7 @@ struct MetalRenderer::Impl {
 
         [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        drawGeometry(encoder, *geometry, *posAttr, false);
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
     }
 
     void renderWater(id<MTLRenderCommandEncoder> encoder, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat) {
@@ -1491,7 +1744,7 @@ struct MetalRenderer::Impl {
         bindTextureOrPlaceholder(encoder, uniformTexture(material->uniforms, "mirrorSampler"), whiteTexture, 1, true);
         [encoder setFragmentSamplerState:defaultSampler atIndex:0];
 
-        drawGeometry(encoder, *geometry, *posAttr, false);
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
     }
 
     bool shouldUpdateShadow(LightShadow& shadow) const {
@@ -1546,7 +1799,7 @@ struct MetalRenderer::Impl {
                                 bindInstancing(encoder, *instancedMesh, false);
                                 instanceCount = static_cast<NSUInteger>(instancedMesh->count());
                             }
-                            drawGeometry(encoder, *geometry, *posAttr, false, instanceCount);
+                            drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount);
                         }
                     }
                 }
@@ -1608,7 +1861,7 @@ struct MetalRenderer::Impl {
                                 bindInstancing(encoder, *instancedMesh, false);
                                 instanceCount = static_cast<NSUInteger>(instancedMesh->count());
                             }
-                            drawGeometry(encoder, *geometry, *posAttr, false, instanceCount);
+                            drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount);
                         }
                     }
                 }
@@ -1948,15 +2201,29 @@ struct MetalRenderer::Impl {
                 continue;
             }
 
-            BufferGeometry* geometry = nullptr;
-            Material* material = nullptr;
-            bool isLine = false;
-            bool isWireframe = false;
-            bool transparent = false;
-            bool isMesh = false;
+            if (auto* points = dynamic_cast<Points*>(obj)) {
+                renderPoints(encoder, *points, camera, colorPixelFormat);
+                continue;
+            }
+
+            if (auto* line = dynamic_cast<Line*>(obj)) {
+                renderLine(encoder, *line, camera, colorPixelFormat);
+                continue;
+            }
 
             if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
-                isMesh = true;
+                if (mesh->material() && mesh->material()->is<RawShaderMaterial>()) {
+                    renderRawShader(encoder, *mesh, camera, colorPixelFormat);
+                    continue;
+                }
+            }
+
+            BufferGeometry* geometry = nullptr;
+            Material* material = nullptr;
+            bool isWireframe = false;
+            bool transparent = false;
+
+            if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
                 geometry = mesh->geometry().get();
                 material = mesh->material().get();
 
@@ -1964,13 +2231,6 @@ struct MetalRenderer::Impl {
                     isWireframe = wf->wireframe;
                 }
                 transparent = material->transparent;
-
-            } else if (auto* lines = dynamic_cast<LineSegments*>(obj)) {
-                geometry = lines->geometry().get();
-                material = lines->material().get();
-
-                transparent = material->transparent;
-                isLine = true;
             }
 
             if (!geometry || !material || !material->visible) continue;
@@ -1987,7 +2247,7 @@ struct MetalRenderer::Impl {
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;
             const bool useNormal = normAttr != nullptr;
-            const bool useLights = isMesh && useNormal && isLightingMaterial(*material);
+            const bool useLights = useNormal && isLightingMaterial(*material);
             const bool useSkinning = skinnedMesh && skinnedMesh->skeleton && hasSkinningAttributes(*geometry);
             const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
             const bool useInstanceColor = useInstancing && instancedMesh->instanceColor() != nullptr;
@@ -2027,7 +2287,7 @@ struct MetalRenderer::Impl {
                     material->depthWrite,
                     material->depthFunc);
             [encoder setDepthStencilState:materialDepthStencilState];
-            const auto frontFaceCW = isMesh && obj->matrixWorld->determinant() < 0;
+            const auto frontFaceCW = obj->matrixWorld->determinant() < 0;
             const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, isWireframe);
             [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
@@ -2071,7 +2331,7 @@ struct MetalRenderer::Impl {
                 [encoder setFragmentSamplerState:defaultSampler atIndex:0];
             }
 
-            drawGeometry(encoder, *geometry, *posAttr, isLine, instanceCount);
+            drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount);
         }
 
         [encoder endEncoding];

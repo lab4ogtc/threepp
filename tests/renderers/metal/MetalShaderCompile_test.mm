@@ -74,6 +74,16 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
 
         REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteFragmentFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateLineVertexFunction(false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateLineFragmentFunction(false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateLineVertexFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateLineFragmentFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderVertexFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateWaterVertexFunction());
@@ -134,6 +144,26 @@ TEST_CASE("Metal P3 buffer manager rotates only dynamic buffers across frames") 
         REQUIRE(dynamic1 != dynamic2);
         REQUIRE(dynamic2 != dynamic3);
         REQUIRE(dynamic0 == dynamic3);
+    }
+}
+
+TEST_CASE("Metal P3 buffer manager allocates transient buffers per draw") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalBufferManager bufferManager((__bridge void*) device);
+
+        std::vector<unsigned int> indices{0u, 1u, 2u, 0u};
+        auto* transient0 = bufferManager.getTransientBuffer(indices.size() * sizeof(unsigned int), indices.data());
+        auto* transient1 = bufferManager.getTransientBuffer(indices.size() * sizeof(unsigned int), indices.data());
+
+        REQUIRE(transient0 != nullptr);
+        REQUIRE(transient1 != nullptr);
+        REQUIRE(transient0 != transient1);
     }
 }
 

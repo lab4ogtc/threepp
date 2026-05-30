@@ -75,6 +75,18 @@ namespace threepp::metal {
 
         void* getOrCreateSpriteFragmentFunction();
 
+        void* getOrCreateLineVertexFunction(bool useVertexColors = false);
+
+        void* getOrCreateLineFragmentFunction(bool useVertexColors = false);
+
+        void* getOrCreatePointsVertexFunction(bool useVertexColors = false);
+
+        void* getOrCreatePointsFragmentFunction(bool useVertexColors = false);
+
+        void* getOrCreateRawShaderVertexFunction();
+
+        void* getOrCreateRawShaderFragmentFunction();
+
         void* getOrCreateSkyVertexFunction();
 
         void* getOrCreateSkyFragmentFunction();

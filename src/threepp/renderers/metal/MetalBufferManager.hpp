@@ -23,6 +23,8 @@ namespace threepp {
 
             void* getDynamicBuffer(const void* key, size_t byteSize, const void* data);
 
+            void* getTransientBuffer(size_t byteSize, const void* data);
+
         private:
             struct Impl;
             std::unique_ptr<Impl> pimpl_;

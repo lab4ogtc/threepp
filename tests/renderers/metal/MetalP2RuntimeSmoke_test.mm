@@ -1,7 +1,9 @@
 #import <Metal/Metal.h>
 
 #include "threepp/lights/LightProbe.hpp"
+#include "threepp/materials/RawShaderMaterial.hpp"
 #include "threepp/objects/InstancedMesh.hpp"
+#include "threepp/objects/LineLoop.hpp"
 #include "threepp/objects/LOD.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/renderers/GLRenderTarget.hpp"
@@ -277,6 +279,85 @@ TEST_CASE("Metal renderer skins meshes with integer skin indices") {
         }));
 
         REQUIRE_NOTHROW(metalRenderer->readRGBPixels());
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer draws primitive and fixed raw shader paths") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal primitive smoke")
+                                  .size(192, 144)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        auto camera = PerspectiveCamera::create(55, canvas.aspect(), 0.1f, 20.f);
+        camera->position.z = 5.f;
+
+        auto lineGeometry = BufferGeometry::create();
+        lineGeometry->setFromPoints(std::vector<Vector3>{{-1.6f, -0.9f, 0.f}, {-0.8f, -0.2f, 0.f}, {-0.1f, -0.9f, 0.f}});
+        auto lineMaterial = LineBasicMaterial::create();
+        lineMaterial->color = Color::green;
+        scene->add(Line::create(lineGeometry, lineMaterial));
+
+        auto loopGeometry = BufferGeometry::create();
+        loopGeometry->setFromPoints(std::vector<Vector3>{{0.4f, -0.9f, 0.f}, {1.2f, -0.9f, 0.f}, {1.2f, -0.2f, 0.f}, {0.4f, -0.2f, 0.f}});
+        loopGeometry->setIndex(std::vector<unsigned int>{0, 1, 2, 3});
+        auto loopMaterial = LineBasicMaterial::create();
+        loopMaterial->color = Color::yellow;
+        scene->add(LineLoop::create(loopGeometry, loopMaterial));
+
+        auto pointsGeometry = BufferGeometry::create();
+        pointsGeometry->setAttribute("position", FloatBufferAttribute::create(std::vector<float>{
+                                                        -1.f, 0.45f, 0.f,
+                                                         0.f, 0.85f, 0.f,
+                                                         1.f, 0.45f, 0.f},
+                                                       3));
+        pointsGeometry->setAttribute("color", FloatBufferAttribute::create(std::vector<float>{
+                                                     1.f, 0.f, 0.f,
+                                                     0.f, 1.f, 0.f,
+                                                     0.f, 0.f, 1.f},
+                                                    3));
+        auto pointsMaterial = PointsMaterial::create();
+        pointsMaterial->size = 16.f;
+        pointsMaterial->sizeAttenuation = false;
+        pointsMaterial->vertexColors = true;
+        scene->add(Points::create(pointsGeometry, pointsMaterial));
+
+        auto rawGeometry = BufferGeometry::create();
+        rawGeometry->setAttribute("position", FloatBufferAttribute::create(std::vector<float>{
+                                                   -0.45f, -0.15f, 0.f,
+                                                    0.45f, -0.15f, 0.f,
+                                                    0.00f,  0.55f, 0.f},
+                                                  3));
+        rawGeometry->setAttribute("color", FloatBufferAttribute::create(std::vector<float>{
+                                                1.f, 0.f, 0.f, 1.f,
+                                                0.f, 1.f, 0.f, 1.f,
+                                                0.f, 0.f, 1.f, 1.f},
+                                               4));
+        auto rawMaterial = RawShaderMaterial::create();
+        rawMaterial->side = Side::Double;
+        rawMaterial->transparent = true;
+        rawMaterial->uniforms["time"].setValue(1.f);
+        scene->add(Mesh::create(rawGeometry, rawMaterial));
+
+        renderer->autoClear = false;
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        auto pixels = metalRenderer->readRGBPixels();
+        REQUIRE(std::any_of(pixels.begin(), pixels.end(), [](auto value) { return value != 0; }));
         canvas.close();
     }
 }

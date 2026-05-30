@@ -130,6 +130,12 @@ TEST_CASE("Metal P4 shader manager exposes dedicated built-in material entry poi
 
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteVertexFunction())>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteFragmentFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateLineVertexFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateLineFragmentFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointsVertexFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointsFragmentFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateRawShaderVertexFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateRawShaderFragmentFunction())>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthVertexFunction(false))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthFragmentFunction(false))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSkyVertexFunction())>);
@@ -150,6 +156,20 @@ TEST_CASE("Metal P4 sprite shader keeps billboard expansion outside the PBR vari
     REQUIRE(vertexSource.find("uniforms.rotation") != std::string_view::npos);
     REQUIRE(fragmentSource.find("fragment float4 sprite_fragment") != std::string_view::npos);
     REQUIRE(fragmentSource.find("texture2d<float> map [[texture(0)]]") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P4 line and points shaders use dedicated primitive outputs") {
+
+    const std::string_view lineVertex{metal::line_vertex};
+    const std::string_view pointsVertex{metal::points_vertex};
+    const std::string_view rawFragment{metal::raw_shader_fragment};
+
+    REQUIRE(lineVertex.find("vertex LineVertexOutput line_vertex") != std::string_view::npos);
+    REQUIRE(lineVertex.find("uniforms.mvp * float4(in.position, 1.0)") != std::string_view::npos);
+    REQUIRE(pointsVertex.find("float pointSize [[point_size]]") != std::string_view::npos);
+    REQUIRE(pointsVertex.find("uniforms.scale / max(projected.w") != std::string_view::npos);
+    REQUIRE(rawFragment.find("fragment float4 raw_shader_fragment") != std::string_view::npos);
+    REQUIRE(rawFragment.find("sin(in.localPosition.x * 10.0 + uniforms.time)") != std::string_view::npos);
 }
 
 TEST_CASE("Metal P4 point light shadows use tiled depth maps without reusing attenuation params") {
@@ -244,6 +264,7 @@ TEST_CASE("Metal P1 managers keep Objective-C types hidden behind void pointers"
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalShaderManager, void*>);
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalTextureManager, void*, void*>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalBufferManager&>().getDynamicBuffer(nullptr, std::size_t{}, nullptr))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalBufferManager&>().getTransientBuffer(std::size_t{}, nullptr))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateVertexFunction(std::declval<const metal::ShaderProgramKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateFragmentFunction(std::declval<const metal::ShaderProgramKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthVertexFunction(true))>);
