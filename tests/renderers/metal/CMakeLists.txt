@@ -1,1 +1,19 @@
 add_test_executable(MetalP1_test)
+
+add_executable(MetalShaderCompile_test MetalShaderCompile_test.mm)
+target_link_libraries(MetalShaderCompile_test PRIVATE threepp Catch2::Catch2WithMain)
+target_include_directories(MetalShaderCompile_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+add_test(NAME MetalShaderCompile_test COMMAND MetalShaderCompile_test)
+
+add_executable(MetalP2RuntimeSmoke_test MetalP2RuntimeSmoke_test.mm)
+target_link_libraries(MetalP2RuntimeSmoke_test PRIVATE threepp Catch2::Catch2WithMain)
+target_include_directories(MetalP2RuntimeSmoke_test PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/external/glfw/include")
+add_test(NAME MetalP2RuntimeSmoke_test COMMAND MetalP2RuntimeSmoke_test)
+
+if (TARGET assimp::assimp)
+    add_executable(MetalSimpleSkinningSmoke_test MetalSimpleSkinningSmoke_test.mm)
+    target_link_libraries(MetalSimpleSkinningSmoke_test PRIVATE threepp Catch2::Catch2WithMain assimp::assimp)
+    target_include_directories(MetalSimpleSkinningSmoke_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_compile_definitions(MetalSimpleSkinningSmoke_test PRIVATE DATA_FOLDER="${PROJECT_SOURCE_DIR}/data")
+    add_test(NAME MetalSimpleSkinningSmoke_test COMMAND MetalSimpleSkinningSmoke_test)
+endif ()

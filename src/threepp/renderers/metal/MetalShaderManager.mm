@@ -21,8 +21,20 @@ namespace threepp::metal {
             source += key.useVertexColors ? "1\n" : "0\n";
             source += "#define USE_NORMAL ";
             source += key.useNormal ? "1\n" : "0\n";
+            source += "#define USE_SKINNING ";
+            source += key.useSkinning ? "1\n" : "0\n";
+            source += "#define USE_LIGHTS ";
+            source += key.useLights ? "1\n" : "0\n";
             source += basic_vertex;
             source += basic_fragment;
+            return source;
+        }
+
+        std::string buildDepthShaderSource(bool useSkinning) {
+            std::string source;
+            source += "#define USE_SKINNING ";
+            source += useSkinning ? "1\n" : "0\n";
+            source += depth_vertex;
             return source;
         }
 
@@ -38,6 +50,8 @@ namespace threepp::metal {
 
         id<MTLDevice> device;
         std::unordered_map<ShaderProgramKey, ShaderProgramInstance, ShaderProgramKeyHash> programs;
+        std::unordered_map<bool, id<MTLLibrary>> depthLibraries;
+        std::unordered_map<bool, id<MTLFunction>> depthVertexFunctions;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
@@ -72,19 +86,52 @@ namespace threepp::metal {
             auto [inserted, _] = programs.emplace(key, instance);
             return inserted->second;
         }
+
+        id<MTLFunction> getOrCreateDepthVertexFunction(bool useSkinning) {
+            auto functionIt = depthVertexFunctions.find(useSkinning);
+            if (functionIt != depthVertexFunctions.end()) {
+                return functionIt->second;
+            }
+
+            const auto sourceText = buildDepthShaderSource(useSkinning);
+            NSString* source = [NSString stringWithUTF8String:sourceText.c_str()];
+
+            NSError* error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) {
+                std::cerr << "=== MSL Depth Compilation Failed ===\n"
+                          << sourceText
+                          << "\n====================================\n";
+                NSString* msg = [NSString stringWithFormat:@"MSL depth compilation failed: %@", error.localizedDescription];
+                throw std::runtime_error([msg UTF8String]);
+            }
+
+            id<MTLFunction> function = [library newFunctionWithName:@"depth_vertex"];
+            if (!function) {
+                throw std::runtime_error("Failed to find MSL depth vertex function");
+            }
+
+            depthLibraries.emplace(useSkinning, library);
+            depthVertexFunctions.emplace(useSkinning, function);
+            return function;
+        }
     };
 
     MetalShaderManager::MetalShaderManager(void* device)
-        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>)device)) {}
+        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>) device)) {}
 
     MetalShaderManager::~MetalShaderManager() = default;
 
     void* MetalShaderManager::getOrCreateVertexFunction(const ShaderProgramKey& key) {
-        return (__bridge void*)pimpl_->getOrCreateProgram(key).vertexFunction;
+        return (__bridge void*) pimpl_->getOrCreateProgram(key).vertexFunction;
     }
 
     void* MetalShaderManager::getOrCreateFragmentFunction(const ShaderProgramKey& key) {
-        return (__bridge void*)pimpl_->getOrCreateProgram(key).fragmentFunction;
+        return (__bridge void*) pimpl_->getOrCreateProgram(key).fragmentFunction;
+    }
+
+    void* MetalShaderManager::getOrCreateDepthVertexFunction(bool useSkinning) {
+        return (__bridge void*) pimpl_->getOrCreateDepthVertexFunction(useSkinning);
     }
 
 }// namespace threepp::metal

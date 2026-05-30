@@ -19,6 +19,7 @@ namespace threepp::metal {
         };
 
         std::unordered_map<BufferAttribute*, CachedBuffer> cache;
+        std::unordered_map<const void*, id<MTLBuffer>> dynamicCache;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
@@ -50,15 +51,39 @@ namespace threepp::metal {
             cache[&attribute] = cb;
             return cb.mtlBuffer;
         }
+
+        id<MTLBuffer> getDynamicBuffer(const void* key, size_t byteSize, const void* data) {
+            auto it = dynamicCache.find(key);
+            if (it != dynamicCache.end()) {
+                if (byteSize > it->second.length) {
+                    it->second = [device newBufferWithBytes:data
+                                                     length:byteSize
+                                                    options:MTLResourceStorageModeShared];
+                } else if (byteSize > 0) {
+                    memcpy(it->second.contents, data, byteSize);
+                }
+                return it->second;
+            }
+
+            id<MTLBuffer> buffer = [device newBufferWithBytes:data
+                                                       length:byteSize
+                                                      options:MTLResourceStorageModeShared];
+            dynamicCache[key] = buffer;
+            return buffer;
+        }
     };
 
     MetalBufferManager::MetalBufferManager(void* device)
-        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>)device)) {}
+        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>) device)) {}
 
     MetalBufferManager::~MetalBufferManager() = default;
 
     void* MetalBufferManager::getBuffer(BufferAttribute& attribute, size_t byteSize, const void* data) {
-        return (__bridge void*)pimpl_->getBuffer(attribute, byteSize, data);
+        return (__bridge void*) pimpl_->getBuffer(attribute, byteSize, data);
+    }
+
+    void* MetalBufferManager::getDynamicBuffer(const void* key, size_t byteSize, const void* data) {
+        return (__bridge void*) pimpl_->getDynamicBuffer(key, byteSize, data);
     }
 
 }// namespace threepp::metal

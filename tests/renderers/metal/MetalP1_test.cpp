@@ -1,9 +1,12 @@
 #include "threepp/cameras/PerspectiveCamera.hpp"
+#include "threepp/constants.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
+#include "threepp/renderers/metal/MetalShaders.hpp"
 #include "threepp/textures/Image.hpp"
 
 #include "threepp/math/Vector4.hpp"
+#include "threepp/renderers/metal/MetalBufferManager.hpp"
 #include "threepp/renderers/metal/MetalCameraUtils.hpp"
 #include "threepp/renderers/metal/MetalPipelineCache.hpp"
 #include "threepp/renderers/metal/MetalRenderStateUtils.hpp"
@@ -36,6 +39,14 @@ namespace {
         renderer.setViewport(0, 0, 1, 1);
         renderer.setScissor(0, 0, 1, 1);
         renderer.setScissorTest(true);
+    };
+
+    template<class T>
+    concept HasMetalShadowMap = requires(T& renderer) {
+        renderer.shadowMap().enabled = true;
+        renderer.shadowMap().autoUpdate = false;
+        renderer.shadowMap().needsUpdate = true;
+        renderer.shadowMap().type = ShadowMap::PFCSoft;
     };
 
 }// namespace
@@ -84,12 +95,85 @@ TEST_CASE("Metal P1 cache keys include shader features and vertex layout") {
     REQUIRE(metal::PipelineKeyHash{}(withUv) != metal::PipelineKeyHash{}(withoutUv));
 }
 
+TEST_CASE("Metal P2 shader keys include skinning and lighting variants") {
+
+    metal::ShaderProgramKey skinned{};
+    skinned.useSkinning = true;
+
+    metal::ShaderProgramKey lit{};
+    lit.useLights = true;
+
+    REQUIRE_FALSE(skinned == lit);
+    REQUIRE(metal::ShaderProgramKeyHash{}(skinned) != metal::ShaderProgramKeyHash{}(lit));
+}
+
+TEST_CASE("Metal P2 fragment shader applies shadow runtime controls") {
+
+    const std::string_view source{metal::basic_fragment};
+    REQUIRE(source.find("smoothstep(light.params.z, light.params.w, angleCos)") != std::string_view::npos);
+    REQUIRE(source.find("params.textureFlags1.w") != std::string_view::npos);
+    REQUIRE(source.find("in.worldPosition + n * light.shadowMapSize.z") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P2 direct light uses GL default non-physical intensity scale") {
+
+    const std::string_view source{metal::basic_fragment};
+    REQUIRE(source.find("radiance *= PI;") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P2 shadow bias follows GL shadow depth convention") {
+
+    const std::string_view source{metal::basic_fragment};
+    REQUIRE(source.find("coord.z += bias;") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P2 skinning applies bind matrices like GL") {
+
+    const std::string_view vertexSource{metal::basic_vertex};
+    REQUIRE(vertexSource.find("transforms.bindMatrixInverse * skinMatrix * transforms.bindMatrix") != std::string_view::npos);
+    REQUIRE(vertexSource.find("localPosition = skinMatrix * localPosition") != std::string_view::npos);
+
+    const std::string_view depthSource{metal::depth_vertex};
+    REQUIRE(depthSource.find("transforms.bindMatrixInverse * skinMatrix * transforms.bindMatrix") != std::string_view::npos);
+    REQUIRE(depthSource.find("localPosition = skinMatrix * localPosition") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P2 env map path is independent from UV texture variants") {
+
+    const std::string_view source{metal::basic_fragment};
+
+    const auto textureBlockStart = source.find("#if USE_MAP\n    , texture2d<float> map");
+    REQUIRE(textureBlockStart != std::string_view::npos);
+    const auto textureBlockEnd = source.find("#endif", textureBlockStart);
+    REQUIRE(textureBlockEnd != std::string_view::npos);
+    const auto textureBlock = source.substr(textureBlockStart, textureBlockEnd - textureBlockStart);
+    REQUIRE(textureBlock.find("texturecube<float> envMap") == std::string_view::npos);
+
+    const auto uvSamplingBlockStart = source.find("#if USE_MAP\n    if (params.textureFlags1.x");
+    REQUIRE(uvSamplingBlockStart != std::string_view::npos);
+    const auto uvSamplingBlockEnd = source.find("#endif", uvSamplingBlockStart);
+    REQUIRE(uvSamplingBlockEnd != std::string_view::npos);
+    const auto uvSamplingBlock = source.substr(uvSamplingBlockStart, uvSamplingBlockEnd - uvSamplingBlockStart);
+    REQUIRE(uvSamplingBlock.find("envMap.sample") == std::string_view::npos);
+
+    REQUIRE(source.find("texturecube<float> envMap [[texture(6)]]") != std::string_view::npos);
+    REQUIRE(source.find("envMap.sample(mapSampler, reflected") != std::string_view::npos);
+}
+
+TEST_CASE("MetalRenderer exposes shadow map controls for example parity") {
+
+    STATIC_REQUIRE(HasMetalShadowMap<MetalRenderer>);
+}
+
 TEST_CASE("Metal P1 managers keep Objective-C types hidden behind void pointers") {
 
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalShaderManager, void*>);
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalTextureManager, void*, void*>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalBufferManager&>().getDynamicBuffer(nullptr, std::size_t{}, nullptr))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateVertexFunction(std::declval<const metal::ShaderProgramKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateFragmentFunction(std::declval<const metal::ShaderProgramKey&>()))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthVertexFunction(true))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalPipelineCache&>().getOrCreateDepthOnlyPipelineState(nullptr, std::uint8_t{0b0001}))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalTextureManager&>().getOrCreateTexture(std::declval<Texture&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalTextureManager&>().getOrCreateSampler(std::declval<Texture&>()))>);
 }

@@ -2,15 +2,24 @@
 #ifndef THREEPP_METAL_RENDERER_HPP
 #define THREEPP_METAL_RENDERER_HPP
 
+#include "threepp/constants.hpp"
 #include "threepp/math/Vector4.hpp"
 #include "threepp/renderers/Renderer.hpp"
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace threepp {
 
     class Window;
+
+    struct MetalShadowMap {
+        bool enabled = false;
+        bool autoUpdate = true;
+        bool needsUpdate = false;
+        ShadowMap type = ShadowMap::PFC;
+    };
 
     class MetalRenderer: public Renderer {
 
@@ -42,6 +51,22 @@ namespace threepp {
         void setRenderTarget(RenderTarget* renderTarget) override;
 
         [[nodiscard]] RenderTarget* getRenderTarget() override;
+
+        /**
+         * Reads the current drawable into an RGB8 pixel buffer.
+         *
+         * The renderer must have an uncommitted frame when this is called. Use
+         * autoClear=false, then call clear(), render(), and readRGBPixels().
+         *
+         * @return RGB pixels in top-to-bottom row order, sized to the current
+         * framebuffer in physical pixels.
+         * @throws std::runtime_error if no frame is pending or readback setup fails.
+         */
+        [[nodiscard]] std::vector<unsigned char> readRGBPixels();
+
+        MetalShadowMap& shadowMap();
+
+        [[nodiscard]] const MetalShadowMap& shadowMap() const;
 
         ~MetalRenderer() override;
 

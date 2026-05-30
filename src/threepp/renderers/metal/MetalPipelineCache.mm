@@ -7,11 +7,19 @@
 
 namespace threepp::metal {
 
+    namespace {
+
+        constexpr std::uint8_t VertexLayoutPosition = 1u << 0u;
+        constexpr std::uint8_t VertexLayoutNormal = 1u << 1u;
+        constexpr std::uint8_t VertexLayoutUv = 1u << 2u;
+        constexpr std::uint8_t VertexLayoutColor = 1u << 3u;
+        constexpr std::uint8_t VertexLayoutTangent = 1u << 4u;
+        constexpr std::uint8_t VertexLayoutSkinning = 1u << 5u;
+
+    }// namespace
+
     bool PipelineKey::operator==(const PipelineKey& other) const {
-        return vertexFunction == other.vertexFunction
-            && fragmentFunction == other.fragmentFunction
-            && alphaBlending == other.alphaBlending
-            && vertexLayoutBitmask == other.vertexLayoutBitmask;
+        return vertexFunction == other.vertexFunction && fragmentFunction == other.fragmentFunction && alphaBlending == other.alphaBlending && vertexLayoutBitmask == other.vertexLayoutBitmask;
     }
 
     size_t PipelineKeyHash::operator()(const PipelineKey& key) const {
@@ -24,12 +32,75 @@ namespace threepp::metal {
 
     namespace {
 
-        void enableAttribute(MTLVertexDescriptor* descriptor, NSUInteger index, MTLVertexFormat format, NSUInteger stride) {
+        struct DepthPipelineKey {
+            void* vertexFunction = nullptr;
+            std::uint8_t vertexLayoutBitmask = VertexLayoutPosition;
+
+            bool operator==(const DepthPipelineKey& other) const {
+                return vertexFunction == other.vertexFunction && vertexLayoutBitmask == other.vertexLayoutBitmask;
+            }
+        };
+
+        struct DepthPipelineKeyHash {
+            std::size_t operator()(const DepthPipelineKey& key) const {
+                auto h1 = std::hash<void*>{}(key.vertexFunction);
+                auto h2 = std::hash<std::uint8_t>{}(key.vertexLayoutBitmask);
+                return h1 ^ (h2 << 1);
+            }
+        };
+
+        struct DepthStencilKey {
+            bool depthTest = true;
+            bool depthWrite = true;
+            DepthFunc depthFunc = DepthFunc::LessEqual;
+
+            bool operator==(const DepthStencilKey& other) const {
+                return depthTest == other.depthTest && depthWrite == other.depthWrite && depthFunc == other.depthFunc;
+            }
+        };
+
+        struct DepthStencilKeyHash {
+            std::size_t operator()(const DepthStencilKey& key) const {
+                auto h1 = std::hash<bool>{}(key.depthTest);
+                auto h2 = std::hash<bool>{}(key.depthWrite);
+                auto h3 = std::hash<int>{}(static_cast<int>(key.depthFunc));
+                return h1 ^ (h2 << 1) ^ (h3 << 2);
+            }
+        };
+
+        MTLCompareFunction toMetalCompareFunction(DepthFunc depthFunc) {
+            switch (depthFunc) {
+                case DepthFunc::Never:
+                    return MTLCompareFunctionNever;
+                case DepthFunc::Always:
+                    return MTLCompareFunctionAlways;
+                case DepthFunc::Less:
+                    return MTLCompareFunctionLess;
+                case DepthFunc::LessEqual:
+                    return MTLCompareFunctionLessEqual;
+                case DepthFunc::Equal:
+                    return MTLCompareFunctionEqual;
+                case DepthFunc::GreaterEqual:
+                    return MTLCompareFunctionGreaterEqual;
+                case DepthFunc::Greater:
+                    return MTLCompareFunctionGreater;
+                case DepthFunc::NotEqual:
+                    return MTLCompareFunctionNotEqual;
+            }
+
+            return MTLCompareFunctionLessEqual;
+        }
+
+        void enableAttribute(MTLVertexDescriptor* descriptor, NSUInteger index, MTLVertexFormat format, NSUInteger stride, NSUInteger bufferIndex) {
             descriptor.attributes[index].format = format;
             descriptor.attributes[index].offset = 0;
-            descriptor.attributes[index].bufferIndex = index;
-            descriptor.layouts[index].stride = stride;
-            descriptor.layouts[index].stepFunction = MTLVertexStepFunctionPerVertex;
+            descriptor.attributes[index].bufferIndex = bufferIndex;
+            descriptor.layouts[bufferIndex].stride = stride;
+            descriptor.layouts[bufferIndex].stepFunction = MTLVertexStepFunctionPerVertex;
+        }
+
+        void enableAttribute(MTLVertexDescriptor* descriptor, NSUInteger index, MTLVertexFormat format, NSUInteger stride) {
+            enableAttribute(descriptor, index, format, stride, index);
         }
 
         MTLVertexDescriptor* createVertexDescriptor(std::uint8_t bitmask) {
@@ -37,16 +108,25 @@ namespace threepp::metal {
 
             enableAttribute(descriptor, 0, MTLVertexFormatFloat3, sizeof(float) * 3);
 
-            if ((bitmask & 0b0010) != 0) {
+            if ((bitmask & VertexLayoutNormal) != 0) {
                 enableAttribute(descriptor, 1, MTLVertexFormatFloat3, sizeof(float) * 3);
             }
 
-            if ((bitmask & 0b0100) != 0) {
+            if ((bitmask & VertexLayoutUv) != 0) {
                 enableAttribute(descriptor, 2, MTLVertexFormatFloat2, sizeof(float) * 2);
             }
 
-            if ((bitmask & 0b1000) != 0) {
+            if ((bitmask & VertexLayoutColor) != 0) {
                 enableAttribute(descriptor, 3, MTLVertexFormatFloat3, sizeof(float) * 3);
+            }
+
+            if ((bitmask & VertexLayoutSkinning) != 0) {
+                enableAttribute(descriptor, 4, MTLVertexFormatFloat4, sizeof(float) * 4, 6);
+                enableAttribute(descriptor, 5, MTLVertexFormatFloat4, sizeof(float) * 4, 7);
+            }
+
+            if ((bitmask & VertexLayoutTangent) != 0) {
+                enableAttribute(descriptor, 6, MTLVertexFormatFloat4, sizeof(float) * 4, 8);
             }
 
             return descriptor;
@@ -57,7 +137,8 @@ namespace threepp::metal {
     struct MetalPipelineCache::Impl {
         id<MTLDevice> device;
         std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelineStates;
-        id<MTLDepthStencilState> depthStencilState = nil;
+        std::unordered_map<DepthPipelineKey, id<MTLRenderPipelineState>, DepthPipelineKeyHash> depthOnlyPipelineStates;
+        std::unordered_map<DepthStencilKey, id<MTLDepthStencilState>, DepthStencilKeyHash> depthStencilStates;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
@@ -70,8 +151,8 @@ namespace threepp::metal {
             }
 
             MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
-            desc.vertexFunction = (__bridge id<MTLFunction>)key.vertexFunction;
-            desc.fragmentFunction = (__bridge id<MTLFunction>)key.fragmentFunction;
+            desc.vertexFunction = (__bridge id<MTLFunction>) key.vertexFunction;
+            desc.fragmentFunction = (__bridge id<MTLFunction>) key.fragmentFunction;
             desc.vertexDescriptor = createVertexDescriptor(key.vertexLayoutBitmask);
 
             desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -100,29 +181,67 @@ namespace threepp::metal {
             return pso;
         }
 
-        id<MTLDepthStencilState> getOrCreateDepthStencilState() {
-            if (depthStencilState) return depthStencilState;
+        id<MTLRenderPipelineState> getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask) {
+            const DepthPipelineKey key{vertexFunction, vertexLayoutBitmask};
+            auto it = depthOnlyPipelineStates.find(key);
+            if (it != depthOnlyPipelineStates.end()) {
+                return it->second;
+            }
+
+            MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+            desc.vertexFunction = (__bridge id<MTLFunction>) vertexFunction;
+            desc.fragmentFunction = nil;
+            desc.vertexDescriptor = createVertexDescriptor(vertexLayoutBitmask);
+            desc.colorAttachments[0].pixelFormat = MTLPixelFormatInvalid;
+            desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+
+            NSError* error = nil;
+            id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+            if (!pso) {
+                NSString* msg = [NSString stringWithFormat:@"Failed to create depth-only PSO: %@", error.localizedDescription];
+                throw std::runtime_error([msg UTF8String]);
+            }
+
+            depthOnlyPipelineStates[key] = pso;
+            return pso;
+        }
+
+        id<MTLDepthStencilState> getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc) {
+            const DepthStencilKey key{depthTest, depthWrite, depthFunc};
+            auto it = depthStencilStates.find(key);
+            if (it != depthStencilStates.end()) {
+                return it->second;
+            }
 
             MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
-            desc.depthCompareFunction = MTLCompareFunctionLessEqual;
-            desc.depthWriteEnabled = YES;
+            desc.depthCompareFunction = depthTest ? toMetalCompareFunction(depthFunc) : MTLCompareFunctionAlways;
+            desc.depthWriteEnabled = depthTest && depthWrite ? YES : NO;
 
-            depthStencilState = [device newDepthStencilStateWithDescriptor:desc];
-            return depthStencilState;
+            id<MTLDepthStencilState> state = [device newDepthStencilStateWithDescriptor:desc];
+            depthStencilStates[key] = state;
+            return state;
         }
     };
 
     MetalPipelineCache::MetalPipelineCache(void* device)
-        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>)device)) {}
+        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>) device)) {}
 
     MetalPipelineCache::~MetalPipelineCache() = default;
 
     void* MetalPipelineCache::getOrCreatePipelineState(const PipelineKey& key) {
-        return (__bridge void*)pimpl_->getOrCreatePipelineState(key);
+        return (__bridge void*) pimpl_->getOrCreatePipelineState(key);
+    }
+
+    void* MetalPipelineCache::getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask) {
+        return (__bridge void*) pimpl_->getOrCreateDepthOnlyPipelineState(vertexFunction, vertexLayoutBitmask);
     }
 
     void* MetalPipelineCache::getOrCreateDepthStencilState() {
-        return (__bridge void*)pimpl_->getOrCreateDepthStencilState();
+        return getOrCreateDepthStencilState(true, true, DepthFunc::LessEqual);
+    }
+
+    void* MetalPipelineCache::getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc) {
+        return (__bridge void*) pimpl_->getOrCreateDepthStencilState(depthTest, depthWrite, depthFunc);
     }
 
 }// namespace threepp::metal

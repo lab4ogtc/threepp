@@ -421,6 +421,11 @@ namespace threepp {
                     case aiTextureMapMode_Clamp:
                         tex.wrapS = TextureWrapping::ClampToEdge;
                         break;
+                    case aiTextureMapMode_Decal:
+                        tex.wrapS = TextureWrapping::ClampToEdge;
+                        break;
+                    case _aiTextureMapMode_Force32Bit:
+                        break;
                 }
             }
             aiTextureMapMode wrapT;
@@ -434,6 +439,11 @@ namespace threepp {
                         break;
                     case aiTextureMapMode_Clamp:
                         tex.wrapT = TextureWrapping::ClampToEdge;
+                        break;
+                    case aiTextureMapMode_Decal:
+                        tex.wrapT = TextureWrapping::ClampToEdge;
+                        break;
+                    case _aiTextureMapMode_Force32Bit:
                         break;
                 }
             }

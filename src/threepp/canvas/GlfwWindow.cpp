@@ -146,18 +146,57 @@ namespace {
         std::cerr << "Error: " << description << std::endl;
     }
 
-    void initGLfw() {
+    std::size_t& activeGlfwWindows() {
+        static std::size_t count = 0;
+        return count;
+    }
+
+    bool& glfwInitialized() {
         static bool initialized = false;
+        return initialized;
+    }
+
+    void initGLfw() {
+        auto& initialized = glfwInitialized();
 
         if (!initialized) {
-            initialized = true;
-
             glfwSetErrorCallback(error_callback);
 
             if (!glfwInit()) {
                 exit(EXIT_FAILURE);
             }
+
+            initialized = true;
         }
+    }
+
+    void retainGlfwWindow() {
+        initGLfw();
+        auto& activeWindows = activeGlfwWindows();
+        ++activeWindows;
+    }
+
+    void terminateGLfw() {
+        auto& activeWindows = activeGlfwWindows();
+        if (activeWindows == 0) return;
+
+        --activeWindows;
+        if (activeWindows == 0) {
+            glfwTerminate();
+            glfwInitialized() = false;
+        }
+    }
+
+    GLFWmonitor* getMonitorOrDefault(int monitor) {
+        int count = 0;
+        auto monitors = glfwGetMonitors(&count);
+        if (!monitors || count <= 0) return nullptr;
+
+        if (monitor < 0 || monitor >= count) {
+            monitor = 0;
+        }
+
+        return monitors[monitor];
     }
 
 }// namespace
@@ -180,7 +219,7 @@ struct GlfwWindow::Impl {
     explicit Impl(GlfwWindow& scope, const Parameters& params)
         : scope(scope), exitOnKeyEscape_(params.exitOnKeyEscape_), clientAPI_(params.clientAPI_) {
 
-        initGLfw();
+        retainGlfwWindow();
 
         if (params.size_) {
             size_ = *params.size_;
@@ -191,6 +230,7 @@ struct GlfwWindow::Impl {
 
 #ifndef __EMSCRIPTEN__
         if (clientAPI_ == ClientAPI::OpenGL) {
+            glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
             glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
@@ -211,7 +251,7 @@ struct GlfwWindow::Impl {
 
         window = glfwCreateWindow(size_.width(), size_.height(), params.title_.c_str(), nullptr, nullptr);
         if (!window) {
-            glfwTerminate();
+            terminateGLfw();
             exit(EXIT_FAILURE);
         }
 
@@ -303,7 +343,7 @@ struct GlfwWindow::Impl {
 
     ~Impl() {
         glfwDestroyWindow(window);
-        glfwTerminate();
+        terminateGLfw();
     }
 
 
@@ -313,6 +353,7 @@ struct GlfwWindow::Impl {
 
         int count;
         GLFWmonitor** monitors = glfwGetMonitors(&count);
+        if (!monitors || count <= 0) return;
 
         for (int i = 0; i < count; ++i) {
             int mx, my;
@@ -647,9 +688,11 @@ WindowSize monitor::monitorSize(int monitor) {
 
     initGLfw();
 
-    int count;
-    auto monitors = glfwGetMonitors(&count);
-    const GLFWvidmode* mode = glfwGetVideoMode(monitors[monitor]);
+    auto* selectedMonitor = getMonitorOrDefault(monitor);
+    if (!selectedMonitor) return {800, 600};
+
+    const GLFWvidmode* mode = glfwGetVideoMode(selectedMonitor);
+    if (!mode) return {800, 600};
 
     return {mode->width, mode->height};
 #endif
@@ -661,11 +704,11 @@ std::pair<float, float> monitor::contentScale(int monitor) {
 #else
     initGLfw();
 
-    int count;
-    auto monitors = glfwGetMonitors(&count);
+    auto* selectedMonitor = getMonitorOrDefault(monitor);
+    if (!selectedMonitor) return {1, 1};
 
     float xscale, yscale;
-    glfwGetMonitorContentScale(monitors[monitor], &xscale, &yscale);
+    glfwGetMonitorContentScale(selectedMonitor, &xscale, &yscale);
 
     return {xscale, yscale};
 #endif

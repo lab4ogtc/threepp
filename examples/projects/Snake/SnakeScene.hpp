@@ -62,7 +62,9 @@ public:
                     if (game_.direction != Direction::LEFT) {
                         game_.nextDirection = Direction::RIGHT;
                     }
-                }
+                } break;
+                default:
+                    break;
             }
         }
 

@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <memory>
 
+#include "threepp/constants.hpp"
+
 namespace threepp::metal {
 
     struct PipelineKey {
@@ -30,7 +32,11 @@ namespace threepp::metal {
 
         void* getOrCreatePipelineState(const PipelineKey& key);
 
+        void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask);
+
         void* getOrCreateDepthStencilState();
+
+        void* getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc);
 
     private:
         struct Impl;

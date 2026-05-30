@@ -161,6 +161,18 @@ namespace {
         }
     }
 
+    GLFWmonitor* getMonitorOrDefault(int monitor) {
+        int count = 0;
+        auto monitors = glfwGetMonitors(&count);
+        if (!monitors || count <= 0) return nullptr;
+
+        if (monitor < 0 || monitor >= count) {
+            monitor = 0;
+        }
+
+        return monitors[monitor];
+    }
+
 }// namespace
 
 struct Canvas::Impl {
@@ -304,6 +316,7 @@ struct Canvas::Impl {
 
         int count;
         GLFWmonitor** monitors = glfwGetMonitors(&count);
+        if (!monitors || count <= 0) return;
 
         // For each monitor, get its bounds
         for (int i = 0; i < count; ++i) {
@@ -609,9 +622,11 @@ WindowSize monitor::monitorSize(int monitor) {
 
     initGLfw();
 
-    int count;
-    auto monitors = glfwGetMonitors(&count);
-    const GLFWvidmode* mode = glfwGetVideoMode(monitors[monitor]);
+    auto* selectedMonitor = getMonitorOrDefault(monitor);
+    if (!selectedMonitor) return {800, 600};
+
+    const GLFWvidmode* mode = glfwGetVideoMode(selectedMonitor);
+    if (!mode) return {800, 600};
 
     return {mode->width, mode->height};
 #endif
@@ -623,11 +638,11 @@ std::pair<float, float> monitor::contentScale(int monitor) {
 #else
     initGLfw();
 
-    int count;
-    auto monitors = glfwGetMonitors(&count);
+    auto* selectedMonitor = getMonitorOrDefault(monitor);
+    if (!selectedMonitor) return {1, 1};
 
     float xscale, yscale;
-    glfwGetMonitorContentScale(monitors[monitor], &xscale, &yscale);
+    glfwGetMonitorContentScale(selectedMonitor, &xscale, &yscale);
 
     return {xscale, yscale};
 #endif

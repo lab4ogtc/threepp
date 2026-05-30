@@ -2,6 +2,7 @@
 
 #import "threepp/constants.hpp"
 #import "threepp/core/EventDispatcher.hpp"
+#import "threepp/textures/CubeTexture.hpp"
 #import "threepp/textures/Texture.hpp"
 
 #import <Metal/Metal.h>
@@ -16,13 +17,6 @@
 namespace threepp::metal {
 
     namespace {
-
-        bool isMipmapFilter(Filter filter) {
-            return filter == Filter::NearestMipmapNearest
-                || filter == Filter::NearestMipmapLinear
-                || filter == Filter::LinearMipmapNearest
-                || filter == Filter::LinearMipmapLinear;
-        }
 
         MTLSamplerAddressMode toAddressMode(TextureWrapping wrapping) {
             switch (wrapping) {
@@ -65,12 +59,10 @@ namespace threepp::metal {
             TextureWrapping wrapT;
             Filter magFilter;
             Filter minFilter;
+            bool mipmapped;
 
             bool operator==(const SamplerKey& other) const {
-                return wrapS == other.wrapS
-                    && wrapT == other.wrapT
-                    && magFilter == other.magFilter
-                    && minFilter == other.minFilter;
+                return wrapS == other.wrapS && wrapT == other.wrapT && magFilter == other.magFilter && minFilter == other.minFilter && mipmapped == other.mipmapped;
             }
         };
 
@@ -80,9 +72,59 @@ namespace threepp::metal {
                 auto h2 = std::hash<int>{}(as_integer(key.wrapT));
                 auto h3 = std::hash<int>{}(as_integer(key.magFilter));
                 auto h4 = std::hash<int>{}(as_integer(key.minFilter));
-                return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+                auto h5 = std::hash<bool>{}(key.mipmapped);
+                return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
             }
         };
+
+        std::vector<unsigned char> toRGBA(const Image& image, Texture& texture) {
+            const auto& source = image.data<unsigned char>();
+            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+            const auto sourceChannels = texture.format == Format::RGB ? 3u : 4u;
+            if (source.size() < pixelCount * sourceChannels) {
+                throw std::runtime_error("Texture image data is smaller than expected");
+            }
+
+            std::vector<unsigned char> rgba(pixelCount * 4u);
+            if (sourceChannels == 4u) {
+                std::copy(source.begin(), source.begin() + static_cast<std::ptrdiff_t>(rgba.size()), rgba.begin());
+                return rgba;
+            }
+
+            for (std::size_t i = 0; i < pixelCount; ++i) {
+                rgba[i * 4u + 0u] = source[i * 3u + 0u];
+                rgba[i * 4u + 1u] = source[i * 3u + 1u];
+                rgba[i * 4u + 2u] = source[i * 3u + 2u];
+                rgba[i * 4u + 3u] = 255;
+            }
+            return rgba;
+        }
+
+        bool wantsMipmaps(const Texture& texture) {
+            return texture.generateMipmaps || !texture.mipmaps().empty();
+        }
+
+        void replace2DRegion(id<MTLTexture> mtlTexture, Texture& texture, const Image& image, NSUInteger level, NSUInteger slice = 0) {
+            auto rgba = toRGBA(image, texture);
+            const auto bytesPerRow = static_cast<NSUInteger>(image.width) * 4u;
+            const auto bytesPerImage = bytesPerRow * static_cast<NSUInteger>(image.height);
+            [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
+                          mipmapLevel:level
+                                slice:slice
+                            withBytes:rgba.data()
+                          bytesPerRow:bytesPerRow
+                        bytesPerImage:bytesPerImage];
+        }
+
+        void uploadMipmaps(id<MTLTexture> mtlTexture, Texture& texture, NSUInteger slice = 0) {
+            const auto& mipmaps = texture.mipmaps();
+            const auto maxManualLevels = mtlTexture.mipmapLevelCount > 0 ? mtlTexture.mipmapLevelCount - 1u : 0u;
+            const auto manualLevelCount = std::min<NSUInteger>(static_cast<NSUInteger>(mipmaps.size()), maxManualLevels);
+
+            for (NSUInteger i = 0; i < manualLevelCount; ++i) {
+                replace2DRegion(mtlTexture, texture, mipmaps[i], i + 1u, slice);
+            }
+        }
 
     }// namespace
 
@@ -135,27 +177,56 @@ namespace threepp::metal {
                 throw std::runtime_error("MetalTextureManager currently supports unsigned byte textures");
             }
 
-            const auto& source = image.data<unsigned char>();
-            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
-            const auto sourceChannels = texture.format == Format::RGB ? 3u : 4u;
-            if (source.size() < pixelCount * sourceChannels) {
-                throw std::runtime_error("Texture image data is smaller than expected");
-            }
-
-            std::vector<unsigned char> rgba;
-            const unsigned char* uploadData = source.data();
-            if (sourceChannels == 3u) {
-                rgba.resize(pixelCount * 4u);
-                for (std::size_t i = 0; i < pixelCount; ++i) {
-                    rgba[i * 4u + 0u] = source[i * 3u + 0u];
-                    rgba[i * 4u + 1u] = source[i * 3u + 1u];
-                    rgba[i * 4u + 2u] = source[i * 3u + 2u];
-                    rgba[i * 4u + 3u] = 255;
+            if (dynamic_cast<CubeTexture*>(&texture)) {
+                const auto& images = texture.images();
+                if (images.size() != 6) {
+                    throw std::runtime_error("Metal cube textures require six images");
                 }
-                uploadData = rgba.data();
+
+                const auto width = images.front().width;
+                const auto height = images.front().height;
+                if (width != height) {
+                    throw std::runtime_error("Metal cube texture faces must be square");
+                }
+
+                const auto mipmapped = wantsMipmaps(texture);
+                MTLTextureDescriptor* desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                                   size:width
+                                                                                              mipmapped:mipmapped ? YES : NO];
+                desc.usage = MTLTextureUsageShaderRead;
+
+                id<MTLTexture> mtlTexture = [device newTextureWithDescriptor:desc];
+                if (!mtlTexture) {
+                    throw std::runtime_error("Failed to create Metal cube texture");
+                }
+
+                for (NSUInteger face = 0; face < 6; ++face) {
+                    const auto& faceImage = images[face];
+                    if (faceImage.width != width || faceImage.height != height) {
+                        throw std::runtime_error("Metal cube texture faces must have identical dimensions");
+                    }
+
+                    replace2DRegion(mtlTexture, texture, faceImage, 0, face);
+                    uploadMipmaps(mtlTexture, texture, face);
+                }
+
+                if (mipmapped && texture.generateMipmaps && texture.mipmaps().empty()) {
+                    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+                    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+                    [blitEncoder generateMipmapsForTexture:mtlTexture];
+                    [blitEncoder endEncoding];
+                    [commandBuffer commit];
+                }
+
+                if (!texture.hasEventListener("dispose", onTextureDispose)) {
+                    texture.addEventListener("dispose", onTextureDispose);
+                }
+
+                textures[&texture] = CachedTexture{mtlTexture, texture.version()};
+                return mtlTexture;
             }
 
-            const auto mipmapped = texture.generateMipmaps || isMipmapFilter(texture.minFilter) || !texture.mipmaps().empty();
+            const auto mipmapped = wantsMipmaps(texture);
             MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
                                                                                             width:image.width
                                                                                            height:image.height
@@ -167,13 +238,10 @@ namespace threepp::metal {
                 throw std::runtime_error("Failed to create Metal texture");
             }
 
-            const auto bytesPerRow = static_cast<NSUInteger>(image.width) * 4u;
-            [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
-                           mipmapLevel:0
-                             withBytes:uploadData
-                           bytesPerRow:bytesPerRow];
+            replace2DRegion(mtlTexture, texture, image, 0);
+            uploadMipmaps(mtlTexture, texture);
 
-            if (mipmapped && texture.generateMipmaps) {
+            if (mipmapped && texture.generateMipmaps && texture.mipmaps().empty()) {
                 id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
                 id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
                 [blitEncoder generateMipmapsForTexture:mtlTexture];
@@ -190,7 +258,8 @@ namespace threepp::metal {
         }
 
         id<MTLSamplerState> getOrCreateSampler(Texture& texture) {
-            const SamplerKey key{texture.wrapS, texture.wrapT, texture.magFilter, texture.minFilter};
+            const auto mipmapped = wantsMipmaps(texture);
+            const SamplerKey key{texture.wrapS, texture.wrapT, texture.magFilter, texture.minFilter, mipmapped};
             auto it = samplers.find(key);
             if (it != samplers.end()) {
                 return it->second;
@@ -201,7 +270,7 @@ namespace threepp::metal {
             desc.tAddressMode = toAddressMode(texture.wrapT);
             desc.magFilter = toMinMagFilter(texture.magFilter);
             desc.minFilter = toMinMagFilter(texture.minFilter);
-            desc.mipFilter = toMipFilter(texture.minFilter);
+            desc.mipFilter = mipmapped ? toMipFilter(texture.minFilter) : MTLSamplerMipFilterNotMipmapped;
 
             id<MTLSamplerState> sampler = [device newSamplerStateWithDescriptor:desc];
             if (!sampler) {
@@ -224,16 +293,16 @@ namespace threepp::metal {
     };
 
     MetalTextureManager::MetalTextureManager(void* device, void* commandQueue)
-        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>)device, (__bridge id<MTLCommandQueue>)commandQueue)) {}
+        : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>) device, (__bridge id<MTLCommandQueue>) commandQueue)) {}
 
     MetalTextureManager::~MetalTextureManager() = default;
 
     void* MetalTextureManager::getOrCreateTexture(Texture& texture) {
-        return (__bridge void*)pimpl_->getOrCreateTexture(texture);
+        return (__bridge void*) pimpl_->getOrCreateTexture(texture);
     }
 
     void* MetalTextureManager::getOrCreateSampler(Texture& texture) {
-        return (__bridge void*)pimpl_->getOrCreateSampler(texture);
+        return (__bridge void*) pimpl_->getOrCreateSampler(texture);
     }
 
     void MetalTextureManager::deallocateTexture(Texture* texture) {
