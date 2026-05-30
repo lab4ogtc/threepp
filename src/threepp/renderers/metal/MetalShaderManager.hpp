@@ -67,6 +67,22 @@ namespace threepp::metal {
 
         void* getOrCreateDepthVertexFunction(bool useSkinning, bool useInstancing = false);
 
+        void* getOrCreatePointDepthVertexFunction(bool useSkinning, bool useInstancing = false);
+
+        void* getOrCreatePointDepthFragmentFunction(bool useSkinning, bool useInstancing = false);
+
+        void* getOrCreateSpriteVertexFunction();
+
+        void* getOrCreateSpriteFragmentFunction();
+
+        void* getOrCreateSkyVertexFunction();
+
+        void* getOrCreateSkyFragmentFunction();
+
+        void* getOrCreateWaterVertexFunction();
+
+        void* getOrCreateWaterFragmentFunction();
+
     private:
         struct Impl;
         std::unique_ptr<Impl> pimpl_;

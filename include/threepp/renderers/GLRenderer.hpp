@@ -99,7 +99,7 @@ namespace threepp {
 
         void setPixelRatio(float value);
 
-        [[nodiscard]] WindowSize size() const;
+        [[nodiscard]] WindowSize size() const override;
 
         void setSize(std::pair<int, int> size) override;
 

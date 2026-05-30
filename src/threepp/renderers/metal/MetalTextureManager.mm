@@ -10,8 +10,11 @@
 #include <any>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace threepp::metal {
@@ -82,6 +85,11 @@ namespace threepp::metal {
             const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
             const auto sourceChannels = texture.format == Format::RGB ? 3u : 4u;
             if (source.size() < pixelCount * sourceChannels) {
+                std::cerr << "[MetalTextureManager] Error: source.size()=" << source.size()
+                          << ", pixelCount=" << pixelCount
+                          << ", width=" << image.width << ", height=" << image.height
+                          << ", sourceChannels=" << sourceChannels
+                          << ", texture.format=" << (int)texture.format << "\n";
                 throw std::runtime_error("Texture image data is smaller than expected");
             }
 
@@ -157,25 +165,57 @@ namespace threepp::metal {
         OnTextureDispose onTextureDispose;
         std::unordered_map<Texture*, CachedTexture> textures;
         std::unordered_map<SamplerKey, id<MTLSamplerState>, SamplerKeyHash> samplers;
+        std::unordered_set<Texture*> placeholderWarnings;
 
         Impl(id<MTLDevice> dev, id<MTLCommandQueue> queue)
             : device(dev),
               commandQueue(queue),
               onTextureDispose(*this) {}
 
-        id<MTLTexture> getOrCreateTexture(Texture& texture) {
+        void warnPlaceholderFallback(Texture& texture, std::string_view reason) {
+            if (!placeholderWarnings.insert(&texture).second) return;
+
+            if (!texture.hasEventListener("dispose", onTextureDispose)) {
+                texture.addEventListener("dispose", onTextureDispose);
+            }
+
+            std::cerr << "[MetalTextureManager] Warning: using placeholder texture for texture "
+                      << texture.id << " (" << reason << ")\n";
+        }
+
+        id<MTLTexture> getOrCreateTexture(Texture& texture, bool allowPlaceholder) {
+            if (texture.type != Type::UnsignedByte) {
+                throw std::runtime_error("MetalTextureManager currently supports unsigned byte textures");
+            }
+
             auto it = textures.find(&texture);
             if (it != textures.end() && (it->second.external || it->second.version == texture.version())) {
                 return it->second.texture;
             }
 
             if (texture.images().empty()) {
-                throw std::runtime_error("Cannot create Metal texture without image data");
+                if (!allowPlaceholder) {
+                    throw std::runtime_error("Cannot create Metal texture without image data");
+                }
+                warnPlaceholderFallback(texture, "missing image data");
+                return nil;
             }
 
             const auto& image = texture.image();
-            if (texture.type != Type::UnsignedByte) {
-                throw std::runtime_error("MetalTextureManager currently supports unsigned byte textures");
+            const auto& source = image.data<unsigned char>();
+            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+            const auto sourceChannels = texture.format == Format::RGB ? 3u : 4u;
+            if (source.size() < pixelCount * sourceChannels) {
+                if (!allowPlaceholder) {
+                    std::cerr << "[MetalTextureManager] Error: source.size()=" << source.size()
+                              << ", pixelCount=" << pixelCount
+                              << ", width=" << image.width << ", height=" << image.height
+                              << ", sourceChannels=" << sourceChannels
+                              << ", texture.format=" << (int)texture.format << "\n";
+                    throw std::runtime_error("Texture image data is smaller than expected");
+                }
+                warnPlaceholderFallback(texture, "image data is smaller than expected");
+                return nil;
             }
 
             if (dynamic_cast<CubeTexture*>(&texture)) {
@@ -298,6 +338,7 @@ namespace threepp::metal {
             if (texture && texture->hasEventListener("dispose", onTextureDispose)) {
                 texture->removeEventListener("dispose", onTextureDispose);
             }
+            placeholderWarnings.erase(texture);
             textures.erase(texture);
         }
 
@@ -313,8 +354,8 @@ namespace threepp::metal {
 
     MetalTextureManager::~MetalTextureManager() = default;
 
-    void* MetalTextureManager::getOrCreateTexture(Texture& texture) {
-        return (__bridge void*) pimpl_->getOrCreateTexture(texture);
+    void* MetalTextureManager::getOrCreateTexture(Texture& texture, bool allowPlaceholder) {
+        return (__bridge void*) pimpl_->getOrCreateTexture(texture, allowPlaceholder);
     }
 
     void* MetalTextureManager::getOrCreateSampler(Texture& texture) {

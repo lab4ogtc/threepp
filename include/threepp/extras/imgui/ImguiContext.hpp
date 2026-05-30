@@ -1,87 +1,56 @@
-
 #ifndef THREEPP_IMGUI_HELPER_HPP
 #define THREEPP_IMGUI_HELPER_HPP
 
 #include <imgui.h>
-#include <imgui_impl_glfw.h>
-#include <imgui_impl_opengl3.h>
+
+#include "threepp/canvas/Monitor.hpp"
 
 #include <functional>
-#include <iostream>
+#include <memory>
 
-#include <threepp/canvas/Canvas.hpp>
-#include <threepp/canvas/Monitor.hpp>
+namespace threepp {
+
+    class GlfwWindow;
+    class Renderer;
+
+}// namespace threepp
 
 class ImguiContext {
 
 public:
-    explicit ImguiContext(void* window) {
-        ImGui::CreateContext();
-        ImGui_ImplGlfw_InitForOpenGL(static_cast<GLFWwindow*>(window), true);
-#ifdef __EMSCRIPTEN__
-        ImGui_ImplOpenGL3_Init("#version 300 es");
-#else
-        ImGui_ImplOpenGL3_Init("#version 330 core");
-#endif
+    struct Impl {
+        virtual void beginFrame() = 0;
+        virtual void renderDrawData(ImDrawData* drawData) = 0;
+        virtual ~Impl() = default;
+    };
 
-        setFontScale(threepp::monitor::contentScale().first);
-    }
+    explicit ImguiContext(void* window);
 
-    explicit ImguiContext(const threepp::GlfwWindow& canvas): ImguiContext(canvas.windowPtr()) {
-        canvas.onMonitorChange([this](int monitor) {
-            setFontScale(threepp::monitor::contentScale(monitor).first);
-        });
-    }
+    ImguiContext(void* window, threepp::Renderer& renderer);
+
+    explicit ImguiContext(const threepp::GlfwWindow& canvas);
+
+    ImguiContext(const threepp::GlfwWindow& canvas, threepp::Renderer& renderer);
 
     ImguiContext(ImguiContext&&) = delete;
     ImguiContext(const ImguiContext&) = delete;
     ImguiContext& operator=(const ImguiContext&) = delete;
 
-    void render() {
-        if (!dpiAwareIsConfigured_) {
+    void render();
 
-            ImGuiStyle& style = ImGui::GetStyle();
-            style = ImGuiStyle();
-            style.FontScaleDpi = dpiScale_;
-            style.ScaleAllSizes(dpiScale_);
+    virtual ~ImguiContext();
 
-            dpiAwareIsConfigured_ = true;
-        }
+    void setFontScale(float scale);
 
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
+    void makeDpiAware();
 
-        onRender();
-
-        ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-    }
-
-    virtual ~ImguiContext() {
-        ImGui_ImplOpenGL3_Shutdown();
-        ImGui_ImplGlfw_Shutdown();
-        ImGui::DestroyContext();
-    }
-
-    void setFontScale(float scale) {
-        dpiAwareIsConfigured_ = false;
-        dpiScale_ = scale;
-    }
-
-    void makeDpiAware() {
-
-        std::cerr << "Deprecated function. Use setFontScale instead." << std::endl;
-    }
-
-    [[nodiscard]] float dpiScale() const {
-        return dpiScale_;
-    }
+    [[nodiscard]] float dpiScale() const;
 
 protected:
     virtual void onRender() = 0;
 
 private:
+    std::unique_ptr<Impl> impl_;
     bool dpiAwareIsConfigured_ = true;
     float dpiScale_ = 1.f;
 };
@@ -89,18 +58,16 @@ private:
 class ImguiFunctionalContext: public ImguiContext {
 
 public:
-    explicit ImguiFunctionalContext(void* window, std::function<void()> f)
-        : ImguiContext(window),
-          f_(std::move(f)) {}
+    explicit ImguiFunctionalContext(void* window, std::function<void()> f);
 
-    explicit ImguiFunctionalContext(const threepp::GlfwWindow& canvas, std::function<void()> f)
-        : ImguiContext(canvas),
-          f_(std::move(f)) {}
+    ImguiFunctionalContext(void* window, threepp::Renderer& renderer, std::function<void()> f);
+
+    explicit ImguiFunctionalContext(const threepp::GlfwWindow& canvas, std::function<void()> f);
+
+    ImguiFunctionalContext(const threepp::GlfwWindow& canvas, threepp::Renderer& renderer, std::function<void()> f);
 
 protected:
-    void onRender() override {
-        f_();
-    }
+    void onRender() override;
 
 private:
     std::function<void()> f_;

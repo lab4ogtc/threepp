@@ -7,7 +7,7 @@
 #include "threepp/core/Raycaster.hpp"
 #include "threepp/math/Box3.hpp"
 #include "threepp/objects/TextSprite.hpp"
-#include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/Renderer.hpp"
 #include "threepp/scenes/Scene.hpp"
 
 #include <iostream>
@@ -65,7 +65,7 @@ struct HUD::Impl: MouseListener {
 
     Scene scene;
 
-    Impl(GLRenderer& renderer, PeripheralsEventSource* eventSource)
+    Impl(Renderer& renderer, PeripheralsEventSource* eventSource)
         : renderer_(&renderer),
           eventSource_(eventSource),
           camera_(0, static_cast<float>(renderer.size().first), static_cast<float>(renderer.size().second), 0, 0.1f, 10.f) {
@@ -91,7 +91,7 @@ struct HUD::Impl: MouseListener {
             }
         }
 
-        renderer_->clearDepth();
+        renderer_->clear(false, true, false);
         renderer_->render(scene, camera_);
     }
 
@@ -162,7 +162,7 @@ struct HUD::Impl: MouseListener {
     }
 
 private:
-    GLRenderer* renderer_;
+    Renderer* renderer_;
     PeripheralsEventSource* eventSource_;
 
     std::pair<int, int> lastSize_;
@@ -210,7 +210,7 @@ private:
     }
 };
 
-HUD::HUD(GLRenderer& renderer, PeripheralsEventSource* eventSource)
+HUD::HUD(Renderer& renderer, PeripheralsEventSource* eventSource)
     : pimpl_(std::make_unique<Impl>(renderer, eventSource)) {}
 
 

@@ -10,7 +10,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <iostream>
 #include <stdexcept>
+#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -63,6 +65,19 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false, false));
         REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(true, false));
         REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false, true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(false, false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(false, false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(true, false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(true, false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(false, true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(false, true));
+
+        REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteVertexFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteFragmentFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateSkyVertexFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateSkyFragmentFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateWaterVertexFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateWaterFragmentFunction());
     }
 }
 
@@ -171,6 +186,63 @@ TEST_CASE("Metal P3 texture manager can register an external Metal texture") {
 
         auto* rawTexture = textureManager.getOrCreateTexture(*texture);
         REQUIRE(rawTexture == (__bridge void*) externalTexture);
+    }
+}
+
+TEST_CASE("Metal P4 texture manager requires explicit placeholder fallback for incomplete image data") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+        metal::MetalTextureManager textureManager((__bridge void*) device, (__bridge void*) commandQueue);
+
+        auto texture = Texture::create(Image{std::vector<unsigned char>{}, 4, 4});
+
+        std::ostringstream strictDiagnostics;
+        auto* previous = std::cerr.rdbuf(strictDiagnostics.rdbuf());
+        REQUIRE_THROWS_AS(textureManager.getOrCreateTexture(*texture), std::runtime_error);
+        std::cerr.rdbuf(previous);
+
+        std::ostringstream diagnostics;
+        previous = std::cerr.rdbuf(diagnostics.rdbuf());
+        auto* rawTexture0 = textureManager.getOrCreateTexture(*texture, true);
+        auto* rawTexture1 = textureManager.getOrCreateTexture(*texture, true);
+        std::cerr.rdbuf(previous);
+
+        REQUIRE(rawTexture0 == nullptr);
+        REQUIRE(rawTexture1 == nullptr);
+
+        const auto message = diagnostics.str();
+        REQUIRE(message.find("using placeholder texture") != std::string::npos);
+        REQUIRE(message.find("using placeholder texture", message.find("using placeholder texture") + 1) == std::string::npos);
+    }
+}
+
+TEST_CASE("Metal P4 texture manager checks texture type before reading unsigned byte image data") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+        metal::MetalTextureManager textureManager((__bridge void*) device, (__bridge void*) commandQueue);
+
+        auto texture = Texture::create(Image{std::vector<float>(4, 1.f), 1, 1});
+        texture->type = Type::Float;
+
+        bool sawExpectedError = false;
+        try {
+            textureManager.getOrCreateTexture(*texture);
+        } catch (const std::runtime_error& e) {
+            sawExpectedError = std::string{e.what()} == "MetalTextureManager currently supports unsigned byte textures";
+        }
+        REQUIRE(sawExpectedError);
     }
 }
 

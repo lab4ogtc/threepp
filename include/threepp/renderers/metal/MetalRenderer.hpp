@@ -2,6 +2,7 @@
 #ifndef THREEPP_METAL_RENDERER_HPP
 #define THREEPP_METAL_RENDERER_HPP
 
+#include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
 #include "threepp/math/Vector4.hpp"
 #include "threepp/renderers/Renderer.hpp"
@@ -30,6 +31,8 @@ namespace threepp {
 
         void setSize(std::pair<int, int> size) override;
 
+        [[nodiscard]] WindowSize size() const override;
+
         void setClearColor(const Color& color, float alpha = 1) override;
 
         void clear(bool color = true, bool depth = true, bool stencil = true) override;
@@ -51,6 +54,12 @@ namespace threepp {
         void setRenderTarget(RenderTarget* renderTarget) override;
 
         [[nodiscard]] RenderTarget* getRenderTarget() override;
+
+        [[nodiscard]] void* device() const;
+
+        [[nodiscard]] void* currentCommandBuffer() const;
+
+        [[nodiscard]] void* currentDrawableTexture() const;
 
         /**
          * Reads the current drawable into an RGB8 pixel buffer.

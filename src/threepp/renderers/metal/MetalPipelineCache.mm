@@ -39,18 +39,22 @@ namespace threepp::metal {
 
         struct DepthPipelineKey {
             void* vertexFunction = nullptr;
+            void* fragmentFunction = nullptr;
             std::uint8_t vertexLayoutBitmask = VertexLayoutPosition;
 
             bool operator==(const DepthPipelineKey& other) const {
-                return vertexFunction == other.vertexFunction && vertexLayoutBitmask == other.vertexLayoutBitmask;
+                return vertexFunction == other.vertexFunction &&
+                       fragmentFunction == other.fragmentFunction &&
+                       vertexLayoutBitmask == other.vertexLayoutBitmask;
             }
         };
 
         struct DepthPipelineKeyHash {
             std::size_t operator()(const DepthPipelineKey& key) const {
                 auto h1 = std::hash<void*>{}(key.vertexFunction);
-                auto h2 = std::hash<std::uint8_t>{}(key.vertexLayoutBitmask);
-                return h1 ^ (h2 << 1);
+                auto h2 = std::hash<void*>{}(key.fragmentFunction);
+                auto h3 = std::hash<std::uint8_t>{}(key.vertexLayoutBitmask);
+                return h1 ^ (h2 << 1) ^ (h3 << 2);
             }
         };
 
@@ -186,8 +190,8 @@ namespace threepp::metal {
             return pso;
         }
 
-        id<MTLRenderPipelineState> getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask) {
-            const DepthPipelineKey key{vertexFunction, vertexLayoutBitmask};
+        id<MTLRenderPipelineState> getOrCreateDepthOnlyPipelineState(void* vertexFunction, void* fragmentFunction, std::uint8_t vertexLayoutBitmask) {
+            const DepthPipelineKey key{vertexFunction, fragmentFunction, vertexLayoutBitmask};
             auto it = depthOnlyPipelineStates.find(key);
             if (it != depthOnlyPipelineStates.end()) {
                 return it->second;
@@ -195,7 +199,7 @@ namespace threepp::metal {
 
             MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
             desc.vertexFunction = (__bridge id<MTLFunction>) vertexFunction;
-            desc.fragmentFunction = nil;
+            desc.fragmentFunction = (__bridge id<MTLFunction>) fragmentFunction;
             desc.vertexDescriptor = createVertexDescriptor(vertexLayoutBitmask);
             desc.colorAttachments[0].pixelFormat = MTLPixelFormatInvalid;
             desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
@@ -238,7 +242,11 @@ namespace threepp::metal {
     }
 
     void* MetalPipelineCache::getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask) {
-        return (__bridge void*) pimpl_->getOrCreateDepthOnlyPipelineState(vertexFunction, vertexLayoutBitmask);
+        return getOrCreateDepthOnlyPipelineState(vertexFunction, nullptr, vertexLayoutBitmask);
+    }
+
+    void* MetalPipelineCache::getOrCreateDepthOnlyPipelineState(void* vertexFunction, void* fragmentFunction, std::uint8_t vertexLayoutBitmask) {
+        return (__bridge void*) pimpl_->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);
     }
 
     void* MetalPipelineCache::getOrCreateDepthStencilState() {

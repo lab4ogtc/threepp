@@ -77,6 +77,10 @@ namespace threepp::metal {
         std::unordered_map<ShaderProgramKey, ShaderProgramInstance, ShaderProgramKeyHash> programs;
         std::unordered_map<DepthShaderKey, id<MTLLibrary>, DepthShaderKeyHash> depthLibraries;
         std::unordered_map<DepthShaderKey, id<MTLFunction>, DepthShaderKeyHash> depthVertexFunctions;
+        std::unordered_map<DepthShaderKey, id<MTLLibrary>, DepthShaderKeyHash> pointDepthLibraries;
+        std::unordered_map<DepthShaderKey, ShaderProgramInstance, DepthShaderKeyHash> pointDepthPrograms;
+        std::unordered_map<std::string, id<MTLLibrary>> builtInLibraries;
+        std::unordered_map<std::string, id<MTLFunction>> builtInFunctions;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
@@ -144,6 +148,74 @@ namespace threepp::metal {
             depthVertexFunctions.emplace(key, function);
             return function;
         }
+
+        ShaderProgramInstance& getOrCreatePointDepthProgram(const DepthShaderKey& key) {
+            validateDepthShaderKey(key);
+
+            auto it = pointDepthPrograms.find(key);
+            if (it != pointDepthPrograms.end()) {
+                return it->second;
+            }
+
+            std::string sourceText;
+            sourceText += "#define USE_SKINNING ";
+            sourceText += key.useSkinning ? "1\n" : "0\n";
+            sourceText += "#define USE_INSTANCING ";
+            sourceText += key.useInstancing ? "1\n" : "0\n";
+            sourceText += point_depth_vertex;
+            sourceText += point_depth_fragment;
+
+            NSString* source = [NSString stringWithUTF8String:sourceText.c_str()];
+
+            NSError* error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) {
+                std::cerr << "=== MSL Point Depth Compilation Failed ===\n"
+                          << sourceText
+                          << "\n==========================================\n";
+                NSString* msg = [NSString stringWithFormat:@"MSL point depth compilation failed: %@", error.localizedDescription];
+                throw std::runtime_error([msg UTF8String]);
+            }
+
+            ShaderProgramInstance instance;
+            instance.library = library;
+            instance.vertexFunction = [library newFunctionWithName:@"point_depth_vertex"];
+            instance.fragmentFunction = [library newFunctionWithName:@"point_depth_fragment"];
+            if (!instance.vertexFunction || !instance.fragmentFunction) {
+                throw std::runtime_error("Failed to find MSL point depth shader functions");
+            }
+
+            pointDepthLibraries.emplace(key, library);
+            auto [inserted, _] = pointDepthPrograms.emplace(key, instance);
+            return inserted->second;
+        }
+
+        id<MTLFunction> getOrCreateBuiltInFunction(const std::string& cacheKey, const char* sourceText, const char* functionName) {
+            auto functionIt = builtInFunctions.find(cacheKey);
+            if (functionIt != builtInFunctions.end()) {
+                return functionIt->second;
+            }
+
+            NSString* source = [NSString stringWithUTF8String:sourceText];
+            NSError* error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) {
+                std::cerr << "=== MSL Built-in Compilation Failed (" << cacheKey << ") ===\n"
+                          << sourceText
+                          << "\n================================================\n";
+                NSString* msg = [NSString stringWithFormat:@"MSL built-in compilation failed: %@", error.localizedDescription];
+                throw std::runtime_error([msg UTF8String]);
+            }
+
+            id<MTLFunction> function = [library newFunctionWithName:[NSString stringWithUTF8String:functionName]];
+            if (!function) {
+                throw std::runtime_error("Failed to find MSL built-in shader function: " + cacheKey);
+            }
+
+            builtInLibraries.emplace(cacheKey, library);
+            builtInFunctions.emplace(cacheKey, function);
+            return function;
+        }
     };
 
     MetalShaderManager::MetalShaderManager(void* device)
@@ -161,6 +233,38 @@ namespace threepp::metal {
 
     void* MetalShaderManager::getOrCreateDepthVertexFunction(bool useSkinning, bool useInstancing) {
         return (__bridge void*) pimpl_->getOrCreateDepthVertexFunction(DepthShaderKey{useSkinning, useInstancing});
+    }
+
+    void* MetalShaderManager::getOrCreatePointDepthVertexFunction(bool useSkinning, bool useInstancing) {
+        return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(DepthShaderKey{useSkinning, useInstancing}).vertexFunction;
+    }
+
+    void* MetalShaderManager::getOrCreatePointDepthFragmentFunction(bool useSkinning, bool useInstancing) {
+        return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(DepthShaderKey{useSkinning, useInstancing}).fragmentFunction;
+    }
+
+    void* MetalShaderManager::getOrCreateSpriteVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_vertex", sprite_vertex, "sprite_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateSpriteFragmentFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_fragment", sprite_fragment, "sprite_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreateSkyVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sky_vertex", sky_vertex, "sky_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateSkyFragmentFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sky_fragment", sky_fragment, "sky_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreateWaterVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("water_vertex", water_vertex, "water_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateWaterFragmentFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("water_fragment", water_fragment, "water_fragment");
     }
 
 }// namespace threepp::metal

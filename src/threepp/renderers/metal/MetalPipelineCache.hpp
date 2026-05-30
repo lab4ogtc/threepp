@@ -35,6 +35,8 @@ namespace threepp::metal {
 
         void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask);
 
+        void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, void* fragmentFunction, std::uint8_t vertexLayoutBitmask);
+
         void* getOrCreateDepthStencilState();
 
         void* getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc);

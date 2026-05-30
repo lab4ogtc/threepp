@@ -159,6 +159,8 @@ struct PointLightUniform {
     float4 position;
     float4 color;
     float4 params;
+    float4 shadowParams;
+    float4 shadowMapSize;
 };
 
 struct SpotLightUniform {
@@ -286,6 +288,81 @@ float sampleSpotShadow(uint shadowIndex,
     return sampleShadowTexture(spotShadowMap3, shadowSampler, coord, shadowMapSize, radius);
 }
 
+float2 cubeToUV(float3 v, float texelSizeY) {
+    float3 absV = abs(v);
+    float scaleToCube = 1.0 / max(absV.x, max(absV.y, absV.z));
+    absV *= scaleToCube;
+    v *= scaleToCube * (1.0 - 2.0 * texelSizeY);
+
+    float2 planar = v.xy;
+    float almostATexel = 1.5 * texelSizeY;
+    float almostOne = 1.0 - almostATexel;
+
+    if (absV.z >= almostOne) {
+        if (v.z > 0.0) {
+            planar.x = 4.0 - v.x;
+        }
+    } else if (absV.x >= almostOne) {
+        float signX = sign(v.x);
+        planar.x = v.z * signX + 2.0 * signX;
+    } else if (absV.y >= almostOne) {
+        float signY = sign(v.y);
+        planar.x = v.x + 2.0 * signY + 2.0;
+        planar.y = v.z * signY - 2.0;
+    }
+
+    return float2(0.125, 0.25) * planar + float2(0.375, 0.75);
+}
+
+float samplePointShadowTexture(depth2d<float> shadowMap,
+                               sampler shadowSampler,
+                               float3 lightToPosition,
+                               float2 shadowMapSize,
+                               float bias,
+                               float radius,
+                               float nearPlane,
+                               float farPlane) {
+    if (farPlane <= nearPlane) return 1.0;
+
+    float2 texelSize = 1.0 / max(shadowMapSize * float2(4.0, 2.0), float2(1.0));
+    float dp = (length(lightToPosition) - nearPlane) / (farPlane - nearPlane);
+    dp += bias;
+    if (dp < 0.0 || dp > 1.0) return 1.0;
+
+    float3 bd3D = normalize(lightToPosition);
+    float2 offset = float2(-1.0, 1.0) * radius * texelSize.y;
+
+    return (
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xyy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yyy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xyx, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yyx, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xxy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yxy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xxx, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yxx, texelSize.y), dp)
+    ) / 9.0;
+}
+
+float getPointShadow(uint shadowIndex,
+                     float3 lightToPosition,
+                     float bias,
+                     float radius,
+                     float2 shadowMapSize,
+                     float nearPlane,
+                     float farPlane,
+                     depth2d<float> pointShadowMap0,
+                     depth2d<float> pointShadowMap1,
+                     depth2d<float> pointShadowMap2,
+                     depth2d<float> pointShadowMap3,
+                     sampler shadowSampler) {
+    if (shadowIndex == 0) return samplePointShadowTexture(pointShadowMap0, shadowSampler, lightToPosition, shadowMapSize, bias, radius, nearPlane, farPlane);
+    if (shadowIndex == 1) return samplePointShadowTexture(pointShadowMap1, shadowSampler, lightToPosition, shadowMapSize, bias, radius, nearPlane, farPlane);
+    if (shadowIndex == 2) return samplePointShadowTexture(pointShadowMap2, shadowSampler, lightToPosition, shadowMapSize, bias, radius, nearPlane, farPlane);
+    return samplePointShadowTexture(pointShadowMap3, shadowSampler, lightToPosition, shadowMapSize, bias, radius, nearPlane, farPlane);
+}
+
 float3 directBRDF(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness) {
     radiance *= PI;
     float3 h = normalize(v + l);
@@ -327,6 +404,10 @@ fragment float4 basic_fragment(
     , depth2d<float> spotShadowMap1 [[texture(12)]]
     , depth2d<float> spotShadowMap2 [[texture(13)]]
     , depth2d<float> spotShadowMap3 [[texture(14)]]
+    , depth2d<float> pointShadowMap0 [[texture(15)]]
+    , depth2d<float> pointShadowMap1 [[texture(16)]]
+    , depth2d<float> pointShadowMap2 [[texture(17)]]
+    , depth2d<float> pointShadowMap3 [[texture(18)]]
     , sampler shadowSampler [[sampler(1)]]
 #endif
 )
@@ -405,7 +486,22 @@ fragment float4 basic_fragment(
         if (light.params.x > 0.0) {
             attenuation = pow(saturateFloat(1.0 - distanceToLight / light.params.x), max(light.params.y, 1.0));
         }
-        color += directBRDF(light.color.rgb * attenuation, n, v, l, albedo, roughness, metalness);
+        float shadow = 1.0;
+        if (params.textureFlags1.w != 0 && light.shadowParams.x > 0.5 && light.shadowParams.y >= 0.0) {
+            shadow = getPointShadow(uint(light.shadowParams.y),
+                                    in.worldPosition - light.position.xyz,
+                                    light.shadowParams.z,
+                                    light.shadowParams.w,
+                                    light.shadowMapSize.xy,
+                                    light.shadowMapSize.z,
+                                    light.shadowMapSize.w,
+                                    pointShadowMap0,
+                                    pointShadowMap1,
+                                    pointShadowMap2,
+                                    pointShadowMap3,
+                                    shadowSampler);
+        }
+        color += directBRDF(light.color.rgb * attenuation, n, v, l, albedo, roughness, metalness) * shadow;
     }
 
     for (uint i = 0; i < min(lights.counts.z, uint(MAX_SPOT_LIGHTS)); ++i) {
@@ -509,6 +605,402 @@ vertex float4 depth_vertex(
     localPosition = instanceMatrices[instanceId] * localPosition;
 #endif
     return transforms.shadowMatrix * localPosition;
+}
+)metal";
+
+    constexpr auto point_depth_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct PointDepthVertexInput {
+    float3 position [[attribute(0)]];
+#if USE_SKINNING
+    float4 skinIndex [[attribute(4)]];
+    float4 skinWeight [[attribute(5)]];
+#endif
+};
+
+struct PointDepthTransformUniforms {
+    float4x4 shadowMatrix;
+    float4x4 modelMatrix;
+    float4x4 bindMatrix;
+    float4x4 bindMatrixInverse;
+    float4 lightPosition;
+    float4 params;
+};
+
+struct PointDepthVertexOutput {
+    float4 position [[position]];
+    float3 worldPosition;
+};
+
+vertex PointDepthVertexOutput point_depth_vertex(
+    PointDepthVertexInput in [[stage_in]],
+    constant PointDepthTransformUniforms& transforms [[buffer(4)]]
+#if USE_SKINNING
+    , constant float4x4* boneMatrices [[buffer(5)]]
+#endif
+#if USE_INSTANCING
+    , constant float4x4* instanceMatrices [[buffer(9)]]
+    , uint instanceId [[instance_id]]
+#endif
+)
+{
+    PointDepthVertexOutput out;
+    float4 localPosition = float4(in.position, 1.0);
+#if USE_SKINNING
+    float4x4 skinMatrix =
+        boneMatrices[uint(in.skinIndex.x)] * in.skinWeight.x +
+        boneMatrices[uint(in.skinIndex.y)] * in.skinWeight.y +
+        boneMatrices[uint(in.skinIndex.z)] * in.skinWeight.z +
+        boneMatrices[uint(in.skinIndex.w)] * in.skinWeight.w;
+    skinMatrix = transforms.bindMatrixInverse * skinMatrix * transforms.bindMatrix;
+    localPosition = skinMatrix * localPosition;
+#endif
+#if USE_INSTANCING
+    localPosition = instanceMatrices[instanceId] * localPosition;
+#endif
+    out.worldPosition = (transforms.modelMatrix * localPosition).xyz;
+    out.position = transforms.shadowMatrix * localPosition;
+    return out;
+}
+)metal";
+
+    constexpr auto point_depth_fragment = R"metal(
+struct PointDepthFragmentOutput {
+    float depth [[depth(any)]];
+};
+
+fragment PointDepthFragmentOutput point_depth_fragment(
+    PointDepthVertexOutput in [[stage_in]],
+    constant PointDepthTransformUniforms& transforms [[buffer(4)]]
+)
+{
+    float nearPlane = transforms.params.x;
+    float farPlane = max(transforms.params.y, nearPlane + 0.0001);
+    PointDepthFragmentOutput out;
+    out.depth = clamp((length(in.worldPosition - transforms.lightPosition.xyz) - nearPlane) / (farPlane - nearPlane), 0.0, 1.0);
+    return out;
+}
+)metal";
+
+    constexpr auto sprite_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SpriteVertexInput {
+    float3 position [[attribute(0)]];
+    float2 uv [[attribute(2)]];
+};
+
+struct SpriteUniforms {
+    float4x4 projectionMatrix;
+    float4x4 modelViewMatrix;
+    float4x4 modelMatrix;
+    float4 color;
+    float2 center;
+    float rotation;
+    float scaleAttenuation;
+};
+
+struct SpriteVertexOutput {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex SpriteVertexOutput sprite_vertex(
+    SpriteVertexInput in [[stage_in]],
+    constant SpriteUniforms& uniforms [[buffer(4)]]
+)
+{
+    SpriteVertexOutput out;
+    float4 mvPosition = uniforms.modelViewMatrix * float4(0.0, 0.0, 0.0, 1.0);
+    float2 scale = float2(length(uniforms.modelMatrix[0].xyz), length(uniforms.modelMatrix[1].xyz));
+    if (uniforms.scaleAttenuation < 0.5) {
+        scale *= -mvPosition.z;
+    }
+
+    float2 alignedPosition = (in.position.xy - (uniforms.center - float2(0.5))) * scale;
+    float c = cos(uniforms.rotation);
+    float s = sin(uniforms.rotation);
+    float2 rotatedPosition = float2(
+        c * alignedPosition.x - s * alignedPosition.y,
+        s * alignedPosition.x + c * alignedPosition.y
+    );
+
+    mvPosition.xy += rotatedPosition;
+    out.position = uniforms.projectionMatrix * mvPosition;
+    out.uv = in.uv;
+    return out;
+}
+)metal";
+
+    constexpr auto sprite_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SpriteVertexOutput {
+    float4 position [[position]];
+    float2 uv;
+};
+
+struct SpriteUniforms {
+    float4x4 projectionMatrix;
+    float4x4 modelViewMatrix;
+    float4x4 modelMatrix;
+    float4 color;
+    float2 center;
+    float rotation;
+    float scaleAttenuation;
+};
+
+fragment float4 sprite_fragment(
+    SpriteVertexOutput in [[stage_in]],
+    constant SpriteUniforms& uniforms [[buffer(4)]],
+    texture2d<float> map [[texture(0)]],
+    sampler mapSampler [[sampler(0)]]
+)
+{
+    float4 texel = map.sample(mapSampler, in.uv);
+    return texel * uniforms.color;
+}
+)metal";
+
+    constexpr auto sky_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SkyVertexInput {
+    float3 position [[attribute(0)]];
+};
+
+struct SkyUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float4 sunPosition;
+    float4 up;
+    float4 params;
+};
+
+struct SkyVertexOutput {
+    float4 position [[position]];
+    float3 worldPosition;
+    float3 sunDirection;
+    float sunfade;
+    float3 betaR;
+    float3 betaM;
+    float sunE;
+};
+
+constant float SKY_E = 2.71828182845904523536;
+constant float SKY_PI = 3.14159265358979323846;
+constant float3 SKY_TOTAL_RAYLEIGH = float3(5.804542996261093E-6, 1.3562911419845635E-5, 3.0265902468824876E-5);
+constant float3 SKY_MIE_CONST = float3(1.8399918514433978E14, 2.7798023919660528E14, 4.0790479543861094E14);
+
+float skySunIntensity(float zenithAngleCos) {
+    zenithAngleCos = clamp(zenithAngleCos, -1.0, 1.0);
+    return 1000.0 * max(0.0, 1.0 - pow(SKY_E, -((1.6110731556870734 - acos(zenithAngleCos)) / 1.5)));
+}
+
+float3 skyTotalMie(float turbidity) {
+    float c = (0.2 * turbidity) * 10E-18;
+    return 0.434 * c * SKY_MIE_CONST;
+}
+
+vertex SkyVertexOutput sky_vertex(
+    SkyVertexInput in [[stage_in]],
+    constant SkyUniforms& uniforms [[buffer(0)]]
+)
+{
+    SkyVertexOutput out;
+    float4 worldPosition = uniforms.modelMatrix * float4(in.position, 1.0);
+    out.worldPosition = worldPosition.xyz;
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    out.position.z = out.position.w;
+
+    float turbidity = uniforms.params.x;
+    float rayleigh = uniforms.params.y;
+    float mieCoefficient = uniforms.params.z;
+    out.sunDirection = normalize(uniforms.sunPosition.xyz);
+    out.sunE = skySunIntensity(dot(out.sunDirection, uniforms.up.xyz));
+    out.sunfade = 1.0 - clamp(1.0 - exp(uniforms.sunPosition.y / 450000.0), 0.0, 1.0);
+    float rayleighCoefficient = rayleigh - (1.0 * (1.0 - out.sunfade));
+    out.betaR = SKY_TOTAL_RAYLEIGH * rayleighCoefficient;
+    out.betaM = skyTotalMie(turbidity) * mieCoefficient;
+    return out;
+}
+)metal";
+
+    constexpr auto sky_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SkyVertexOutput {
+    float4 position [[position]];
+    float3 worldPosition;
+    float3 sunDirection;
+    float sunfade;
+    float3 betaR;
+    float3 betaM;
+    float sunE;
+};
+
+struct SkyUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float4 sunPosition;
+    float4 up;
+    float4 params;
+};
+
+constant float SKY_FRAG_PI = 3.14159265358979323846;
+constant float SUN_ANGULAR_DIAMETER_COS = 0.9999566769464484;
+constant float THREE_OVER_SIXTEENPI = 0.05968310365946075;
+constant float ONE_OVER_FOURPI = 0.07957747154594767;
+
+float skyRayleighPhase(float cosTheta) {
+    return THREE_OVER_SIXTEENPI * (1.0 + pow(cosTheta, 2.0));
+}
+
+float skyHgPhase(float cosTheta, float g) {
+    float g2 = pow(g, 2.0);
+    float inverse = 1.0 / pow(1.0 - 2.0 * g * cosTheta + g2, 1.5);
+    return ONE_OVER_FOURPI * ((1.0 - g2) * inverse);
+}
+
+fragment float4 sky_fragment(
+    SkyVertexOutput in [[stage_in]],
+    constant SkyUniforms& uniforms [[buffer(0)]]
+)
+{
+    float3 up = uniforms.up.xyz;
+    float mieDirectionalG = uniforms.params.w;
+    float3 direction = normalize(in.worldPosition);
+    float zenithAngle = acos(max(0.0, dot(up, direction)));
+    float inverse = 1.0 / (cos(zenithAngle) + 0.15 * pow(93.885 - ((zenithAngle * 180.0) / SKY_FRAG_PI), -1.253));
+    float sR = 8.4E3 * inverse;
+    float sM = 1.25E3 * inverse;
+    float3 fex = exp(-(in.betaR * sR + in.betaM * sM));
+    float cosTheta = dot(direction, in.sunDirection);
+    float rPhase = skyRayleighPhase(cosTheta * 0.5 + 0.5);
+    float3 betaRTheta = in.betaR * rPhase;
+    float mPhase = skyHgPhase(cosTheta, mieDirectionalG);
+    float3 betaMTheta = in.betaM * mPhase;
+    float3 denom = max(in.betaR + in.betaM, float3(0.000001));
+    float3 lin = pow(in.sunE * ((betaRTheta + betaMTheta) / denom) * (1.0 - fex), float3(1.5));
+    lin *= mix(float3(1.0), pow(in.sunE * ((betaRTheta + betaMTheta) / denom) * fex, float3(0.5)), clamp(pow(1.0 - dot(up, in.sunDirection), 5.0), 0.0, 1.0));
+    float3 l0 = float3(0.1) * fex;
+    float sundisk = smoothstep(SUN_ANGULAR_DIAMETER_COS, SUN_ANGULAR_DIAMETER_COS + 0.00002, cosTheta);
+    l0 += (in.sunE * 19000.0 * fex) * sundisk;
+    float3 texColor = (lin + l0) * 0.04 + float3(0.0, 0.0003, 0.00075);
+    float3 retColor = pow(texColor, float3(1.0 / (1.2 + (1.2 * in.sunfade))));
+    return float4(retColor, 1.0);
+}
+)metal";
+
+    constexpr auto water_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct WaterVertexInput {
+    float3 position [[attribute(0)]];
+};
+
+struct WaterUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float4x4 textureMatrix;
+    float4 sunDirection;
+    float4 sunColor;
+    float4 eye;
+    float4 waterColor;
+    float4 params;
+};
+
+struct WaterVertexOutput {
+    float4 position [[position]];
+    float4 mirrorCoord;
+    float4 worldPosition;
+};
+
+vertex WaterVertexOutput water_vertex(
+    WaterVertexInput in [[stage_in]],
+    constant WaterUniforms& uniforms [[buffer(0)]]
+)
+{
+    WaterVertexOutput out;
+    out.worldPosition = uniforms.modelMatrix * float4(in.position, 1.0);
+    out.mirrorCoord = uniforms.textureMatrix * out.worldPosition;
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    return out;
+}
+)metal";
+
+    constexpr auto water_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct WaterVertexOutput {
+    float4 position [[position]];
+    float4 mirrorCoord;
+    float4 worldPosition;
+};
+
+struct WaterUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float4x4 textureMatrix;
+    float4 sunDirection;
+    float4 sunColor;
+    float4 eye;
+    float4 waterColor;
+    float4 params;
+};
+
+float4 waterNoise(texture2d<float> normalSampler, sampler mapSampler, float2 uv, float time) {
+    float2 uv0 = (uv / 103.0) + float2(time / 17.0, time / 29.0);
+    float2 uv1 = (uv / 107.0) - float2(time / -19.0, time / 31.0);
+    float2 uv2 = (uv / float2(8907.0, 9803.0)) + float2(time / 101.0, time / 97.0);
+    float2 uv3 = (uv / float2(1091.0, 1027.0)) - float2(time / 109.0, time / -113.0);
+    float4 noise = normalSampler.sample(mapSampler, uv0) +
+                   normalSampler.sample(mapSampler, uv1) +
+                   normalSampler.sample(mapSampler, uv2) +
+                   normalSampler.sample(mapSampler, uv3);
+    return noise * 0.5 - 1.0;
+}
+
+fragment float4 water_fragment(
+    WaterVertexOutput in [[stage_in]],
+    constant WaterUniforms& uniforms [[buffer(0)]],
+    texture2d<float> normalSampler [[texture(0)]],
+    texture2d<float> mirrorSampler [[texture(1)]],
+    sampler mapSampler [[sampler(0)]]
+)
+{
+    float alpha = uniforms.params.x;
+    float time = uniforms.params.y;
+    float size = uniforms.params.z;
+    float distortionScale = uniforms.params.w;
+
+    float4 noise = waterNoise(normalSampler, mapSampler, in.worldPosition.xz * size, time);
+    float3 surfaceNormal = normalize(noise.xzy * float3(1.5, 1.0, 1.5));
+    float3 eyeDirection = normalize(uniforms.eye.xyz - in.worldPosition.xyz);
+    float distanceToEye = length(uniforms.eye.xyz - in.worldPosition.xyz);
+    float2 distortion = surfaceNormal.xz * (0.001 + 1.0 / max(distanceToEye, 0.0001)) * distortionScale;
+    float2 mirrorUv = in.mirrorCoord.xy / max(in.mirrorCoord.w, 0.0001) + distortion;
+    float3 reflectionSample = mirrorSampler.sample(mapSampler, mirrorUv).rgb;
+
+    float3 sunDirection = normalize(uniforms.sunDirection.xyz);
+    float3 reflection = normalize(reflect(-sunDirection, surfaceNormal));
+    float specular = pow(max(0.0, dot(eyeDirection, reflection)), 100.0) * 2.0;
+    float diffuse = max(dot(sunDirection, surfaceNormal), 0.0) * 0.5;
+    float theta = max(dot(eyeDirection, surfaceNormal), 0.0);
+    float reflectance = 0.3 + 0.7 * pow(1.0 - theta, 5.0);
+    float3 scatter = max(0.0, dot(surfaceNormal, eyeDirection)) * uniforms.waterColor.rgb;
+    float3 albedo = mix(uniforms.sunColor.rgb * diffuse * 0.3 + scatter,
+                        float3(0.1) + reflectionSample * 0.9 + reflectionSample * uniforms.sunColor.rgb * specular,
+                        reflectance);
+    return float4(albedo, alpha);
 }
 )metal";
 

@@ -1,6 +1,7 @@
 #include "threepp/geometries/TorusKnotGeometry.hpp"
 #include "threepp/helpers/PointLightHelper.hpp"
 #include "threepp/renderers/Renderer.hpp"
+#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <cmath>
@@ -18,6 +19,8 @@ namespace {
         material->emissive = 0x000000;
         auto knot = Mesh::create(geometry, material);
         knot->position.y = 1;
+        knot->castShadow = true;
+        knot->receiveShadow = true;
 
         return knot;
     }
@@ -29,6 +32,7 @@ namespace {
         planeMaterial->side = Side::Double;
         auto plane = Mesh::create(planeGeometry, planeMaterial);
         plane->rotateX(math::degToRad(-90));
+        plane->receiveShadow = true;
 
         return plane;
     }
@@ -37,14 +41,17 @@ namespace {
         const auto light1 = PointLight::create(Color::yellow);
         light1->distance = 8;
         light1->position.y = 4;
+        light1->castShadow = true;
 
         const auto light2 = PointLight::create(Color::white);
         light2->distance = 8;
         light2->position.y = 4;
+        light2->castShadow = true;
 
         const auto light3 = PointLight::create(Color::purple);
         light3->distance = 10;
         light3->position.y = 7;
+        light3->castShadow = true;
 
         const auto lightHelper1 = PointLightHelper::create(*light1, 0.25f);
         const auto lightHelper2 = PointLightHelper::create(*light2, 0.25f);
@@ -69,6 +76,9 @@ int main() {
 
     GlfwWindow canvas("PointLight (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
+    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
+    metalRenderer.shadowMap().enabled = true;
+    metalRenderer.shadowMap().type = ShadowMap::PFCSoft;
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 100);

@@ -1,4 +1,5 @@
 #include "threepp/cameras/PerspectiveCamera.hpp"
+#include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
@@ -42,11 +43,23 @@ namespace {
     };
 
     template<class T>
+    concept HasRendererSize = requires(const T& renderer) {
+        { renderer.size() } -> std::same_as<WindowSize>;
+    };
+
+    template<class T>
     concept HasMetalShadowMap = requires(T& renderer) {
         renderer.shadowMap().enabled = true;
         renderer.shadowMap().autoUpdate = false;
         renderer.shadowMap().needsUpdate = true;
         renderer.shadowMap().type = ShadowMap::PFCSoft;
+    };
+
+    template<class T>
+    concept HasMetalExternalFrameHandles = requires(const T& renderer) {
+        { renderer.device() } -> std::same_as<void*>;
+        { renderer.currentCommandBuffer() } -> std::same_as<void*>;
+        { renderer.currentDrawableTexture() } -> std::same_as<void*>;
     };
 
 }// namespace
@@ -59,6 +72,12 @@ TEST_CASE("MetalRenderer exposes P1 viewport and scissor API") {
 TEST_CASE("Renderer base exposes backend-independent viewport and scissor API") {
 
     STATIC_REQUIRE(HasBaseViewport<Renderer>);
+}
+
+TEST_CASE("Renderer base exposes backend-independent size API") {
+
+    STATIC_REQUIRE(HasRendererSize<Renderer>);
+    STATIC_REQUIRE(HasRendererSize<MetalRenderer>);
 }
 
 TEST_CASE("Image exposes const pixel data for read-only texture upload") {
@@ -105,6 +124,56 @@ TEST_CASE("Metal P2 shader keys include skinning and lighting variants") {
 
     REQUIRE_FALSE(skinned == lit);
     REQUIRE(metal::ShaderProgramKeyHash{}(skinned) != metal::ShaderProgramKeyHash{}(lit));
+}
+
+TEST_CASE("Metal P4 shader manager exposes dedicated built-in material entry points") {
+
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteVertexFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteFragmentFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthVertexFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthFragmentFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSkyVertexFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSkyFragmentFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateWaterVertexFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateWaterFragmentFunction())>);
+}
+
+TEST_CASE("Metal P4 sprite shader keeps billboard expansion outside the PBR variant path") {
+
+    const std::string_view vertexSource{metal::sprite_vertex};
+    const std::string_view fragmentSource{metal::sprite_fragment};
+
+    REQUIRE(vertexSource.find("vertex SpriteVertexOutput sprite_vertex") != std::string_view::npos);
+    REQUIRE(vertexSource.find("modelViewMatrix * float4(0.0, 0.0, 0.0, 1.0)") != std::string_view::npos);
+    REQUIRE(vertexSource.find("length(uniforms.modelMatrix[0].xyz)") != std::string_view::npos);
+    REQUIRE(vertexSource.find("uniforms.center") != std::string_view::npos);
+    REQUIRE(vertexSource.find("uniforms.rotation") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("fragment float4 sprite_fragment") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("texture2d<float> map [[texture(0)]]") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P4 point light shadows use tiled depth maps without reusing attenuation params") {
+
+    const std::string_view source{metal::basic_fragment};
+    const std::string_view pointDepthFragment{metal::point_depth_fragment};
+
+    REQUIRE(source.find("struct PointLightUniform") != std::string_view::npos);
+    REQUIRE(source.find("float4 shadowParams;") != std::string_view::npos);
+    REQUIRE(source.find("float4 shadowMapSize;") != std::string_view::npos);
+    REQUIRE(source.find("float getPointShadow") != std::string_view::npos);
+    REQUIRE(source.find("depth2d<float> pointShadowMap0 [[texture(15)]]") != std::string_view::npos);
+    REQUIRE(source.find("depth2d<float> pointShadowMap3 [[texture(18)]]") != std::string_view::npos);
+    REQUIRE(source.find("light.params.x") != std::string_view::npos);
+    REQUIRE(pointDepthFragment.find("[[depth(any)]]") != std::string_view::npos);
+    REQUIRE(pointDepthFragment.find("length(in.worldPosition - transforms.lightPosition.xyz)") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P4 built-in Sky and Water shaders are available as dedicated MSL sources") {
+
+    REQUIRE(std::string_view{metal::sky_vertex}.find("vertex SkyVertexOutput sky_vertex") != std::string_view::npos);
+    REQUIRE(std::string_view{metal::sky_fragment}.find("fragment float4 sky_fragment") != std::string_view::npos);
+    REQUIRE(std::string_view{metal::water_vertex}.find("vertex WaterVertexOutput water_vertex") != std::string_view::npos);
+    REQUIRE(std::string_view{metal::water_fragment}.find("fragment float4 water_fragment") != std::string_view::npos);
 }
 
 TEST_CASE("Metal P2 fragment shader applies shadow runtime controls") {
@@ -165,6 +234,11 @@ TEST_CASE("MetalRenderer exposes shadow map controls for example parity") {
     STATIC_REQUIRE(HasMetalShadowMap<MetalRenderer>);
 }
 
+TEST_CASE("MetalRenderer exposes opaque frame handles for external encoders") {
+
+    STATIC_REQUIRE(HasMetalExternalFrameHandles<MetalRenderer>);
+}
+
 TEST_CASE("Metal P1 managers keep Objective-C types hidden behind void pointers") {
 
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalShaderManager, void*>);
@@ -174,6 +248,7 @@ TEST_CASE("Metal P1 managers keep Objective-C types hidden behind void pointers"
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateFragmentFunction(std::declval<const metal::ShaderProgramKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthVertexFunction(true))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalPipelineCache&>().getOrCreateDepthOnlyPipelineState(nullptr, std::uint8_t{0b0001}))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalPipelineCache&>().getOrCreateDepthOnlyPipelineState(nullptr, nullptr, std::uint8_t{0b0001}))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalTextureManager&>().getOrCreateTexture(std::declval<Texture&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalTextureManager&>().getOrCreateSampler(std::declval<Texture&>()))>);
 }

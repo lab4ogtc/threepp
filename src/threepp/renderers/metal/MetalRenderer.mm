@@ -17,6 +17,7 @@
 #import "threepp/lights/HemisphereLight.hpp"
 #import "threepp/lights/LightProbe.hpp"
 #import "threepp/lights/PointLight.hpp"
+#import "threepp/lights/PointLightShadow.hpp"
 #import "threepp/lights/SpotLight.hpp"
 #import "threepp/materials/LineBasicMaterial.hpp"
 #import "threepp/materials/Material.hpp"
@@ -24,6 +25,8 @@
 #import "threepp/materials/MeshLambertMaterial.hpp"
 #import "threepp/materials/MeshPhongMaterial.hpp"
 #import "threepp/materials/MeshStandardMaterial.hpp"
+#import "threepp/materials/ShaderMaterial.hpp"
+#import "threepp/materials/SpriteMaterial.hpp"
 #import "threepp/materials/interfaces.hpp"
 #import "threepp/math/Matrix3.hpp"
 #import "threepp/math/Matrix4.hpp"
@@ -31,7 +34,10 @@
 #import "threepp/objects/LOD.hpp"
 #import "threepp/objects/LineSegments.hpp"
 #import "threepp/objects/Mesh.hpp"
+#import "threepp/objects/Sky.hpp"
 #import "threepp/objects/SkinnedMesh.hpp"
+#import "threepp/objects/Sprite.hpp"
+#import "threepp/objects/Water.hpp"
 #import "threepp/renderers/GLRenderTarget.hpp"
 #import "threepp/renderers/RenderTarget.hpp"
 #import "threepp/scenes/Scene.hpp"
@@ -89,6 +95,15 @@ namespace {
         float bindMatrixInverse[16];
     };
 
+    struct alignas(16) PointDepthTransformUniforms {
+        float shadowMatrix[16];
+        float modelMatrix[16];
+        float bindMatrix[16];
+        float bindMatrixInverse[16];
+        float lightPosition[4];
+        float params[4];
+    };
+
     struct alignas(16) ShadingParams {
         float baseColor[4];
         float emissiveColor[4];
@@ -96,6 +111,35 @@ namespace {
         std::uint32_t textureFlags0[4];
         std::uint32_t textureFlags1[4];
         float cameraPosition[4];
+    };
+
+    struct alignas(16) SpriteUniforms {
+        float projectionMatrix[16];
+        float modelViewMatrix[16];
+        float modelMatrix[16];
+        float color[4];
+        float center[2];
+        float rotation;
+        float scaleAttenuation;
+    };
+
+    struct alignas(16) SkyUniforms {
+        float mvp[16];
+        float modelMatrix[16];
+        float sunPosition[4];
+        float up[4];
+        float params[4];
+    };
+
+    struct alignas(16) WaterUniforms {
+        float mvp[16];
+        float modelMatrix[16];
+        float textureMatrix[16];
+        float sunDirection[4];
+        float sunColor[4];
+        float eye[4];
+        float waterColor[4];
+        float params[4];
     };
 
     struct alignas(16) DirectionalLightUniform {
@@ -110,6 +154,8 @@ namespace {
         float position[4];
         float color[4];
         float params[4];
+        float shadowParams[4];
+        float shadowMapSize[4];
     };
 
     struct alignas(16) SpotLightUniform {
@@ -149,8 +195,10 @@ namespace {
 
     struct ShadowResources {
         std::unordered_map<unsigned int, std::uint32_t> directionalShadowIndices;
+        std::unordered_map<unsigned int, std::uint32_t> pointShadowIndices;
         std::unordered_map<unsigned int, std::uint32_t> spotShadowIndices;
         std::array<id<MTLTexture>, maxShadowMapsPerLightType> directionalTextures{};
+        std::array<id<MTLTexture>, maxShadowMapsPerLightType> pointTextures{};
         std::array<id<MTLTexture>, maxShadowMapsPerLightType> spotTextures{};
     };
 
@@ -202,6 +250,25 @@ namespace {
         }
     }
 
+    void computeSpriteUniforms(const Camera& camera, const Sprite& sprite, const SpriteMaterial& material, SpriteUniforms& out) {
+        const auto projection = metal::convertProjectionToMetalClipSpace(camera.projectionMatrix);
+        copyMatrix(projection, out.projectionMatrix);
+
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *sprite.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
+        copyMatrix(*sprite.matrixWorld, out.modelMatrix);
+
+        out.color[0] = material.color.r;
+        out.color[1] = material.color.g;
+        out.color[2] = material.color.b;
+        out.color[3] = material.opacity;
+        out.center[0] = sprite.center.x;
+        out.center[1] = sprite.center.y;
+        out.rotation = material.rotation;
+        out.scaleAttenuation = material.sizeAttenuation ? 1.f : 0.f;
+    }
+
     void computeShadowMVP(const Camera& shadowCamera, const Object3D& object, Matrix4& out) {
         out.copy(metal::convertProjectionToMetalClipSpace(shadowCamera.projectionMatrix));
         out.multiply(shadowCamera.matrixWorldInverse);
@@ -222,6 +289,28 @@ namespace {
         }
     }
 
+    void computePointDepthTransformUniforms(const Camera& shadowCamera, const Object3D& object, const Vector3& lightPosition, float nearPlane, float farPlane, PointDepthTransformUniforms& out) {
+        Matrix4 shadowMVP;
+        computeShadowMVP(shadowCamera, object, shadowMVP);
+        copyMatrix(shadowMVP, out.shadowMatrix);
+        copyMatrix(*object.matrixWorld, out.modelMatrix);
+
+        if (const auto* skinnedMesh = dynamic_cast<const SkinnedMesh*>(&object)) {
+            copyMatrix(skinnedMesh->bindMatrix, out.bindMatrix);
+            copyMatrix(skinnedMesh->bindMatrixInverse, out.bindMatrixInverse);
+        } else {
+            copyIdentityMatrix(out.bindMatrix);
+            copyIdentityMatrix(out.bindMatrixInverse);
+        }
+
+        out.lightPosition[0] = lightPosition.x;
+        out.lightPosition[1] = lightPosition.y;
+        out.lightPosition[2] = lightPosition.z;
+        out.lightPosition[3] = 1.f;
+        out.params[0] = nearPlane;
+        out.params[1] = farPlane;
+    }
+
     Matrix4 computeShadowTextureMatrix(const Camera& shadowCamera) {
         Matrix4 textureBias;
         textureBias.set(
@@ -240,7 +329,7 @@ namespace {
     void collectRenderables(Object3D& object, std::vector<Object3D*>& out) {
         if (!object.visible) return;
 
-        if (dynamic_cast<Mesh*>(&object) || dynamic_cast<LineSegments*>(&object)) {
+        if (dynamic_cast<Mesh*>(&object) || dynamic_cast<LineSegments*>(&object) || dynamic_cast<Sprite*>(&object)) {
             out.push_back(&object);
         }
 
@@ -294,6 +383,10 @@ namespace {
         return texture != nullptr && !texture->images().empty();
     }
 
+    bool hasTexture(const Texture* texture) {
+        return texture != nullptr && !texture->images().empty();
+    }
+
     bool hasCubeTexture(const std::shared_ptr<Texture>& texture) {
         return hasTexture(texture) && dynamic_cast<CubeTexture*>(texture.get()) != nullptr;
     }
@@ -338,6 +431,50 @@ namespace {
         target[1] = vector.y;
         target[2] = vector.z;
         target[3] = w;
+    }
+
+    UniformValue* findUniformValue(UniformMap& uniforms, const std::string& name) {
+        auto it = uniforms.find(name);
+        if (it == uniforms.end() || !it->second.hasValue()) return nullptr;
+        return &it->second.value();
+    }
+
+    float uniformFloat(UniformMap& uniforms, const std::string& name, float fallback) {
+        auto* value = findUniformValue(uniforms, name);
+        if (!value) return fallback;
+        if (const auto* v = std::get_if<float>(value)) return *v;
+        if (const auto* v = std::get_if<int>(value)) return static_cast<float>(*v);
+        return fallback;
+    }
+
+    Vector3 uniformVector3(UniformMap& uniforms, const std::string& name, const Vector3& fallback) {
+        auto* value = findUniformValue(uniforms, name);
+        if (!value) return fallback;
+        if (const auto* v = std::get_if<Vector3>(value)) return *v;
+        if (const auto* v = std::get_if<Vector3*>(value); v && *v) return **v;
+        return fallback;
+    }
+
+    Color uniformColor(UniformMap& uniforms, const std::string& name, const Color& fallback) {
+        auto* value = findUniformValue(uniforms, name);
+        if (!value) return fallback;
+        if (const auto* v = std::get_if<Color>(value)) return *v;
+        return fallback;
+    }
+
+    Matrix4 uniformMatrix4(UniformMap& uniforms, const std::string& name, const Matrix4& fallback) {
+        auto* value = findUniformValue(uniforms, name);
+        if (!value) return fallback;
+        if (const auto* v = std::get_if<Matrix4>(value)) return *v;
+        if (const auto* v = std::get_if<Matrix4*>(value); v && *v) return **v;
+        return fallback;
+    }
+
+    Texture* uniformTexture(UniformMap& uniforms, const std::string& name) {
+        auto* value = findUniformValue(uniforms, name);
+        if (!value) return nullptr;
+        if (const auto* v = std::get_if<Texture*>(value)) return *v;
+        return nullptr;
     }
 
     void getLightDirection(const LightWithTarget& light, const Object3D& lightObject, Vector3& target) {
@@ -513,6 +650,8 @@ struct MetalRenderer::Impl {
     bool clearDepthFlag = true;
     bool clearRequested = false;
     bool explicitFrameInProgress = false;
+    bool currentCommandBufferExternallyAccessed = false;
+    bool lastFrameWasExternallyAccessed = false;
 
     int fbWidth = 0;
     int fbHeight = 0;
@@ -594,6 +733,8 @@ struct MetalRenderer::Impl {
         currentCommandBuffer = nil;
         currentDrawable = nil;
         explicitFrameInProgress = false;
+        lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
+        currentCommandBufferExternallyAccessed = false;
     }
 
     void ensureFrameStarted() {
@@ -813,6 +954,20 @@ struct MetalRenderer::Impl {
         return texture;
     }
 
+    id<MTLTexture> getOrCreatePointShadowTexture(PointLight& light, PointLightShadow& shadow) {
+        const auto frameExtents = shadow.getFrameExtents();
+        const auto width = static_cast<NSUInteger>(std::max(1.f, std::ceil(shadow.mapSize.x * frameExtents.x)));
+        const auto height = static_cast<NSUInteger>(std::max(1.f, std::ceil(shadow.mapSize.y * frameExtents.y)));
+        auto it = shadowTextures.find(light.id);
+        if (it != shadowTextures.end() && it->second.width == width && it->second.height == height) {
+            return it->second;
+        }
+
+        id<MTLTexture> texture = createDepthTexture(width, height);
+        shadowTextures[light.id] = texture;
+        return texture;
+    }
+
     id<MTLBuffer> getDefaultTangentBuffer(std::size_t vertexCount) {
         if (defaultTangentBuffer && defaultTangentVertexCount >= vertexCount) {
             return defaultTangentBuffer;
@@ -942,12 +1097,31 @@ struct MetalRenderer::Impl {
         [encoder setScissorRect:rect];
     }
 
-    void bindTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, id<MTLTexture> placeholder, NSUInteger index) {
+    void bindTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, id<MTLTexture> placeholder, NSUInteger index, bool allowPlaceholder = false) {
         id<MTLTexture> metalTexture = placeholder;
         id<MTLSamplerState> sampler = defaultSampler;
-        if (hasTexture(texture)) {
-            metalTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture);
-            sampler = (__bridge id<MTLSamplerState>) textureManager->getOrCreateSampler(*texture);
+        if (texture) {
+            id<MTLTexture> tex = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture, allowPlaceholder);
+            if (tex) {
+                metalTexture = tex;
+                sampler = (__bridge id<MTLSamplerState>) textureManager->getOrCreateSampler(*texture);
+            }
+        }
+        [encoder setFragmentTexture:metalTexture atIndex:index];
+        if (index == 0) {
+            [encoder setFragmentSamplerState:sampler atIndex:0];
+        }
+    }
+
+    void bindTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, Texture* texture, id<MTLTexture> placeholder, NSUInteger index, bool allowPlaceholder = false) {
+        id<MTLTexture> metalTexture = placeholder;
+        id<MTLSamplerState> sampler = defaultSampler;
+        if (texture) {
+            id<MTLTexture> tex = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture, allowPlaceholder);
+            if (tex) {
+                metalTexture = tex;
+                sampler = (__bridge id<MTLSamplerState>) textureManager->getOrCreateSampler(*texture);
+            }
         }
         [encoder setFragmentTexture:metalTexture atIndex:index];
         if (index == 0) {
@@ -957,7 +1131,7 @@ struct MetalRenderer::Impl {
 
     void bindCubeTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, NSUInteger index) {
         id<MTLTexture> metalTexture = whiteCubeTexture;
-        if (hasCubeTexture(texture)) {
+        if (texture && dynamic_cast<CubeTexture*>(texture.get()) != nullptr) {
             metalTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture);
         }
         [encoder setFragmentTexture:metalTexture atIndex:index];
@@ -968,8 +1142,10 @@ struct MetalRenderer::Impl {
         for (std::size_t i = 0; i < maxShadowMapsPerLightType; ++i) {
             id<MTLTexture> directionalTexture = shadowResources.directionalTextures[i] ? shadowResources.directionalTextures[i] : whiteDepthTexture;
             id<MTLTexture> spotTexture = shadowResources.spotTextures[i] ? shadowResources.spotTextures[i] : whiteDepthTexture;
+            id<MTLTexture> pointTexture = shadowResources.pointTextures[i] ? shadowResources.pointTextures[i] : whiteDepthTexture;
             [encoder setFragmentTexture:directionalTexture atIndex:7 + i];
             [encoder setFragmentTexture:spotTexture atIndex:11 + i];
+            [encoder setFragmentTexture:pointTexture atIndex:15 + i];
         }
         [encoder setFragmentSamplerState:shadowSampler atIndex:1];
     }
@@ -1153,6 +1329,171 @@ struct MetalRenderer::Impl {
         }
     }
 
+    void renderSprite(id<MTLRenderCommandEncoder> encoder, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto* material = sprite.material()->as<SpriteMaterial>();
+        if (!material || !material->visible) return;
+
+        static constexpr float positions[] = {
+                -0.5f, -0.5f, 0.f,
+                 0.5f, -0.5f, 0.f,
+                -0.5f,  0.5f, 0.f,
+                 0.5f,  0.5f, 0.f};
+        static constexpr float uvs[] = {
+                0.f, 0.f,
+                1.f, 0.f,
+                0.f, 1.f,
+                1.f, 1.f};
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateSpriteVertexFunction();
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateSpriteFragmentFunction();
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+
+        const auto faceCullingState = metal::computeFaceCullingState(material->side, false, false);
+        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+        [encoder setVertexBytes:positions length:sizeof(positions) atIndex:0];
+        [encoder setVertexBytes:uvs length:sizeof(uvs) atIndex:2];
+
+        SpriteUniforms uniforms;
+        computeSpriteUniforms(camera, sprite, *material, uniforms);
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+        bindTextureOrPlaceholder(encoder, material->map, whiteTexture, 0);
+        [encoder setFragmentSamplerState:defaultSampler atIndex:0];
+
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+    }
+
+    void renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto materialPtr = sky.material();
+        auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
+        auto geometry = sky.geometry();
+        if (!material || !geometry || !material->visible) return;
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        if (!posAttr) return;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateSkyVertexFunction();
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateSkyFragmentFunction();
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+
+        const auto frontFaceCW = sky.matrixWorld->determinant() < 0;
+        const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, false);
+        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+        bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+
+        SkyUniforms uniforms{};
+        Matrix4 mvp;
+        computeMVP(camera, sky, mvp);
+        copyMatrix(mvp, uniforms.mvp);
+        copyMatrix(*sky.matrixWorld, uniforms.modelMatrix);
+        copyVector3(uniformVector3(material->uniforms, "sunPosition", Vector3{}), uniforms.sunPosition);
+        copyVector3(uniformVector3(material->uniforms, "up", Vector3{0, 1, 0}), uniforms.up);
+        uniforms.params[0] = uniformFloat(material->uniforms, "turbidity", 2.f);
+        uniforms.params[1] = uniformFloat(material->uniforms, "rayleigh", 1.f);
+        uniforms.params[2] = uniformFloat(material->uniforms, "mieCoefficient", 0.005f);
+        uniforms.params[3] = uniformFloat(material->uniforms, "mieDirectionalG", 0.8f);
+
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        drawGeometry(encoder, *geometry, *posAttr, false);
+    }
+
+    void renderWater(id<MTLRenderCommandEncoder> encoder, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto materialPtr = water.material();
+        auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
+        auto geometry = water.geometry();
+        if (!material || !geometry || !material->visible) return;
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        if (!posAttr) return;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateWaterVertexFunction();
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateWaterFragmentFunction();
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+
+        const auto frontFaceCW = water.matrixWorld->determinant() < 0;
+        const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, false);
+        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+        bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+
+        WaterUniforms uniforms{};
+        Matrix4 mvp;
+        Matrix4 identity;
+        computeMVP(camera, water, mvp);
+        copyMatrix(mvp, uniforms.mvp);
+        copyMatrix(*water.matrixWorld, uniforms.modelMatrix);
+        const auto textureMatrix = uniformMatrix4(material->uniforms, "textureMatrix", identity);
+        copyMatrix(textureMatrix, uniforms.textureMatrix);
+        copyVector3(uniformVector3(material->uniforms, "sunDirection", Vector3{0.70707f, 0.70707f, 0}), uniforms.sunDirection);
+        const auto sunColor = uniformColor(material->uniforms, "sunColor", Color{0x7f7f7f});
+        uniforms.sunColor[0] = sunColor.r;
+        uniforms.sunColor[1] = sunColor.g;
+        uniforms.sunColor[2] = sunColor.b;
+        uniforms.sunColor[3] = 1.f;
+        copyVector3(uniformVector3(material->uniforms, "eye", Vector3{}), uniforms.eye);
+        const auto waterColor = uniformColor(material->uniforms, "waterColor", Color{0x555555});
+        uniforms.waterColor[0] = waterColor.r;
+        uniforms.waterColor[1] = waterColor.g;
+        uniforms.waterColor[2] = waterColor.b;
+        uniforms.waterColor[3] = 1.f;
+        uniforms.params[0] = uniformFloat(material->uniforms, "alpha", material->opacity);
+        uniforms.params[1] = uniformFloat(material->uniforms, "time", 0.f);
+        uniforms.params[2] = uniformFloat(material->uniforms, "size", 1.f);
+        uniforms.params[3] = uniformFloat(material->uniforms, "distortionScale", 20.f);
+
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+
+        bindTextureOrPlaceholder(encoder, uniformTexture(material->uniforms, "normalSampler"), normalTexture, 0);
+        bindTextureOrPlaceholder(encoder, uniformTexture(material->uniforms, "mirrorSampler"), whiteTexture, 1, true);
+        [encoder setFragmentSamplerState:defaultSampler atIndex:0];
+
+        drawGeometry(encoder, *geometry, *posAttr, false);
+    }
+
     bool shouldUpdateShadow(LightShadow& shadow) const {
         return shadowMapState.autoUpdate || shadowMapState.needsUpdate || shadow.autoUpdate || shadow.needsUpdate;
     }
@@ -1217,6 +1558,68 @@ struct MetalRenderer::Impl {
         }
     }
 
+    void renderPointDepthObject(id<MTLRenderCommandEncoder> encoder, Object3D& object, Camera& shadowCamera, const Frustum& frustum, const Vector3& lightPosition, float nearPlane, float farPlane) {
+        if (!object.visible) return;
+
+        if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
+            if (object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
+                auto* geometry = mesh->geometry().get();
+                auto* material = mesh->material().get();
+                if (geometry && material && material->visible) {
+                    auto* posAttr = getFloatAttribute(*geometry, "position");
+                    if (posAttr) {
+                        const auto* wf = dynamic_cast<MaterialWithWireframe*>(material);
+                        const bool isWireframe = wf && wf->wireframe;
+                        const auto frontFaceCW = object.matrixWorld->determinant() < 0;
+                        const auto shadowSide = material->shadowSide.value_or(material->side);
+                        const auto faceCullingState = metal::computeFaceCullingState(shadowSide, frontFaceCW, isWireframe);
+                        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+                        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+                        [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+
+                        auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
+                        const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
+                        auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(mesh);
+                        const bool useSkinning = bindSkinning(encoder, *geometry, skinnedMesh);
+                        if (useInstancing && useSkinning) {
+                            std::cerr << "MetalRenderer: skipping unsupported instanced skinned point shadow caster " << object.id << "\n";
+                        } else {
+                            std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
+                            if (useSkinning) vertexLayoutBitmask |= vertexLayoutSkinning;
+
+                            auto* vertexFunction = shaderManager->getOrCreatePointDepthVertexFunction(useSkinning, useInstancing);
+                            auto* fragmentFunction = shaderManager->getOrCreatePointDepthFragmentFunction(useSkinning, useInstancing);
+                            id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);
+                            [encoder setRenderPipelineState:pso];
+
+                            auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
+                                    *posAttr,
+                                    posAttr->count() * posAttr->itemSize() * sizeof(float),
+                                    posAttr->array().data());
+                            [encoder setVertexBuffer:posBuf offset:0 atIndex:0];
+
+                            PointDepthTransformUniforms depthTransforms;
+                            computePointDepthTransformUniforms(shadowCamera, object, lightPosition, nearPlane, farPlane, depthTransforms);
+                            [encoder setVertexBytes:&depthTransforms length:sizeof(depthTransforms) atIndex:4];
+                            [encoder setFragmentBytes:&depthTransforms length:sizeof(depthTransforms) atIndex:4];
+
+                            NSUInteger instanceCount = 1;
+                            if (useInstancing) {
+                                bindInstancing(encoder, *instancedMesh, false);
+                                instanceCount = static_cast<NSUInteger>(instancedMesh->count());
+                            }
+                            drawGeometry(encoder, *geometry, *posAttr, false, instanceCount);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const auto& child : object.children) {
+            renderPointDepthObject(encoder, *child, shadowCamera, frustum, lightPosition, nearPlane, farPlane);
+        }
+    }
+
     void renderShadowForLight(Scene& scene, Light& light, LightShadow& shadow, id<MTLTexture> shadowTexture) {
         if (!shouldUpdateShadow(shadow)) return;
 
@@ -1236,9 +1639,45 @@ struct MetalRenderer::Impl {
         shadow.needsUpdate = false;
     }
 
+    void renderPointLightShadow(Scene& scene, PointLight& light, PointLightShadow& shadow, id<MTLTexture> shadowTexture) {
+        if (!shouldUpdateShadow(shadow)) return;
+
+        MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
+        passDesc.depthAttachment.texture = shadowTexture;
+        passDesc.depthAttachment.loadAction = MTLLoadActionClear;
+        passDesc.depthAttachment.clearDepth = 1.0;
+        passDesc.depthAttachment.storeAction = MTLStoreActionStore;
+
+        id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
+        [encoder setDepthStencilState:depthStencilState];
+
+        const auto faceWidth = static_cast<double>(std::max(1.f, shadow.mapSize.x));
+        const auto faceHeight = static_cast<double>(std::max(1.f, shadow.mapSize.y));
+        Vector3 lightPosition;
+        lightPosition.setFromMatrixPosition(*light.matrixWorld);
+        for (std::size_t i = 0; i < shadow.getViewportCount(); ++i) {
+            shadow.updateMatrices(light, i);
+            const auto& viewport = shadow.getViewport(i);
+            const MTLViewport metalViewport{
+                    static_cast<double>(viewport.x) * faceWidth,
+                    static_cast<double>(viewport.y) * faceHeight,
+                    static_cast<double>(viewport.z) * faceWidth,
+                    static_cast<double>(viewport.w) * faceHeight,
+                    0.0,
+                    1.0};
+            [encoder setViewport:metalViewport];
+            renderPointDepthObject(encoder, scene, *shadow.camera, shadow.getFrustum(), lightPosition, shadow.camera->nearPlane, shadow.camera->farPlane);
+        }
+
+        [encoder endEncoding];
+
+        shadow.needsUpdate = false;
+    }
+
     ShadowResources renderShadowPasses(Scene& scene, const SceneLightSet& sceneLights) {
         ShadowResources resources;
         resources.directionalTextures.fill(whiteDepthTexture);
+        resources.pointTextures.fill(whiteDepthTexture);
         resources.spotTextures.fill(whiteDepthTexture);
 
         if (!shadowMapState.enabled) return resources;
@@ -1253,6 +1692,21 @@ struct MetalRenderer::Impl {
             resources.directionalTextures[directionalIndex] = texture;
             renderShadowForLight(scene, *light, *light->shadow, texture);
             ++directionalIndex;
+        }
+
+        std::uint32_t pointIndex = 0;
+        for (auto* light : sceneLights.point) {
+            if (pointIndex >= maxShadowMapsPerLightType) break;
+            if (!light->castShadow || !light->shadow) continue;
+
+            auto* pointShadow = dynamic_cast<PointLightShadow*>(light->shadow.get());
+            if (!pointShadow) continue;
+
+            auto* texture = getOrCreatePointShadowTexture(*light, *pointShadow);
+            resources.pointShadowIndices[light->id] = pointIndex;
+            resources.pointTextures[pointIndex] = texture;
+            renderPointLightShadow(scene, *light, *pointShadow, texture);
+            ++pointIndex;
         }
 
         std::uint32_t spotIndex = 0;
@@ -1312,6 +1766,18 @@ struct MetalRenderer::Impl {
             copyColorWithIntensity(light->color, light->intensity, dst.color);
             dst.params[0] = light->distance;
             dst.params[1] = light->decay;
+            dst.shadowParams[1] = -1.f;
+            auto shadowIt = shadows.pointShadowIndices.find(light->id);
+            if (shadowIt != shadows.pointShadowIndices.end() && light->shadow) {
+                dst.shadowParams[0] = 1.f;
+                dst.shadowParams[1] = static_cast<float>(shadowIt->second);
+                dst.shadowParams[2] = light->shadow->bias;
+                dst.shadowParams[3] = light->shadow->radius;
+                dst.shadowMapSize[0] = light->shadow->mapSize.x;
+                dst.shadowMapSize[1] = light->shadow->mapSize.y;
+                dst.shadowMapSize[2] = light->shadow->camera ? light->shadow->camera->nearPlane : 0.5f;
+                dst.shadowMapSize[3] = light->shadow->camera ? light->shadow->camera->farPlane : 500.f;
+            }
             uniforms.counts[1]++;
         }
 
@@ -1379,14 +1845,10 @@ struct MetalRenderer::Impl {
     }
 
     void render(Scene& scene, Camera& camera, bool autoClear) {
-        const auto now = std::chrono::steady_clock::now();
-        if (currentCommandBuffer && !explicitFrameInProgress && lastRenderTime.time_since_epoch().count() != 0) {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastRenderTime);
-            if (elapsed.count() > 5) {
-                commitPendingFrame();
-            }
+        if (currentCommandBuffer && !explicitFrameInProgress) {
+            commitPendingFrame();
         }
-        lastRenderTime = now;
+        lastRenderTime = std::chrono::steady_clock::now();
 
         scene.updateMatrixWorld(false);
         metal::prepareCameraForRender(camera);
@@ -1471,6 +1933,21 @@ struct MetalRenderer::Impl {
         bindPassLightResources(encoder, lightUniforms, shadowResources);
 
         for (auto* obj : renderables) {
+            if (auto* sky = dynamic_cast<Sky*>(obj)) {
+                renderSky(encoder, *sky, camera, colorPixelFormat);
+                continue;
+            }
+
+            if (auto* water = dynamic_cast<Water*>(obj)) {
+                renderWater(encoder, *water, camera, colorPixelFormat);
+                continue;
+            }
+
+            if (auto* sprite = dynamic_cast<Sprite*>(obj)) {
+                renderSprite(encoder, *sprite, camera, colorPixelFormat);
+                continue;
+            }
+
             BufferGeometry* geometry = nullptr;
             Material* material = nullptr;
             bool isLine = false;
@@ -1607,7 +2084,9 @@ struct MetalRenderer::Impl {
         clearDepthFlag = true;
 
         if (autoClear) {
-            commitPendingFrame();
+            if (!lastFrameWasExternallyAccessed) {
+                commitPendingFrame();
+            }
         }
     }
 };
@@ -1621,6 +2100,27 @@ void MetalRenderer::render(Scene& scene, Camera& camera) {
 
 void MetalRenderer::setSize(std::pair<int, int> size) {
     pimpl_->setSize(size);
+}
+
+WindowSize MetalRenderer::size() const {
+    return pimpl_->window.size();
+}
+
+void* MetalRenderer::device() const {
+    return (__bridge void*) pimpl_->device;
+}
+
+void* MetalRenderer::currentCommandBuffer() const {
+    pimpl_->ensureFrameStarted();
+    pimpl_->currentCommandBufferExternallyAccessed = true;
+    return (__bridge void*) pimpl_->currentCommandBuffer;
+}
+
+void* MetalRenderer::currentDrawableTexture() const {
+    pimpl_->ensureFrameStarted();
+    pimpl_->currentCommandBufferExternallyAccessed = true;
+    if (!pimpl_->ensureDrawable()) return nullptr;
+    return (__bridge void*) pimpl_->currentDrawable.texture;
 }
 
 void MetalRenderer::setClearColor(const Color& color, float alpha) {

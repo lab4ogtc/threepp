@@ -5,6 +5,8 @@
 #include <memory>
 #include <utility>
 
+#include "threepp/canvas/WindowSize.hpp"
+
 namespace threepp {
 
     class Window;
@@ -32,6 +34,8 @@ namespace threepp {
         virtual void render(Scene& scene, Camera& camera) = 0;
 
         virtual void setSize(std::pair<int, int> size) = 0;
+
+        [[nodiscard]] virtual WindowSize size() const = 0;
 
         virtual void setClearColor(const Color& color, float alpha = 1) = 0;
 

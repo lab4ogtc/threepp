@@ -16,7 +16,7 @@ namespace threepp {
 
             ~MetalTextureManager();
 
-            void* getOrCreateTexture(Texture& texture);
+            void* getOrCreateTexture(Texture& texture, bool allowPlaceholder = false);
 
             void* getOrCreateSampler(Texture& texture);
 
