@@ -46,8 +46,6 @@ int main() {
     Clock clock;
     canvas.animate([&]() {
         camera.position.z = -5 + 3 * std::sin(clock.getElapsedTime() * 0.5f);
-        lod1.update(camera);
-        lod2.update(camera);
 
         renderer->render(scene, camera);
     });

@@ -5,6 +5,7 @@
 #include "threepp/threepp.hpp"
 
 #include <cmath>
+#include <iostream>
 
 using namespace threepp;
 
@@ -81,6 +82,7 @@ namespace {
 
         auto mesh = SkinnedMesh::create(geometry, material);
         mesh->castShadow = true;
+        mesh->receiveShadow = true;
         const auto skeleton = Skeleton::create(bones);
 
         mesh->add(bones[0]);
@@ -117,9 +119,7 @@ namespace {
         auto grid = GridHelper::create(gridSize, 10, Color::yellow);
 
         const auto geometry = PlaneGeometry::create(gridSize, gridSize);
-        const auto material = ShadowMaterial::create();
-        material->color = 0x000000;
-        material->opacity = 0.2f;
+        const auto material = MeshPhongMaterial::create({{"color", Color(0x333333)}, {"side", Side::Double}});
 
         const auto plane = Mesh::create(geometry, material);
         plane->rotation.x = -math::PI / 2;
@@ -151,9 +151,24 @@ int main() {
     auto light3 = PointLight::create(0xffffff);
     light3->position.set(-100, -200, -100);
 
+    auto shadowTarget = Object3D::create();
+    shadowTarget->position.y = 16;
+    scene.add(shadowTarget);
+
+    auto shadowLight = DirectionalLight::create(0xffffff, 0.8f);
+    shadowLight->position.set(30, 60, 40);
+    shadowLight->castShadow = true;
+    shadowLight->shadow->mapSize.set(1024, 1024);
+    shadowLight->shadow->camera->as<OrthographicCamera>()->left = -45;
+    shadowLight->shadow->camera->as<OrthographicCamera>()->right = 45;
+    shadowLight->shadow->camera->as<OrthographicCamera>()->top = 45;
+    shadowLight->shadow->camera->as<OrthographicCamera>()->bottom = -25;
+    shadowLight->setTarget(*shadowTarget);
+
     scene.add(light1);
     scene.add(light2);
     scene.add(light3);
+    scene.add(shadowLight);
 
     auto plane = initPlane();
     scene.add(plane);
@@ -170,12 +185,24 @@ int main() {
         renderer->setSize(size);
     });
 
+    bool animate{false};
+    KeyAdapter keyAdapter(KeyAdapter::Mode::KEY_PRESSED, [&](KeyEvent evt) {
+        if (evt.key == Key::A) {
+            animate = !animate;
+        }
+    });
+    canvas.addKeyListener(keyAdapter);
+
+    std::cout << "Press 'a' to toggle bone animation." << std::endl;
+
     Clock clock;
     canvas.animate([&] {
         const auto time = clock.getElapsedTime();
 
-        for (unsigned i = 0; i < bones->skeleton->bones.size(); i++) {
-            bones->skeleton->bones[i]->rotation.z = std::sin(time) * 2 / float(bones->skeleton->bones.size());
+        if (animate) {
+            for (unsigned i = 0; i < bones->skeleton->bones.size(); i++) {
+                bones->skeleton->bones[i]->rotation.z = std::sin(time) * 2 / float(bones->skeleton->bones.size());
+            }
         }
 
         renderer->render(scene, camera);

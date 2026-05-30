@@ -28,6 +28,7 @@
 #import "threepp/math/Matrix3.hpp"
 #import "threepp/math/Matrix4.hpp"
 #import "threepp/objects/InstancedMesh.hpp"
+#import "threepp/objects/LOD.hpp"
 #import "threepp/objects/LineSegments.hpp"
 #import "threepp/objects/Mesh.hpp"
 #import "threepp/objects/SkinnedMesh.hpp"
@@ -245,6 +246,20 @@ namespace {
 
         for (const auto& child : object.children) {
             collectRenderables(*child, out);
+        }
+    }
+
+    void updateLODs(Object3D& object, Camera& camera) {
+        if (!object.visible) return;
+
+        if (auto* lod = dynamic_cast<LOD*>(&object)) {
+            if (lod->autoUpdate) {
+                lod->update(camera);
+            }
+        }
+
+        for (const auto& child : object.children) {
+            updateLODs(*child, camera);
         }
     }
 
@@ -1375,6 +1390,7 @@ struct MetalRenderer::Impl {
 
         scene.updateMatrixWorld(false);
         metal::prepareCameraForRender(camera);
+        updateLODs(scene, camera);
 
         SceneLightSet sceneLights;
         collectLights(scene, sceneLights);

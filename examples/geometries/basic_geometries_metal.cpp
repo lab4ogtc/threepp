@@ -1,10 +1,46 @@
-#include "threepp/geometries/TorusKnotGeometry.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/threepp.hpp"
+
+#include <iostream>
 
 using namespace threepp;
 
 namespace {
+
+    enum class GeomType {
+        Box,
+        Sphere,
+        Cylinder,
+        Plane
+    };
+
+    const char* geomName(GeomType type) {
+        switch (type) {
+            case GeomType::Box:
+                return "Box";
+            case GeomType::Sphere:
+                return "Sphere";
+            case GeomType::Cylinder:
+                return "Cylinder";
+            case GeomType::Plane:
+                return "Plane";
+        }
+        return "Unknown";
+    }
+
+    std::shared_ptr<BufferGeometry> createGeometry(GeomType type) {
+        switch (type) {
+            case GeomType::Box:
+                return BoxGeometry::create(1.5f, 1.5f, 1.5f, 4, 4, 4);
+            case GeomType::Sphere:
+                return SphereGeometry::create(1.f, 32, 16);
+            case GeomType::Cylinder:
+                return CylinderGeometry::create(0.5f, 0.9f, 1.8f, 32, 4);
+            case GeomType::Plane:
+                return PlaneGeometry::create(2.f, 1.5f, 8, 6);
+        }
+        return BoxGeometry::create();
+    }
 
     auto createWireframe(const BufferGeometry& geometry) {
         auto line = LineSegments::create(WireframeGeometry::create(geometry));
@@ -12,12 +48,18 @@ namespace {
         return line;
     }
 
-    auto createMesh(const std::shared_ptr<BufferGeometry>& geometry, const Color& color, const Vector3& position) {
-        const auto material = MeshBasicMaterial::create({{"color", color}, {"side", Side::Double}});
+    auto createMesh() {
+        const auto geometry = createGeometry(GeomType::Box);
+        const auto material = MeshBasicMaterial::create({{"color", Color::orange}, {"side", Side::Double}});
         auto mesh = Mesh::create(geometry, material);
-        mesh->position.copy(position);
         mesh->add(createWireframe(*geometry));
         return mesh;
+    }
+
+    void setGeometry(Mesh& mesh, const std::shared_ptr<BufferGeometry>& geometry) {
+        mesh.setGeometry(geometry);
+        mesh.children[0]->removeFromParent();
+        mesh.add(createWireframe(*geometry));
     }
 
 }// namespace
@@ -30,17 +72,41 @@ int main() {
     const auto scene = Scene::create();
     scene->background = Color::blue;
     const auto camera = PerspectiveCamera::create(60, canvas.aspect(), 0.1f, 100);
-    camera->position.z = 7;
+    camera->position.z = 5;
 
     OrbitControls controls{*camera, canvas};
 
-    const auto group = Group::create();
-    group->add(createMesh(BoxGeometry::create(), Color::orange, {-2.5f, 1.25f, 0}));
-    group->add(createMesh(SphereGeometry::create(0.75f, 24, 16), Color::green, {0, 1.25f, 0}));
-    group->add(createMesh(CylinderGeometry::create(0.5f, 0.8f, 1.5f, 24), Color::red, {2.5f, 1.25f, 0}));
-    group->add(createMesh(PlaneGeometry::create(1.6f, 1.2f, 4, 3), Color::yellow, {-1.25f, -1.4f, 0}));
-    group->add(createMesh(TorusKnotGeometry::create(0.5f, 0.15f, 64, 12), Color::purple, {1.25f, -1.4f, 0}));
-    scene->add(group);
+    const auto mesh = createMesh();
+    scene->add(mesh);
+
+    GeomType currentType = GeomType::Box;
+    auto selectGeometry = [&](GeomType type) {
+        currentType = type;
+        setGeometry(*mesh, createGeometry(currentType));
+        std::cout << "Geometry: " << geomName(currentType) << std::endl;
+    };
+
+    KeyAdapter keyAdapter(KeyAdapter::Mode::KEY_PRESSED, [&](const KeyEvent& evt) {
+        switch (evt.key) {
+            case Key::NUM_1:
+                selectGeometry(GeomType::Box);
+                break;
+            case Key::NUM_2:
+                selectGeometry(GeomType::Sphere);
+                break;
+            case Key::NUM_3:
+                selectGeometry(GeomType::Cylinder);
+                break;
+            case Key::NUM_4:
+                selectGeometry(GeomType::Plane);
+                break;
+            default:
+                break;
+        }
+    });
+    canvas.addKeyListener(keyAdapter);
+
+    std::cout << "Press 1-4 to switch geometry type." << std::endl;
 
     canvas.onWindowResize([&](WindowSize size) {
         camera->aspect = size.aspect();
@@ -52,8 +118,8 @@ int main() {
     canvas.animate([&]() {
         const auto dt = clock.getDelta();
 
-        group->rotation.y += 0.6f * dt;
-        group->rotation.x += 0.25f * dt;
+        mesh->rotation.y += 0.8f * dt;
+        mesh->rotation.x += 0.5f * dt;
 
         renderer->render(*scene, *camera);
     });

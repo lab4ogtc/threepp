@@ -3,7 +3,6 @@
 
 #include "bvh/BVH.hpp"
 
-#include <algorithm>
 #include <cmath>
 #include <iostream>
 
@@ -109,15 +108,11 @@ int main() {
         renderer->setSize(size);
     });
 
-    std::vector<std::shared_ptr<Mesh>> collisionMarkers;
-    const auto collisionGeometry = SphereGeometry::create(0.5f, 16, 8);
-    const auto collisionMaterial = MeshBasicMaterial::create({{"color", Color::yellow}});
-    for (int i = 0; i < 128; ++i) {
-        auto marker = Mesh::create(collisionGeometry, collisionMaterial);
-        marker->visible = false;
-        collisionMarkers.emplace_back(marker);
-        scene->add(marker);
-    }
+    auto collisions = InstancedMesh::create(
+            SphereGeometry::create(0.5f, 16, 8),
+            MeshBasicMaterial::create({{"color", Color::yellow}}), 10000);
+    collisions->frustumCulled = false;
+    scene->add(collisions);
 
     Clock clock;
     const auto count = static_cast<float>(geometry1->getIndex()->count());
@@ -127,17 +122,17 @@ int main() {
         const auto map = math::mapLinear(std::sin(clock.elapsedTime), -1, 1, 0, count);
         geometry1->setDrawRange(0, static_cast<int>(map));
 
-        for (auto& marker : collisionMarkers) {
-            marker->visible = false;
-        }
-
         if (BVH::intersects(bvh1, bvh2, *tube1->matrixWorld, *tube2->matrixWorld)) {
+            static Matrix4 m;
             const auto res = BVH::intersect(bvh1, *tube1->matrixWorld, bvh2, *tube2->matrixWorld);
-            const auto markerCount = std::min(res.size(), collisionMarkers.size());
-            for (std::size_t i = 0; i < markerCount; ++i) {
-                collisionMarkers[i]->position.copy(res[i].position);
-                collisionMarkers[i]->visible = true;
+            collisions->setCount(res.size());
+            for (std::size_t i = 0; i < collisions->count(); ++i) {
+                const auto& intersection = res[i];
+                collisions->setMatrixAt(i, m.makeTranslation(intersection.position));
             }
+            collisions->instanceMatrix()->needsUpdate();
+        } else {
+            collisions->setCount(0);
         }
 
         renderer->render(*scene, *camera);

@@ -2,6 +2,7 @@
 
 #include "threepp/lights/LightProbe.hpp"
 #include "threepp/objects/InstancedMesh.hpp"
+#include "threepp/objects/LOD.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/renderers/GLRenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
@@ -425,6 +426,43 @@ TEST_CASE("Metal P3 renderer supports instanced render target mixed pass") {
         REQUIRE(std::any_of(pixels.begin(), pixels.end(), [](auto value) {
             return value != 0;
         }));
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer auto-updates LOD objects during traversal") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal LOD auto update smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        Scene scene;
+        PerspectiveCamera camera(60, canvas.aspect(), 0.1f, 20.f);
+        camera.position.z = -5.f;
+
+        auto nearMesh = Mesh::create(IcosahedronGeometry::create(0.5f, 2), MeshBasicMaterial::create({{"wireframe", true}}));
+        auto farMesh = Mesh::create(IcosahedronGeometry::create(0.5f, 0), MeshBasicMaterial::create({{"wireframe", true}}));
+
+        LOD lod;
+        lod.addLevel(nearMesh, 0.f);
+        lod.addLevel(farMesh, 3.f);
+        scene.add(lod);
+
+        REQUIRE(lod.getCurrentLevel() == 0);
+        REQUIRE_NOTHROW(renderer->render(scene, camera));
+        REQUIRE(lod.getCurrentLevel() == 1);
+        REQUIRE_FALSE(nearMesh->visible);
+        REQUIRE(farMesh->visible);
 
         canvas.close();
     }

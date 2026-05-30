@@ -3,6 +3,8 @@
 #include "threepp/canvas/Monitor.hpp"
 #include "threepp/renderers/Renderer.hpp"
 
+#include <iostream>
+
 int main() {
 
     SnakeGame game(10);
@@ -20,6 +22,8 @@ int main() {
             0, static_cast<float>(game.gridSize()),
             0, static_cast<float>(game.gridSize()));
     camera.position.z = 1;
+
+    std::cout << "Use arrow keys or WASD to steer. Press 'r' to reset." << std::endl;
 
     canvas.onWindowResize([&](WindowSize size) {
         camera.right = static_cast<float>(game.gridSize()) * size.aspect();
