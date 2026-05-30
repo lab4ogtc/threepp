@@ -23,3 +23,8 @@ add_example(NAME "particle_system" LINK_IMGUI)
 add_example(NAME "text_sprite" LINK_IMGUI WEB WEB_EMBED
         "${PROJECT_SOURCE_DIR}/data/fonts@data/fonts"
 )
+
+if (APPLE)
+    add_example(NAME "lod_metal")
+    add_example(NAME "bones_metal")
+endif ()
