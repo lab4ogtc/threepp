@@ -1,11 +1,14 @@
 #import <Metal/Metal.h>
 
 #include "threepp/lights/LightProbe.hpp"
+#include "threepp/objects/InstancedMesh.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
+#include "threepp/renderers/GLRenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/DataTexture.hpp"
+#include "threepp/textures/DepthTexture.hpp"
 #include "threepp/textures/Image.hpp"
 #include "threepp/threepp.hpp"
 
@@ -360,4 +363,105 @@ TEST_CASE("GlfwWindow resets client API between Metal and OpenGL windows") {
     REQUIRE(glfwGetCurrentContext() == glWindow);
     glCanvas.close();
     metalCanvas.close();
+}
+
+TEST_CASE("Metal P3 renderer supports instanced render target mixed pass") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal P3 instancing render target smoke")
+                                  .size(128, 128)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        RenderTarget::Options targetOptions;
+        targetOptions.format = Format::RGBA;
+        targetOptions.generateMipmaps = true;
+        targetOptions.depthTexture = DepthTexture::create(Type::Float);
+        auto target = GLRenderTarget::create(64, 64, targetOptions);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 4.f;
+
+        auto instancedMaterial = MeshBasicMaterial::create({{"color", Color::white},
+                                                            {"side", Side::Double}});
+        auto instanced = InstancedMesh::create(PlaneGeometry::create(0.55f, 0.55f), instancedMaterial, 2);
+
+        Matrix4 matrix;
+        instanced->setMatrixAt(0, matrix.makeTranslation(-0.35f, 0.f, 0.f));
+        instanced->setMatrixAt(1, matrix.makeTranslation(0.35f, 0.f, 0.f));
+        instanced->instanceMatrix()->needsUpdate();
+        instanced->setColorAt(0, Color::red);
+        instanced->setColorAt(1, Color::green);
+        instanced->instanceColor()->needsUpdate();
+        scene->add(instanced);
+
+        auto screenScene = Scene::create();
+        auto screenCamera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        screenCamera->position.z = 2.f;
+        auto screenMaterial = MeshBasicMaterial::create({{"color", Color::white},
+                                                         {"side", Side::Double}});
+        screenMaterial->map = target->texture;
+        screenScene->add(Mesh::create(PlaneGeometry::create(2.f, 2.f), screenMaterial));
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        renderer->setRenderTarget(target.get());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+        renderer->setRenderTarget(nullptr);
+        REQUIRE_NOTHROW(renderer->render(*screenScene, *screenCamera));
+
+        auto pixels = metalRenderer->readRGBPixels();
+        REQUIRE(std::any_of(pixels.begin(), pixels.end(), [](auto value) {
+            return value != 0;
+        }));
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal P3 renderer releases GLRenderTarget resources on dispose") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal P3 render target dispose smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        RenderTarget::Options targetOptions;
+        targetOptions.format = Format::BGRA;
+        auto target = GLRenderTarget::create(32, 32, targetOptions);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+        auto material = MeshBasicMaterial::create({{"color", Color::white},
+                                                   {"side", Side::Double}});
+        scene->add(Mesh::create(PlaneGeometry::create(1.f, 1.f), material));
+
+        renderer->setRenderTarget(target.get());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+        renderer->setRenderTarget(nullptr);
+        REQUIRE_NOTHROW(target->dispose());
+        target.reset();
+        renderer.reset();
+        canvas.close();
+    }
 }

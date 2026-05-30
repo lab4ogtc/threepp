@@ -133,6 +133,7 @@ namespace threepp::metal {
         struct CachedTexture {
             id<MTLTexture> texture = nil;
             unsigned int version = 0;
+            bool external = false;
         };
 
         struct OnTextureDispose: EventListener {
@@ -164,7 +165,7 @@ namespace threepp::metal {
 
         id<MTLTexture> getOrCreateTexture(Texture& texture) {
             auto it = textures.find(&texture);
-            if (it != textures.end() && it->second.version == texture.version()) {
+            if (it != textures.end() && (it->second.external || it->second.version == texture.version())) {
                 return it->second.texture;
             }
 
@@ -222,7 +223,7 @@ namespace threepp::metal {
                     texture.addEventListener("dispose", onTextureDispose);
                 }
 
-                textures[&texture] = CachedTexture{mtlTexture, texture.version()};
+                textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
                 return mtlTexture;
             }
 
@@ -253,7 +254,7 @@ namespace threepp::metal {
                 texture.addEventListener("dispose", onTextureDispose);
             }
 
-            textures[&texture] = CachedTexture{mtlTexture, texture.version()};
+            textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
             return mtlTexture;
         }
 
@@ -281,7 +282,22 @@ namespace threepp::metal {
             return sampler;
         }
 
+        void registerExternalTexture(Texture& texture, id<MTLTexture> mtlTexture) {
+            if (!mtlTexture) {
+                throw std::runtime_error("Cannot register a null Metal texture");
+            }
+
+            if (!texture.hasEventListener("dispose", onTextureDispose)) {
+                texture.addEventListener("dispose", onTextureDispose);
+            }
+
+            textures[&texture] = CachedTexture{mtlTexture, texture.version(), true};
+        }
+
         void deallocateTexture(Texture* texture) {
+            if (texture && texture->hasEventListener("dispose", onTextureDispose)) {
+                texture->removeEventListener("dispose", onTextureDispose);
+            }
             textures.erase(texture);
         }
 
@@ -303,6 +319,10 @@ namespace threepp::metal {
 
     void* MetalTextureManager::getOrCreateSampler(Texture& texture) {
         return (__bridge void*) pimpl_->getOrCreateSampler(texture);
+    }
+
+    void MetalTextureManager::registerExternalTexture(Texture& texture, void* mtlTexture) {
+        pimpl_->registerExternalTexture(texture, (__bridge id<MTLTexture>) mtlTexture);
     }
 
     void MetalTextureManager::deallocateTexture(Texture* texture) {

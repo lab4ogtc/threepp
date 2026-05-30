@@ -1,5 +1,7 @@
 #import <Metal/Metal.h>
 
+#include "threepp/core/BufferAttribute.hpp"
+#include "threepp/renderers/metal/MetalBufferManager.hpp"
 #include "threepp/renderers/metal/MetalShaderManager.hpp"
 #include "threepp/renderers/metal/MetalTextureManager.hpp"
 #include "threepp/textures/CubeTexture.hpp"
@@ -8,6 +10,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -38,20 +41,84 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
 
         metal::MetalShaderManager shaderManager((__bridge void*) device);
 
-        for (unsigned int mask = 0; mask < 32; ++mask) {
+        for (unsigned int mask = 0; mask < 128; ++mask) {
             metal::ShaderProgramKey key;
             key.useMap = (mask & 1u) != 0u;
             key.useVertexColors = (mask & 2u) != 0u;
             key.useNormal = (mask & 4u) != 0u;
             key.useSkinning = (mask & 8u) != 0u;
             key.useLights = (mask & 16u) != 0u;
+            key.useInstancing = (mask & 32u) != 0u;
+            key.useInstanceColor = (mask & 64u) != 0u;
+
+            if ((key.useInstancing && key.useSkinning) ||
+                (key.useInstanceColor && !key.useInstancing)) {
+                continue;
+            }
 
             REQUIRE_NOTHROW(shaderManager.getOrCreateVertexFunction(key));
             REQUIRE_NOTHROW(shaderManager.getOrCreateFragmentFunction(key));
         }
 
-        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false, false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(true, false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false, true));
+    }
+}
+
+TEST_CASE("Metal P3 shader manager rejects invalid instancing variants") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalShaderManager shaderManager((__bridge void*) device);
+
+        metal::ShaderProgramKey instancedSkinning;
+        instancedSkinning.useInstancing = true;
+        instancedSkinning.useSkinning = true;
+        REQUIRE_THROWS_AS(shaderManager.getOrCreateVertexFunction(instancedSkinning), std::runtime_error);
+
+        metal::ShaderProgramKey orphanInstanceColor;
+        orphanInstanceColor.useInstanceColor = true;
+        REQUIRE_THROWS_AS(shaderManager.getOrCreateFragmentFunction(orphanInstanceColor), std::runtime_error);
+
+        REQUIRE_THROWS_AS(shaderManager.getOrCreateDepthVertexFunction(true, true), std::runtime_error);
+    }
+}
+
+TEST_CASE("Metal P3 buffer manager rotates only dynamic buffers across frames") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalBufferManager bufferManager((__bridge void*) device);
+
+        std::vector<float> vertices{0.f, 0.f, 0.f, 1.f, 0.f, 0.f, 0.f, 1.f, 0.f};
+        auto position = FloatBufferAttribute::create(vertices, 3);
+        auto* static0 = bufferManager.getBuffer(*position, vertices.size() * sizeof(float), vertices.data());
+        bufferManager.beginFrame();
+        auto* static1 = bufferManager.getBuffer(*position, vertices.size() * sizeof(float), vertices.data());
+        REQUIRE(static0 == static1);
+
+        std::vector<float> dynamic{1.f, 2.f, 3.f, 4.f};
+        auto* dynamic0 = bufferManager.getDynamicBuffer(&dynamic, dynamic.size() * sizeof(float), dynamic.data());
+        bufferManager.beginFrame();
+        auto* dynamic1 = bufferManager.getDynamicBuffer(&dynamic, dynamic.size() * sizeof(float), dynamic.data());
+        bufferManager.beginFrame();
+        auto* dynamic2 = bufferManager.getDynamicBuffer(&dynamic, dynamic.size() * sizeof(float), dynamic.data());
+        bufferManager.beginFrame();
+        auto* dynamic3 = bufferManager.getDynamicBuffer(&dynamic, dynamic.size() * sizeof(float), dynamic.data());
+
+        REQUIRE(dynamic0 != dynamic1);
+        REQUIRE(dynamic1 != dynamic2);
+        REQUIRE(dynamic2 != dynamic3);
+        REQUIRE(dynamic0 == dynamic3);
     }
 }
 
@@ -77,6 +144,33 @@ TEST_CASE("Metal P2 texture manager uploads CubeTexture as a Metal cube texture"
         REQUIRE(metalTexture.width == 1);
         REQUIRE(metalTexture.height == 1);
         REQUIRE(metalTexture.depth == 1);
+    }
+}
+
+TEST_CASE("Metal P3 texture manager can register an external Metal texture") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+        metal::MetalTextureManager textureManager((__bridge void*) device, (__bridge void*) commandQueue);
+
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                        width:4
+                                                                                       height:4
+                                                                                    mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+        id<MTLTexture> externalTexture = [device newTextureWithDescriptor:desc];
+        REQUIRE(externalTexture != nil);
+
+        auto texture = Texture::create(Image({}, 4, 4));
+        textureManager.registerExternalTexture(*texture, (__bridge void*) externalTexture);
+
+        auto* rawTexture = textureManager.getOrCreateTexture(*texture);
+        REQUIRE(rawTexture == (__bridge void*) externalTexture);
     }
 }
 

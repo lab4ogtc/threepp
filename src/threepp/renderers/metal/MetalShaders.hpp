@@ -48,7 +48,7 @@ struct VertexOutput {
 #if USE_MAP
     float2 uv;
 #endif
-#if USE_VERTEX_COLORS
+#if USE_VERTEX_COLORS || USE_INSTANCE_COLOR
     float4 color;
 #endif
 };
@@ -58,6 +58,13 @@ vertex VertexOutput basic_vertex(
     constant TransformUniforms& transforms [[buffer(4)]]
 #if USE_SKINNING
     , constant float4x4* boneMatrices [[buffer(5)]]
+#endif
+#if USE_INSTANCING
+    , constant float4x4* instanceMatrices [[buffer(9)]]
+    , uint instanceId [[instance_id]]
+#endif
+#if USE_INSTANCE_COLOR
+    , constant float3* instanceColors [[buffer(10)]]
 #endif
 )
 {
@@ -80,9 +87,21 @@ vertex VertexOutput basic_vertex(
 #endif
 #endif
 
+#if USE_INSTANCING
+    float4x4 instanceMatrix = instanceMatrices[instanceId];
+    localPosition = instanceMatrix * localPosition;
+#if USE_NORMAL
+    localNormal = (instanceMatrix * float4(localNormal, 0.0)).xyz;
+#endif
+#endif
+
     float4 worldPosition = transforms.modelMatrix * localPosition;
     out.worldPosition = worldPosition.xyz;
+#if USE_INSTANCING
+    out.position = transforms.mvp * worldPosition;
+#else
     out.position = transforms.mvp * localPosition;
+#endif
 
 #if USE_NORMAL
     out.normal = normalize((transforms.normalMatrix * float4(localNormal, 0.0)).xyz);
@@ -95,8 +114,15 @@ vertex VertexOutput basic_vertex(
 #if USE_MAP
     out.uv = in.uv;
 #endif
+#if USE_VERTEX_COLORS || USE_INSTANCE_COLOR
+    float4 vertexColor = float4(1.0);
 #if USE_VERTEX_COLORS
-    out.color = float4(in.color, 1.0);
+    vertexColor *= float4(in.color, 1.0);
+#endif
+#if USE_INSTANCE_COLOR
+    vertexColor *= float4(instanceColors[instanceId], 1.0);
+#endif
+    out.color = vertexColor;
 #endif
     return out;
 }
@@ -306,7 +332,7 @@ fragment float4 basic_fragment(
 )
 {
     float4 baseColor = params.baseColor;
-#if USE_VERTEX_COLORS
+#if USE_VERTEX_COLORS || USE_INSTANCE_COLOR
     baseColor *= in.color;
 #endif
 #if USE_MAP
@@ -463,6 +489,10 @@ vertex float4 depth_vertex(
 #if USE_SKINNING
     , constant float4x4* boneMatrices [[buffer(5)]]
 #endif
+#if USE_INSTANCING
+    , constant float4x4* instanceMatrices [[buffer(9)]]
+    , uint instanceId [[instance_id]]
+#endif
 )
 {
     float4 localPosition = float4(in.position, 1.0);
@@ -474,6 +504,9 @@ vertex float4 depth_vertex(
         boneMatrices[uint(in.skinIndex.w)] * in.skinWeight.w;
     skinMatrix = transforms.bindMatrixInverse * skinMatrix * transforms.bindMatrix;
     localPosition = skinMatrix * localPosition;
+#endif
+#if USE_INSTANCING
+    localPosition = instanceMatrices[instanceId] * localPosition;
 #endif
     return transforms.shadowMatrix * localPosition;
 }

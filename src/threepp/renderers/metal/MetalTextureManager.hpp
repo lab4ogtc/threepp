@@ -20,6 +20,8 @@ namespace threepp {
 
             void* getOrCreateSampler(Texture& texture);
 
+            void registerExternalTexture(Texture& texture, void* mtlTexture);
+
             void deallocateTexture(Texture* texture);
 
         private:

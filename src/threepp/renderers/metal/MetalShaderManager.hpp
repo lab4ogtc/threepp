@@ -12,15 +12,45 @@ namespace threepp::metal {
         bool useNormal = false;
         bool useSkinning = false;
         bool useLights = false;
+        bool useInstancing = false;
+        bool useInstanceColor = false;
 
         bool operator==(const ShaderProgramKey& other) const {
-            return useMap == other.useMap && useVertexColors == other.useVertexColors && useNormal == other.useNormal && useSkinning == other.useSkinning && useLights == other.useLights;
+            return useMap == other.useMap &&
+                   useVertexColors == other.useVertexColors &&
+                   useNormal == other.useNormal &&
+                   useSkinning == other.useSkinning &&
+                   useLights == other.useLights &&
+                   useInstancing == other.useInstancing &&
+                   useInstanceColor == other.useInstanceColor;
         }
     };
 
     struct ShaderProgramKeyHash {
         std::size_t operator()(const ShaderProgramKey& key) const {
-            return (key.useMap ? 1u : 0u) | ((key.useVertexColors ? 1u : 0u) << 1u) | ((key.useNormal ? 1u : 0u) << 2u) | ((key.useSkinning ? 1u : 0u) << 3u) | ((key.useLights ? 1u : 0u) << 4u);
+            return (key.useMap ? 1u : 0u) |
+                   ((key.useVertexColors ? 1u : 0u) << 1u) |
+                   ((key.useNormal ? 1u : 0u) << 2u) |
+                   ((key.useSkinning ? 1u : 0u) << 3u) |
+                   ((key.useLights ? 1u : 0u) << 4u) |
+                   ((key.useInstancing ? 1u : 0u) << 5u) |
+                   ((key.useInstanceColor ? 1u : 0u) << 6u);
+        }
+    };
+
+    struct DepthShaderKey {
+        bool useSkinning = false;
+        bool useInstancing = false;
+
+        bool operator==(const DepthShaderKey& other) const {
+            return useSkinning == other.useSkinning && useInstancing == other.useInstancing;
+        }
+    };
+
+    struct DepthShaderKeyHash {
+        std::size_t operator()(const DepthShaderKey& key) const {
+            return (key.useSkinning ? 1u : 0u) |
+                   ((key.useInstancing ? 1u : 0u) << 1u);
         }
     };
 
@@ -35,7 +65,7 @@ namespace threepp::metal {
 
         void* getOrCreateFragmentFunction(const ShaderProgramKey& key);
 
-        void* getOrCreateDepthVertexFunction(bool useSkinning);
+        void* getOrCreateDepthVertexFunction(bool useSkinning, bool useInstancing = false);
 
     private:
         struct Impl;

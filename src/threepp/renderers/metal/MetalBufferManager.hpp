@@ -17,6 +17,8 @@ namespace threepp {
 
             ~MetalBufferManager();
 
+            void beginFrame();
+
             void* getBuffer(BufferAttribute& attribute, size_t byteSize, const void* data);
 
             void* getDynamicBuffer(const void* key, size_t byteSize, const void* data);

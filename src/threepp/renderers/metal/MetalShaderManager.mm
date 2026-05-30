@@ -13,7 +13,24 @@ namespace threepp::metal {
 
     namespace {
 
+        void validateShaderKey(const ShaderProgramKey& key) {
+            if (key.useInstancing && key.useSkinning) {
+                throw std::runtime_error("Metal shader variant cannot enable instancing and skinning together");
+            }
+            if (key.useInstanceColor && !key.useInstancing) {
+                throw std::runtime_error("Metal shader variant cannot enable instance colors without instancing");
+            }
+        }
+
+        void validateDepthShaderKey(const DepthShaderKey& key) {
+            if (key.useInstancing && key.useSkinning) {
+                throw std::runtime_error("Metal depth shader variant cannot enable instancing and skinning together");
+            }
+        }
+
         std::string buildShaderSource(const ShaderProgramKey& key) {
+            validateShaderKey(key);
+
             std::string source;
             source += "#define USE_MAP ";
             source += key.useMap ? "1\n" : "0\n";
@@ -25,15 +42,23 @@ namespace threepp::metal {
             source += key.useSkinning ? "1\n" : "0\n";
             source += "#define USE_LIGHTS ";
             source += key.useLights ? "1\n" : "0\n";
+            source += "#define USE_INSTANCING ";
+            source += key.useInstancing ? "1\n" : "0\n";
+            source += "#define USE_INSTANCE_COLOR ";
+            source += key.useInstanceColor ? "1\n" : "0\n";
             source += basic_vertex;
             source += basic_fragment;
             return source;
         }
 
-        std::string buildDepthShaderSource(bool useSkinning) {
+        std::string buildDepthShaderSource(const DepthShaderKey& key) {
+            validateDepthShaderKey(key);
+
             std::string source;
             source += "#define USE_SKINNING ";
-            source += useSkinning ? "1\n" : "0\n";
+            source += key.useSkinning ? "1\n" : "0\n";
+            source += "#define USE_INSTANCING ";
+            source += key.useInstancing ? "1\n" : "0\n";
             source += depth_vertex;
             return source;
         }
@@ -50,13 +75,15 @@ namespace threepp::metal {
 
         id<MTLDevice> device;
         std::unordered_map<ShaderProgramKey, ShaderProgramInstance, ShaderProgramKeyHash> programs;
-        std::unordered_map<bool, id<MTLLibrary>> depthLibraries;
-        std::unordered_map<bool, id<MTLFunction>> depthVertexFunctions;
+        std::unordered_map<DepthShaderKey, id<MTLLibrary>, DepthShaderKeyHash> depthLibraries;
+        std::unordered_map<DepthShaderKey, id<MTLFunction>, DepthShaderKeyHash> depthVertexFunctions;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
 
         ShaderProgramInstance& getOrCreateProgram(const ShaderProgramKey& key) {
+            validateShaderKey(key);
+
             auto it = programs.find(key);
             if (it != programs.end()) {
                 return it->second;
@@ -87,13 +114,15 @@ namespace threepp::metal {
             return inserted->second;
         }
 
-        id<MTLFunction> getOrCreateDepthVertexFunction(bool useSkinning) {
-            auto functionIt = depthVertexFunctions.find(useSkinning);
+        id<MTLFunction> getOrCreateDepthVertexFunction(const DepthShaderKey& key) {
+            validateDepthShaderKey(key);
+
+            auto functionIt = depthVertexFunctions.find(key);
             if (functionIt != depthVertexFunctions.end()) {
                 return functionIt->second;
             }
 
-            const auto sourceText = buildDepthShaderSource(useSkinning);
+            const auto sourceText = buildDepthShaderSource(key);
             NSString* source = [NSString stringWithUTF8String:sourceText.c_str()];
 
             NSError* error = nil;
@@ -111,8 +140,8 @@ namespace threepp::metal {
                 throw std::runtime_error("Failed to find MSL depth vertex function");
             }
 
-            depthLibraries.emplace(useSkinning, library);
-            depthVertexFunctions.emplace(useSkinning, function);
+            depthLibraries.emplace(key, library);
+            depthVertexFunctions.emplace(key, function);
             return function;
         }
     };
@@ -130,8 +159,8 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreateProgram(key).fragmentFunction;
     }
 
-    void* MetalShaderManager::getOrCreateDepthVertexFunction(bool useSkinning) {
-        return (__bridge void*) pimpl_->getOrCreateDepthVertexFunction(useSkinning);
+    void* MetalShaderManager::getOrCreateDepthVertexFunction(bool useSkinning, bool useInstancing) {
+        return (__bridge void*) pimpl_->getOrCreateDepthVertexFunction(DepthShaderKey{useSkinning, useInstancing});
     }
 
 }// namespace threepp::metal

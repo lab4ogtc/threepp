@@ -23,6 +23,7 @@ RenderTarget::RenderTarget(unsigned int width, unsigned int height, const Option
     if (options.type) texture->type = *options.type;
     if (options.anisotropy) texture->anisotropy = *options.anisotropy;
     if (options.encoding) texture->encoding = *options.encoding;
+    texture->generateMipmaps = options.generateMipmaps;
 
     if (options.depthTexture) depthTexture = options.depthTexture;
 }

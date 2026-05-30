@@ -19,7 +19,11 @@ namespace threepp::metal {
     }// namespace
 
     bool PipelineKey::operator==(const PipelineKey& other) const {
-        return vertexFunction == other.vertexFunction && fragmentFunction == other.fragmentFunction && alphaBlending == other.alphaBlending && vertexLayoutBitmask == other.vertexLayoutBitmask;
+        return vertexFunction == other.vertexFunction &&
+               fragmentFunction == other.fragmentFunction &&
+               alphaBlending == other.alphaBlending &&
+               vertexLayoutBitmask == other.vertexLayoutBitmask &&
+               colorPixelFormat == other.colorPixelFormat;
     }
 
     size_t PipelineKeyHash::operator()(const PipelineKey& key) const {
@@ -27,7 +31,8 @@ namespace threepp::metal {
         auto h2 = std::hash<void*>{}(key.fragmentFunction);
         auto h3 = std::hash<bool>{}(key.alphaBlending);
         auto h4 = std::hash<std::uint8_t>{}(key.vertexLayoutBitmask);
-        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3);
+        auto h5 = std::hash<std::uint64_t>{}(key.colorPixelFormat);
+        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
     }
 
     namespace {
@@ -155,7 +160,7 @@ namespace threepp::metal {
             desc.fragmentFunction = (__bridge id<MTLFunction>) key.fragmentFunction;
             desc.vertexDescriptor = createVertexDescriptor(key.vertexLayoutBitmask);
 
-            desc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+            desc.colorAttachments[0].pixelFormat = static_cast<MTLPixelFormat>(key.colorPixelFormat);
             desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
 
             if (key.alphaBlending) {

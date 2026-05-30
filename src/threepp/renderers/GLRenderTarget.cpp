@@ -25,6 +25,7 @@ void GLRenderTarget::setSize(unsigned int width, unsigned int height, unsigned i
         this->texture->image().depth = depth;
 
         this->dispose();
+        this->disposed = false;
     }
 
     this->viewport.set(0, 0, static_cast<float>(width), static_cast<float>(height));

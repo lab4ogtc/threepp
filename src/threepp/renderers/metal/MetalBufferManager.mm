@@ -5,13 +5,33 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <unordered_map>
 
 namespace threepp::metal {
 
+    namespace {
+
+        constexpr std::size_t maxFramesInFlight = 3;
+
+        id<MTLBuffer> createSharedBuffer(id<MTLDevice> device, size_t byteSize, const void* data) {
+            const auto length = static_cast<NSUInteger>(std::max<std::size_t>(byteSize, 1));
+            if (byteSize > 0 && data) {
+                return [device newBufferWithBytes:data
+                                           length:length
+                                          options:MTLResourceStorageModeShared];
+            }
+            return [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+        }
+
+    }// namespace
+
     struct MetalBufferManager::Impl {
 
         id<MTLDevice> device;
+        std::uint32_t frameIndex = 0;
 
         struct CachedBuffer {
             id<MTLBuffer> mtlBuffer;
@@ -19,10 +39,14 @@ namespace threepp::metal {
         };
 
         std::unordered_map<BufferAttribute*, CachedBuffer> cache;
-        std::unordered_map<const void*, id<MTLBuffer>> dynamicCache;
+        std::unordered_map<const void*, std::array<id<MTLBuffer>, maxFramesInFlight>> dynamicCache;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
+
+        void beginFrame() {
+            frameIndex = (frameIndex + 1u) % maxFramesInFlight;
+        }
 
         id<MTLBuffer> getBuffer(BufferAttribute& attribute, size_t byteSize, const void* data) {
             auto it = cache.find(&attribute);
@@ -31,9 +55,7 @@ namespace threepp::metal {
                 if (cached.lastVersion != attribute.version) {
                     if (byteSize > 0) {
                         if (byteSize > cached.mtlBuffer.length) {
-                            cached.mtlBuffer = [device newBufferWithBytes:data
-                                                                   length:byteSize
-                                                                  options:MTLResourceStorageModeShared];
+                            cached.mtlBuffer = createSharedBuffer(device, byteSize, data);
                         } else {
                             memcpy(cached.mtlBuffer.contents, data, byteSize);
                         }
@@ -44,31 +66,20 @@ namespace threepp::metal {
             }
 
             CachedBuffer cb;
-            cb.mtlBuffer = [device newBufferWithBytes:data
-                                               length:byteSize
-                                              options:MTLResourceStorageModeShared];
+            cb.mtlBuffer = createSharedBuffer(device, byteSize, data);
             cb.lastVersion = attribute.version;
             cache[&attribute] = cb;
             return cb.mtlBuffer;
         }
 
         id<MTLBuffer> getDynamicBuffer(const void* key, size_t byteSize, const void* data) {
-            auto it = dynamicCache.find(key);
-            if (it != dynamicCache.end()) {
-                if (byteSize > it->second.length) {
-                    it->second = [device newBufferWithBytes:data
-                                                     length:byteSize
-                                                    options:MTLResourceStorageModeShared];
-                } else if (byteSize > 0) {
-                    memcpy(it->second.contents, data, byteSize);
-                }
-                return it->second;
+            auto& buffers = dynamicCache[key];
+            auto& buffer = buffers[frameIndex];
+            if (!buffer || byteSize > buffer.length) {
+                buffer = createSharedBuffer(device, byteSize, data);
+            } else if (byteSize > 0) {
+                memcpy(buffer.contents, data, byteSize);
             }
-
-            id<MTLBuffer> buffer = [device newBufferWithBytes:data
-                                                       length:byteSize
-                                                      options:MTLResourceStorageModeShared];
-            dynamicCache[key] = buffer;
             return buffer;
         }
     };
@@ -77,6 +88,10 @@ namespace threepp::metal {
         : pimpl_(std::make_unique<Impl>((__bridge id<MTLDevice>) device)) {}
 
     MetalBufferManager::~MetalBufferManager() = default;
+
+    void MetalBufferManager::beginFrame() {
+        pimpl_->beginFrame();
+    }
 
     void* MetalBufferManager::getBuffer(BufferAttribute& attribute, size_t byteSize, const void* data) {
         return (__bridge void*) pimpl_->getBuffer(attribute, byteSize, data);
