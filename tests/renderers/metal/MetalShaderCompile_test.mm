@@ -10,15 +10,30 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstddef>
 #include <iostream>
-#include <stdexcept>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
 using namespace threepp;
 
 namespace {
+
+    class TestBufferAttribute: public BufferAttribute {
+
+    public:
+        explicit TestBufferAttribute(int count)
+            : BufferAttribute(1, false), count_(count) {}
+
+        [[nodiscard]] int count() const override {
+            return count_;
+        }
+
+    private:
+        int count_;
+    };
 
     std::vector<Image> makeCubeFaces(unsigned int size = 1) {
         std::vector<Image> faces;
@@ -144,6 +159,62 @@ TEST_CASE("Metal P3 buffer manager rotates only dynamic buffers across frames") 
         REQUIRE(dynamic1 != dynamic2);
         REQUIRE(dynamic2 != dynamic3);
         REQUIRE(dynamic0 == dynamic3);
+    }
+}
+
+TEST_CASE("Metal buffer manager refreshes reused attribute addresses") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalBufferManager bufferManager((__bridge void*) device);
+
+        alignas(TestBufferAttribute) std::byte storage[sizeof(TestBufferAttribute)];
+        std::vector<float> first{1.f, 2.f, 3.f};
+        std::vector<float> second{4.f, 5.f, 6.f};
+
+        auto* firstAttribute = new (storage) TestBufferAttribute(static_cast<int>(first.size()));
+        auto* firstBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(*firstAttribute, first.size() * sizeof(float), first.data());
+        REQUIRE(firstBuffer != nil);
+        REQUIRE(static_cast<const float*>(firstBuffer.contents)[0] == 1.f);
+        firstAttribute->~TestBufferAttribute();
+
+        auto* secondAttribute = new (storage) TestBufferAttribute(static_cast<int>(second.size()));
+        REQUIRE(static_cast<void*>(secondAttribute) == static_cast<void*>(storage));
+        auto* secondBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(*secondAttribute, second.size() * sizeof(float), second.data());
+        REQUIRE(secondBuffer != nil);
+        REQUIRE(static_cast<const float*>(secondBuffer.contents)[0] == 4.f);
+        secondAttribute->~TestBufferAttribute();
+    }
+}
+
+TEST_CASE("Metal buffer manager drops removed static buffers") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalBufferManager bufferManager((__bridge void*) device);
+
+        std::vector<float> first{1.f, 2.f, 3.f};
+        std::vector<float> second{4.f, 5.f, 6.f};
+        auto attribute = FloatBufferAttribute::create(first, 1);
+
+        auto* firstBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(*attribute, first.size() * sizeof(float), first.data());
+        REQUIRE(firstBuffer != nil);
+        REQUIRE(static_cast<const float*>(firstBuffer.contents)[0] == 1.f);
+
+        bufferManager.remove(*attribute);
+
+        attribute->array() = second;
+        auto* secondBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(*attribute, attribute->array().size() * sizeof(float), attribute->array().data());
+        REQUIRE(secondBuffer != nil);
+        REQUIRE(static_cast<const float*>(secondBuffer.contents)[0] == 4.f);
     }
 }
 

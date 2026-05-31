@@ -36,7 +36,9 @@ namespace threepp::metal {
 
         struct CachedBuffer {
             id<MTLBuffer> mtlBuffer;
+            unsigned int attributeId = 0;
             unsigned int lastVersion = 0;
+            size_t byteSize = 0;
         };
 
         std::unordered_map<BufferAttribute*, CachedBuffer> cache;
@@ -56,7 +58,7 @@ namespace threepp::metal {
             auto it = cache.find(&attribute);
             if (it != cache.end()) {
                 auto& cached = it->second;
-                if (cached.lastVersion != attribute.version) {
+                if (cached.attributeId != attribute.id || cached.lastVersion != attribute.version || cached.byteSize != byteSize) {
                     if (byteSize > 0) {
                         if (byteSize > cached.mtlBuffer.length) {
                             cached.mtlBuffer = createSharedBuffer(device, byteSize, data);
@@ -64,16 +66,24 @@ namespace threepp::metal {
                             memcpy(cached.mtlBuffer.contents, data, byteSize);
                         }
                     }
+                    cached.attributeId = attribute.id;
                     cached.lastVersion = attribute.version;
+                    cached.byteSize = byteSize;
                 }
                 return cached.mtlBuffer;
             }
 
             CachedBuffer cb;
             cb.mtlBuffer = createSharedBuffer(device, byteSize, data);
+            cb.attributeId = attribute.id;
             cb.lastVersion = attribute.version;
+            cb.byteSize = byteSize;
             cache[&attribute] = cb;
             return cb.mtlBuffer;
+        }
+
+        void remove(BufferAttribute& attribute) {
+            cache.erase(&attribute);
         }
 
         id<MTLBuffer> getDynamicBuffer(const void* key, size_t byteSize, const void* data) {
@@ -116,6 +126,10 @@ namespace threepp::metal {
 
     void* MetalBufferManager::getBuffer(BufferAttribute& attribute, size_t byteSize, const void* data) {
         return (__bridge void*) pimpl_->getBuffer(attribute, byteSize, data);
+    }
+
+    void MetalBufferManager::remove(BufferAttribute& attribute) {
+        pimpl_->remove(attribute);
     }
 
     void* MetalBufferManager::getDynamicBuffer(const void* key, size_t byteSize, const void* data) {

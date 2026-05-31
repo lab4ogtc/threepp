@@ -676,6 +676,7 @@ struct MetalRenderer::Impl {
         std::vector<float> values;
     };
     std::unordered_map<BufferAttribute*, ConvertedSkinIndexBuffer> convertedSkinIndexBuffers;
+    std::unordered_map<BufferGeometry*, bool> geometries;
     std::vector<unsigned int> lineLoopIndices;
 
     struct MetalRenderTargetResources {
@@ -706,7 +707,24 @@ struct MetalRenderer::Impl {
         Impl& scope;
     };
 
+    struct OnGeometryDispose: EventListener {
+        explicit OnGeometryDispose(Impl& scope)
+            : scope(scope) {}
+
+        void onEvent(Event& event) override {
+            auto** geometryPtr = std::any_cast<BufferGeometry*>(&event.target);
+            if (!geometryPtr || !*geometryPtr) return;
+
+            auto* geometry = *geometryPtr;
+            geometry->removeEventListener("dispose", *this);
+            scope.deallocateGeometry(*geometry);
+        }
+
+        Impl& scope;
+    };
+
     OnRenderTargetDispose onRenderTargetDispose;
+    OnGeometryDispose onGeometryDispose;
     std::unordered_map<RenderTarget*, MetalRenderTargetResources> renderTargetResources;
 
     Color clearColor{0, 0, 0};
@@ -730,7 +748,8 @@ struct MetalRenderer::Impl {
 
     explicit Impl(Window& w)
         : window(w),
-          onRenderTargetDispose(*this) {
+          onRenderTargetDispose(*this),
+          onGeometryDispose(*this) {
 
         GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window.nativeHandle());
         NSWindow* nsWindow = glfwGetCocoaWindow(glfwWin);
@@ -786,6 +805,38 @@ struct MetalRenderer::Impl {
         for (auto& [target, _] : renderTargetResources) {
             target->removeEventListener("dispose", onRenderTargetDispose);
         }
+        for (auto& [geometry, _] : geometries) {
+            geometry->removeEventListener("dispose", onGeometryDispose);
+        }
+    }
+
+    void removeAttribute(BufferAttribute* attribute) {
+        if (!attribute) return;
+
+        bufferManager->remove(*attribute);
+        convertedSkinIndexBuffers.erase(attribute);
+    }
+
+    void deallocateGeometry(BufferGeometry& geometry) {
+        removeAttribute(geometry.getIndex());
+
+        for (const auto& [_, attribute] : geometry.getAttributes()) {
+            removeAttribute(attribute.get());
+        }
+        for (const auto& [_, attributes] : geometry.getMorphAttributes()) {
+            for (const auto& attribute : attributes) {
+                removeAttribute(attribute.get());
+            }
+        }
+
+        geometries.erase(&geometry);
+    }
+
+    void trackGeometry(BufferGeometry& geometry) {
+        if (geometries.contains(&geometry)) return;
+
+        geometry.addEventListener("dispose", onGeometryDispose);
+        geometries[&geometry] = true;
     }
 
     void commitPendingFrame() {
@@ -1449,6 +1500,7 @@ struct MetalRenderer::Impl {
         auto* material = materialPtr ? materialPtr->as<LineBasicMaterial>() : nullptr;
         auto geometry = line.geometry();
         if (!material || !geometry || !material->visible) return;
+        trackGeometry(*geometry);
 
         auto* posAttr = getFloatAttribute(*geometry, "position");
         if (!posAttr) return;
@@ -1505,6 +1557,7 @@ struct MetalRenderer::Impl {
         auto* material = materialPtr ? materialPtr->as<PointsMaterial>() : nullptr;
         auto geometry = points.geometry();
         if (!material || !geometry || !material->visible) return;
+        trackGeometry(*geometry);
 
         auto* posAttr = getFloatAttribute(*geometry, "position");
         if (!posAttr) return;
@@ -1546,6 +1599,7 @@ struct MetalRenderer::Impl {
         auto* material = materialPtr ? materialPtr->as<RawShaderMaterial>() : nullptr;
         auto geometry = mesh.geometry();
         if (!material || !geometry || !material->visible) return;
+        trackGeometry(*geometry);
 
         auto* posAttr = getFloatAttribute(*geometry, "position");
         auto* colorAttr = getFloatAttribute(*geometry, "color");
@@ -1636,6 +1690,7 @@ struct MetalRenderer::Impl {
         auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
         auto geometry = sky.geometry();
         if (!material || !geometry || !material->visible) return;
+        trackGeometry(*geometry);
 
         auto* posAttr = getFloatAttribute(*geometry, "position");
         if (!posAttr) return;
@@ -1685,6 +1740,7 @@ struct MetalRenderer::Impl {
         auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
         auto geometry = water.geometry();
         if (!material || !geometry || !material->visible) return;
+        trackGeometry(*geometry);
 
         auto* posAttr = getFloatAttribute(*geometry, "position");
         if (!posAttr) return;
@@ -1759,6 +1815,7 @@ struct MetalRenderer::Impl {
                 auto* geometry = mesh->geometry().get();
                 auto* material = mesh->material().get();
                 if (geometry && material && material->visible) {
+                    trackGeometry(*geometry);
                     auto* posAttr = getFloatAttribute(*geometry, "position");
                     if (posAttr) {
                         const auto* wf = dynamic_cast<MaterialWithWireframe*>(material);
@@ -1819,6 +1876,7 @@ struct MetalRenderer::Impl {
                 auto* geometry = mesh->geometry().get();
                 auto* material = mesh->material().get();
                 if (geometry && material && material->visible) {
+                    trackGeometry(*geometry);
                     auto* posAttr = getFloatAttribute(*geometry, "position");
                     if (posAttr) {
                         const auto* wf = dynamic_cast<MaterialWithWireframe*>(material);
@@ -2234,6 +2292,7 @@ struct MetalRenderer::Impl {
             }
 
             if (!geometry || !material || !material->visible) continue;
+            trackGeometry(*geometry);
 
             auto* posAttr = getFloatAttribute(*geometry, "position");
             if (!posAttr) continue;

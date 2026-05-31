@@ -13,7 +13,7 @@ add_example(NAME "basic_geometries" LINK_IMGUI WEB)
 
 if (APPLE)
     add_example(NAME "dynamic_metal")
-    add_example(NAME "basic_geometries_metal")
+    add_example(NAME "basic_geometries_metal" LINK_IMGUI)
     add_example(NAME "tube_geometry_metal")
     add_example(NAME "shape_geometry_metal")
 endif ()

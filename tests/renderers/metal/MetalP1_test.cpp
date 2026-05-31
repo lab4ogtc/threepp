@@ -263,6 +263,7 @@ TEST_CASE("Metal P1 managers keep Objective-C types hidden behind void pointers"
 
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalShaderManager, void*>);
     STATIC_REQUIRE(std::is_constructible_v<metal::MetalTextureManager, void*, void*>);
+    STATIC_REQUIRE(std::is_same_v<void, decltype(std::declval<metal::MetalBufferManager&>().remove(std::declval<BufferAttribute&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalBufferManager&>().getDynamicBuffer(nullptr, std::size_t{}, nullptr))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalBufferManager&>().getTransientBuffer(std::size_t{}, nullptr))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateVertexFunction(std::declval<const metal::ShaderProgramKey&>()))>);
