@@ -1811,7 +1811,10 @@ struct MetalRenderer::Impl {
         if (!object.visible) return;
 
         if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
-            if (object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
+            auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
+            const bool hasRenderableInstances = !instancedMesh || instancedMesh->count() > 0;
+
+            if (hasRenderableInstances && object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
                 auto* geometry = mesh->geometry().get();
                 auto* material = mesh->material().get();
                 if (geometry && material && material->visible) {
@@ -1827,7 +1830,6 @@ struct MetalRenderer::Impl {
                         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
                         [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
-                        auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
                         const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
                         auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(mesh);
                         const bool useSkinning = bindSkinning(encoder, *geometry, skinnedMesh);
@@ -1872,7 +1874,10 @@ struct MetalRenderer::Impl {
         if (!object.visible) return;
 
         if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
-            if (object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
+            auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
+            const bool hasRenderableInstances = !instancedMesh || instancedMesh->count() > 0;
+
+            if (hasRenderableInstances && object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
                 auto* geometry = mesh->geometry().get();
                 auto* material = mesh->material().get();
                 if (geometry && material && material->visible) {
@@ -1888,7 +1893,6 @@ struct MetalRenderer::Impl {
                         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
                         [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
-                        auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
                         const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
                         auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(mesh);
                         const bool useSkinning = bindSkinning(encoder, *geometry, skinnedMesh);
@@ -2299,8 +2303,9 @@ struct MetalRenderer::Impl {
             auto* normAttr = getFloatAttribute(*geometry, "normal");
             auto* uvAttr = getFloatAttribute(*geometry, "uv");
             auto* colorAttr = getFloatAttribute(*geometry, "color");
-            auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
             auto* instancedMesh = dynamic_cast<InstancedMesh*>(obj);
+            if (instancedMesh && instancedMesh->count() == 0) continue;
+            auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
 
             const auto shadingParams = extractShadingParams(*material, camera, obj->receiveShadow);
             const bool useUv = uvAttr && needsUv(shadingParams);
@@ -2324,6 +2329,8 @@ struct MetalRenderer::Impl {
             shaderKey.useLights = useLights;
             shaderKey.useInstancing = useInstancing;
             shaderKey.useInstanceColor = useInstanceColor;
+            shaderKey.doubleSided = material->side == Side::Double;
+            shaderKey.flipSided = material->side == Side::Back;
 
             std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
             if (useNormal) vertexLayoutBitmask |= vertexLayoutNormal;

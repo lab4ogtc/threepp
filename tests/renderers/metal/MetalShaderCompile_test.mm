@@ -58,7 +58,7 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
 
         metal::MetalShaderManager shaderManager((__bridge void*) device);
 
-        for (unsigned int mask = 0; mask < 128; ++mask) {
+        for (unsigned int mask = 0; mask < 512; ++mask) {
             metal::ShaderProgramKey key;
             key.useMap = (mask & 1u) != 0u;
             key.useVertexColors = (mask & 2u) != 0u;
@@ -67,9 +67,12 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
             key.useLights = (mask & 16u) != 0u;
             key.useInstancing = (mask & 32u) != 0u;
             key.useInstanceColor = (mask & 64u) != 0u;
+            key.doubleSided = (mask & 128u) != 0u;
+            key.flipSided = (mask & 256u) != 0u;
 
             if ((key.useInstancing && key.useSkinning) ||
-                (key.useInstanceColor && !key.useInstancing)) {
+                (key.useInstanceColor && !key.useInstancing) ||
+                (key.doubleSided && key.flipSided)) {
                 continue;
             }
 
@@ -124,6 +127,11 @@ TEST_CASE("Metal P3 shader manager rejects invalid instancing variants") {
         metal::ShaderProgramKey orphanInstanceColor;
         orphanInstanceColor.useInstanceColor = true;
         REQUIRE_THROWS_AS(shaderManager.getOrCreateFragmentFunction(orphanInstanceColor), std::runtime_error);
+
+        metal::ShaderProgramKey conflictingSide;
+        conflictingSide.doubleSided = true;
+        conflictingSide.flipSided = true;
+        REQUIRE_THROWS_AS(shaderManager.getOrCreateFragmentFunction(conflictingSide), std::runtime_error);
 
         REQUIRE_THROWS_AS(shaderManager.getOrCreateDepthVertexFunction(true, true), std::runtime_error);
     }

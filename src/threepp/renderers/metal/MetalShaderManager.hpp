@@ -14,6 +14,8 @@ namespace threepp::metal {
         bool useLights = false;
         bool useInstancing = false;
         bool useInstanceColor = false;
+        bool doubleSided = false;
+        bool flipSided = false;
 
         bool operator==(const ShaderProgramKey& other) const {
             return useMap == other.useMap &&
@@ -22,7 +24,9 @@ namespace threepp::metal {
                    useSkinning == other.useSkinning &&
                    useLights == other.useLights &&
                    useInstancing == other.useInstancing &&
-                   useInstanceColor == other.useInstanceColor;
+                   useInstanceColor == other.useInstanceColor &&
+                   doubleSided == other.doubleSided &&
+                   flipSided == other.flipSided;
         }
     };
 
@@ -34,7 +38,9 @@ namespace threepp::metal {
                    ((key.useSkinning ? 1u : 0u) << 3u) |
                    ((key.useLights ? 1u : 0u) << 4u) |
                    ((key.useInstancing ? 1u : 0u) << 5u) |
-                   ((key.useInstanceColor ? 1u : 0u) << 6u);
+                   ((key.useInstanceColor ? 1u : 0u) << 6u) |
+                   ((key.doubleSided ? 1u : 0u) << 7u) |
+                   ((key.flipSided ? 1u : 0u) << 8u);
         }
     };
 

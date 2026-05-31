@@ -410,6 +410,9 @@ fragment float4 basic_fragment(
     , depth2d<float> pointShadowMap3 [[texture(18)]]
     , sampler shadowSampler [[sampler(1)]]
 #endif
+#if USE_NORMAL && USE_DOUBLE_SIDED
+    , bool frontFacing [[front_facing]]
+#endif
 )
 {
     float4 baseColor = params.baseColor;
@@ -444,13 +447,21 @@ fragment float4 basic_fragment(
 
 #if USE_NORMAL
     float3 n = normalize(in.normal);
+    float normalFaceDirection = 1.0;
+#if USE_DOUBLE_SIDED
+    normalFaceDirection *= frontFacing ? 1.0 : -1.0;
+#endif
+#if USE_FLIP_SIDED
+    normalFaceDirection *= -1.0;
+#endif
+    n *= normalFaceDirection;
 #else
     float3 n = float3(0.0, 0.0, 1.0);
 #endif
 
 #if USE_MAP && USE_NORMAL
     if (params.textureFlags0.y != 0) {
-        n = perturbNormalFromMap(n, in.tangent, in.bitangent, in.uv, normalMap, mapSampler);
+        n = perturbNormalFromMap(n, in.tangent * normalFaceDirection, in.bitangent * normalFaceDirection, in.uv, normalMap, mapSampler);
     }
 #endif
 

@@ -20,6 +20,9 @@ namespace threepp::metal {
             if (key.useInstanceColor && !key.useInstancing) {
                 throw std::runtime_error("Metal shader variant cannot enable instance colors without instancing");
             }
+            if (key.doubleSided && key.flipSided) {
+                throw std::runtime_error("Metal shader variant cannot enable double-sided and flip-sided normals together");
+            }
         }
 
         void validateDepthShaderKey(const DepthShaderKey& key) {
@@ -46,6 +49,10 @@ namespace threepp::metal {
             source += key.useInstancing ? "1\n" : "0\n";
             source += "#define USE_INSTANCE_COLOR ";
             source += key.useInstanceColor ? "1\n" : "0\n";
+            source += "#define USE_DOUBLE_SIDED ";
+            source += key.doubleSided ? "1\n" : "0\n";
+            source += "#define USE_FLIP_SIDED ";
+            source += key.flipSided ? "1\n" : "0\n";
             source += basic_vertex;
             source += basic_fragment;
             return source;

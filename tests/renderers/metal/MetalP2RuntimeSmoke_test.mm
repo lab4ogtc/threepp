@@ -512,6 +512,105 @@ TEST_CASE("Metal P3 renderer supports instanced render target mixed pass") {
     }
 }
 
+TEST_CASE("Metal renderer skips instanced meshes with zero count") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal zero-count instancing smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto material = MeshBasicMaterial::create({{"color", Color::yellow},
+                                                   {"side", Side::Double}});
+        auto instanced = InstancedMesh::create(PlaneGeometry::create(1.5f, 1.5f), material, 1);
+        instanced->setCount(0);
+        scene->add(instanced);
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        auto pixels = metalRenderer->readRGBPixels();
+        REQUIRE(std::none_of(pixels.begin(), pixels.end(), [](auto value) {
+            return value != 0;
+        }));
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer lights double-sided back faces with flipped normals") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal double-sided normal smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+
+        auto material = MeshPhongMaterial::create({{"color", Color::white},
+                                                   {"side", Side::Double}});
+        auto plane = Mesh::create(PlaneGeometry::create(1.5f, 1.5f), material);
+        scene->add(plane);
+
+        auto light = DirectionalLight::create(Color::white, 1.f);
+        scene->add(light);
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+
+        auto renderCenterLuminance = [&](float z) {
+            camera->position.set(0.f, 0.f, z);
+            camera->lookAt(0.f, 0.f, 0.f);
+            light->position.set(0.f, 0.f, z);
+
+            renderer->clear();
+            renderer->render(*scene, *camera);
+
+            const auto pixels = metalRenderer->readRGBPixels();
+            const auto [width, height] = canvas.size();
+            const auto center = (static_cast<std::size_t>(height) / 2u * static_cast<std::size_t>(width) + static_cast<std::size_t>(width) / 2u) * 3u;
+            REQUIRE(center + 2u < pixels.size());
+            return static_cast<float>(pixels[center]) +
+                   static_cast<float>(pixels[center + 1u]) +
+                   static_cast<float>(pixels[center + 2u]);
+        };
+
+        const auto frontLuminance = renderCenterLuminance(2.f);
+        const auto backLuminance = renderCenterLuminance(-2.f);
+
+        REQUIRE(frontLuminance > 50.f);
+        REQUIRE(backLuminance > frontLuminance * 0.5f);
+
+        canvas.close();
+    }
+}
+
 TEST_CASE("Metal renderer auto-updates LOD objects during traversal") {
 
     @autoreleasepool {

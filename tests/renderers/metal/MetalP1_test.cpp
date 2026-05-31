@@ -102,6 +102,15 @@ TEST_CASE("Metal P1 cache keys include shader features and vertex layout") {
     REQUIRE_FALSE(textured == vertexColored);
     REQUIRE(metal::ShaderProgramKeyHash{}(textured) != metal::ShaderProgramKeyHash{}(vertexColored));
 
+    metal::ShaderProgramKey doubleSided{};
+    doubleSided.doubleSided = true;
+
+    metal::ShaderProgramKey flipSided{};
+    flipSided.flipSided = true;
+
+    REQUIRE_FALSE(doubleSided == flipSided);
+    REQUIRE(metal::ShaderProgramKeyHash{}(doubleSided) != metal::ShaderProgramKeyHash{}(flipSided));
+
     metal::PipelineKey withUv{};
     withUv.vertexFunction = reinterpret_cast<void*>(0x1);
     withUv.fragmentFunction = reinterpret_cast<void*>(0x2);
