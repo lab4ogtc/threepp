@@ -37,7 +37,8 @@ void GLRenderTarget::dispose() {
     if (!disposed) {
 
         disposed = true;
-        this->dispatchEvent("dispose", this);
+        RenderTarget* target = this;
+        this->dispatchEvent("dispose", target);
     }
 }
 

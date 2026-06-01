@@ -1,4 +1,6 @@
 add_test_executable(MetalP1_test)
+add_test_executable(MetalRenderList_test)
+target_include_directories(MetalRenderList_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
 add_executable(MetalShaderCompile_test MetalShaderCompile_test.mm)
 target_link_libraries(MetalShaderCompile_test PRIVATE threepp Catch2::Catch2WithMain)

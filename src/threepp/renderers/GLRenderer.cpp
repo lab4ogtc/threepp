@@ -2,6 +2,7 @@
 #include "threepp/renderers/GLRenderer.hpp"
 
 #include "threepp/renderers/GLRenderTarget.hpp"
+#include "threepp/renderers/RenderJob.hpp"
 
 #include "threepp/canvas/Window.hpp"
 
@@ -145,6 +146,8 @@ struct GLRenderer::Impl {
     std::unique_ptr<gl::GLIndexedBufferRenderer> indexedBufferRenderer;
 
     gl::GLShadowMap shadowMap;
+    std::vector<RenderJob> preRenderJobs;
+    bool renderingPrePass = false;
 
     Impl(GLRenderer& scope, Window& window, const Parameters& parameters)
         : Impl(scope, window.size(), parameters) {
@@ -257,6 +260,8 @@ struct GLRenderer::Impl {
 
         renderListStack.emplace_back(currentRenderList);
 
+        if (!renderingPrePass) preRenderJobs.clear();
+
         projectObject(scene, camera, 0, scope.sortObjects);
 
         currentRenderList->finish();
@@ -293,6 +298,7 @@ struct GLRenderer::Impl {
         auto& transparentObjects = currentRenderList->transparent;
         //
         if (!opaqueObjects.empty()) renderObjects(opaqueObjects, scene, camera);
+        if (!renderingPrePass) renderPreRenderJobs(scene);
         if (!transparentObjects.empty()) renderObjects(transparentObjects, scene, camera);
 
         //
@@ -543,6 +549,14 @@ struct GLRenderer::Impl {
 
                 if (!object->frustumCulled || _frustum.intersectsObject(*object)) {
 
+                    if (!renderingPrePass) {
+                        if (auto* preRenderable = dynamic_cast<PreRenderable*>(object)) {
+                            if (auto job = preRenderable->getPreRenderJob(*camera)) {
+                                scope.addPreRenderJob(*job);
+                            }
+                        }
+                    }
+
                     if (sortObjects) {
 
                         _vector3.setFromMatrixPosition(*object->matrixWorld)
@@ -596,6 +610,56 @@ struct GLRenderer::Impl {
 
             renderObject(object, scene, camera, geometry, material, group);
         }
+    }
+
+    void addPreRenderJob(const RenderJob& job) {
+        if (!job.initiator || !job.camera || !job.renderTarget) return;
+
+        preRenderJobs.emplace_back(job);
+    }
+
+    void renderPreRenderJobs(Object3D* scene) {
+        if (preRenderJobs.empty()) return;
+
+        const auto jobs = std::move(preRenderJobs);
+        preRenderJobs.clear();
+
+        const auto previousRenderTarget = _currentRenderTarget;
+        const auto previousActiveCubeFace = _currentActiveCubeFace;
+        const auto previousActiveMipmapLevel = _currentActiveMipmapLevel;
+        const auto previousRenderingPrePass = renderingPrePass;
+        const auto previousShadowAutoUpdate = shadowMap.autoUpdate;
+
+        renderingPrePass = true;
+
+        for (const auto& job : jobs) {
+            auto* glRenderTarget = dynamic_cast<GLRenderTarget*>(job.renderTarget);
+            if (!job.initiator || !job.camera || !glRenderTarget) continue;
+
+            const auto previousVisible = job.initiator->visible;
+
+            try {
+                job.initiator->visible = false;
+                shadowMap.autoUpdate = false;
+                setRenderTarget(glRenderTarget, 0, 0);
+                state.depthBuffer.setMask(true);
+
+                if (!scope.autoClear) scope.clear();
+                render(scene, job.camera);
+            } catch (...) {
+                job.initiator->visible = previousVisible;
+                shadowMap.autoUpdate = previousShadowAutoUpdate;
+                setRenderTarget(previousRenderTarget, previousActiveCubeFace, previousActiveMipmapLevel);
+                renderingPrePass = previousRenderingPrePass;
+                throw;
+            }
+
+            job.initiator->visible = previousVisible;
+        }
+
+        shadowMap.autoUpdate = previousShadowAutoUpdate;
+        setRenderTarget(previousRenderTarget, previousActiveCubeFace, previousActiveMipmapLevel);
+        renderingPrePass = previousRenderingPrePass;
     }
 
     void renderObject(Object3D* object, Object3D* scene, Camera* camera, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
@@ -1502,6 +1566,11 @@ void GLRenderer::setRenderTarget(RenderTarget* renderTarget) {
 [[nodiscard]] GLRenderTarget* GLRenderer::getRenderTarget() {
 
     return pimpl_->_currentRenderTarget;
+}
+
+void GLRenderer::addPreRenderJob(const RenderJob& job) {
+
+    pimpl_->addPreRenderJob(job);
 }
 
 void GLRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {

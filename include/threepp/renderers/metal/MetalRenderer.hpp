@@ -55,6 +55,8 @@ namespace threepp {
 
         [[nodiscard]] RenderTarget* getRenderTarget() override;
 
+        void addPreRenderJob(const RenderJob& job) override;
+
         [[nodiscard]] void* device() const;
 
         [[nodiscard]] void* currentCommandBuffer() const;

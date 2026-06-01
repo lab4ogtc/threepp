@@ -19,8 +19,6 @@ namespace threepp::metal {
 
     inline void prepareCameraForRender(Camera& camera) {
 
-        camera.updateProjectionMatrix();
-
         if (camera.parent == nullptr) {
             camera.updateMatrixWorld();
         } else {

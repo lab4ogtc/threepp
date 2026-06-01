@@ -3,6 +3,59 @@
 
 namespace threepp::metal {
 
+    constexpr auto tone_mapping_functions = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+float3 LinearToneMapping(float3 color, float exposure) {
+    return exposure * color;
+}
+
+float3 ReinhardToneMapping(float3 color, float exposure) {
+    color *= exposure;
+    return clamp(color / (float3(1.0) + color), 0.0, 1.0);
+}
+
+float3 OptimizedCineonToneMapping(float3 color, float exposure) {
+    color *= exposure;
+    color = max(float3(0.0), color - 0.004);
+    return pow((color * (6.2 * color + 0.5)) / (color * (6.2 * color + 1.7) + 0.06), float3(2.2));
+}
+
+float3 RRTAndODTFit(float3 v) {
+    float3 a = v * (v + 0.0245786) - 0.000090537;
+    float3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return a / b;
+}
+
+float3 ACESFilmicToneMapping(float3 color, float exposure) {
+    const float3x3 ACESInputMat = float3x3(
+        float3(0.59719, 0.07600, 0.02840),
+        float3(0.35458, 0.90834, 0.13383),
+        float3(0.04823, 0.01566, 0.83777)
+    );
+    const float3x3 ACESOutputMat = float3x3(
+        float3( 1.60475, -0.10208, -0.00327),
+        float3(-0.53108,  1.10813, -0.07276),
+        float3(-0.07367, -0.00605,  1.07602)
+    );
+
+    color *= exposure / 0.6;
+    color = ACESInputMat * color;
+    color = RRTAndODTFit(color);
+    color = ACESOutputMat * color;
+    return clamp(color, 0.0, 1.0);
+}
+
+float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
+    if (toneMappingType == 1) return LinearToneMapping(color, exposure);
+    if (toneMappingType == 2) return ReinhardToneMapping(color, exposure);
+    if (toneMappingType == 3) return OptimizedCineonToneMapping(color, exposure);
+    if (toneMappingType == 4) return ACESFilmicToneMapping(color, exposure);
+    return color;
+}
+)metal";
+
     constexpr auto basic_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;
@@ -30,6 +83,7 @@ struct VertexInput {
 struct TransformUniforms {
     float4x4 mvp;
     float4x4 modelMatrix;
+    float4x4 modelViewMatrix;
     float4x4 normalMatrix;
     float4x4 bindMatrix;
     float4x4 bindMatrixInverse;
@@ -38,6 +92,7 @@ struct TransformUniforms {
 struct VertexOutput {
     float4 position [[position]];
     float3 worldPosition;
+    float fogDepth;
 #if USE_NORMAL
     float3 normal;
 #endif
@@ -97,6 +152,8 @@ vertex VertexOutput basic_vertex(
 
     float4 worldPosition = transforms.modelMatrix * localPosition;
     out.worldPosition = worldPosition.xyz;
+    float4 modelViewPosition = transforms.modelViewMatrix * localPosition;
+    out.fogDepth = -modelViewPosition.z;
 #if USE_INSTANCING
     out.position = transforms.mvp * worldPosition;
 #else
@@ -145,6 +202,13 @@ struct ShadingParams {
     uint4 textureFlags0;
     uint4 textureFlags1;
     float4 cameraPosition;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    uint materialType;
+    float4 specularColor;
+    float4 fogColor;
+    float4 fogParams;
 };
 
 struct DirectionalLightUniform {
@@ -228,6 +292,67 @@ float3 evaluateSH(float3 n, constant float4* sh) {
         sh[6].xyz * (0.315392 * (3.0 * n.z * n.z - 1.0)) +
         sh[7].xyz * (1.092548 * n.x * n.z) +
         sh[8].xyz * (0.546274 * (n.x * n.x - n.y * n.y));
+}
+
+float3 LinearToneMapping(float3 color, float exposure) {
+    return exposure * color;
+}
+
+float3 ReinhardToneMapping(float3 color, float exposure) {
+    color *= exposure;
+    return clamp(color / (float3(1.0) + color), 0.0, 1.0);
+}
+
+float3 OptimizedCineonToneMapping(float3 color, float exposure) {
+    color *= exposure;
+    color = max(float3(0.0), color - 0.004);
+    return pow((color * (6.2 * color + 0.5)) / (color * (6.2 * color + 1.7) + 0.06), float3(2.2));
+}
+
+float3 RRTAndODTFit(float3 v) {
+    float3 a = v * (v + 0.0245786) - 0.000090537;
+    float3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return a / b;
+}
+
+float3 ACESFilmicToneMapping(float3 color, float exposure) {
+    const float3x3 ACESInputMat = float3x3(
+        float3(0.59719, 0.07600, 0.02840),
+        float3(0.35458, 0.90834, 0.13383),
+        float3(0.04823, 0.01566, 0.83777)
+    );
+    const float3x3 ACESOutputMat = float3x3(
+        float3( 1.60475, -0.10208, -0.00327),
+        float3(-0.53108,  1.10813, -0.07276),
+        float3(-0.07367, -0.00605,  1.07602)
+    );
+
+    color *= exposure / 0.6;
+    color = ACESInputMat * color;
+    color = RRTAndODTFit(color);
+    color = ACESOutputMat * color;
+    return clamp(color, 0.0, 1.0);
+}
+
+float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
+    if (toneMappingType == 1) return LinearToneMapping(color, exposure);
+    if (toneMappingType == 2) return ReinhardToneMapping(color, exposure);
+    if (toneMappingType == 3) return OptimizedCineonToneMapping(color, exposure);
+    if (toneMappingType == 4) return ACESFilmicToneMapping(color, exposure);
+    return color;
+}
+
+float3 applyFog(float3 color, float fogDepth, constant ShadingParams& params) {
+    if (params.fogParams.w == 1.0) {
+        float fogFactor = smoothstep(params.fogParams.x, params.fogParams.y, fogDepth);
+        return mix(color, params.fogColor.rgb, fogFactor);
+    }
+    if (params.fogParams.w == 2.0) {
+        float density = params.fogParams.z;
+        float fogFactor = 1.0 - exp(-density * density * fogDepth * fogDepth);
+        return mix(color, params.fogColor.rgb, clamp(fogFactor, 0.0, 1.0));
+    }
+    return color;
 }
 
 float3 perturbNormalFromMap(float3 n, float3 tangent, float3 bitangent, float2 uv, texture2d<float> normalMap, sampler mapSampler) {
@@ -377,6 +502,27 @@ float3 directBRDF(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, 
     return (diffuse + specular) * radiance * nDotL;
 }
 
+float3 directLambert(float3 radiance, float3 n, float3 l, float3 albedo) {
+    return radiance * max(dot(n, l), 0.0) * albedo;
+}
+
+float3 blinnPhongFresnel(float3 specularColor, float dotLH) {
+    float fresnel = exp2((-5.55473 * dotLH - 6.98316) * dotLH);
+    return (1.0 - specularColor) * fresnel + specularColor;
+}
+
+float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float3 specularColor, float shininess) {
+    float nDotL = max(dot(n, l), 0.0);
+    float3 irradiance = radiance * nDotL;
+    float3 diffuse = irradiance * albedo;
+    float3 halfDir = normalize(l + v);
+    float dotNH = max(dot(n, halfDir), 0.0);
+    float dotLH = max(dot(l, halfDir), 0.0);
+    float3 fresnel = blinnPhongFresnel(specularColor, dotLH);
+    float specularStrength = 0.25 * (shininess * 0.5 + 1.0) * pow(dotNH, shininess);
+    return diffuse + irradiance * fresnel * specularStrength;
+}
+
 fragment float4 basic_fragment(
     VertexOutput in [[stage_in]],
     constant ShadingParams& params [[buffer(0)]]
@@ -465,6 +611,15 @@ fragment float4 basic_fragment(
     }
 #endif
 
+    if (params.materialType == 1) {
+        float3 color = n * 0.5 + 0.5;
+        if (params.toneMapped != 0 && params.toneMappingType != 0) {
+            color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
+        }
+        color = applyFog(color, in.fogDepth, params);
+        return float4(color, alpha);
+    }
+
 #if USE_LIGHTS
     float3 v = normalize(params.cameraPosition.xyz - in.worldPosition);
     float3 color = lights.ambientColor.rgb * albedo;
@@ -485,7 +640,13 @@ fragment float4 basic_fragment(
                                              directionalShadowMap3,
                                              shadowSampler);
         }
-        color += directBRDF(light.color.rgb, n, v, l, albedo, roughness, metalness) * shadow;
+        if (params.materialType == 2) {
+            color += directBlinnPhong(light.color.rgb, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
+        } else if (params.materialType == 3) {
+            color += directLambert(light.color.rgb, n, l, albedo) * shadow;
+        } else {
+            color += directBRDF(light.color.rgb, n, v, l, albedo, roughness, metalness) * shadow;
+        }
     }
 
     for (uint i = 0; i < min(lights.counts.y, uint(MAX_POINT_LIGHTS)); ++i) {
@@ -512,7 +673,14 @@ fragment float4 basic_fragment(
                                     pointShadowMap3,
                                     shadowSampler);
         }
-        color += directBRDF(light.color.rgb * attenuation, n, v, l, albedo, roughness, metalness) * shadow;
+        float3 radiance = light.color.rgb * attenuation;
+        if (params.materialType == 2) {
+            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
+        } else if (params.materialType == 3) {
+            color += directLambert(radiance, n, l, albedo) * shadow;
+        } else {
+            color += directBRDF(radiance, n, v, l, albedo, roughness, metalness) * shadow;
+        }
     }
 
     for (uint i = 0; i < min(lights.counts.z, uint(MAX_SPOT_LIGHTS)); ++i) {
@@ -541,7 +709,14 @@ fragment float4 basic_fragment(
                                       spotShadowMap3,
                                       shadowSampler);
         }
-        color += directBRDF(light.color.rgb * attenuation, n, v, l, albedo, roughness, metalness) * shadow;
+        float3 radiance = light.color.rgb * attenuation;
+        if (params.materialType == 2) {
+            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
+        } else if (params.materialType == 3) {
+            color += directLambert(radiance, n, l, albedo) * shadow;
+        } else {
+            color += directBRDF(radiance, n, v, l, albedo, roughness, metalness) * shadow;
+        }
     }
 
     for (uint i = 0; i < min(lights.counts.w, uint(MAX_HEMI_LIGHTS)); ++i) {
@@ -565,9 +740,18 @@ fragment float4 basic_fragment(
     }
 
     color += emissive;
+    if (params.toneMapped != 0 && params.toneMappingType != 0) {
+        color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
+    }
+    color = applyFog(color, in.fogDepth, params);
     return float4(color, alpha);
 #else
-    return float4(albedo + emissive, alpha);
+    float3 color = albedo + emissive;
+    if (params.toneMapped != 0 && params.toneMappingType != 0) {
+        color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
+    }
+    color = applyFog(color, in.fogDepth, params);
+    return float4(color, alpha);
 #endif
 }
 )metal";
@@ -709,6 +893,10 @@ struct LineVertexInput {
 struct LineUniforms {
     float4x4 mvp;
     float4 color;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
 };
 
 struct LineVertexOutput {
@@ -741,9 +929,16 @@ struct LineFragmentInput {
     float4 color;
 };
 
-fragment float4 line_fragment(LineFragmentInput in [[stage_in]])
+fragment float4 line_fragment(
+    LineFragmentInput in [[stage_in]],
+    constant LineUniforms& uniforms [[buffer(4)]]
+)
 {
-    return in.color;
+    float4 color = in.color;
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+    return color;
 }
 )metal";
 
@@ -764,7 +959,10 @@ struct PointUniforms {
     float pointSize;
     float scale;
     uint sizeAttenuation;
-    uint padding;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float2 padding;
 };
 
 struct PointVertexOutput {
@@ -805,9 +1003,16 @@ struct PointFragmentInput {
     float pointSize [[point_size]];
 };
 
-fragment float4 points_fragment(PointFragmentInput in [[stage_in]])
+fragment float4 points_fragment(
+    PointFragmentInput in [[stage_in]],
+    constant PointUniforms& uniforms [[buffer(4)]]
+)
 {
-    return in.color;
+    float4 color = in.color;
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+    return color;
 }
 )metal";
 
@@ -889,6 +1094,10 @@ struct SpriteUniforms {
     float2 center;
     float rotation;
     float scaleAttenuation;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
 };
 
 struct SpriteVertexOutput {
@@ -940,6 +1149,10 @@ struct SpriteUniforms {
     float2 center;
     float rotation;
     float scaleAttenuation;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
 };
 
 fragment float4 sprite_fragment(
@@ -950,7 +1163,11 @@ fragment float4 sprite_fragment(
 )
 {
     float4 texel = map.sample(mapSampler, in.uv);
-    return texel * uniforms.color;
+    float4 color = texel * uniforms.color;
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+    return color;
 }
 )metal";
 
@@ -968,6 +1185,10 @@ struct SkyUniforms {
     float4 sunPosition;
     float4 up;
     float4 params;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
 };
 
 struct SkyVertexOutput {
@@ -997,7 +1218,7 @@ float3 skyTotalMie(float turbidity) {
 
 vertex SkyVertexOutput sky_vertex(
     SkyVertexInput in [[stage_in]],
-    constant SkyUniforms& uniforms [[buffer(0)]]
+    constant SkyUniforms& uniforms [[buffer(4)]]
 )
 {
     SkyVertexOutput out;
@@ -1039,6 +1260,10 @@ struct SkyUniforms {
     float4 sunPosition;
     float4 up;
     float4 params;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
 };
 
 constant float SKY_FRAG_PI = 3.14159265358979323846;
@@ -1058,7 +1283,7 @@ float skyHgPhase(float cosTheta, float g) {
 
 fragment float4 sky_fragment(
     SkyVertexOutput in [[stage_in]],
-    constant SkyUniforms& uniforms [[buffer(0)]]
+    constant SkyUniforms& uniforms [[buffer(4)]]
 )
 {
     float3 up = uniforms.up.xyz;
@@ -1082,6 +1307,9 @@ fragment float4 sky_fragment(
     l0 += (in.sunE * 19000.0 * fex) * sundisk;
     float3 texColor = (lin + l0) * 0.04 + float3(0.0, 0.0003, 0.00075);
     float3 retColor = pow(texColor, float3(1.0 / (1.2 + (1.2 * in.sunfade))));
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        retColor = toneMapping(retColor, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
     return float4(retColor, 1.0);
 }
 )metal";
@@ -1097,28 +1325,38 @@ struct WaterVertexInput {
 struct WaterUniforms {
     float4x4 mvp;
     float4x4 modelMatrix;
+    float4x4 modelViewMatrix;
     float4x4 textureMatrix;
     float4 sunDirection;
     float4 sunColor;
     float4 eye;
     float4 waterColor;
     float4 params;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
+    float4 fogColor;
+    float4 fogParams;
 };
 
 struct WaterVertexOutput {
     float4 position [[position]];
     float4 mirrorCoord;
     float4 worldPosition;
+    float fogDepth;
 };
 
 vertex WaterVertexOutput water_vertex(
     WaterVertexInput in [[stage_in]],
-    constant WaterUniforms& uniforms [[buffer(0)]]
+    constant WaterUniforms& uniforms [[buffer(4)]]
 )
 {
     WaterVertexOutput out;
     out.worldPosition = uniforms.modelMatrix * float4(in.position, 1.0);
     out.mirrorCoord = uniforms.textureMatrix * out.worldPosition;
+    float4 modelViewPosition = uniforms.modelViewMatrix * float4(in.position, 1.0);
+    out.fogDepth = -modelViewPosition.z;
     out.position = uniforms.mvp * float4(in.position, 1.0);
     return out;
 }
@@ -1132,18 +1370,87 @@ struct WaterVertexOutput {
     float4 position [[position]];
     float4 mirrorCoord;
     float4 worldPosition;
+    float fogDepth;
 };
 
 struct WaterUniforms {
     float4x4 mvp;
     float4x4 modelMatrix;
+    float4x4 modelViewMatrix;
     float4x4 textureMatrix;
     float4 sunDirection;
     float4 sunColor;
     float4 eye;
     float4 waterColor;
     float4 params;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
+    float4 fogColor;
+    float4 fogParams;
 };
+
+float3 LinearToneMapping(float3 color, float exposure) {
+    return exposure * color;
+}
+
+float3 ReinhardToneMapping(float3 color, float exposure) {
+    color *= exposure;
+    return clamp(color / (float3(1.0) + color), 0.0, 1.0);
+}
+
+float3 OptimizedCineonToneMapping(float3 color, float exposure) {
+    color *= exposure;
+    color = max(float3(0.0), color - 0.004);
+    return pow((color * (6.2 * color + 0.5)) / (color * (6.2 * color + 1.7) + 0.06), float3(2.2));
+}
+
+float3 RRTAndODTFit(float3 v) {
+    float3 a = v * (v + 0.0245786) - 0.000090537;
+    float3 b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return a / b;
+}
+
+float3 ACESFilmicToneMapping(float3 color, float exposure) {
+    const float3x3 ACESInputMat = float3x3(
+        float3(0.59719, 0.07600, 0.02840),
+        float3(0.35458, 0.90834, 0.13383),
+        float3(0.04823, 0.01566, 0.83777)
+    );
+    const float3x3 ACESOutputMat = float3x3(
+        float3( 1.60475, -0.10208, -0.00327),
+        float3(-0.53108,  1.10813, -0.07276),
+        float3(-0.07367, -0.00605,  1.07602)
+    );
+
+    color *= exposure / 0.6;
+    color = ACESInputMat * color;
+    color = RRTAndODTFit(color);
+    color = ACESOutputMat * color;
+    return clamp(color, 0.0, 1.0);
+}
+
+float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
+    if (toneMappingType == 1) return LinearToneMapping(color, exposure);
+    if (toneMappingType == 2) return ReinhardToneMapping(color, exposure);
+    if (toneMappingType == 3) return OptimizedCineonToneMapping(color, exposure);
+    if (toneMappingType == 4) return ACESFilmicToneMapping(color, exposure);
+    return color;
+}
+
+float3 applyFog(float3 color, float fogDepth, constant WaterUniforms& uniforms) {
+    if (uniforms.fogParams.w == 1.0) {
+        float fogFactor = smoothstep(uniforms.fogParams.x, uniforms.fogParams.y, fogDepth);
+        return mix(color, uniforms.fogColor.rgb, fogFactor);
+    }
+    if (uniforms.fogParams.w == 2.0) {
+        float density = uniforms.fogParams.z;
+        float fogFactor = 1.0 - exp(-density * density * fogDepth * fogDepth);
+        return mix(color, uniforms.fogColor.rgb, clamp(fogFactor, 0.0, 1.0));
+    }
+    return color;
+}
 
 float4 waterNoise(texture2d<float> normalSampler, sampler mapSampler, float2 uv, float time) {
     float2 uv0 = (uv / 103.0) + float2(time / 17.0, time / 29.0);
@@ -1159,10 +1466,11 @@ float4 waterNoise(texture2d<float> normalSampler, sampler mapSampler, float2 uv,
 
 fragment float4 water_fragment(
     WaterVertexOutput in [[stage_in]],
-    constant WaterUniforms& uniforms [[buffer(0)]],
+    constant WaterUniforms& uniforms [[buffer(4)]],
     texture2d<float> normalSampler [[texture(0)]],
     texture2d<float> mirrorSampler [[texture(1)]],
-    sampler mapSampler [[sampler(0)]]
+    sampler normalMapSampler [[sampler(0)]],
+    sampler mirrorMapSampler [[sampler(1)]]
 )
 {
     float alpha = uniforms.params.x;
@@ -1170,13 +1478,14 @@ fragment float4 water_fragment(
     float size = uniforms.params.z;
     float distortionScale = uniforms.params.w;
 
-    float4 noise = waterNoise(normalSampler, mapSampler, in.worldPosition.xz * size, time);
+    float4 noise = waterNoise(normalSampler, normalMapSampler, in.worldPosition.xz * size, time);
     float3 surfaceNormal = normalize(noise.xzy * float3(1.5, 1.0, 1.5));
     float3 eyeDirection = normalize(uniforms.eye.xyz - in.worldPosition.xyz);
     float distanceToEye = length(uniforms.eye.xyz - in.worldPosition.xyz);
     float2 distortion = surfaceNormal.xz * (0.001 + 1.0 / max(distanceToEye, 0.0001)) * distortionScale;
-    float2 mirrorUv = in.mirrorCoord.xy / max(in.mirrorCoord.w, 0.0001) + distortion;
-    float3 reflectionSample = mirrorSampler.sample(mapSampler, mirrorUv).rgb;
+    float2 mirrorUv = in.mirrorCoord.xy / in.mirrorCoord.w + distortion;
+    mirrorUv.y = 1.0 - mirrorUv.y;
+    float3 reflectionSample = mirrorSampler.sample(mirrorMapSampler, mirrorUv).rgb;
 
     float3 sunDirection = normalize(uniforms.sunDirection.xyz);
     float3 reflection = normalize(reflect(-sunDirection, surfaceNormal));
@@ -1188,6 +1497,10 @@ fragment float4 water_fragment(
     float3 albedo = mix(uniforms.sunColor.rgb * diffuse * 0.3 + scatter,
                         float3(0.1) + reflectionSample * 0.9 + reflectionSample * uniforms.sunColor.rgb * specular,
                         reflectance);
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        albedo = toneMapping(albedo, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+    albedo = applyFog(albedo, in.fogDepth, uniforms);
     return float4(albedo, alpha);
 }
 )metal";

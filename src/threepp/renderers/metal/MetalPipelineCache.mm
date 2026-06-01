@@ -3,6 +3,7 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <unordered_map>
 
 namespace threepp::metal {
@@ -24,7 +25,8 @@ namespace threepp::metal {
                fragmentFunction == other.fragmentFunction &&
                alphaBlending == other.alphaBlending &&
                vertexLayoutBitmask == other.vertexLayoutBitmask &&
-               colorPixelFormat == other.colorPixelFormat;
+               colorPixelFormat == other.colorPixelFormat &&
+               rasterSampleCount == other.rasterSampleCount;
     }
 
     size_t PipelineKeyHash::operator()(const PipelineKey& key) const {
@@ -33,7 +35,8 @@ namespace threepp::metal {
         auto h3 = std::hash<bool>{}(key.alphaBlending);
         auto h4 = std::hash<std::uint8_t>{}(key.vertexLayoutBitmask);
         auto h5 = std::hash<std::uint64_t>{}(key.colorPixelFormat);
-        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+        auto h6 = std::hash<std::uint64_t>{}(key.rasterSampleCount);
+        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
     }
 
     namespace {
@@ -169,13 +172,14 @@ namespace threepp::metal {
 
             desc.colorAttachments[0].pixelFormat = static_cast<MTLPixelFormat>(key.colorPixelFormat);
             desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
+            desc.rasterSampleCount = static_cast<NSUInteger>(std::max<std::uint64_t>(key.rasterSampleCount, 1));
 
             if (key.alphaBlending) {
                 desc.colorAttachments[0].blendingEnabled = YES;
                 desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
                 desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
                 desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-                desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorSourceAlpha;
+                desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
                 desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
                 desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
             } else {

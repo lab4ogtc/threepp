@@ -7,8 +7,10 @@
 #include "threepp/utils/StringUtils.hpp"
 
 #ifndef __EMSCRIPTEN__
-#include "threepp/utils/LoadGlad.hpp"
 #define GLFW_INCLUDE_NONE
+#ifdef THREEPP_HAS_GL
+#include "threepp/utils/LoadGlad.hpp"
+#endif
 #else
 #include <emscripten.h>
 #endif
@@ -17,6 +19,7 @@
 
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 
 using namespace threepp;
 
@@ -211,13 +214,17 @@ struct GlfwWindow::Impl {
 
     bool close_{false};
     bool exitOnKeyEscape_;
+    int antialiasing_;
     ClientAPI clientAPI_;
 
     std::vector<std::function<void(WindowSize)>> resizeListener;
     std::vector<std::function<void(int monitor)>> monitorChangesListener;
 
     explicit Impl(GlfwWindow& scope, const Parameters& params)
-        : scope(scope), exitOnKeyEscape_(params.exitOnKeyEscape_), clientAPI_(params.clientAPI_) {
+        : scope(scope),
+          exitOnKeyEscape_(params.exitOnKeyEscape_),
+          antialiasing_(params.antialiasing_),
+          clientAPI_(params.clientAPI_) {
 
         retainGlfwWindow();
 
@@ -229,13 +236,22 @@ struct GlfwWindow::Impl {
         }
 
 #ifndef __EMSCRIPTEN__
+#ifndef THREEPP_HAS_GL
+        if (clientAPI_ == ClientAPI::OpenGL) {
+            throw std::runtime_error("OpenGL window client API not enabled in this build");
+        }
+#endif
+
+#ifdef THREEPP_HAS_GL
         if (clientAPI_ == ClientAPI::OpenGL) {
             glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
             glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
             glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
             glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-        } else if (clientAPI_ == ClientAPI::Metal || clientAPI_ == ClientAPI::None) {
+        } else
+#endif
+        if (clientAPI_ == ClientAPI::Metal || clientAPI_ == ClientAPI::None) {
             glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
         }
 
@@ -277,6 +293,7 @@ struct GlfwWindow::Impl {
         glfwSetDropCallback(window, drop_callback);
 
         if (clientAPI_ == ClientAPI::OpenGL) {
+#ifdef THREEPP_HAS_GL
             glfwMakeContextCurrent(window);
 
 #ifndef __EMSCRIPTEN__
@@ -288,6 +305,7 @@ struct GlfwWindow::Impl {
             }
 
             glEnable(GL_PROGRAM_POINT_SIZE);
+#endif
 #endif
         }
     }
@@ -529,6 +547,11 @@ void GlfwWindow::close() {
 void* GlfwWindow::windowPtr() const {
 
     return pimpl_->window;
+}
+
+int GlfwWindow::antialiasing() const {
+
+    return pimpl_->antialiasing_;
 }
 
 GlfwWindow::~GlfwWindow() = default;

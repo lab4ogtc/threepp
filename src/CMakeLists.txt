@@ -212,6 +212,7 @@ set(publicHeaders
 
         "threepp/renderers/GLRenderer.hpp"
         "threepp/renderers/GLRenderTarget.hpp"
+        "threepp/renderers/RenderJob.hpp"
         "threepp/renderers/RenderTarget.hpp"
         "threepp/renderers/Renderer.hpp"
 
@@ -577,9 +578,44 @@ list(APPEND sources
         "${generatedSourcesDir}/threepp/renderers/shaders/ShaderChunk.cpp"
 )
 
+if (NOT THREEPP_WITH_GL)
+    list(REMOVE_ITEM sources
+            "threepp/helpers/DepthSensor.cpp"
+            "threepp/helpers/LidarSensor.cpp"
+            "threepp/renderers/GLRenderer.cpp"
+            "threepp/renderers/GLRenderTarget.cpp"
+            "threepp/renderers/gl/GLAttributes.cpp"
+            "threepp/renderers/gl/GLBackground.cpp"
+            "threepp/renderers/gl/GLBindingStates.cpp"
+            "threepp/renderers/gl/GLBufferRenderer.cpp"
+            "threepp/renderers/gl/GLClipping.cpp"
+            "threepp/renderers/gl/GLCubeMaps.cpp"
+            "threepp/renderers/gl/GLGeometries.cpp"
+            "threepp/renderers/gl/GLInfo.cpp"
+            "threepp/renderers/gl/GLLights.cpp"
+            "threepp/renderers/gl/GLObjects.cpp"
+            "threepp/renderers/gl/GLProgram.cpp"
+            "threepp/renderers/gl/GLPrograms.cpp"
+            "threepp/renderers/gl/GLMaterials.cpp"
+            "threepp/renderers/gl/GLRenderLists.cpp"
+            "threepp/renderers/gl/GLRenderStates.cpp"
+            "threepp/renderers/gl/GLShadowMap.cpp"
+            "threepp/renderers/gl/GLState.cpp"
+            "threepp/renderers/gl/GLTextures.cpp"
+            "threepp/renderers/gl/GLUniforms.cpp"
+            "threepp/renderers/gl/ProgramParameters.cpp"
+            "external/glad/glad.c"
+            "threepp/utils/LoadGlad.cpp"
+    )
+endif ()
+
 add_library(threepp ${sources} ${privateHeaders} ${publicHeadersFull})
 add_library(threepp::threepp ALIAS threepp)
 target_compile_features(threepp PUBLIC "cxx_std_20")
+
+if (THREEPP_WITH_GL)
+    target_compile_definitions(threepp PUBLIC THREEPP_HAS_GL=1)
+endif ()
 
 if (UNIX)
     target_link_libraries(threepp PRIVATE pthread dl)
@@ -608,10 +644,12 @@ endif ()
 
 if (NOT DEFINED EMSCRIPTEN)
 
-    target_include_directories(threepp
-            PRIVATE
-            "${CMAKE_CURRENT_SOURCE_DIR}/external/glad"
-    )
+    if (THREEPP_WITH_GL)
+        target_include_directories(threepp
+                PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/external/glad"
+        )
+    endif ()
 
     if (THREEPP_USE_EXTERNAL_GLFW OR BUILD_SHARED_LIBS)
         target_link_libraries(threepp PRIVATE glfw)
@@ -620,7 +658,9 @@ if (NOT DEFINED EMSCRIPTEN)
         if (APPLE)
             target_link_libraries(threepp PUBLIC "-framework IOKit")
             target_link_libraries(threepp PUBLIC "-framework Cocoa")
-            target_link_libraries(threepp PUBLIC "-framework OpenGL")
+            if (THREEPP_WITH_GL)
+                target_link_libraries(threepp PUBLIC "-framework OpenGL")
+            endif ()
             target_link_libraries(threepp PUBLIC "-framework Metal")
             target_link_libraries(threepp PUBLIC "-framework MetalKit")
             target_link_libraries(threepp PUBLIC "-framework QuartzCore")

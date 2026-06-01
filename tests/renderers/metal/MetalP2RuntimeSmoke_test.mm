@@ -6,7 +6,7 @@
 #include "threepp/objects/LineLoop.hpp"
 #include "threepp/objects/LOD.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
-#include "threepp/renderers/GLRenderTarget.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/textures/CubeTexture.hpp"
@@ -59,6 +59,39 @@ namespace {
 
     std::shared_ptr<Texture> makeFlatNormalMap() {
         return DataTexture::create(std::vector<unsigned char>{128, 128, 255, 255}, 1, 1);
+    }
+
+    std::shared_ptr<Texture> makeManualMipmapProbeTexture() {
+        constexpr unsigned int size = 64;
+        std::vector<unsigned char> base(static_cast<std::size_t>(size) * size * 4u);
+
+        for (std::size_t i = 0; i < base.size(); i += 4u) {
+            base[i + 0u] = 0u;
+            base[i + 1u] = 0u;
+            base[i + 2u] = 255u;
+            base[i + 3u] = 255u;
+        }
+
+        auto texture = Texture::create(Image{base, size, size});
+        texture->format = Format::RGBA;
+        texture->generateMipmaps = false;
+        texture->minFilter = Filter::LinearMipmapLinear;
+        texture->magFilter = Filter::Linear;
+
+        for (unsigned int levelSize = size / 2u; levelSize > 0u; levelSize /= 2u) {
+            std::vector<unsigned char> mip(static_cast<std::size_t>(levelSize) * levelSize * 4u);
+            for (std::size_t i = 0; i < mip.size(); i += 4u) {
+                mip[i + 0u] = 255u;
+                mip[i + 1u] = 0u;
+                mip[i + 2u] = 0u;
+                mip[i + 3u] = 255u;
+            }
+            texture->mipmaps().emplace_back(std::move(mip), levelSize, levelSize);
+            if (levelSize == 1u) break;
+        }
+
+        texture->needsUpdate();
+        return texture;
     }
 
     enum class SkinIndexStorage {
@@ -362,6 +395,206 @@ TEST_CASE("Metal renderer draws primitive and fixed raw shader paths") {
     }
 }
 
+TEST_CASE("Metal renderer draws MeshNormalMaterial with normal-derived colors") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal normal material smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto material = MeshNormalMaterial::create({{"side", Side::Double}});
+        scene->add(Mesh::create(PlaneGeometry::create(1.5f, 1.5f), material));
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        const auto [width, height] = canvas.size();
+        const auto center = (static_cast<std::size_t>(height) / 2u * static_cast<std::size_t>(width) + static_cast<std::size_t>(width) / 2u) * 3u;
+        REQUIRE(center + 2u < pixels.size());
+        const auto r = pixels[center];
+        const auto g = pixels[center + 1u];
+        const auto b = pixels[center + 2u];
+
+        REQUIRE(b > r + 40);
+        REQUIRE(b > g + 40);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer preserves mipmapped sampler for mesh texture maps") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal texture mip sampler smoke")
+                                  .size(128, 128)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto material = MeshBasicMaterial::create({{"color", Color::white},
+                                                   {"side", Side::Double}});
+        material->map = makeManualMipmapProbeTexture();
+        scene->add(Mesh::create(PlaneGeometry::create(0.25f, 0.25f), material));
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        std::size_t redDominant = 0;
+        std::size_t blueDominant = 0;
+
+        for (std::size_t i = 0; i + 2u < pixels.size(); i += 3u) {
+            const auto r = pixels[i + 0u];
+            const auto g = pixels[i + 1u];
+            const auto b = pixels[i + 2u];
+            if (r > 180 && g < 80 && b < 80) ++redDominant;
+            if (b > 180 && r < 80 && g < 80) ++blueDominant;
+        }
+
+        CAPTURE(redDominant, blueDominant);
+        REQUIRE(redDominant > 40);
+        REQUIRE(redDominant > blueDominant * 4u);
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer honors window antialiasing for drawable edges") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal drawable antialiasing smoke")
+                                  .size(64, 64)
+                                  .antialiasing(4)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = BufferGeometry::create();
+        geometry->setAttribute("position", FloatBufferAttribute::create(std::vector<float>{
+                                                -0.85f, -0.85f, 0.f,
+                                                 0.80f, -0.85f, 0.f,
+                                                -0.85f,  0.65f, 0.f},
+                                               3));
+        auto material = MeshBasicMaterial::create({{"color", Color::white},
+                                                   {"side", Side::Double}});
+        scene->add(Mesh::create(geometry, material));
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        std::size_t partialCoveragePixels = 0;
+        for (std::size_t i = 0; i + 2u < pixels.size(); i += 3u) {
+            const auto r = pixels[i + 0u];
+            const auto g = pixels[i + 1u];
+            const auto b = pixels[i + 2u];
+            if (r == g && g == b && r > 16 && r < 239) {
+                ++partialCoveragePixels;
+            }
+        }
+
+        CAPTURE(partialCoveragePixels);
+        REQUIRE(partialCoveragePixels > 0);
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer applies linear scene fog to fog-enabled mesh materials") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal fog smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        scene->fog = Fog(Color::red, 0.f, 1.f);
+
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto material = MeshBasicMaterial::create({{"color", Color::white},
+                                                   {"side", Side::Double}});
+        scene->add(Mesh::create(PlaneGeometry::create(1.5f, 1.5f), material));
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        const auto [width, height] = canvas.size();
+        const auto center = (static_cast<std::size_t>(height) / 2u * static_cast<std::size_t>(width) + static_cast<std::size_t>(width) / 2u) * 3u;
+        REQUIRE(center + 2u < pixels.size());
+
+        const auto r = pixels[center];
+        const auto g = pixels[center + 1u];
+        const auto b = pixels[center + 2u];
+
+        REQUIRE(r > 180);
+        REQUIRE(g < 80);
+        REQUIRE(b < 80);
+        canvas.close();
+    }
+}
+
 TEST_CASE("Metal renderer honors material depthWrite state") {
 
     @autoreleasepool {
@@ -468,7 +701,7 @@ TEST_CASE("Metal P3 renderer supports instanced render target mixed pass") {
         targetOptions.format = Format::RGBA;
         targetOptions.generateMipmaps = true;
         targetOptions.depthTexture = DepthTexture::create(Type::Float);
-        auto target = GLRenderTarget::create(64, 64, targetOptions);
+        auto target = RenderTarget::create(64, 64, targetOptions);
 
         auto scene = Scene::create();
         auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
@@ -648,7 +881,7 @@ TEST_CASE("Metal renderer auto-updates LOD objects during traversal") {
     }
 }
 
-TEST_CASE("Metal P3 renderer releases GLRenderTarget resources on dispose") {
+TEST_CASE("Metal P3 renderer releases RenderTarget resources on dispose") {
 
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -665,7 +898,7 @@ TEST_CASE("Metal P3 renderer releases GLRenderTarget resources on dispose") {
 
         RenderTarget::Options targetOptions;
         targetOptions.format = Format::BGRA;
-        auto target = GLRenderTarget::create(32, 32, targetOptions);
+        auto target = RenderTarget::create(32, 32, targetOptions);
 
         auto scene = Scene::create();
         auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);

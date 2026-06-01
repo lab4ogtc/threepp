@@ -16,6 +16,7 @@ namespace threepp::metal {
         bool alphaBlending = false;
         std::uint8_t vertexLayoutBitmask = 0b0001;
         std::uint64_t colorPixelFormat = 80;// MTLPixelFormatBGRA8Unorm
+        std::uint64_t rasterSampleCount = 1;
 
         bool operator==(const PipelineKey& other) const;
     };

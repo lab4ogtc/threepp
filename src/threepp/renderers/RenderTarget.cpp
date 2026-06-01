@@ -3,7 +3,42 @@
 
 #include "threepp/math/MathUtils.hpp"
 
+#ifdef THREEPP_HAS_GL
+#include "threepp/renderers/GLRenderTarget.hpp"
+#endif
+
 using namespace threepp;
+
+namespace {
+
+#ifndef THREEPP_HAS_GL
+    class GenericRenderTarget: public RenderTarget {
+
+    public:
+        GenericRenderTarget(unsigned int width, unsigned int height, const Options& options)
+            : RenderTarget(width, height, options) {}
+
+        void setSize(unsigned int width, unsigned int height, unsigned int depth = 1) override {
+            if (this->width != width || this->height != height || this->depth != depth) {
+                this->width = width;
+                this->height = height;
+                this->depth = depth;
+
+                this->texture->image().width = width;
+                this->texture->image().height = height;
+                this->texture->image().depth = depth;
+
+                this->dispose();
+                this->disposed = false;
+            }
+
+            this->viewport.set(0, 0, static_cast<float>(width), static_cast<float>(height));
+            this->scissor.set(0, 0, static_cast<float>(width), static_cast<float>(height));
+        }
+    };
+#endif
+
+}// namespace
 
 RenderTarget::RenderTarget(unsigned int width, unsigned int height, const Options& options)
     : uuid(math::generateUUID()),
@@ -26,6 +61,20 @@ RenderTarget::RenderTarget(unsigned int width, unsigned int height, const Option
     texture->generateMipmaps = options.generateMipmaps;
 
     if (options.depthTexture) depthTexture = options.depthTexture;
+}
+
+std::shared_ptr<RenderTarget> RenderTarget::create(unsigned int width, unsigned int height) {
+
+    return create(width, height, Options{});
+}
+
+std::shared_ptr<RenderTarget> RenderTarget::create(unsigned int width, unsigned int height, const Options& options) {
+
+#ifdef THREEPP_HAS_GL
+    return std::make_shared<GLRenderTarget>(width, height, options);
+#else
+    return std::make_shared<GenericRenderTarget>(width, height, options);
+#endif
 }
 
 RenderTarget& RenderTarget::copy(const RenderTarget& source) {

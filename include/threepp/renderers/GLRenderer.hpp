@@ -71,11 +71,6 @@ namespace threepp {
 
         bool physicallyCorrectLights = false;
 
-        // tone mapping
-
-        ToneMapping toneMapping{ToneMapping::None};
-        float toneMappingExposure = 1.0f;
-
         bool checkShaderErrors = false;
 
         explicit GLRenderer(Window& window, const Parameters& parameters = {});
@@ -164,6 +159,8 @@ namespace threepp {
         void setRenderTarget(RenderTarget* renderTarget) override;
 
         void setRenderTarget(std::nullptr_t) { setRenderTarget(static_cast<RenderTarget*>(nullptr)); }
+
+        void addPreRenderJob(const RenderJob& job) override;
 
         void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0);
 

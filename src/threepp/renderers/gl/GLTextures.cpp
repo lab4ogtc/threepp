@@ -625,7 +625,8 @@ void gl::GLTextures::TextureEventListener::onEvent(Event& event) {
 
 void gl::GLTextures::RenderTargetEventListener::onEvent(Event& event) {
 
-    const auto renderTarget = std::any_cast<GLRenderTarget*>(event.target);
+    auto* renderTarget = dynamic_cast<GLRenderTarget*>(std::any_cast<RenderTarget*>(event.target));
+    if (!renderTarget) return;
 
     renderTarget->removeEventListener("dispose", *this);
 

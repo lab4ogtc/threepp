@@ -10,9 +10,11 @@
 #include "threepp/math/Vector2.hpp"
 #include "threepp/math/Vector4.hpp"
 
+#include <memory>
+
 namespace threepp {
 
-    class GLRenderTarget;
+    class RenderTarget;
 
     class LightShadow {
 
@@ -25,8 +27,8 @@ namespace threepp {
 
         Vector2 mapSize{1024, 1024};
 
-        std::unique_ptr<GLRenderTarget> map;
-        std::unique_ptr<GLRenderTarget> mapPass;
+        std::shared_ptr<RenderTarget> map;
+        std::shared_ptr<RenderTarget> mapPass;
 
         Matrix4 matrix;
 

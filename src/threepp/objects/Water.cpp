@@ -7,8 +7,7 @@
 #include "threepp/core/Shader.hpp"
 #include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/math/MathUtils.hpp"
-#include "threepp/renderers/GLRenderTarget.hpp"
-#include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/shaders/UniformsLib.hpp"
 #include "threepp/renderers/shaders/UniformsUtil.hpp"
 
@@ -150,12 +149,12 @@ struct Water::Impl {
 
         Shader shader = mirrorShader();
 
-        GLRenderTarget::Options parameters;
+        RenderTarget::Options parameters;
         parameters.minFilter = Filter::Linear;
         parameters.magFilter = Filter::Linear;
         parameters.format = Format::RGB;
 
-        renderTarget = GLRenderTarget::create(textureWidth, textureHeight, parameters);
+        renderTarget = RenderTarget::create(textureWidth, textureHeight, parameters);
 
         if (!math::isPowerOfTwo((int) textureWidth) || !math::isPowerOfTwo((int) textureHeight)) {
 
@@ -170,6 +169,9 @@ struct Water::Impl {
         material->transparent = true;
         material->side = options.side.value_or(Side::Front);
         material->fog = options.fog.value_or(false);
+        material->polygonOffset = true;
+        material->polygonOffsetFactor = 1.f;
+        material->polygonOffsetUnits = 1.f;
 
         material->uniforms["mirrorSampler"].setValue(renderTarget->texture.get());
         material->uniforms["textureMatrix"].setValue(&textureMatrix);
@@ -182,81 +184,82 @@ struct Water::Impl {
         material->uniforms["distortionScale"].setValue(distortionScale);
         material->uniforms["eye"].setValue(&eye);
 
-        water_.onBeforeRender = RenderCallback([this, material](void* renderer, auto scene, auto camera, auto, auto, auto) {
-            mirrorWorldPosition.setFromMatrixPosition(*water_.matrixWorld);
-            cameraWorldPosition.setFromMatrixPosition(*camera->matrixWorld);
-            rotationMatrix.extractRotation(*water_.matrixWorld);
-            normal.set(0, 0, 1);
-            normal.applyMatrix4(rotationMatrix);
-            view.subVectors(mirrorWorldPosition, cameraWorldPosition);// Avoid rendering when mirror is facing away
-
-            if (view.dot(normal) > 0) return;
-            view.reflect(normal).negate();
-            view.add(mirrorWorldPosition);
-            rotationMatrix.extractRotation(*camera->matrixWorld);
-            lookAtPosition.set(0, 0, -1);
-            lookAtPosition.applyMatrix4(rotationMatrix);
-            lookAtPosition.add(cameraWorldPosition);
-            target.subVectors(mirrorWorldPosition, lookAtPosition);
-            target.reflect(normal).negate();
-            target.add(mirrorWorldPosition);
-            mirrorCamera->position.copy(view);
-            mirrorCamera->up.set(0, 1, 0);
-            mirrorCamera->up.applyMatrix4(rotationMatrix);
-            mirrorCamera->up.reflect(normal);
-            mirrorCamera->lookAt(target);
-            mirrorCamera->farPlane = camera->farPlane;// Used in WebGLBackground
-
-            mirrorCamera->updateMatrixWorld();
-            mirrorCamera->projectionMatrix.copy(camera->projectionMatrix);// Update the texture matrix
-
-            textureMatrix.set(0.5f, 0.f, 0.f, 0.5f,
-                              0.f, 0.5f, 0.f, 0.5f,
-                              0.f, 0.f, 0.5f, 0.5f,
-                              0.f, 0.f, 0.f, 1.f);
-            textureMatrix.multiply(mirrorCamera->projectionMatrix);
-            textureMatrix.multiply(mirrorCamera->matrixWorldInverse);// Now update projection matrix with new clip plane, implementing code from: http://www.terathon.com/code/oblique.html
-                                                                     // Paper explaining this technique: http://www.terathon.com/lengyel/Lengyel-Oblique.pdf
-
-            mirrorPlane.setFromNormalAndCoplanarPoint(normal, mirrorWorldPosition);
-            mirrorPlane.applyMatrix4(mirrorCamera->matrixWorldInverse);
-            clipPlane.set(mirrorPlane.normal.x, mirrorPlane.normal.y, mirrorPlane.normal.z, mirrorPlane.constant);
-            auto& projectionMatrix = mirrorCamera->projectionMatrix;
-            q.x = (static_cast<float>(math::sgn(clipPlane.x)) + projectionMatrix.elements[8]) / projectionMatrix.elements[0];
-            q.y = (static_cast<float>(math::sgn(clipPlane.y)) + projectionMatrix.elements[9]) / projectionMatrix.elements[5];
-            q.z = -1.0;
-            q.w = (1.f + projectionMatrix.elements[10]) / projectionMatrix.elements[14];// Calculate the scaled plane vector
-
-            clipPlane.multiplyScalar(2.f / clipPlane.dot(q));// Replacing the third row of the projection matrix
-
-            projectionMatrix.elements[2] = clipPlane.x;
-            projectionMatrix.elements[6] = clipPlane.y;
-            projectionMatrix.elements[10] = clipPlane.z + 1.f - clipBias;
-            projectionMatrix.elements[14] = clipPlane.w;
-            eye.setFromMatrixPosition(*camera->matrixWorld);// Render
-
-            auto _renderer = static_cast<GLRenderer*>(renderer);
-
-            const auto currentRenderTarget = _renderer->getRenderTarget();
-            const auto currentShadowAutoUpdate = _renderer->shadowMap().autoUpdate;
-            water_.visible = false;
-
-            _renderer->shadowMap().autoUpdate = false;// Avoid re-computing shadows
-
-            _renderer->setRenderTarget(renderTarget.get());
-            _renderer->state().depthBuffer.setMask(true);// make sure the depth buffer is writable so it can be properly cleared, see #18897
-
-            if (!_renderer->autoClear) _renderer->clear();
-            _renderer->render(*scene, *mirrorCamera);
-            water_.visible = true;
-            _renderer->shadowMap().autoUpdate = currentShadowAutoUpdate;
-            _renderer->setRenderTarget(currentRenderTarget);// Restore viewport
-        });
-
         water_.materials_[0] = material;
     }
 
     ~Impl() = default;
+
+    bool updateReflection(Camera& camera) {
+        mirrorWorldPosition.setFromMatrixPosition(*water_.matrixWorld);
+        cameraWorldPosition.setFromMatrixPosition(*camera.matrixWorld);
+        rotationMatrix.extractRotation(*water_.matrixWorld);
+        normal.set(0, 0, 1);
+        normal.applyMatrix4(rotationMatrix);
+        view.subVectors(mirrorWorldPosition, cameraWorldPosition);
+
+        if (view.dot(normal) > 0) return false;
+        view.reflect(normal).negate();
+        view.add(mirrorWorldPosition);
+        rotationMatrix.extractRotation(*camera.matrixWorld);
+        lookAtPosition.set(0, 0, -1);
+        lookAtPosition.applyMatrix4(rotationMatrix);
+        lookAtPosition.add(cameraWorldPosition);
+        target.subVectors(mirrorWorldPosition, lookAtPosition);
+        target.reflect(normal).negate();
+        target.add(mirrorWorldPosition);
+        mirrorCamera->position.copy(view);
+        mirrorCamera->up.set(0, 1, 0);
+        mirrorCamera->up.applyMatrix4(rotationMatrix);
+        mirrorCamera->up.reflect(normal);
+        mirrorCamera->lookAt(target);
+        mirrorCamera->farPlane = camera.farPlane;
+
+        mirrorCamera->updateMatrixWorld();
+        mirrorCamera->projectionMatrix.copy(camera.projectionMatrix);
+
+        textureMatrix.set(0.5f, 0.f, 0.f, 0.5f,
+                          0.f, 0.5f, 0.f, 0.5f,
+                          0.f, 0.f, 0.5f, 0.5f,
+                          0.f, 0.f, 0.f, 1.f);
+        textureMatrix.multiply(mirrorCamera->projectionMatrix);
+        textureMatrix.multiply(mirrorCamera->matrixWorldInverse);
+
+        mirrorPlane.setFromNormalAndCoplanarPoint(normal, mirrorWorldPosition);
+        mirrorPlane.applyMatrix4(mirrorCamera->matrixWorldInverse);
+        clipPlane.set(mirrorPlane.normal.x, mirrorPlane.normal.y, mirrorPlane.normal.z, mirrorPlane.constant);
+        auto& projectionMatrix = mirrorCamera->projectionMatrix;
+        q.x = (static_cast<float>(math::sgn(clipPlane.x)) + projectionMatrix.elements[8]) / projectionMatrix.elements[0];
+        q.y = (static_cast<float>(math::sgn(clipPlane.y)) + projectionMatrix.elements[9]) / projectionMatrix.elements[5];
+        q.z = -1.0;
+        q.w = (1.f + projectionMatrix.elements[10]) / projectionMatrix.elements[14];
+
+        clipPlane.multiplyScalar(2.f / clipPlane.dot(q));
+
+        projectionMatrix.elements[2] = clipPlane.x;
+        projectionMatrix.elements[6] = clipPlane.y;
+        projectionMatrix.elements[10] = clipPlane.z + 1.f - clipBias;
+        projectionMatrix.elements[14] = clipPlane.w;
+        eye.setFromMatrixPosition(*camera.matrixWorld);
+
+        return true;
+    }
+
+    [[nodiscard]] RenderTarget* reflectionRenderTarget() const {
+        return renderTarget.get();
+    }
+
+    [[nodiscard]] PerspectiveCamera& reflectionCamera() const {
+        return *mirrorCamera;
+    }
+
+    std::optional<RenderJob> getPreRenderJob(Camera& camera) {
+        if (!updateReflection(camera)) return std::nullopt;
+
+        return RenderJob{
+                &water_,
+                mirrorCamera.get(),
+                renderTarget.get()};
+    }
 
 private:
     Water& water_;
@@ -278,7 +281,7 @@ private:
     std::shared_ptr<Texture> waterNormals;
 
     std::shared_ptr<PerspectiveCamera> mirrorCamera = PerspectiveCamera::create();
-    std::shared_ptr<GLRenderTarget> renderTarget;
+    std::shared_ptr<RenderTarget> renderTarget;
 };
 
 Water::Water(const std::shared_ptr<BufferGeometry>& geometry, const Water::Options& options)
@@ -287,6 +290,26 @@ Water::Water(const std::shared_ptr<BufferGeometry>& geometry, const Water::Optio
 std::string threepp::Water::type() const {
 
     return "Water";
+}
+
+bool Water::updateReflection(Camera& camera) {
+
+    return pimpl_->updateReflection(camera);
+}
+
+RenderTarget* Water::reflectionRenderTarget() const {
+
+    return pimpl_->reflectionRenderTarget();
+}
+
+PerspectiveCamera& Water::reflectionCamera() const {
+
+    return pimpl_->reflectionCamera();
+}
+
+std::optional<RenderJob> Water::getPreRenderJob(Camera& mainCamera) {
+
+    return pimpl_->getPreRenderJob(mainCamera);
 }
 
 std::shared_ptr<Water> threepp::Water::create(

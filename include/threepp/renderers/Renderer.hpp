@@ -6,6 +6,7 @@
 #include <utility>
 
 #include "threepp/canvas/WindowSize.hpp"
+#include "threepp/constants.hpp"
 
 namespace threepp {
 
@@ -13,6 +14,7 @@ namespace threepp {
     class Scene;
     class Camera;
     class RenderTarget;
+    struct RenderJob;
     class Color;
 
     enum class Backend {
@@ -51,7 +53,12 @@ namespace threepp {
 
         [[nodiscard]] virtual RenderTarget* getRenderTarget() = 0;
 
+        virtual void addPreRenderJob(const RenderJob& job) = 0;
+
         bool autoClear = true;
+
+        ToneMapping toneMapping{ToneMapping::None};
+        float toneMappingExposure = 1.0f;
 
         virtual ~Renderer() = default;
     };

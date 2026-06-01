@@ -184,13 +184,13 @@ namespace threepp::metal {
         }
 
         id<MTLTexture> getOrCreateTexture(Texture& texture, bool allowPlaceholder) {
-            if (texture.type != Type::UnsignedByte) {
-                throw std::runtime_error("MetalTextureManager currently supports unsigned byte textures");
-            }
-
             auto it = textures.find(&texture);
             if (it != textures.end() && (it->second.external || it->second.version == texture.version())) {
                 return it->second.texture;
+            }
+
+            if (texture.type != Type::UnsignedByte) {
+                throw std::runtime_error("MetalTextureManager currently supports unsigned byte textures");
             }
 
             if (texture.images().empty()) {

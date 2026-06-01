@@ -3,6 +3,8 @@
 
 #include "threepp/constants.hpp"
 
+#include <optional>
+
 namespace threepp::metal {
 
     enum class FrontFaceWinding {
@@ -30,6 +32,31 @@ namespace threepp::metal {
         return {
             flipSided ? FrontFaceWinding::Clockwise : FrontFaceWinding::CounterClockwise,
             (wireframe || side == Side::Double) ? CullMode::None : CullMode::Back};
+    }
+
+    inline Side defaultShadowSide(Side side) {
+
+        switch (side) {
+            case Side::Front:
+                return Side::Back;
+            case Side::Back:
+                return Side::Front;
+            case Side::Double:
+                return Side::Double;
+        }
+
+        return Side::Double;
+    }
+
+    inline FaceCullingState computeShadowFaceCullingState(
+            Side materialSide,
+            std::optional<Side> shadowSide,
+            bool frontFaceCW,
+            bool wireframe = false,
+            bool isVSM = false) {
+
+        const auto effectiveSide = shadowSide.value_or(isVSM ? materialSide : defaultShadowSide(materialSide));
+        return computeFaceCullingState(effectiveSide, frontFaceCW, wireframe);
     }
 
 }// namespace threepp::metal

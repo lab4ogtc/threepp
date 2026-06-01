@@ -58,6 +58,23 @@ namespace threepp {
 
         std::shared_ptr<DepthTexture> depthTexture;
 
+        /**
+         * @brief Creates a render target suitable for the enabled backend set.
+         *
+         * With OpenGL support enabled, this returns a GLRenderTarget so existing
+         * GL renderer internals keep their strong target type. Without OpenGL
+         * support, it returns a generic backend-neutral RenderTarget whose GPU
+         * resources are allocated lazily by the active renderer.
+         *
+         * @param width Target width in pixels.
+         * @param height Target height in pixels.
+         * @param options Texture/depth/stencil creation options.
+         * @return Shared render target instance.
+         */
+        static std::shared_ptr<RenderTarget> create(unsigned int width, unsigned int height);
+
+        static std::shared_ptr<RenderTarget> create(unsigned int width, unsigned int height, const Options& options);
+
         virtual void setSize(unsigned int width, unsigned int height, unsigned int depth = 1) = 0;
 
         RenderTarget& copy(const RenderTarget& source);

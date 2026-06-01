@@ -3,6 +3,7 @@
 #include "threepp/core/BufferAttribute.hpp"
 #include "threepp/renderers/metal/MetalBufferManager.hpp"
 #include "threepp/renderers/metal/MetalShaderManager.hpp"
+#include "threepp/renderers/metal/MetalShaders.hpp"
 #include "threepp/renderers/metal/MetalTextureManager.hpp"
 #include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/Image.hpp"
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -46,7 +48,28 @@ namespace {
         return faces;
     }
 
+    bool contains(std::string_view source, std::string_view token) {
+        return source.find(token) != std::string_view::npos;
+    }
+
 }// namespace
+
+TEST_CASE("Metal special shaders bind uniforms away from vertex attributes") {
+
+    CHECK(contains(metal::sky_vertex, "constant SkyUniforms& uniforms [[buffer(4)]]"));
+    CHECK(contains(metal::sky_fragment, "constant SkyUniforms& uniforms [[buffer(4)]]"));
+    CHECK(contains(metal::water_vertex, "constant WaterUniforms& uniforms [[buffer(4)]]"));
+    CHECK(contains(metal::water_fragment, "constant WaterUniforms& uniforms [[buffer(4)]]"));
+    CHECK(contains(metal::water_fragment, "sampler normalMapSampler [[sampler(0)]]"));
+    CHECK(contains(metal::water_fragment, "sampler mirrorMapSampler [[sampler(1)]]"));
+    CHECK(contains(metal::water_fragment, "float2 mirrorUv = in.mirrorCoord.xy / in.mirrorCoord.w + distortion;"));
+    CHECK(contains(metal::water_fragment, "mirrorUv.y = 1.0 - mirrorUv.y"));
+    CHECK(contains(metal::water_fragment, "mirrorSampler.sample(mirrorMapSampler, mirrorUv)"));
+    CHECK(contains(metal::water_fragment, "applyFog("));
+    CHECK(contains(metal::basic_fragment, "directBlinnPhong("));
+    CHECK(contains(metal::basic_fragment, "params.materialType == 2"));
+    CHECK(contains(metal::basic_fragment, "float4 specularColor"));
+}
 
 TEST_CASE("Metal P2 shader manager compiles every configured variant") {
 

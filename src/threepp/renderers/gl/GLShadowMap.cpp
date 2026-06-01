@@ -14,8 +14,8 @@
 #include "threepp/lights/PointLight.hpp"
 #include "threepp/lights/PointLightShadow.hpp"
 
-#include "threepp/renderers/GLRenderTarget.hpp"
 #include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/shaders/ShaderChunk.hpp"
 #include "threepp/renderers/shaders/ShaderLib.hpp"
 
@@ -307,27 +307,27 @@ struct GLShadowMap::Impl {
 
             if (!shadow->map && !std::dynamic_pointer_cast<PointLightShadow>(shadow) && scope->type == ShadowMap::VSM) {
 
-                GLRenderTarget::Options pars{};
+                RenderTarget::Options pars{};
                 pars.minFilter = Filter::Linear;
                 pars.magFilter = Filter::Linear;
                 pars.format = Format::RGBA;
 
-                shadow->map = GLRenderTarget::create(static_cast<int>(_shadowMapSize.x), static_cast<int>(_shadowMapSize.y), pars);
+                shadow->map = RenderTarget::create(static_cast<int>(_shadowMapSize.x), static_cast<int>(_shadowMapSize.y), pars);
                 shadow->map->texture->name = light->name + ".shadowMap";
 
-                shadow->mapPass = GLRenderTarget::create(static_cast<int>(_shadowMapSize.x), static_cast<int>(_shadowMapSize.y), pars);
+                shadow->mapPass = RenderTarget::create(static_cast<int>(_shadowMapSize.x), static_cast<int>(_shadowMapSize.y), pars);
 
                 shadow->camera->updateProjectionMatrix();
             }
 
             if (!shadow->map) {
 
-                GLRenderTarget::Options pars{};
+                RenderTarget::Options pars{};
                 pars.minFilter = Filter::Nearest;
                 pars.magFilter = Filter::Nearest;
                 pars.format = Format::RGBA;
 
-                shadow->map = GLRenderTarget::create(static_cast<int>(_shadowMapSize.x), static_cast<int>(_shadowMapSize.y), pars);
+                shadow->map = RenderTarget::create(static_cast<int>(_shadowMapSize.x), static_cast<int>(_shadowMapSize.y), pars);
                 shadow->map->texture->name = light->name + ".shadowMap";
 
                 shadow->camera->updateProjectionMatrix();

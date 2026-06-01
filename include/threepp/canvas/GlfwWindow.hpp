@@ -64,6 +64,8 @@ namespace threepp {
 
         [[nodiscard]] void* windowPtr() const;
 
+        [[nodiscard]] int antialiasing() const;
+
         ~GlfwWindow() override;
 
     private:

@@ -1,9 +1,17 @@
 #include "threepp/cameras/PerspectiveCamera.hpp"
 #include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
+#include "threepp/geometries/PlaneGeometry.hpp"
+#include "threepp/math/MathUtils.hpp"
+#include "threepp/materials/ShaderMaterial.hpp"
+#include "threepp/objects/Reflector.hpp"
+#include "threepp/objects/Water.hpp"
+#include "threepp/renderers/RenderJob.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/renderers/metal/MetalShaders.hpp"
+#include "threepp/textures/DepthTexture.hpp"
 #include "threepp/textures/Image.hpp"
 
 #include "threepp/math/Vector4.hpp"
@@ -18,6 +26,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <functional>
+#include <string>
 #include <type_traits>
 
 using namespace threepp;
@@ -40,6 +49,11 @@ namespace {
         renderer.setViewport(0, 0, 1, 1);
         renderer.setScissor(0, 0, 1, 1);
         renderer.setScissorTest(true);
+    };
+
+    template<class T>
+    concept HasBasePreRenderQueue = requires(T& renderer, const RenderJob& job) {
+        renderer.addPreRenderJob(job);
     };
 
     template<class T>
@@ -72,6 +86,31 @@ TEST_CASE("MetalRenderer exposes P1 viewport and scissor API") {
 TEST_CASE("Renderer base exposes backend-independent viewport and scissor API") {
 
     STATIC_REQUIRE(HasBaseViewport<Renderer>);
+}
+
+TEST_CASE("Renderer base exposes backend-independent pre-render job API") {
+
+    STATIC_REQUIRE(HasBasePreRenderQueue<Renderer>);
+}
+
+TEST_CASE("RenderTarget factory creates backend-neutral targets") {
+
+    RenderTarget::Options options;
+    options.format = Format::RGBA;
+    options.depthTexture = DepthTexture::create(Type::Float);
+
+    auto target = RenderTarget::create(16, 8, options);
+    REQUIRE(target != nullptr);
+    REQUIRE(target->width == 16);
+    REQUIRE(target->height == 8);
+    REQUIRE(target->texture != nullptr);
+    REQUIRE(target->depthTexture != nullptr);
+
+    target->setSize(4, 2);
+    REQUIRE(target->width == 4);
+    REQUIRE(target->height == 2);
+    REQUIRE(target->viewport.z == 4);
+    REQUIRE(target->viewport.w == 2);
 }
 
 TEST_CASE("Renderer base exposes backend-independent size API") {
@@ -297,6 +336,88 @@ TEST_CASE("Metal render preparation refreshes standalone camera matrices") {
     REQUIRE(camera.matrixWorldInverse.elements[14] == -4);
 }
 
+TEST_CASE("Metal render preparation preserves Water oblique reflection projection") {
+
+    auto water = Water::create(PlaneGeometry::create(10.f, 10.f));
+    water->rotateX(-math::PI / 2.f);
+    water->updateMatrixWorld(true);
+
+    PerspectiveCamera camera{60, 1, 0.1f, 100.f};
+    camera.position.set(0.f, 5.f, 5.f);
+    camera.lookAt(0.f, 0.f, 0.f);
+    camera.updateMatrixWorld(true);
+
+    const auto originalProjection = camera.projectionMatrix;
+    REQUIRE(water->updateReflection(camera));
+
+    auto& reflectionCamera = water->reflectionCamera();
+    const auto obliqueProjection = reflectionCamera.projectionMatrix;
+
+    REQUIRE(obliqueProjection.elements[10] != Catch::Approx(originalProjection.elements[10]));
+    REQUIRE(obliqueProjection.elements[14] != Catch::Approx(originalProjection.elements[14]));
+
+    metal::prepareCameraForRender(reflectionCamera);
+
+    REQUIRE(reflectionCamera.projectionMatrix.elements[2] == Catch::Approx(obliqueProjection.elements[2]));
+    REQUIRE(reflectionCamera.projectionMatrix.elements[6] == Catch::Approx(obliqueProjection.elements[6]));
+    REQUIRE(reflectionCamera.projectionMatrix.elements[10] == Catch::Approx(obliqueProjection.elements[10]));
+    REQUIRE(reflectionCamera.projectionMatrix.elements[14] == Catch::Approx(obliqueProjection.elements[14]));
+}
+
+TEST_CASE("Water registers a pre-render job without renderer-specific callbacks") {
+
+    auto water = Water::create(PlaneGeometry::create(10.f, 10.f));
+    water->rotateX(-math::PI / 2.f);
+    water->updateMatrixWorld(true);
+
+    auto material = water->material();
+    REQUIRE(material != nullptr);
+    REQUIRE(material->polygonOffset);
+    REQUIRE(material->polygonOffsetFactor == Catch::Approx(1.f));
+    REQUIRE(material->polygonOffsetUnits == Catch::Approx(1.f));
+    REQUIRE_FALSE(water->onBeforeRender.has_value());
+
+    PerspectiveCamera camera{60, 1, 0.1f, 100.f};
+    camera.position.set(0.f, 5.f, 5.f);
+    camera.lookAt(0.f, 0.f, 0.f);
+    camera.updateMatrixWorld(true);
+
+    auto job = water->getPreRenderJob(camera);
+    REQUIRE(job.has_value());
+    REQUIRE(job->initiator == water.get());
+    REQUIRE(job->camera == &water->reflectionCamera());
+    REQUIRE(job->renderTarget == water->reflectionRenderTarget());
+    REQUIRE(job->renderTarget->texture->encoding == Encoding::Linear);
+}
+
+TEST_CASE("Water shader samples the GL reflection target in native orientation") {
+
+    auto water = Water::create(PlaneGeometry::create(10.f, 10.f));
+    auto* material = water->material()->as<ShaderMaterial>();
+    REQUIRE(material != nullptr);
+
+    REQUIRE(material->fragmentShader.find("texture2D( mirrorSampler, mirrorCoord.xy / mirrorCoord.w + distortion )") != std::string::npos);
+    REQUIRE(material->fragmentShader.find("mirrorUv.y = 1.0 - mirrorUv.y;") == std::string::npos);
+}
+
+TEST_CASE("Reflector registers a pre-render job without renderer-specific callbacks") {
+
+    auto reflector = Reflector::create(PlaneGeometry::create(4.f, 4.f));
+    reflector->updateMatrixWorld(true);
+    REQUIRE_FALSE(reflector->onBeforeRender.has_value());
+
+    PerspectiveCamera camera{60, 1, 0.1f, 100.f};
+    camera.position.set(0.f, 0.f, 5.f);
+    camera.lookAt(0.f, 0.f, 0.f);
+    camera.updateMatrixWorld(true);
+
+    auto job = reflector->getPreRenderJob(camera);
+    REQUIRE(job.has_value());
+    REQUIRE(job->initiator == reflector.get());
+    REQUIRE(job->camera == &reflector->reflectionCamera());
+    REQUIRE(job->renderTarget == reflector->reflectionRenderTarget());
+}
+
 TEST_CASE("Metal projection maps OpenGL depth clip range to Metal depth clip range") {
 
     PerspectiveCamera camera{60, 1, 1, 10};
@@ -334,6 +455,25 @@ TEST_CASE("Metal face culling state matches OpenGL material side semantics") {
 
     auto doubleSided = metal::computeFaceCullingState(Side::Double, false);
     REQUIRE(doubleSided.cullMode == metal::CullMode::None);
+}
+
+TEST_CASE("Metal shadow face culling state matches OpenGL shadow caster semantics") {
+
+    const auto front = metal::computeShadowFaceCullingState(Side::Front, std::nullopt, false, false, false);
+    REQUIRE(front.frontFaceWinding == metal::FrontFaceWinding::Clockwise);
+    REQUIRE(front.cullMode == metal::CullMode::Back);
+
+    const auto back = metal::computeShadowFaceCullingState(Side::Back, std::nullopt, false, false, false);
+    REQUIRE(back.frontFaceWinding == metal::FrontFaceWinding::CounterClockwise);
+    REQUIRE(back.cullMode == metal::CullMode::Back);
+
+    const auto explicitFront = metal::computeShadowFaceCullingState(Side::Back, Side::Front, false, false, false);
+    REQUIRE(explicitFront.frontFaceWinding == metal::FrontFaceWinding::CounterClockwise);
+    REQUIRE(explicitFront.cullMode == metal::CullMode::Back);
+
+    const auto vsmFront = metal::computeShadowFaceCullingState(Side::Front, std::nullopt, false, false, true);
+    REQUIRE(vsmFront.frontFaceWinding == metal::FrontFaceWinding::CounterClockwise);
+    REQUIRE(vsmFront.cullMode == metal::CullMode::Back);
 }
 
 TEST_CASE("Metal wireframe rendering disables triangle culling like GL line wireframes") {

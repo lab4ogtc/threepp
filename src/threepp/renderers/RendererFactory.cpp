@@ -1,6 +1,10 @@
 
 #include "threepp/renderers/Renderer.hpp"
+#include <stdexcept>
+
+#ifdef THREEPP_HAS_GL
 #include "threepp/renderers/GLRenderer.hpp"
+#endif
 
 #ifdef __APPLE__
 #include "threepp/renderers/metal/MetalRenderer.hpp"
@@ -16,7 +20,11 @@ std::unique_ptr<Renderer> Renderer::create(
     switch (backend) {
 
         case Backend::OpenGL:
+#ifdef THREEPP_HAS_GL
             return std::make_unique<GLRenderer>(window);
+#else
+            throw std::runtime_error("OpenGL backend not enabled in this build");
+#endif
 
         case Backend::Metal:
 #ifdef __APPLE__

@@ -3,12 +3,14 @@
 #import "MetalBufferManager.hpp"
 #import "MetalCameraUtils.hpp"
 #import "MetalPipelineCache.hpp"
+#import "MetalRenderList.hpp"
 #import "MetalRenderStateUtils.hpp"
 #import "MetalShaderManager.hpp"
 #import "MetalTextureManager.hpp"
 
 #import "threepp/cameras/Camera.hpp"
 #import "threepp/cameras/PerspectiveCamera.hpp"
+#import "threepp/canvas/GlfwWindow.hpp"
 #import "threepp/canvas/Window.hpp"
 #import "threepp/core/BufferAttribute.hpp"
 #import "threepp/core/BufferGeometry.hpp"
@@ -24,6 +26,7 @@
 #import "threepp/materials/Material.hpp"
 #import "threepp/materials/MeshBasicMaterial.hpp"
 #import "threepp/materials/MeshLambertMaterial.hpp"
+#import "threepp/materials/MeshNormalMaterial.hpp"
 #import "threepp/materials/MeshPhongMaterial.hpp"
 #import "threepp/materials/MeshStandardMaterial.hpp"
 #import "threepp/materials/PointsMaterial.hpp"
@@ -44,7 +47,7 @@
 #import "threepp/objects/SkinnedMesh.hpp"
 #import "threepp/objects/Sprite.hpp"
 #import "threepp/objects/Water.hpp"
-#import "threepp/renderers/GLRenderTarget.hpp"
+#import "threepp/renderers/RenderJob.hpp"
 #import "threepp/renderers/RenderTarget.hpp"
 #import "threepp/scenes/Scene.hpp"
 #import "threepp/textures/CubeTexture.hpp"
@@ -66,8 +69,10 @@
 #include <cstdint>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 using namespace threepp;
@@ -88,9 +93,34 @@ namespace {
     constexpr std::uint8_t vertexLayoutSkinning = 1u << 5u;
     constexpr std::uint8_t vertexLayoutColor4 = 1u << 6u;
 
+    int requestedAntialiasingSamples(Window& window) {
+        if (auto* glfwWindow = dynamic_cast<GlfwWindow*>(&window)) {
+            return glfwWindow->antialiasing();
+        }
+        return 1;
+    }
+
+    NSUInteger selectSupportedSampleCount(id<MTLDevice> device, int requestedSamples) {
+        if (requestedSamples <= 1) return 1;
+
+        const std::array<NSUInteger, 4> candidates{
+                static_cast<NSUInteger>(requestedSamples),
+                8u,
+                4u,
+                2u};
+        for (auto sampleCount : candidates) {
+            if (sampleCount > 1u && sampleCount <= static_cast<NSUInteger>(requestedSamples) && [device supportsTextureSampleCount:sampleCount]) {
+                return sampleCount;
+            }
+        }
+
+        return 1;
+    }
+
     struct alignas(16) TransformUniforms {
         float mvp[16];
         float modelMatrix[16];
+        float modelViewMatrix[16];
         float normalMatrix[16];
         float bindMatrix[16];
         float bindMatrixInverse[16];
@@ -118,6 +148,13 @@ namespace {
         std::uint32_t textureFlags0[4];
         std::uint32_t textureFlags1[4];
         float cameraPosition[4];
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        std::uint32_t materialType;
+        float specularColor[4];
+        float fogColor[4];
+        float fogParams[4];
     };
 
     struct alignas(16) SpriteUniforms {
@@ -128,11 +165,19 @@ namespace {
         float center[2];
         float rotation;
         float scaleAttenuation;
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding;
     };
 
     struct alignas(16) LineUniforms {
         float mvp[16];
         float color[4];
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding;
     };
 
     struct alignas(16) PointUniforms {
@@ -141,7 +186,10 @@ namespace {
         float pointSize;
         float scale;
         std::uint32_t sizeAttenuation;
-        std::uint32_t padding;
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding[2];
     };
 
     struct alignas(16) RawShaderUniforms {
@@ -156,17 +204,28 @@ namespace {
         float sunPosition[4];
         float up[4];
         float params[4];
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding;
     };
 
     struct alignas(16) WaterUniforms {
         float mvp[16];
         float modelMatrix[16];
+        float modelViewMatrix[16];
         float textureMatrix[16];
         float sunDirection[4];
         float sunColor[4];
         float eye[4];
         float waterColor[4];
         float params[4];
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding;
+        float fogColor[4];
+        float fogParams[4];
     };
 
     struct alignas(16) DirectionalLightUniform {
@@ -255,6 +314,10 @@ namespace {
         copyMatrix(mvp, out.mvp);
         copyMatrix(*object.matrixWorld, out.modelMatrix);
 
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *object.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
+
         Matrix3 normalMatrix;
         normalMatrix.getNormalMatrix(*object.matrixWorld);
         copyIdentityMatrix(out.normalMatrix);
@@ -317,7 +380,6 @@ namespace {
         out.pointSize = material.size;
         out.scale = scale;
         out.sizeAttenuation = sizeAttenuation ? 1u : 0u;
-        out.padding = 0u;
     }
 
     void computeRawShaderUniforms(const Camera& camera, const Mesh& mesh, float time, RawShaderUniforms& out) {
@@ -402,6 +464,29 @@ namespace {
         }
     }
 
+    Material* materialForRenderOrder(Object3D& object) {
+        auto material = object.material();
+        return material ? material.get() : nullptr;
+    }
+
+    void buildRenderList(const std::vector<Object3D*>& renderables, const Camera& camera, metal::MetalRenderList& renderList) {
+        Matrix4 projScreenMatrix;
+        projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+
+        Vector3 projectedPosition;
+        for (auto* object : renderables) {
+            auto* material = materialForRenderOrder(*object);
+            if (!material || !material->visible) continue;
+
+            projectedPosition
+                    .setFromMatrixPosition(*object->matrixWorld)
+                    .applyMatrix4(projScreenMatrix);
+            renderList.push(*object, *material, projectedPosition.z);
+        }
+
+        renderList.sort();
+    }
+
     void updateLODs(Object3D& object, Camera& camera) {
         if (!object.visible) return;
 
@@ -413,6 +498,24 @@ namespace {
 
         for (const auto& child : object.children) {
             updateLODs(*child, camera);
+        }
+    }
+
+    void collectPreRenderables(Object3D& object, Camera& camera, const Frustum& frustum, Renderer& renderer) {
+        if (!object.visible) return;
+
+        if (object.layers.test(camera.layers)) {
+            if (auto* preRenderable = dynamic_cast<PreRenderable*>(&object)) {
+                if (!object.frustumCulled || frustum.intersectsObject(object)) {
+                    if (auto job = preRenderable->getPreRenderJob(camera)) {
+                        renderer.addPreRenderJob(*job);
+                    }
+                }
+            }
+        }
+
+        for (const auto& child : object.children) {
+            collectPreRenderables(*child, camera, frustum, renderer);
         }
     }
 
@@ -553,7 +656,43 @@ namespace {
         return dynamic_cast<const MeshStandardMaterial*>(&material) != nullptr || dynamic_cast<const MeshPhongMaterial*>(&material) != nullptr || dynamic_cast<const MeshLambertMaterial*>(&material) != nullptr;
     }
 
-    ShadingParams extractShadingParams(Material& material, const Camera& camera, bool receiveShadow) {
+    template<class Uniforms>
+    void fillToneMappingUniforms(const Renderer& renderer, const Material& material, Uniforms& uniforms) {
+        uniforms.toneMappingType = static_cast<std::uint32_t>(material.toneMapped ? renderer.toneMapping : ToneMapping::None);
+        uniforms.toneMappingExposure = renderer.toneMappingExposure;
+        uniforms.toneMapped = material.toneMapped ? 1u : 0u;
+    }
+
+    template<class Uniforms>
+    void fillFogUniforms(const Scene& scene, const Material& material, Uniforms& uniforms) {
+        uniforms.fogColor[0] = 1.f;
+        uniforms.fogColor[1] = 1.f;
+        uniforms.fogColor[2] = 1.f;
+        uniforms.fogColor[3] = 1.f;
+        uniforms.fogParams[0] = 1.f;
+        uniforms.fogParams[1] = 2000.f;
+        uniforms.fogParams[2] = 0.00025f;
+        uniforms.fogParams[3] = 0.f;
+
+        if (!material.fog || !scene.fog.has_value()) return;
+
+        if (const auto* fog = std::get_if<Fog>(&*scene.fog)) {
+            uniforms.fogColor[0] = fog->color.r;
+            uniforms.fogColor[1] = fog->color.g;
+            uniforms.fogColor[2] = fog->color.b;
+            uniforms.fogParams[0] = fog->nearPlane;
+            uniforms.fogParams[1] = fog->farPlane;
+            uniforms.fogParams[3] = 1.f;
+        } else if (const auto* fog = std::get_if<FogExp2>(&*scene.fog)) {
+            uniforms.fogColor[0] = fog->color.r;
+            uniforms.fogColor[1] = fog->color.g;
+            uniforms.fogColor[2] = fog->color.b;
+            uniforms.fogParams[2] = fog->density;
+            uniforms.fogParams[3] = 2.f;
+        }
+    }
+
+    ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow) {
         ShadingParams params{};
         params.baseColor[0] = 1.f;
         params.baseColor[1] = 1.f;
@@ -563,6 +702,10 @@ namespace {
         params.pbrParams[1] = 0.f;
         params.pbrParams[2] = 1.f;
         params.pbrParams[3] = 1.f;
+        params.specularColor[0] = 0.04f;
+        params.specularColor[1] = 0.04f;
+        params.specularColor[2] = 0.04f;
+        params.specularColor[3] = 30.f;
 
         if (auto* colorMaterial = dynamic_cast<MaterialWithColor*>(&material)) {
             params.baseColor[0] = colorMaterial->color.r;
@@ -579,6 +722,13 @@ namespace {
         } else if (dynamic_cast<MeshLambertMaterial*>(&material)) {
             params.pbrParams[0] = 1.f;
             params.pbrParams[1] = 0.f;
+        }
+
+        if (auto* specular = dynamic_cast<MaterialWithSpecular*>(&material)) {
+            params.specularColor[0] = specular->specular.r;
+            params.specularColor[1] = specular->specular.g;
+            params.specularColor[2] = specular->specular.b;
+            params.specularColor[3] = specular->shininess;
         }
 
         if (auto* roughness = dynamic_cast<MaterialWithRoughness*>(&material)) {
@@ -616,6 +766,17 @@ namespace {
         params.cameraPosition[1] = cameraPosition.y;
         params.cameraPosition[2] = cameraPosition.z;
         params.cameraPosition[3] = 1.f;
+        fillToneMappingUniforms(renderer, material, params);
+        fillFogUniforms(scene, material, params);
+        if (dynamic_cast<MeshNormalMaterial*>(&material)) {
+            params.materialType = 1u;
+        } else if (dynamic_cast<MeshPhongMaterial*>(&material)) {
+            params.materialType = 2u;
+        } else if (dynamic_cast<MeshLambertMaterial*>(&material)) {
+            params.materialType = 3u;
+        } else {
+            params.materialType = 0u;
+        }
         return params;
     }
 
@@ -630,12 +791,13 @@ namespace {
 
     MTLPixelFormat toRenderTargetColorPixelFormat(const Texture& texture) {
         switch (texture.format) {
+            case Format::RGB:
             case Format::RGBA:
                 return MTLPixelFormatRGBA8Unorm;
             case Format::BGRA:
                 return MTLPixelFormatBGRA8Unorm;
             default:
-                throw std::runtime_error("Metal RenderTarget currently supports only RGBA8 and BGRA8 color textures");
+                throw std::runtime_error("Metal RenderTarget currently supports only RGB8, RGBA8, and BGRA8 color textures");
         }
     }
 
@@ -643,12 +805,15 @@ namespace {
 
 struct MetalRenderer::Impl {
 
+    MetalRenderer& renderer;
     Window& window;
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> commandQueue = nil;
     CAMetalLayer* metalLayer = nil;
     id<MTLDepthStencilState> depthStencilState = nil;
     id<MTLTexture> depthTexture = nil;
+    id<MTLTexture> multisampleColorTexture = nil;
+    MTLPixelFormat multisampleColorPixelFormat = MTLPixelFormatInvalid;
     id<CAMetalDrawable> currentDrawable = nil;
     id<MTLCommandBuffer> currentCommandBuffer = nil;
     dispatch_semaphore_t inFlightSemaphore = nullptr;
@@ -695,8 +860,6 @@ struct MetalRenderer::Impl {
             RenderTarget* target = nullptr;
             if (auto** renderTargetPtr = std::any_cast<RenderTarget*>(&event.target)) {
                 target = *renderTargetPtr;
-            } else if (auto** glRenderTargetPtr = std::any_cast<GLRenderTarget*>(&event.target)) {
-                target = *glRenderTargetPtr;
             }
             if (!target) return;
 
@@ -735,10 +898,16 @@ struct MetalRenderer::Impl {
     bool explicitFrameInProgress = false;
     bool currentCommandBufferExternallyAccessed = false;
     bool lastFrameWasExternallyAccessed = false;
+    bool renderingPrePass = false;
+    std::vector<RenderJob> preRenderJobs;
+    std::optional<float> currentDepthBiasFactor;
+    std::optional<float> currentDepthBiasUnits;
 
     int fbWidth = 0;
     int fbHeight = 0;
     float pixelRatio = 1;
+    NSUInteger drawableSampleCount = 1;
+    NSUInteger activeRenderSampleCount = 1;
     Vector4 viewport;
     Vector4 scissor;
     bool scissorTest = false;
@@ -746,8 +915,9 @@ struct MetalRenderer::Impl {
 
     RenderTarget* renderTarget = nullptr;
 
-    explicit Impl(Window& w)
-        : window(w),
+    explicit Impl(MetalRenderer& r, Window& w)
+        : renderer(r),
+          window(w),
           onRenderTargetDispose(*this),
           onGeometryDispose(*this) {
 
@@ -759,6 +929,7 @@ struct MetalRenderer::Impl {
         if (!device) {
             throw std::runtime_error("Metal is not supported on this device");
         }
+        drawableSampleCount = selectSupportedSampleCount(device, requestedAntialiasingSamples(window));
 
         commandQueue = [device newCommandQueue];
         inFlightSemaphore = dispatch_semaphore_create(3);
@@ -890,9 +1061,33 @@ struct MetalRenderer::Impl {
                                                                                         width:std::max(fbWidth, 1)
                                                                                        height:std::max(fbHeight, 1)
                                                                                     mipmapped:NO];
+        desc.textureType = drawableSampleCount > 1 ? MTLTextureType2DMultisample : MTLTextureType2D;
+        desc.sampleCount = drawableSampleCount;
         desc.usage = MTLTextureUsageRenderTarget;
         desc.storageMode = MTLStorageModePrivate;
         depthTexture = [device newTextureWithDescriptor:desc];
+    }
+
+    id<MTLTexture> getOrCreateMultisampleColorTexture(MTLPixelFormat pixelFormat) {
+        if (drawableSampleCount <= 1) return nil;
+        if (multisampleColorTexture &&
+            multisampleColorTexture.width == static_cast<NSUInteger>(std::max(fbWidth, 1)) &&
+            multisampleColorTexture.height == static_cast<NSUInteger>(std::max(fbHeight, 1)) &&
+            multisampleColorPixelFormat == pixelFormat) {
+            return multisampleColorTexture;
+        }
+
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                                        width:std::max(fbWidth, 1)
+                                                                                       height:std::max(fbHeight, 1)
+                                                                                    mipmapped:NO];
+        desc.textureType = MTLTextureType2DMultisample;
+        desc.sampleCount = drawableSampleCount;
+        desc.usage = MTLTextureUsageRenderTarget;
+        desc.storageMode = MTLStorageModePrivate;
+        multisampleColorTexture = [device newTextureWithDescriptor:desc];
+        multisampleColorPixelFormat = pixelFormat;
+        return multisampleColorTexture;
     }
 
     id<MTLTexture> createSolidTexture2D(std::array<unsigned char, 4> rgba) const {
@@ -1053,7 +1248,7 @@ struct MetalRenderer::Impl {
         shadowSamplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
         shadowSamplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
         shadowSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-        shadowSamplerDesc.compareFunction = MTLCompareFunctionLessEqual;
+        shadowSamplerDesc.compareFunction = MTLCompareFunctionGreaterEqual;
         shadowSampler = [device newSamplerStateWithDescriptor:shadowSamplerDesc];
     }
 
@@ -1110,6 +1305,8 @@ struct MetalRenderer::Impl {
         updatePixelRatio(WindowSize{size});
         metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
         metalLayer.contentsScale = pixelRatio;
+        multisampleColorTexture = nil;
+        multisampleColorPixelFormat = MTLPixelFormatInvalid;
         createDepthTexture();
         setViewport(0, 0, size.first, size.second);
         setScissor(0, 0, size.first, size.second);
@@ -1121,7 +1318,9 @@ struct MetalRenderer::Impl {
     }
 
     void clear(bool color, bool depth, bool /*stencil*/) {
-        commitPendingFrame();
+        if (currentCommandBuffer && color) {
+            commitPendingFrame();
+        }
 
         clearColorFlag = color;
         clearDepthFlag = depth;
@@ -1213,6 +1412,26 @@ struct MetalRenderer::Impl {
         [encoder setScissorRect:rect];
     }
 
+    void resetDepthBiasCache() {
+        currentDepthBiasFactor.reset();
+        currentDepthBiasUnits.reset();
+    }
+
+    void applyDepthBias(id<MTLRenderCommandEncoder> encoder, const Material& material) {
+        const auto factor = material.polygonOffset ? material.polygonOffsetFactor : 0.f;
+        const auto units = material.polygonOffset ? material.polygonOffsetUnits : 0.f;
+
+        if (currentDepthBiasFactor && currentDepthBiasUnits &&
+            *currentDepthBiasFactor == factor &&
+            *currentDepthBiasUnits == units) {
+            return;
+        }
+
+        [encoder setDepthBias:units slopeScale:factor clamp:0.f];
+        currentDepthBiasFactor = factor;
+        currentDepthBiasUnits = units;
+    }
+
     void bindTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, id<MTLTexture> placeholder, NSUInteger index, bool allowPlaceholder = false) {
         id<MTLTexture> metalTexture = placeholder;
         id<MTLSamplerState> sampler = defaultSampler;
@@ -1243,6 +1462,11 @@ struct MetalRenderer::Impl {
         if (index == 0) {
             [encoder setFragmentSamplerState:sampler atIndex:0];
         }
+    }
+
+    id<MTLSamplerState> samplerForTexture(Texture* texture) {
+        if (!texture) return defaultSampler;
+        return (__bridge id<MTLSamplerState>) textureManager->getOrCreateSampler(*texture);
     }
 
     void bindCubeTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, NSUInteger index) {
@@ -1521,6 +1745,7 @@ struct MetalRenderer::Impl {
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
         if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
         [encoder setRenderPipelineState:pso];
@@ -1531,11 +1756,13 @@ struct MetalRenderer::Impl {
         [encoder setDepthStencilState:materialDepthStencilState];
         [encoder setCullMode:MTLCullModeNone];
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
 
         bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
 
         LineUniforms uniforms{};
         computeLineUniforms(camera, line, *material, uniforms);
+        fillToneMappingUniforms(renderer, *material, uniforms);
         [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
@@ -1572,6 +1799,7 @@ struct MetalRenderer::Impl {
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
         if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
         [encoder setRenderPipelineState:pso];
@@ -1582,12 +1810,14 @@ struct MetalRenderer::Impl {
         [encoder setDepthStencilState:materialDepthStencilState];
         [encoder setCullMode:MTLCullModeNone];
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
 
         bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
 
         PointUniforms uniforms{};
         const bool useSizeAttenuation = material->sizeAttenuation && dynamic_cast<PerspectiveCamera*>(&camera) != nullptr;
         computePointUniforms(camera, points, *material, pointScale(), useSizeAttenuation, uniforms);
+        fillToneMappingUniforms(renderer, *material, uniforms);
         [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
@@ -1611,6 +1841,7 @@ struct MetalRenderer::Impl {
         pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutColor4;
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
         [encoder setRenderPipelineState:pso];
@@ -1625,6 +1856,7 @@ struct MetalRenderer::Impl {
         [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
 
         bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, true, false);
 
@@ -1657,6 +1889,7 @@ struct MetalRenderer::Impl {
         pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
         [encoder setRenderPipelineState:pso];
@@ -1670,12 +1903,14 @@ struct MetalRenderer::Impl {
         [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
 
         [encoder setVertexBytes:positions length:sizeof(positions) atIndex:0];
         [encoder setVertexBytes:uvs length:sizeof(uvs) atIndex:2];
 
-        SpriteUniforms uniforms;
+        SpriteUniforms uniforms{};
         computeSpriteUniforms(camera, sprite, *material, uniforms);
+        fillToneMappingUniforms(renderer, *material, uniforms);
         [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
@@ -1701,6 +1936,7 @@ struct MetalRenderer::Impl {
         pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
         [encoder setRenderPipelineState:pso];
@@ -1715,6 +1951,7 @@ struct MetalRenderer::Impl {
         [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
 
         bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
 
@@ -1729,13 +1966,14 @@ struct MetalRenderer::Impl {
         uniforms.params[1] = uniformFloat(material->uniforms, "rayleigh", 1.f);
         uniforms.params[2] = uniformFloat(material->uniforms, "mieCoefficient", 0.005f);
         uniforms.params[3] = uniformFloat(material->uniforms, "mieDirectionalG", 0.8f);
+        fillToneMappingUniforms(renderer, *material, uniforms);
 
-        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
         drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
     }
 
-    void renderWater(id<MTLRenderCommandEncoder> encoder, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    void renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat) {
         auto materialPtr = water.material();
         auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
         auto geometry = water.geometry();
@@ -1751,6 +1989,7 @@ struct MetalRenderer::Impl {
         pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
         [encoder setRenderPipelineState:pso];
@@ -1765,6 +2004,7 @@ struct MetalRenderer::Impl {
         [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
 
         bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
 
@@ -1774,6 +2014,9 @@ struct MetalRenderer::Impl {
         computeMVP(camera, water, mvp);
         copyMatrix(mvp, uniforms.mvp);
         copyMatrix(*water.matrixWorld, uniforms.modelMatrix);
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *water.matrixWorld);
+        copyMatrix(modelViewMatrix, uniforms.modelViewMatrix);
         const auto textureMatrix = uniformMatrix4(material->uniforms, "textureMatrix", identity);
         copyMatrix(textureMatrix, uniforms.textureMatrix);
         copyVector3(uniformVector3(material->uniforms, "sunDirection", Vector3{0.70707f, 0.70707f, 0}), uniforms.sunDirection);
@@ -1792,13 +2035,19 @@ struct MetalRenderer::Impl {
         uniforms.params[1] = uniformFloat(material->uniforms, "time", 0.f);
         uniforms.params[2] = uniformFloat(material->uniforms, "size", 1.f);
         uniforms.params[3] = uniformFloat(material->uniforms, "distortionScale", 20.f);
+        fillToneMappingUniforms(renderer, *material, uniforms);
+        fillFogUniforms(scene, *material, uniforms);
 
-        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:0];
-        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
-        bindTextureOrPlaceholder(encoder, uniformTexture(material->uniforms, "normalSampler"), normalTexture, 0);
-        bindTextureOrPlaceholder(encoder, uniformTexture(material->uniforms, "mirrorSampler"), whiteTexture, 1, true);
-        [encoder setFragmentSamplerState:defaultSampler atIndex:0];
+        auto normalSamplerTexture = uniformTexture(material->uniforms, "normalSampler");
+        auto mirrorSamplerTexture = uniformTexture(material->uniforms, "mirrorSampler");
+
+        bindTextureOrPlaceholder(encoder, normalSamplerTexture, normalTexture, 0);
+        bindTextureOrPlaceholder(encoder, mirrorSamplerTexture, whiteTexture, 1, true);
+        [encoder setFragmentSamplerState:samplerForTexture(normalSamplerTexture) atIndex:0];
+        [encoder setFragmentSamplerState:samplerForTexture(mirrorSamplerTexture) atIndex:1];
 
         drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
     }
@@ -1824,8 +2073,12 @@ struct MetalRenderer::Impl {
                         const auto* wf = dynamic_cast<MaterialWithWireframe*>(material);
                         const bool isWireframe = wf && wf->wireframe;
                         const auto frontFaceCW = object.matrixWorld->determinant() < 0;
-                        const auto shadowSide = material->shadowSide.value_or(material->side);
-                        const auto faceCullingState = metal::computeFaceCullingState(shadowSide, frontFaceCW, isWireframe);
+                        const auto faceCullingState = metal::computeShadowFaceCullingState(
+                                material->side,
+                                material->shadowSide,
+                                frontFaceCW,
+                                isWireframe,
+                                shadowMapState.type == ShadowMap::VSM);
                         [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
                         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
                         [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
@@ -1887,8 +2140,12 @@ struct MetalRenderer::Impl {
                         const auto* wf = dynamic_cast<MaterialWithWireframe*>(material);
                         const bool isWireframe = wf && wf->wireframe;
                         const auto frontFaceCW = object.matrixWorld->determinant() < 0;
-                        const auto shadowSide = material->shadowSide.value_or(material->side);
-                        const auto faceCullingState = metal::computeFaceCullingState(shadowSide, frontFaceCW, isWireframe);
+                        const auto faceCullingState = metal::computeShadowFaceCullingState(
+                                material->side,
+                                material->shadowSide,
+                                frontFaceCW,
+                                isWireframe,
+                                shadowMapState.type == ShadowMap::VSM);
                         [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
                         [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
                         [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
@@ -1947,6 +2204,7 @@ struct MetalRenderer::Impl {
         passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
         id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
+        resetDepthBiasCache();
         [encoder setDepthStencilState:depthStencilState];
         renderDepthObject(encoder, scene, *shadow.camera, shadow.getFrustum());
         [encoder endEncoding];
@@ -2159,6 +2417,74 @@ struct MetalRenderer::Impl {
         [blitEncoder endEncoding];
     }
 
+    void addPreRenderJob(const RenderJob& job) {
+        if (!job.initiator || !job.camera || !job.renderTarget) return;
+
+        preRenderJobs.emplace_back(job);
+    }
+
+    void collectPreRenderJobs(Scene& scene, Camera& camera) {
+        if (renderingPrePass) return;
+
+        preRenderJobs.clear();
+        Matrix4 projScreenMatrix;
+        projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        Frustum frustum;
+        frustum.setFromProjectionMatrix(projScreenMatrix);
+        collectPreRenderables(scene, camera, frustum, renderer);
+    }
+
+    void renderPreRenderJobs(Scene& scene) {
+        if (renderingPrePass || preRenderJobs.empty()) return;
+
+        const auto jobs = std::move(preRenderJobs);
+        preRenderJobs.clear();
+
+        const auto previousRenderTarget = renderTarget;
+        const auto previousClearRequested = clearRequested;
+        const auto previousClearColorFlag = clearColorFlag;
+        const auto previousClearDepthFlag = clearDepthFlag;
+        const auto previousExplicitFrameInProgress = explicitFrameInProgress;
+        const auto previousRenderingPrePass = renderingPrePass;
+
+        renderingPrePass = true;
+
+        for (const auto& job : jobs) {
+            if (!job.initiator || !job.camera || !job.renderTarget || renderTarget == job.renderTarget) continue;
+
+            const auto previousVisible = job.initiator->visible;
+
+            const auto restore = [&] {
+                job.initiator->visible = previousVisible;
+                renderTarget = previousRenderTarget;
+                clearRequested = previousClearRequested;
+                clearColorFlag = previousClearColorFlag;
+                clearDepthFlag = previousClearDepthFlag;
+                explicitFrameInProgress = previousExplicitFrameInProgress;
+                renderingPrePass = previousRenderingPrePass;
+            };
+
+            job.initiator->visible = false;
+            renderTarget = job.renderTarget;
+            clearRequested = true;
+            clearColorFlag = true;
+            clearDepthFlag = true;
+            explicitFrameInProgress = false;
+
+            try {
+                render(scene, *job.camera, true);
+            } catch (...) {
+                restore();
+                throw;
+            }
+
+            restore();
+            renderingPrePass = true;
+        }
+
+        renderingPrePass = previousRenderingPrePass;
+    }
+
     void render(Scene& scene, Camera& camera, bool autoClear) {
         if (currentCommandBuffer && !explicitFrameInProgress) {
             commitPendingFrame();
@@ -2176,6 +2502,10 @@ struct MetalRenderer::Impl {
         float effectiveClearAlpha = clearAlpha;
         if (!scene.background.empty() && scene.background.isColor()) {
             effectiveClearColor.copy(scene.background.color());
+        }
+        if (!renderingPrePass) {
+            collectPreRenderJobs(scene, camera);
+            renderPreRenderJobs(scene);
         }
 
         if (!currentCommandBuffer) {
@@ -2196,6 +2526,7 @@ struct MetalRenderer::Impl {
             colorTexture = resources.colorTexture;
             passDepthTexture = resources.depthTexture;
             colorPixelFormat = resources.colorPixelFormat;
+            activeRenderSampleCount = 1;
         } else {
             if (!ensureDrawable()) {
                 commitPendingFrame();
@@ -2204,6 +2535,10 @@ struct MetalRenderer::Impl {
             colorTexture = currentDrawable.texture;
             passDepthTexture = depthTexture;
             colorPixelFormat = colorTexture.pixelFormat;
+            activeRenderSampleCount = drawableSampleCount;
+            if (activeRenderSampleCount > 1) {
+                colorTexture = getOrCreateMultisampleColorTexture(colorPixelFormat);
+            }
         }
 
         const auto shouldClear = autoClear || clearRequested;
@@ -2212,7 +2547,12 @@ struct MetalRenderer::Impl {
         passDesc.colorAttachments[0].texture = colorTexture;
         passDesc.colorAttachments[0].loadAction = shouldClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
         passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
-        passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        if (!renderTarget && activeRenderSampleCount > 1) {
+            passDesc.colorAttachments[0].resolveTexture = currentDrawable.texture;
+            passDesc.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        } else {
+            passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
 
         passDesc.depthAttachment.texture = passDepthTexture;
         passDesc.depthAttachment.loadAction = shouldClear && clearDepthFlag ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -2220,6 +2560,7 @@ struct MetalRenderer::Impl {
         passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
         id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
+        resetDepthBiasCache();
         [encoder setDepthStencilState:depthStencilState];
         if (renderTarget) {
             const MTLViewport targetViewport{
@@ -2243,8 +2584,11 @@ struct MetalRenderer::Impl {
             applyScissor(encoder);
         }
 
-        std::vector<Object3D*> renderables;
-        collectRenderables(scene, renderables);
+        std::vector<Object3D*> collectedRenderables;
+        collectRenderables(scene, collectedRenderables);
+        metal::MetalRenderList renderList;
+        buildRenderList(collectedRenderables, camera, renderList);
+        const auto renderables = renderList.orderedObjects();
         bindPassLightResources(encoder, lightUniforms, shadowResources);
 
         for (auto* obj : renderables) {
@@ -2254,7 +2598,7 @@ struct MetalRenderer::Impl {
             }
 
             if (auto* water = dynamic_cast<Water*>(obj)) {
-                renderWater(encoder, *water, camera, colorPixelFormat);
+                renderWater(encoder, scene, *water, camera, colorPixelFormat);
                 continue;
             }
 
@@ -2307,7 +2651,7 @@ struct MetalRenderer::Impl {
             if (instancedMesh && instancedMesh->count() == 0) continue;
             auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
 
-            const auto shadingParams = extractShadingParams(*material, camera, obj->receiveShadow);
+            const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow);
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;
             const bool useNormal = normAttr != nullptr;
@@ -2345,6 +2689,7 @@ struct MetalRenderer::Impl {
             pipelineKey.alphaBlending = transparent;
             pipelineKey.vertexLayoutBitmask = vertexLayoutBitmask;
             pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+            pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
             id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
             [encoder setRenderPipelineState:pso];
@@ -2358,6 +2703,7 @@ struct MetalRenderer::Impl {
             [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+            applyDepthBias(encoder, *material);
 
             bindDrawAttributes(encoder, *geometry, *posAttr, normAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent);
             if (useSkinning) {
@@ -2393,7 +2739,7 @@ struct MetalRenderer::Impl {
             if (useLights) {
                 bindCubeTextureOrPlaceholder(encoder, envMaterial ? envMaterial->envMap : nullptr, 6);
             }
-            if (useUv || useLights) {
+            if (!useUv && useLights) {
                 [encoder setFragmentSamplerState:defaultSampler atIndex:0];
             }
 
@@ -2418,7 +2764,7 @@ struct MetalRenderer::Impl {
 };
 
 MetalRenderer::MetalRenderer(Window& window)
-    : pimpl_(std::make_unique<Impl>(window)) {}
+    : pimpl_(std::make_unique<Impl>(*this, window)) {}
 
 void MetalRenderer::render(Scene& scene, Camera& camera) {
     pimpl_->render(scene, camera, autoClear);
@@ -2491,6 +2837,10 @@ void MetalRenderer::setRenderTarget(RenderTarget* renderTarget) {
 
 RenderTarget* MetalRenderer::getRenderTarget() {
     return pimpl_->renderTarget;
+}
+
+void MetalRenderer::addPreRenderJob(const RenderJob& job) {
+    pimpl_->addPreRenderJob(job);
 }
 
 std::vector<unsigned char> MetalRenderer::readRGBPixels() {

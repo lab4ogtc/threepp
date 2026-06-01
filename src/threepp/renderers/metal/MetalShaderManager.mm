@@ -74,6 +74,7 @@ namespace threepp::metal {
             std::string source;
             source += "#define USE_VERTEX_COLORS ";
             source += useVertexColors ? "1\n" : "0\n";
+            source += tone_mapping_functions;
             source += line_vertex;
             source += line_fragment;
             return source;
@@ -83,6 +84,7 @@ namespace threepp::metal {
             std::string source;
             source += "#define USE_VERTEX_COLORS ";
             source += useVertexColors ? "1\n" : "0\n";
+            source += tone_mapping_functions;
             source += points_vertex;
             source += points_fragment;
             return source;
@@ -300,7 +302,10 @@ namespace threepp::metal {
     }
 
     void* MetalShaderManager::getOrCreateSpriteFragmentFunction() {
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_fragment", sprite_fragment, "sprite_fragment");
+        std::string source;
+        source += tone_mapping_functions;
+        source += sprite_fragment;
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_fragment", source, "sprite_fragment");
     }
 
     void* MetalShaderManager::getOrCreateLineVertexFunction(bool useVertexColors) {
@@ -336,7 +341,10 @@ namespace threepp::metal {
     }
 
     void* MetalShaderManager::getOrCreateSkyFragmentFunction() {
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sky_fragment", sky_fragment, "sky_fragment");
+        std::string source;
+        source += tone_mapping_functions;
+        source += sky_fragment;
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sky_fragment", source, "sky_fragment");
     }
 
     void* MetalShaderManager::getOrCreateWaterVertexFunction() {
