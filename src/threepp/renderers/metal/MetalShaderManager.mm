@@ -355,4 +355,15 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("water_fragment", water_fragment, "water_fragment");
     }
 
+    void* MetalShaderManager::getOrCreateReflectorVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("reflector_vertex", reflector_vertex, "reflector_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateReflectorFragmentFunction() {
+        std::string source;
+        source += tone_mapping_functions;
+        source += reflector_fragment;
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("reflector_fragment", source, "reflector_fragment");
+    }
+
 }// namespace threepp::metal

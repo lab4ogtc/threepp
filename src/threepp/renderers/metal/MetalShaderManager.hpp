@@ -101,6 +101,10 @@ namespace threepp::metal {
 
         void* getOrCreateWaterFragmentFunction();
 
+        void* getOrCreateReflectorVertexFunction();
+
+        void* getOrCreateReflectorFragmentFunction();
+
     private:
         struct Impl;
         std::unique_ptr<Impl> pimpl_;

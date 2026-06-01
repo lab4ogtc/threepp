@@ -1505,6 +1505,95 @@ fragment float4 water_fragment(
 }
 )metal";
 
+    constexpr auto reflector_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReflectorVertexInput {
+    float3 position [[attribute(0)]];
+};
+
+struct ReflectorUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float4x4 textureMatrix;
+    float4 color;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
+};
+
+struct ReflectorVertexOutput {
+    float4 position [[position]];
+    float4 vUv;
+};
+
+vertex ReflectorVertexOutput reflector_vertex(
+    ReflectorVertexInput in [[stage_in]],
+    constant ReflectorUniforms& uniforms [[buffer(4)]]
+)
+{
+    ReflectorVertexOutput out;
+    out.vUv = uniforms.textureMatrix * float4(in.position, 1.0);
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    return out;
+}
+)metal";
+
+    constexpr auto reflector_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ReflectorVertexOutput {
+    float4 position [[position]];
+    float4 vUv;
+};
+
+struct ReflectorUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float4x4 textureMatrix;
+    float4 color;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding;
+};
+
+float blendOverlay(float base, float blend) {
+    return base < 0.5 ? 2.0 * base * blend : 1.0 - 2.0 * (1.0 - base) * (1.0 - blend);
+}
+
+float3 blendOverlay(float3 base, float3 blend) {
+    return float3(
+        blendOverlay(base.r, blend.r),
+        blendOverlay(base.g, blend.g),
+        blendOverlay(base.b, blend.b)
+    );
+}
+
+fragment float4 reflector_fragment(
+    ReflectorVertexOutput in [[stage_in]],
+    constant ReflectorUniforms& uniforms [[buffer(4)]],
+    texture2d<float> tDiffuse [[texture(0)]],
+    sampler tDiffuseSampler [[sampler(0)]]
+)
+{
+    float2 uv = in.vUv.xy / in.vUv.w;
+    uv.y = 1.0 - uv.y;
+
+    float4 base = tDiffuse.sample(tDiffuseSampler, uv);
+    float3 blended = blendOverlay(base.rgb, uniforms.color.rgb);
+
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        blended = toneMapping(blended, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+
+    return float4(blended, 1.0);
+}
+)metal";
+
 }// namespace threepp::metal
 
 #endif

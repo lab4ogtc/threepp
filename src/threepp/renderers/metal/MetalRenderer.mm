@@ -43,6 +43,7 @@
 #import "threepp/objects/LineSegments.hpp"
 #import "threepp/objects/Mesh.hpp"
 #import "threepp/objects/Points.hpp"
+#import "threepp/objects/Reflector.hpp"
 #import "threepp/objects/Sky.hpp"
 #import "threepp/objects/SkinnedMesh.hpp"
 #import "threepp/objects/Sprite.hpp"
@@ -226,6 +227,17 @@ namespace {
         float padding;
         float fogColor[4];
         float fogParams[4];
+    };
+
+    struct alignas(16) ReflectorUniforms {
+        float mvp[16];
+        float modelMatrix[16];
+        float textureMatrix[16];
+        float color[4];
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding;
     };
 
     struct alignas(16) DirectionalLightUniform {
@@ -2052,6 +2064,68 @@ struct MetalRenderer::Impl {
         drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
     }
 
+    void renderReflector(id<MTLRenderCommandEncoder> encoder, Scene&, Reflector& reflector, Camera& camera, MTLPixelFormat colorPixelFormat) {
+        auto materialPtr = reflector.material();
+        auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
+        auto geometry = reflector.geometry();
+        if (!material || !geometry || !material->visible) return;
+        trackGeometry(*geometry);
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        if (!posAttr) return;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateReflectorVertexFunction();
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateReflectorFragmentFunction();
+        pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                material->depthTest,
+                material->depthWrite,
+                material->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+
+        const auto frontFaceCW = reflector.matrixWorld->determinant() < 0;
+        const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, false);
+        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *material);
+
+        bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+
+        ReflectorUniforms uniforms{};
+        Matrix4 mvp;
+        Matrix4 identity;
+        computeMVP(camera, reflector, mvp);
+        copyMatrix(mvp, uniforms.mvp);
+        copyMatrix(*reflector.matrixWorld, uniforms.modelMatrix);
+
+        const auto textureMatrix = uniformMatrix4(material->uniforms, "textureMatrix", identity);
+        copyMatrix(textureMatrix, uniforms.textureMatrix);
+
+        const auto color = uniformColor(material->uniforms, "color", Color{0x7f7f7f});
+        uniforms.color[0] = color.r;
+        uniforms.color[1] = color.g;
+        uniforms.color[2] = color.b;
+        uniforms.color[3] = 1.f;
+
+        fillToneMappingUniforms(renderer, *material, uniforms);
+
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+        auto mirrorSamplerTexture = uniformTexture(material->uniforms, "tDiffuse");
+        bindTextureOrPlaceholder(encoder, mirrorSamplerTexture, whiteTexture, 0, true);
+
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
+    }
+
     bool shouldUpdateShadow(LightShadow& shadow) const {
         return shadowMapState.autoUpdate || shadowMapState.needsUpdate || shadow.autoUpdate || shadow.needsUpdate;
     }
@@ -2599,6 +2673,11 @@ struct MetalRenderer::Impl {
 
             if (auto* water = dynamic_cast<Water*>(obj)) {
                 renderWater(encoder, scene, *water, camera, colorPixelFormat);
+                continue;
+            }
+
+            if (auto* reflector = dynamic_cast<Reflector*>(obj)) {
+                renderReflector(encoder, scene, *reflector, camera, colorPixelFormat);
                 continue;
             }
 

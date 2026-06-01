@@ -66,6 +66,11 @@ TEST_CASE("Metal special shaders bind uniforms away from vertex attributes") {
     CHECK(contains(metal::water_fragment, "mirrorUv.y = 1.0 - mirrorUv.y"));
     CHECK(contains(metal::water_fragment, "mirrorSampler.sample(mirrorMapSampler, mirrorUv)"));
     CHECK(contains(metal::water_fragment, "applyFog("));
+    CHECK(contains(metal::reflector_vertex, "constant ReflectorUniforms& uniforms [[buffer(4)]]"));
+    CHECK(contains(metal::reflector_fragment, "constant ReflectorUniforms& uniforms [[buffer(4)]]"));
+    CHECK(contains(metal::reflector_fragment, "sampler tDiffuseSampler [[sampler(0)]]"));
+    CHECK(contains(metal::reflector_fragment, "uv.y = 1.0 - uv.y"));
+    CHECK(contains(metal::reflector_fragment, "toneMapping("));
     CHECK(contains(metal::basic_fragment, "directBlinnPhong("));
     CHECK(contains(metal::basic_fragment, "params.materialType == 2"));
     CHECK(contains(metal::basic_fragment, "float4 specularColor"));
@@ -129,6 +134,8 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateWaterVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateWaterFragmentFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateReflectorVertexFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateReflectorFragmentFunction());
     }
 }
 
