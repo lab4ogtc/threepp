@@ -453,7 +453,6 @@ float samplePointShadowTexture(depth2d<float> shadowMap,
     float2 texelSize = 1.0 / max(shadowMapSize * float2(4.0, 2.0), float2(1.0));
     float dp = (length(lightToPosition) - nearPlane) / (farPlane - nearPlane);
     dp += bias;
-    if (dp < 0.0 || dp > 1.0) return 1.0;
 
     float3 bd3D = normalize(lightToPosition);
     float2 offset = float2(-1.0, 1.0) * radius * texelSize.y;

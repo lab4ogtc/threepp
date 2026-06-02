@@ -25,6 +25,8 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <string>
 #include <type_traits>
@@ -75,6 +77,21 @@ namespace {
         { renderer.currentCommandBuffer() } -> std::same_as<void*>;
         { renderer.currentDrawableTexture() } -> std::same_as<void*>;
     };
+
+    std::string readProjectFile(const std::filesystem::path& relativePath) {
+        const auto projectRoot = std::filesystem::path(__FILE__).parent_path().parent_path().parent_path().parent_path();
+        std::ifstream file(projectRoot / relativePath);
+        REQUIRE(file.is_open());
+        return {std::istreambuf_iterator<char>{file}, std::istreambuf_iterator<char>{}};
+    }
+
+    std::size_t countOccurrences(std::string_view source, std::string_view needle) {
+        std::size_t count = 0;
+        for (auto pos = source.find(needle); pos != std::string_view::npos; pos = source.find(needle, pos + needle.size())) {
+            ++count;
+        }
+        return count;
+    }
 
 }// namespace
 
@@ -234,6 +251,25 @@ TEST_CASE("Metal P4 point light shadows use tiled depth maps without reusing att
     REQUIRE(source.find("light.params.x") != std::string_view::npos);
     REQUIRE(pointDepthFragment.find("[[depth(any)]]") != std::string_view::npos);
     REQUIRE(pointDepthFragment.find("length(in.worldPosition - transforms.lightPosition.xyz)") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P4 point light shadows sample GL cube atlas without a whole-texture y flip") {
+
+    const std::string_view source{metal::basic_fragment};
+    REQUIRE(source.find("float2 pointShadowUV(") == std::string_view::npos);
+    REQUIRE(source.find("return float2(uv.x, 1.0 - uv.y);") == std::string_view::npos);
+    REQUIRE(source.find("sample_compare(shadowSampler, cubeToUV(bd3D, texelSize.y), dp)") != std::string_view::npos);
+}
+
+TEST_CASE("Metal point light example mirrors GL shadow receiver and bias setup") {
+
+    const auto glSource = readProjectFile("examples/lights/point_light.cpp");
+    const auto metalSource = readProjectFile("examples/lights/point_light_metal.cpp");
+
+    REQUIRE(glSource.find("knot->receiveShadow = true") == std::string::npos);
+    REQUIRE(metalSource.find("knot->receiveShadow = true") == std::string::npos);
+    REQUIRE(countOccurrences(metalSource, "shadow->bias = -0.005f") == countOccurrences(glSource, "shadow->bias = -0.005f"));
+    REQUIRE(metalSource.find("renderer->shadowMap().type") == std::string::npos);
 }
 
 TEST_CASE("Metal P4 built-in Sky and Water shaders are available as dedicated MSL sources") {
