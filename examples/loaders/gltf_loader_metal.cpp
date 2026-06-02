@@ -10,6 +10,7 @@ using namespace threepp;
 int main() {
     GlfwWindow canvas("GLTF Demo (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->outputEncoding = Encoding::sRGB;
     renderer->shadowMap().enabled = true;
 
     auto scene = Scene::create();

@@ -134,6 +134,8 @@ namespace threepp {
 
         bool ensureDrawable();
 
+        void updateMetalLayerPixelFormat();
+
         void updatePixelRatio(const WindowSize& size);
 
         void createDepthTexture();

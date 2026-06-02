@@ -112,6 +112,16 @@ namespace threepp::metal {
             return texture.generateMipmaps || !texture.mipmaps().empty();
         }
 
+        MTLPixelFormat toColorPixelFormat(const Texture& texture) {
+            switch (texture.encoding) {
+                case Encoding::sRGB:
+                case Encoding::Gamma:
+                    return MTLPixelFormatRGBA8Unorm_sRGB;
+                default:
+                    return MTLPixelFormatRGBA8Unorm;
+            }
+        }
+
         void replace2DRegion(id<MTLTexture> mtlTexture, Texture& texture, const Image& image, NSUInteger level, NSUInteger slice = 0) {
             auto rgba = toRGBA(image, texture);
             const auto bytesPerRow = static_cast<NSUInteger>(image.width) * 4u;
@@ -231,7 +241,7 @@ namespace threepp::metal {
                 }
 
                 const auto mipmapped = wantsMipmaps(texture);
-                MTLTextureDescriptor* desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                MTLTextureDescriptor* desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:toColorPixelFormat(texture)
                                                                                                    size:width
                                                                                               mipmapped:mipmapped ? YES : NO];
                 desc.usage = MTLTextureUsageShaderRead;
@@ -268,7 +278,7 @@ namespace threepp::metal {
             }
 
             const auto mipmapped = wantsMipmaps(texture);
-            MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+            MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:toColorPixelFormat(texture)
                                                                                             width:image.width
                                                                                            height:image.height
                                                                                         mipmapped:mipmapped ? YES : NO];

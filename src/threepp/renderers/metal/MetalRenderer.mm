@@ -147,8 +147,22 @@ void MetalRenderer::Impl::ensureFrameStarted() {
 bool MetalRenderer::Impl::ensureDrawable() {
     if (currentDrawable) return true;
 
+    updateMetalLayerPixelFormat();
     currentDrawable = [metalLayer nextDrawable];
     return currentDrawable != nil;
+}
+
+void MetalRenderer::Impl::updateMetalLayerPixelFormat() {
+    if (renderTarget) return;
+
+    const auto targetPixelFormat = usesSRGBColorEncoding(renderer.outputEncoding)
+                                           ? MTLPixelFormatBGRA8Unorm_sRGB
+                                           : MTLPixelFormatBGRA8Unorm;
+    if (metalLayer.pixelFormat == targetPixelFormat) return;
+
+    metalLayer.pixelFormat = targetPixelFormat;
+    multisampleColorPixelFormat = MTLPixelFormatInvalid;
+    multisampleColorTexture = nil;
 }
 
 void MetalRenderer::Impl::updatePixelRatio(const WindowSize& size) {
@@ -395,6 +409,7 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
         throw std::runtime_error("MetalRenderer::readRGBPixels requires an uncommitted frame; set autoClear=false, clear, render, then read");
     }
 
+    // 读回保持 BGRA->RGB 拷贝；Linear/sRGB 的字节含义由当前 drawable 像素格式决定。
     id<MTLTexture> sourceTexture = currentDrawable.texture;
     const auto width = static_cast<NSUInteger>(sourceTexture.width);
     const auto height = static_cast<NSUInteger>(sourceTexture.height);
@@ -632,6 +647,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     if (currentCommandBuffer && !explicitFrameInProgress) {
         commitPendingFrame();
     }
+    updateMetalLayerPixelFormat();
     lastRenderTime = std::chrono::steady_clock::now();
 
     scene.updateMatrixWorld(false);

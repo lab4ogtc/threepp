@@ -64,6 +64,12 @@ namespace {
     };
 
     template<class T>
+    concept HasBaseOutputEncoding = requires(T& renderer) {
+        renderer.outputEncoding = Encoding::sRGB;
+        { renderer.outputEncoding } -> std::same_as<Encoding&>;
+    };
+
+    template<class T>
     concept HasMetalShadowMap = requires(T& renderer) {
         renderer.shadowMap().enabled = true;
         renderer.shadowMap().autoUpdate = false;
@@ -134,6 +140,12 @@ TEST_CASE("Renderer base exposes backend-independent size API") {
 
     STATIC_REQUIRE(HasRendererSize<Renderer>);
     STATIC_REQUIRE(HasRendererSize<MetalRenderer>);
+}
+
+TEST_CASE("Renderer base exposes backend-independent output encoding") {
+
+    STATIC_REQUIRE(HasBaseOutputEncoding<Renderer>);
+    STATIC_REQUIRE(HasBaseOutputEncoding<MetalRenderer>);
 }
 
 TEST_CASE("Image exposes const pixel data for read-only texture upload") {

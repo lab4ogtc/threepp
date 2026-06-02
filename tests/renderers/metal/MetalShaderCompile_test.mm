@@ -2,6 +2,7 @@
 
 #include "threepp/core/BufferAttribute.hpp"
 #include "threepp/renderers/metal/MetalBufferManager.hpp"
+#include "threepp/renderers/metal/MetalRenderObjects.hpp"
 #include "threepp/renderers/metal/MetalShaderManager.hpp"
 #include "threepp/renderers/metal/MetalShaders.hpp"
 #include "threepp/renderers/metal/MetalTextureManager.hpp"
@@ -298,6 +299,60 @@ TEST_CASE("Metal P2 texture manager uploads CubeTexture as a Metal cube texture"
         REQUIRE(metalTexture.width == 1);
         REQUIRE(metalTexture.height == 1);
         REQUIRE(metalTexture.depth == 1);
+    }
+}
+
+TEST_CASE("Metal RenderTarget color pixel format respects texture encoding") {
+
+    auto rgba = Texture::create();
+    rgba->format = Format::RGBA;
+    rgba->encoding = Encoding::sRGB;
+    REQUIRE(toRenderTargetColorPixelFormat(*rgba) == MTLPixelFormatRGBA8Unorm_sRGB);
+
+    auto rgb = Texture::create();
+    rgb->format = Format::RGB;
+    rgb->encoding = Encoding::Gamma;
+    REQUIRE(toRenderTargetColorPixelFormat(*rgb) == MTLPixelFormatRGBA8Unorm_sRGB);
+
+    auto bgra = Texture::create();
+    bgra->format = Format::BGRA;
+    bgra->encoding = Encoding::Gamma;
+    REQUIRE(toRenderTargetColorPixelFormat(*bgra) == MTLPixelFormatBGRA8Unorm_sRGB);
+
+    auto hdrFallback = Texture::create();
+    hdrFallback->format = Format::RGBA;
+    hdrFallback->encoding = Encoding::RGBE;
+    REQUIRE(toRenderTargetColorPixelFormat(*hdrFallback) == MTLPixelFormatRGBA8Unorm);
+}
+
+TEST_CASE("Metal texture manager creates sRGB Metal textures for sRGB and Gamma encodings") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        id<MTLCommandQueue> commandQueue = [device newCommandQueue];
+        metal::MetalTextureManager textureManager((__bridge void*) device, (__bridge void*) commandQueue);
+
+        auto srgbTexture = Texture::create(Image{std::vector<unsigned char>{255, 128, 64, 255}, 1, 1});
+        srgbTexture->encoding = Encoding::sRGB;
+        srgbTexture->generateMipmaps = false;
+        auto srgbMetalTexture = (__bridge id<MTLTexture>) textureManager.getOrCreateTexture(*srgbTexture);
+        REQUIRE(srgbMetalTexture.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB);
+
+        auto gammaCubeTexture = CubeTexture::create(makeCubeFaces());
+        gammaCubeTexture->encoding = Encoding::Gamma;
+        gammaCubeTexture->generateMipmaps = false;
+        auto gammaMetalTexture = (__bridge id<MTLTexture>) textureManager.getOrCreateTexture(*gammaCubeTexture);
+        REQUIRE(gammaMetalTexture.pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB);
+
+        auto hdrFallbackTexture = Texture::create(Image{std::vector<unsigned char>{255, 128, 64, 255}, 1, 1});
+        hdrFallbackTexture->encoding = Encoding::RGBE;
+        hdrFallbackTexture->generateMipmaps = false;
+        auto hdrFallbackMetalTexture = (__bridge id<MTLTexture>) textureManager.getOrCreateTexture(*hdrFallbackTexture);
+        REQUIRE(hdrFallbackMetalTexture.pixelFormat == MTLPixelFormatRGBA8Unorm);
     }
 }
 

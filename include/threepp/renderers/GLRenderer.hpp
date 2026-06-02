@@ -65,7 +65,6 @@ namespace threepp {
         // physically based shading
 
         float gammaFactor = 2.0f;// for backwards compatibility
-        Encoding outputEncoding{Encoding::Linear};
 
         // physical lights
 

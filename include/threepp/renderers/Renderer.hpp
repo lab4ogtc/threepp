@@ -70,6 +70,7 @@ namespace threepp {
 
         ToneMapping toneMapping{ToneMapping::None};
         float toneMappingExposure = 1.0f;
+        Encoding outputEncoding{Encoding::Linear};
 
         virtual ~Renderer() = default;
     };

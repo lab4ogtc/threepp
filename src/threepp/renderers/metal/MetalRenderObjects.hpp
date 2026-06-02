@@ -811,13 +811,24 @@ namespace threepp {
         return static_cast<NSUInteger>(std::clamp<long>(rounded, 0, static_cast<long>(maxValue)));
     }
 
+    inline bool usesSRGBColorEncoding(Encoding encoding) {
+        switch (encoding) {
+            case Encoding::sRGB:
+            case Encoding::Gamma:
+                return true;
+            default:
+                return false;
+        }
+    }
+
     inline MTLPixelFormat toRenderTargetColorPixelFormat(const Texture& texture) {
+        const auto srgb = usesSRGBColorEncoding(texture.encoding);
         switch (texture.format) {
             case Format::RGB:
             case Format::RGBA:
-                return MTLPixelFormatRGBA8Unorm;
+                return srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
             case Format::BGRA:
-                return MTLPixelFormatBGRA8Unorm;
+                return srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
             default:
                 throw std::runtime_error("Metal RenderTarget currently supports only RGB8, RGBA8, and BGRA8 color textures");
         }

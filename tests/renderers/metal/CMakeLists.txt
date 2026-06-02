@@ -4,7 +4,7 @@ target_include_directories(MetalRenderList_test PRIVATE "${PROJECT_SOURCE_DIR}/s
 
 add_executable(MetalShaderCompile_test MetalShaderCompile_test.mm)
 target_link_libraries(MetalShaderCompile_test PRIVATE threepp Catch2::Catch2WithMain)
-target_include_directories(MetalShaderCompile_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_include_directories(MetalShaderCompile_test PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/external/glfw/include")
 add_test(NAME MetalShaderCompile_test COMMAND MetalShaderCompile_test)
 
 add_executable(MetalP2RuntimeSmoke_test MetalP2RuntimeSmoke_test.mm)

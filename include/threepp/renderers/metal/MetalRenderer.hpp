@@ -59,14 +59,17 @@ namespace threepp {
         [[nodiscard]] void* currentDrawableTexture() const;
 
         /**
-         * Reads the current drawable into an RGB8 pixel buffer.
+         * @brief 将当前 drawable 读取为 RGB8 像素缓冲。
          *
-         * The renderer must have an uncommitted frame when this is called. Use
-         * autoClear=false, then call clear(), render(), and readRGBPixels().
+         * 调用时渲染器必须仍持有未提交的当前帧。典型流程是设置 autoClear=false，
+         * 依次调用 clear()、render()，再调用 readRGBPixels()。
          *
-         * @return RGB pixels in top-to-bottom row order, sized to the current
-         * framebuffer in physical pixels.
-         * @throws std::runtime_error if no frame is pending or readback setup fails.
+         * 返回的字节流跟随当前 drawable 的像素格式；该格式在获取 drawable 前由
+         * outputEncoding 同步。Linear 输出返回线性附件中的字节，sRGB/Gamma 输出返回
+         * Metal 硬件 sRGB 写入后的字节，适合直接写出为常见图片文件。
+         *
+         * @return 当前物理 framebuffer 尺寸对应的 RGB 像素，按从上到下的行顺序排列。
+         * @throws std::runtime_error 当前没有待提交帧或读回资源创建失败时抛出。
          */
         [[nodiscard]] std::vector<unsigned char> readRGBPixels();
 
