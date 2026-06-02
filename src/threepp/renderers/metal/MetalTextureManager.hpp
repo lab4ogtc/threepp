@@ -22,6 +22,8 @@ namespace threepp {
 
             void registerExternalTexture(Texture& texture, void* mtlTexture);
 
+            void updateCachedTexture(Texture& texture, void* mtlTexture);
+
             void deallocateTexture(Texture* texture);
 
         private:

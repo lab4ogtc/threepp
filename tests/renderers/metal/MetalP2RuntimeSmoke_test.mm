@@ -1148,6 +1148,135 @@ TEST_CASE("Metal renderer preserves mipmapped sampler for mesh texture maps") {
     }
 }
 
+TEST_CASE("Metal renderer uploads float RGB data textures") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal float data texture smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto texture = DataTexture::create(std::vector<float>{1.f, 0.f, 0.f}, 1, 1);
+        texture->type = Type::Float;
+        texture->format = Format::RGB;
+        texture->encoding = Encoding::sRGB;
+        texture->needsUpdate();
+
+        auto material = MeshBasicMaterial::create({{"color", Color::white},
+                                                   {"side", Side::Double}});
+        material->map = texture;
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        scene->add(Mesh::create(PlaneGeometry::create(1.5f, 1.5f), material));
+
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        const auto [logicalWidth, logicalHeight] = canvas.size();
+        const auto [width, height] = inferPixelDimensions(pixels, logicalWidth, logicalHeight);
+        REQUIRE(width > 0);
+        REQUIRE(height > 0);
+
+        const auto center = (static_cast<std::size_t>(height) / 2u * static_cast<std::size_t>(width) + static_cast<std::size_t>(width) / 2u) * 3u;
+        REQUIRE(center + 2u < pixels.size());
+        const auto r = pixels[center];
+        const auto g = pixels[center + 1u];
+        const auto b = pixels[center + 2u];
+
+        REQUIRE(r > 180);
+        REQUIRE(g < 80);
+        REQUIRE(b < 80);
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer copies framebuffer into a data texture") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal framebuffer copy smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        MetalRenderer renderer(canvas);
+        renderer.autoClear = false;
+        renderer.setClearColor(Color::black);
+
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto sourceScene = Scene::create();
+        sourceScene->background = Color::black;
+        auto redMaterial = MeshBasicMaterial::create({{"color", Color::red},
+                                                      {"side", Side::Double}});
+        sourceScene->add(Mesh::create(PlaneGeometry::create(0.9f, 0.9f), redMaterial));
+
+        constexpr unsigned int textureSize = 16;
+        auto texture = DataTexture::create(3, textureSize, textureSize);
+        texture->format = Format::RGB;
+        texture->minFilter = Filter::Nearest;
+        texture->magFilter = Filter::Nearest;
+
+        auto copyScene = Scene::create();
+        auto copyMaterial = MeshBasicMaterial::create({{"color", Color::white},
+                                                       {"side", Side::Double}});
+        copyMaterial->map = texture;
+        auto copyPlane = Mesh::create(PlaneGeometry::create(0.55f, 0.55f), copyMaterial);
+        copyPlane->position.set(0.55f, -0.55f, 0.f);
+        copyScene->add(copyPlane);
+
+        renderer.clear();
+        renderer.render(*sourceScene, *camera);
+        REQUIRE_NOTHROW(renderer.copyFramebufferToTexture(Vector2{24.f, 24.f}, *texture));
+        REQUIRE(renderer.getMetalTexture(*texture).has_value());
+
+        renderer.clearDepth();
+        REQUIRE_NOTHROW(renderer.render(*copyScene, *camera));
+
+        const auto pixels = renderer.readRGBPixels();
+        const auto [logicalWidth, logicalHeight] = canvas.size();
+        const auto [width, height] = inferPixelDimensions(pixels, logicalWidth, logicalHeight);
+        REQUIRE(width > 0);
+        REQUIRE(height > 0);
+
+        std::size_t copiedRedPixels = 0;
+        for (int y = height / 2; y < height; ++y) {
+            for (int x = width / 2; x < width; ++x) {
+                const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3u;
+                const auto r = pixels[offset];
+                const auto g = pixels[offset + 1u];
+                const auto b = pixels[offset + 2u];
+                if (r > 180 && g < 80 && b < 80) ++copiedRedPixels;
+            }
+        }
+
+        CAPTURE(copiedRedPixels);
+        REQUIRE(copiedRedPixels > 40);
+        canvas.close();
+    }
+}
+
 TEST_CASE("Metal renderer honors window antialiasing for drawable edges") {
 
     @autoreleasepool {

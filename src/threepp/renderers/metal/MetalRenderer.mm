@@ -2,6 +2,8 @@
 
 #include "threepp/geometries/BoxGeometry.hpp"
 
+#include <cmath>
+
 using namespace threepp;
 
 void MetalRenderer::Impl::OnRenderTargetDispose::onEvent(Event& event) {
@@ -446,6 +448,94 @@ void MetalRenderer::Impl::clear(bool color, bool depth, bool /*stencil*/) {
     clearDepthFlag = depth;
     clearRequested = true;
     explicitFrameInProgress = true;
+}
+
+void MetalRenderer::Impl::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
+    if (level < 0) {
+        throw std::invalid_argument("MetalRenderer::copyFramebufferToTexture requires a non-negative mip level");
+    }
+
+    id<MTLTexture> sourceTexture = nil;
+    bool temporaryCommandBuffer = false;
+
+    if (renderTarget) {
+        auto& resources = getOrCreateRenderTargetResources(*renderTarget);
+        sourceTexture = resources.colorTexture;
+        if (!currentCommandBuffer) {
+            ensureFrameStarted();
+            temporaryCommandBuffer = true;
+        }
+    } else {
+        if (!currentCommandBuffer) {
+            throw std::runtime_error("MetalRenderer::copyFramebufferToTexture requires an active screen frame; set autoClear=false and copy before the frame is committed");
+        }
+        if (!currentDrawable && !ensureDrawable()) {
+            throw std::runtime_error("MetalRenderer::copyFramebufferToTexture requires a current drawable");
+        }
+        sourceTexture = currentDrawable.texture;
+    }
+
+    if (!sourceTexture || !currentCommandBuffer) {
+        throw std::runtime_error("MetalRenderer::copyFramebufferToTexture could not acquire a source texture or command buffer");
+    }
+
+    id<MTLTexture> targetTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(texture);
+    const auto mipmapped = texture.generateMipmaps || !texture.mipmaps().empty() || level > 0;
+    const auto baseWidth = std::max<NSUInteger>(static_cast<NSUInteger>(texture.image().width), 1u);
+    const auto baseHeight = std::max<NSUInteger>(static_cast<NSUInteger>(texture.image().height), 1u);
+
+    if (!targetTexture ||
+        targetTexture.pixelFormat != sourceTexture.pixelFormat ||
+        targetTexture.width != baseWidth ||
+        targetTexture.height != baseHeight ||
+        static_cast<NSUInteger>(level) >= targetTexture.mipmapLevelCount) {
+        MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:sourceTexture.pixelFormat
+                                                                                        width:baseWidth
+                                                                                       height:baseHeight
+                                                                                    mipmapped:mipmapped ? YES : NO];
+        desc.usage = MTLTextureUsageShaderRead;
+        desc.storageMode = MTLStorageModePrivate;
+        targetTexture = [device newTextureWithDescriptor:desc];
+        if (!targetTexture) {
+            throw std::runtime_error("Failed to create Metal framebuffer copy target texture");
+        }
+        textureManager->updateCachedTexture(texture, (__bridge void*) targetTexture);
+    }
+
+    if (static_cast<NSUInteger>(level) >= targetTexture.mipmapLevelCount) {
+        throw std::runtime_error("MetalRenderer::copyFramebufferToTexture target texture does not contain the requested mip level");
+    }
+
+    const auto levelScale = std::pow(2.0, -static_cast<double>(level));
+    const auto copyWidth = std::max<NSInteger>(static_cast<NSInteger>(std::floor(static_cast<double>(texture.image().width) * levelScale)), 1);
+    const auto copyHeight = std::max<NSInteger>(static_cast<NSInteger>(std::floor(static_cast<double>(texture.image().height) * levelScale)), 1);
+    const auto coordinateRatio = renderTarget ? 1.f : pixelRatio;
+    const auto sourceX = static_cast<NSInteger>(std::floor(static_cast<double>(position.x) * coordinateRatio));
+    const auto logicalY = static_cast<NSInteger>(std::floor(static_cast<double>(position.y) * coordinateRatio));
+    const auto sourceY = static_cast<NSInteger>(sourceTexture.height) - logicalY - copyHeight;
+
+    if (sourceX < 0 ||
+        sourceY < 0 ||
+        sourceX + copyWidth > static_cast<NSInteger>(sourceTexture.width) ||
+        sourceY + copyHeight > static_cast<NSInteger>(sourceTexture.height)) {
+        throw std::runtime_error("MetalRenderer::copyFramebufferToTexture source region is outside the framebuffer");
+    }
+
+    id<MTLBlitCommandEncoder> blitEncoder = [currentCommandBuffer blitCommandEncoder];
+    [blitEncoder copyFromTexture:sourceTexture
+                     sourceSlice:0
+                     sourceLevel:0
+                    sourceOrigin:MTLOriginMake(static_cast<NSUInteger>(sourceX), static_cast<NSUInteger>(sourceY), 0)
+                      sourceSize:MTLSizeMake(static_cast<NSUInteger>(copyWidth), static_cast<NSUInteger>(copyHeight), 1)
+                       toTexture:targetTexture
+                destinationSlice:0
+                destinationLevel:static_cast<NSUInteger>(level)
+               destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [blitEncoder endEncoding];
+
+    if (temporaryCommandBuffer) {
+        commitPendingFrame();
+    }
 }
 
 std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
@@ -1084,6 +1174,10 @@ void MetalRenderer::clear(bool color, bool depth, bool stencil) {
     pimpl_->clear(color, depth, stencil);
 }
 
+void MetalRenderer::clearDepth() {
+    pimpl_->clear(false, true, false);
+}
+
 void MetalRenderer::setViewport(const Vector4& v) {
     pimpl_->setViewport(static_cast<int>(v.x), static_cast<int>(v.y), static_cast<int>(v.z), static_cast<int>(v.w));
 }
@@ -1122,6 +1216,16 @@ RenderTarget* MetalRenderer::getRenderTarget() {
 
 void MetalRenderer::addPreRenderJob(const RenderJob& job) {
     pimpl_->addPreRenderJob(job);
+}
+
+void MetalRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
+    pimpl_->copyFramebufferToTexture(position, texture, level);
+}
+
+std::optional<void*> MetalRenderer::getMetalTexture(Texture& texture) const {
+    auto* metalTexture = pimpl_->textureManager->getOrCreateTexture(texture);
+    if (!metalTexture) return std::nullopt;
+    return metalTexture;
 }
 
 std::vector<unsigned char> MetalRenderer::readRGBPixels() {

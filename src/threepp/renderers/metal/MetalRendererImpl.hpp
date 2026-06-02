@@ -175,6 +175,8 @@ namespace threepp {
 
         void clear(bool color, bool depth, bool stencil);
 
+        void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level);
+
         std::vector<unsigned char> readRGBPixels();
 
         void setViewport(int x, int y, int width, int height);

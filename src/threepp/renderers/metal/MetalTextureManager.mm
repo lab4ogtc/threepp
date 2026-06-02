@@ -7,12 +7,14 @@
 
 #import <Metal/Metal.h>
 
+#include <algorithm>
 #include <any>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -80,58 +82,177 @@ namespace threepp::metal {
             }
         };
 
-        std::vector<unsigned char> toRGBA(const Image& image, Texture& texture) {
-            const auto& source = image.data<unsigned char>();
-            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
-            const auto sourceChannels = texture.format == Format::RGB ? 3u : 4u;
-            if (source.size() < pixelCount * sourceChannels) {
-                std::cerr << "[MetalTextureManager] Error: source.size()=" << source.size()
-                          << ", pixelCount=" << pixelCount
-                          << ", width=" << image.width << ", height=" << image.height
-                          << ", sourceChannels=" << sourceChannels
-                          << ", texture.format=" << (int)texture.format << "\n";
-                throw std::runtime_error("Texture image data is smaller than expected");
-            }
-
-            std::vector<unsigned char> rgba(pixelCount * 4u);
-            if (sourceChannels == 4u) {
-                std::copy(source.begin(), source.begin() + static_cast<std::ptrdiff_t>(rgba.size()), rgba.begin());
-                return rgba;
-            }
-
-            for (std::size_t i = 0; i < pixelCount; ++i) {
-                rgba[i * 4u + 0u] = source[i * 3u + 0u];
-                rgba[i * 4u + 1u] = source[i * 3u + 1u];
-                rgba[i * 4u + 2u] = source[i * 3u + 2u];
-                rgba[i * 4u + 3u] = 255;
-            }
-            return rgba;
-        }
-
         bool wantsMipmaps(const Texture& texture) {
             return texture.generateMipmaps || !texture.mipmaps().empty();
         }
 
-        MTLPixelFormat toColorPixelFormat(const Texture& texture) {
+        unsigned int sourceChannelCount(Format format) {
+            switch (format) {
+                case Format::Red:
+                    return 1u;
+                case Format::RG:
+                    return 2u;
+                case Format::RGB:
+                    return 3u;
+                case Format::RGBA:
+                    return 4u;
+                default:
+                    throw std::runtime_error("MetalTextureManager supports only Red, RG, RGB, and RGBA texture formats");
+            }
+        }
+
+        unsigned int uploadChannelCount(Format format) {
+            return format == Format::RGB ? 4u : sourceChannelCount(format);
+        }
+
+        bool usesSRGBTextureEncoding(const Texture& texture) {
+            if (texture.type != Type::UnsignedByte) return false;
+            if (texture.format != Format::RGB && texture.format != Format::RGBA) return false;
+
             switch (texture.encoding) {
                 case Encoding::sRGB:
                 case Encoding::Gamma:
-                    return MTLPixelFormatRGBA8Unorm_sRGB;
+                    return true;
                 default:
-                    return MTLPixelFormatRGBA8Unorm;
+                    return false;
+            }
+        }
+
+        MTLPixelFormat toColorPixelFormat(const Texture& texture) {
+            const auto srgb = usesSRGBTextureEncoding(texture);
+
+            switch (texture.type) {
+                case Type::UnsignedByte:
+                    switch (texture.format) {
+                        case Format::Red:
+                            return MTLPixelFormatR8Unorm;
+                        case Format::RG:
+                            return MTLPixelFormatRG8Unorm;
+                        case Format::RGB:
+                        case Format::RGBA:
+                            return srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
+                        default:
+                            break;
+                    }
+                    break;
+                case Type::Float:
+                    switch (texture.format) {
+                        case Format::Red:
+                            return MTLPixelFormatR32Float;
+                        case Format::RG:
+                            return MTLPixelFormatRG32Float;
+                        case Format::RGB:
+                        case Format::RGBA:
+                            return MTLPixelFormatRGBA32Float;
+                        default:
+                            break;
+                    }
+                    break;
+                default:
+                    break;
+            }
+
+            throw std::runtime_error("MetalTextureManager supports only unsigned byte and float Red, RG, RGB, and RGBA textures");
+        }
+
+        template<class T>
+        T opaqueAlpha() {
+            if constexpr (std::is_same_v<T, unsigned char>) {
+                return 255;
+            } else {
+                return 1.f;
+            }
+        }
+
+        template<class T>
+        struct UploadableData {
+            std::vector<T> converted;
+            const T* bytes = nullptr;
+            NSUInteger bytesPerRow = 0;
+            NSUInteger bytesPerImage = 0;
+        };
+
+        template<class T>
+        UploadableData<T> getUploadableDataImpl(const Image& image, Texture& texture) {
+            const auto& source = image.data<T>();
+            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+            const auto sourceChannels = sourceChannelCount(texture.format);
+            const auto uploadChannels = uploadChannelCount(texture.format);
+            const auto expectedSize = pixelCount * static_cast<std::size_t>(sourceChannels);
+            if (source.size() < expectedSize) {
+                std::cerr << "[MetalTextureManager] Error: source.size()=" << source.size()
+                          << ", pixelCount=" << pixelCount
+                          << ", width=" << image.width << ", height=" << image.height
+                          << ", sourceChannels=" << sourceChannels
+                          << ", texture.format=" << static_cast<int>(texture.format)
+                          << ", texture.type=" << static_cast<int>(texture.type) << "\n";
+                throw std::runtime_error("Texture image data is smaller than expected");
+            }
+
+            UploadableData<T> result;
+            result.bytesPerRow = static_cast<NSUInteger>(image.width) * static_cast<NSUInteger>(uploadChannels) * sizeof(T);
+            result.bytesPerImage = result.bytesPerRow * static_cast<NSUInteger>(image.height);
+
+            if (texture.format != Format::RGB) {
+                result.bytes = source.data();
+                return result;
+            }
+
+            result.converted.resize(pixelCount * 4u);
+            for (std::size_t i = 0; i < pixelCount; ++i) {
+                result.converted[i * 4u + 0u] = source[i * 3u + 0u];
+                result.converted[i * 4u + 1u] = source[i * 3u + 1u];
+                result.converted[i * 4u + 2u] = source[i * 3u + 2u];
+                result.converted[i * 4u + 3u] = opaqueAlpha<T>();
+            }
+            result.bytes = result.converted.data();
+            return result;
+        }
+
+        bool hasUploadableImageData(const Texture& texture, const Image& image) {
+            try {
+                const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+                const auto sourceChannels = sourceChannelCount(texture.format);
+                const auto expectedSize = pixelCount * static_cast<std::size_t>(sourceChannels);
+
+                switch (texture.type) {
+                    case Type::UnsignedByte:
+                        return image.data<unsigned char>().size() >= expectedSize;
+                    case Type::Float:
+                        return image.data<float>().size() >= expectedSize;
+                    default:
+                        return false;
+                }
+            } catch (...) {
+                return false;
             }
         }
 
         void replace2DRegion(id<MTLTexture> mtlTexture, Texture& texture, const Image& image, NSUInteger level, NSUInteger slice = 0) {
-            auto rgba = toRGBA(image, texture);
-            const auto bytesPerRow = static_cast<NSUInteger>(image.width) * 4u;
-            const auto bytesPerImage = bytesPerRow * static_cast<NSUInteger>(image.height);
-            [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
-                          mipmapLevel:level
-                                slice:slice
-                            withBytes:rgba.data()
-                          bytesPerRow:bytesPerRow
-                        bytesPerImage:bytesPerImage];
+            switch (texture.type) {
+                case Type::UnsignedByte: {
+                    const auto upload = getUploadableDataImpl<unsigned char>(image, texture);
+                    [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
+                                  mipmapLevel:level
+                                        slice:slice
+                                    withBytes:upload.bytes
+                                  bytesPerRow:upload.bytesPerRow
+                                bytesPerImage:upload.bytesPerImage];
+                    return;
+                }
+                case Type::Float: {
+                    const auto upload = getUploadableDataImpl<float>(image, texture);
+                    [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
+                                  mipmapLevel:level
+                                        slice:slice
+                                    withBytes:upload.bytes
+                                  bytesPerRow:upload.bytesPerRow
+                                bytesPerImage:upload.bytesPerImage];
+                    return;
+                }
+                default:
+                    throw std::runtime_error("MetalTextureManager supports only unsigned byte and float texture uploads");
+            }
         }
 
         void uploadMipmaps(id<MTLTexture> mtlTexture, Texture& texture, NSUInteger slice = 0) {
@@ -199,10 +320,6 @@ namespace threepp::metal {
                 return it->second.texture;
             }
 
-            if (texture.type != Type::UnsignedByte) {
-                throw std::runtime_error("MetalTextureManager currently supports unsigned byte textures");
-            }
-
             if (texture.images().empty()) {
                 if (!allowPlaceholder) {
                     throw std::runtime_error("Cannot create Metal texture without image data");
@@ -212,19 +329,11 @@ namespace threepp::metal {
             }
 
             const auto& image = texture.image();
-            const auto& source = image.data<unsigned char>();
-            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
-            const auto sourceChannels = texture.format == Format::RGB ? 3u : 4u;
-            if (source.size() < pixelCount * sourceChannels) {
+            if (!hasUploadableImageData(texture, image)) {
                 if (!allowPlaceholder) {
-                    std::cerr << "[MetalTextureManager] Error: source.size()=" << source.size()
-                              << ", pixelCount=" << pixelCount
-                              << ", width=" << image.width << ", height=" << image.height
-                              << ", sourceChannels=" << sourceChannels
-                              << ", texture.format=" << (int)texture.format << "\n";
-                    throw std::runtime_error("Texture image data is smaller than expected");
+                    throw std::runtime_error("Texture image data is incompatible with texture format/type or smaller than expected");
                 }
-                warnPlaceholderFallback(texture, "image data is smaller than expected");
+                warnPlaceholderFallback(texture, "image data is incompatible with texture format/type or smaller than expected");
                 return nil;
             }
 
@@ -344,6 +453,18 @@ namespace threepp::metal {
             textures[&texture] = CachedTexture{mtlTexture, texture.version(), true};
         }
 
+        void updateCachedTexture(Texture& texture, id<MTLTexture> mtlTexture) {
+            if (!mtlTexture) {
+                throw std::runtime_error("Cannot cache a null Metal texture");
+            }
+
+            if (!texture.hasEventListener("dispose", onTextureDispose)) {
+                texture.addEventListener("dispose", onTextureDispose);
+            }
+
+            textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+        }
+
         void deallocateTexture(Texture* texture) {
             if (texture && texture->hasEventListener("dispose", onTextureDispose)) {
                 texture->removeEventListener("dispose", onTextureDispose);
@@ -374,6 +495,10 @@ namespace threepp::metal {
 
     void MetalTextureManager::registerExternalTexture(Texture& texture, void* mtlTexture) {
         pimpl_->registerExternalTexture(texture, (__bridge id<MTLTexture>) mtlTexture);
+    }
+
+    void MetalTextureManager::updateCachedTexture(Texture& texture, void* mtlTexture) {
+        pimpl_->updateCachedTexture(texture, (__bridge id<MTLTexture>) mtlTexture);
     }
 
     void MetalTextureManager::deallocateTexture(Texture* texture) {

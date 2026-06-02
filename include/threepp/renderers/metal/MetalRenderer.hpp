@@ -4,15 +4,18 @@
 
 #include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
+#include "threepp/math/Vector2.hpp"
 #include "threepp/math/Vector4.hpp"
 #include "threepp/renderers/Renderer.hpp"
 
 #include <memory>
+#include <optional>
 #include <utility>
 #include <vector>
 
 namespace threepp {
 
+    class Texture;
     class Window;
 
     struct MetalShadowMap: public RendererShadowMap {};
@@ -31,6 +34,8 @@ namespace threepp {
         void setClearColor(const Color& color, float alpha = 1) override;
 
         void clear(bool color = true, bool depth = true, bool stencil = true) override;
+
+        void clearDepth();
 
         void setViewport(const Vector4& v);
 
@@ -52,11 +57,26 @@ namespace threepp {
 
         void addPreRenderJob(const RenderJob& job) override;
 
+        void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0);
+
         [[nodiscard]] void* device() const;
 
         [[nodiscard]] void* currentCommandBuffer() const;
 
         [[nodiscard]] void* currentDrawableTexture() const;
+
+        /**
+         * @brief 获取 threepp 纹理对应的 Metal `id<MTLTexture>` 裸指针。
+         *
+         * 返回值通过 `__bridge void*` 零开销桥接，调用方可将其还原为 `id<MTLTexture>`。
+         * 该指针仅在当前帧且获取后的当前作用域内有效；不得跨帧持有，也不得在同一帧
+         * 获取后对同一个 Texture 调用 `needsUpdate()` 或 `dispose()`。
+         *
+         * @param texture 需要查询的 threepp Texture。
+         * @return 存在底层 Metal 纹理时返回 `void*`，创建失败或占位失败时返回 `std::nullopt`。
+         * @throws std::runtime_error 当纹理格式/类型不受 Metal 后端支持时抛出。
+         */
+        [[nodiscard]] std::optional<void*> getMetalTexture(Texture& texture) const;
 
         /**
          * @brief 将当前 drawable 读取为 RGB8 像素缓冲。
