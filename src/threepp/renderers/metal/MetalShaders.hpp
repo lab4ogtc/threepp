@@ -637,6 +637,7 @@ fragment float4 basic_fragment(
     }
 
 #if USE_LIGHTS
+    float shadowMask = 1.0;
     float3 v = normalize(params.cameraPosition.xyz - in.worldPosition);
     float3 color = lights.ambientColor.rgb * albedo;
 
@@ -655,6 +656,10 @@ fragment float4 basic_fragment(
                                              directionalShadowMap2,
                                              directionalShadowMap3,
                                              shadowSampler);
+        }
+        if (params.materialType == 4) {
+            shadowMask *= shadow;
+            continue;
         }
         if (params.materialType == 2) {
             color += directBlinnPhong(light.color.rgb, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
@@ -689,6 +694,10 @@ fragment float4 basic_fragment(
                                     pointShadowMap2,
                                     pointShadowMap3,
                                     shadowSampler);
+        }
+        if (params.materialType == 4) {
+            shadowMask *= shadow;
+            continue;
         }
         float3 radiance = light.color.rgb * attenuation;
         if (params.materialType == 2) {
@@ -726,6 +735,10 @@ fragment float4 basic_fragment(
                                       spotShadowMap3,
                                       shadowSampler);
         }
+        if (params.materialType == 4) {
+            shadowMask *= shadow;
+            continue;
+        }
         float3 radiance = light.color.rgb * attenuation;
         if (params.materialType == 2) {
             color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
@@ -757,6 +770,10 @@ fragment float4 basic_fragment(
     }
 
     color += emissive;
+    if (params.materialType == 4) {
+        color = albedo;
+        alpha = baseColor.a * (1.0 - shadowMask);
+    }
     if (params.toneMapped != 0 && params.toneMappingType != 0) {
         color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
     }
@@ -764,6 +781,10 @@ fragment float4 basic_fragment(
     return float4(color, alpha);
 #else
     float3 color = albedo + emissive;
+    if (params.materialType == 4) {
+        color = albedo;
+        alpha = 0.0;
+    }
     if (params.toneMapped != 0 && params.toneMappingType != 0) {
         color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
     }

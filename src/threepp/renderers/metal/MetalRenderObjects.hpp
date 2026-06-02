@@ -27,6 +27,7 @@
 #import "threepp/materials/PointsMaterial.hpp"
 #import "threepp/materials/RawShaderMaterial.hpp"
 #import "threepp/materials/ShaderMaterial.hpp"
+#import "threepp/materials/ShadowMaterial.hpp"
 #import "threepp/materials/SpriteMaterial.hpp"
 #import "threepp/materials/interfaces.hpp"
 #import "threepp/math/Matrix3.hpp"
@@ -680,6 +681,10 @@ namespace threepp {
         return dynamic_cast<const MeshStandardMaterial*>(&material) != nullptr || dynamic_cast<const MeshPhongMaterial*>(&material) != nullptr || dynamic_cast<const MeshLambertMaterial*>(&material) != nullptr;
     }
 
+    inline bool isShadowMaterial(const Material& material) {
+        return dynamic_cast<const ShadowMaterial*>(&material) != nullptr;
+    }
+
     template<class Uniforms>
     inline void fillToneMappingUniforms(const Renderer& renderer, const Material& material, Uniforms& uniforms) {
         uniforms.toneMappingType = static_cast<std::uint32_t>(material.toneMapped ? renderer.toneMapping : ToneMapping::None);
@@ -798,6 +803,8 @@ namespace threepp {
             params.materialType = 2u;
         } else if (dynamic_cast<MeshLambertMaterial*>(&material)) {
             params.materialType = 3u;
+        } else if (dynamic_cast<ShadowMaterial*>(&material)) {
+            params.materialType = 4u;
         } else {
             params.materialType = 0u;
         }

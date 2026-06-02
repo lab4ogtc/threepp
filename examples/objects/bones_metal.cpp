@@ -1,4 +1,6 @@
+#include "threepp/extras/imgui/ImguiContext.hpp"
 #include "threepp/helpers/SkeletonHelper.hpp"
+#include "threepp/materials/ShadowMaterial.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/threepp.hpp"
@@ -81,7 +83,6 @@ namespace {
 
         auto mesh = SkinnedMesh::create(geometry, material);
         mesh->castShadow = true;
-        mesh->receiveShadow = true;
         const auto skeleton = Skeleton::create(bones);
 
         mesh->add(bones[0]);
@@ -118,7 +119,9 @@ namespace {
         auto grid = GridHelper::create(gridSize, 10, Color::yellow);
 
         const auto geometry = PlaneGeometry::create(gridSize, gridSize);
-        const auto material = MeshPhongMaterial::create({{"color", Color(0x333333)}, {"side", Side::Double}});
+        const auto material = ShadowMaterial::create();
+        material->color = 0x000000;
+        material->opacity = 0.2f;
 
         const auto plane = Mesh::create(geometry, material);
         plane->rotation.x = -math::PI / 2;
@@ -144,29 +147,20 @@ int main() {
 
     auto light1 = PointLight::create(0xffffff);
     light1->position.set(0, 200, 0);
+    light1->castShadow = true;
+    light1->shadow->bias = -0.005f;
     auto light2 = PointLight::create(0xffffff);
     light2->position.set(100, 200, 100);
+    light2->castShadow = true;
+    light2->shadow->bias = -0.005f;
     auto light3 = PointLight::create(0xffffff);
     light3->position.set(-100, -200, -100);
-
-    auto shadowTarget = Object3D::create();
-    shadowTarget->position.y = 16;
-    scene.add(shadowTarget);
-
-    auto shadowLight = DirectionalLight::create(0xffffff, 0.8f);
-    shadowLight->position.set(30, 60, 40);
-    shadowLight->castShadow = true;
-    shadowLight->shadow->mapSize.set(1024, 1024);
-    shadowLight->shadow->camera->as<OrthographicCamera>()->left = -45;
-    shadowLight->shadow->camera->as<OrthographicCamera>()->right = 45;
-    shadowLight->shadow->camera->as<OrthographicCamera>()->top = 45;
-    shadowLight->shadow->camera->as<OrthographicCamera>()->bottom = -25;
-    shadowLight->setTarget(*shadowTarget);
+    light3->castShadow = true;
+    light3->shadow->bias = -0.005f;
 
     scene.add(light1);
     scene.add(light2);
     scene.add(light3);
-    scene.add(shadowLight);
 
     auto plane = initPlane();
     scene.add(plane);
@@ -184,14 +178,19 @@ int main() {
     });
 
     bool animate{false};
-    KeyAdapter keyAdapter(KeyAdapter::Mode::KEY_PRESSED, [&](KeyEvent evt) {
-        if (evt.key == Key::A) {
-            animate = !animate;
-        }
+    ImguiFunctionalContext ui(canvas, *renderer, [&] {
+        ImGui::SetNextWindowPos({0, 0}, 0, {0, 0});
+        ImGui::SetNextWindowSize({0, 0}, 0);
+        ImGui::Begin("Options");
+        ImGui::Checkbox("animate", &animate);
+        ImGui::End();
     });
-    canvas.addKeyListener(keyAdapter);
 
-    std::cout << "Press 'a' to toggle bone animation." << std::endl;
+    IOCapture capture{};
+    capture.preventMouseEvent = [] {
+        return ImGui::GetIO().WantCaptureMouse;
+    };
+    canvas.setIOCapture(&capture);
 
     Clock clock;
     canvas.animate([&] {
@@ -204,5 +203,6 @@ int main() {
         }
 
         renderer->render(scene, camera);
+        ui.render();
     });
 }
