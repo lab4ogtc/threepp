@@ -2397,6 +2397,7 @@ struct MetalRenderer::Impl {
             copyColorWithIntensity(light->color, light->intensity, dst.color);
             dst.params[0] = light->distance;
             dst.params[1] = light->decay;
+            dst.params[2] = light->shadow ? light->shadow->normalBias : 0.f;
             dst.shadowParams[1] = -1.f;
             auto shadowIt = shadows.pointShadowIndices.find(light->id);
             if (shadowIt != shadows.pointShadowIndices.end() && light->shadow) {
