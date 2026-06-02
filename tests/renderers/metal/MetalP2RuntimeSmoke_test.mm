@@ -519,6 +519,109 @@ TEST_CASE("Metal renderer draws MeshNormalMaterial with normal-derived colors") 
     }
 }
 
+TEST_CASE("Metal renderer supports multiple material geometry groups") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal material groups smoke")
+                                  .size(96, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = BufferGeometry::create();
+        geometry->setAttribute("position", FloatBufferAttribute::create(std::vector<float>{
+                                                -0.8f, -0.6f, 0.f,
+                                                -0.1f, -0.6f, 0.f,
+                                                -0.1f,  0.6f, 0.f,
+                                                -0.8f,  0.6f, 0.f,
+                                                 0.1f, -0.6f, 0.f,
+                                                 0.8f, -0.6f, 0.f,
+                                                 0.8f,  0.6f, 0.f,
+                                                 0.1f,  0.6f, 0.f},
+                                               3));
+        geometry->setIndex(std::vector<unsigned int>{
+                0, 1, 2, 0, 2, 3,
+                4, 5, 6, 4, 6, 7});
+        geometry->addGroup(0, 6, 0);
+        geometry->addGroup(6, 6, 1);
+
+        auto redMaterial = MeshBasicMaterial::create({{"color", Color::red},
+                                                      {"side", Side::Double}});
+        auto blueMaterial = MeshBasicMaterial::create({{"color", Color::blue},
+                                                       {"side", Side::Double}});
+        scene->add(Mesh::create(geometry, std::vector<std::shared_ptr<Material>>{redMaterial, blueMaterial}));
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        const auto [width, height] = canvas.size();
+        const auto logicalPixels = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+        const auto pixelCount = pixels.size() / 3u;
+        REQUIRE(logicalPixels > 0);
+        REQUIRE(pixelCount % logicalPixels == 0);
+
+        const auto pixelScaleSquared = pixelCount / logicalPixels;
+        const auto pixelScale = static_cast<int>(std::round(std::sqrt(static_cast<float>(pixelScaleSquared))));
+        REQUIRE(static_cast<std::size_t>(pixelScale * pixelScale) == pixelScaleSquared);
+        const auto pixelWidth = width * pixelScale;
+        const auto pixelHeight = height * pixelScale;
+
+        std::size_t leftRed = 0;
+        std::size_t leftBlue = 0;
+        std::size_t rightRed = 0;
+        std::size_t rightBlue = 0;
+        unsigned int maxRed = 0;
+        unsigned int maxGreen = 0;
+        unsigned int maxBlue = 0;
+        std::size_t nonBlack = 0;
+        for (int y = 0; y < pixelHeight; ++y) {
+            for (int x = 0; x < pixelWidth; ++x) {
+                const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(pixelWidth) + static_cast<std::size_t>(x)) * 3u;
+
+                const auto r = pixels[offset];
+                const auto g = pixels[offset + 1u];
+                const auto b = pixels[offset + 2u];
+                maxRed = std::max<unsigned int>(maxRed, r);
+                maxGreen = std::max<unsigned int>(maxGreen, g);
+                maxBlue = std::max<unsigned int>(maxBlue, b);
+                if (r != 0 || g != 0 || b != 0) ++nonBlack;
+                const bool redDominant = r > 180 && g < 80 && b < 80;
+                const bool blueDominant = b > 180 && r < 80 && g < 80;
+                if (x < pixelWidth / 2) {
+                    if (redDominant) ++leftRed;
+                    if (blueDominant) ++leftBlue;
+                } else {
+                    if (redDominant) ++rightRed;
+                    if (blueDominant) ++rightBlue;
+                }
+            }
+        }
+
+        CAPTURE(pixels.size(), pixelWidth, pixelHeight, leftRed, leftBlue, rightRed, rightBlue, maxRed, maxGreen, maxBlue, nonBlack);
+        REQUIRE(leftRed > 300);
+        REQUIRE(rightBlue > 300);
+        REQUIRE(leftRed > leftBlue * 4u);
+        REQUIRE(rightBlue > rightRed * 4u);
+        canvas.close();
+    }
+}
+
 TEST_CASE("Metal directional shadow compare leaves empty shadow map lit") {
 
     @autoreleasepool {

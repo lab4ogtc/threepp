@@ -22,11 +22,10 @@ TEST_CASE("MetalRenderList renders opaque objects before transparent objects") {
     list.push(opaqueChild, *opaqueMaterial, 0.1f);
     list.sort();
 
-    const auto ordered = list.orderedObjects();
-
-    REQUIRE(ordered.size() == 2);
-    CHECK(ordered[0] == &opaqueChild);
-    CHECK(ordered[1] == &transparentParent);
+    REQUIRE(list.opaque.size() == 1);
+    REQUIRE(list.transparent.size() == 1);
+    CHECK(list.opaque[0].object == &opaqueChild);
+    CHECK(list.transparent[0].object == &transparentParent);
 }
 
 TEST_CASE("MetalRenderList sorts transparent objects back to front") {

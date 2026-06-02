@@ -2,9 +2,11 @@
 #define THREEPP_METAL_RENDER_LIST_HPP
 
 #include "threepp/core/Object3D.hpp"
+#include "threepp/core/misc.hpp"
 #include "threepp/materials/Material.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <vector>
 
 namespace threepp::metal {
@@ -13,6 +15,7 @@ namespace threepp::metal {
 
         Object3D* object = nullptr;
         Material* material = nullptr;
+        std::optional<GeometryGroup> group;
         unsigned int renderOrder = 0;
         float z = 0;
     };
@@ -28,8 +31,8 @@ namespace threepp::metal {
             transparent.clear();
         }
 
-        void push(Object3D& object, Material& material, float z) {
-            MetalRenderItem item{&object, &material, object.renderOrder, z};
+        void push(Object3D& object, Material& material, float z, std::optional<GeometryGroup> group = std::nullopt) {
+            MetalRenderItem item{&object, &material, group, object.renderOrder, z};
             if (material.transparent) {
                 transparent.emplace_back(item);
             } else {
@@ -54,18 +57,6 @@ namespace threepp::metal {
                     return a.object->id < b.object->id;
                 });
             }
-        }
-
-        [[nodiscard]] std::vector<Object3D*> orderedObjects() const {
-            std::vector<Object3D*> objects;
-            objects.reserve(opaque.size() + transparent.size());
-            for (const auto& item : opaque) {
-                objects.emplace_back(item.object);
-            }
-            for (const auto& item : transparent) {
-                objects.emplace_back(item.object);
-            }
-            return objects;
         }
     };
 
