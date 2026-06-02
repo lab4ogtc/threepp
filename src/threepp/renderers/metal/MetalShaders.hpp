@@ -56,6 +56,24 @@ float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
 }
 )metal";
 
+    constexpr auto fog_functions = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+float3 applyFog(float3 color, float fogDepth, float4 fogColor, float4 fogParams) {
+    if (fogParams.w == 1.0) {
+        float fogFactor = smoothstep(fogParams.x, fogParams.y, fogDepth);
+        return mix(color, fogColor.rgb, fogFactor);
+    }
+    if (fogParams.w == 2.0) {
+        float density = fogParams.z;
+        float fogFactor = 1.0 - exp(-density * density * fogDepth * fogDepth);
+        return mix(color, fogColor.rgb, clamp(fogFactor, 0.0, 1.0));
+    }
+    return color;
+}
+)metal";
+
     constexpr auto basic_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;
@@ -343,16 +361,7 @@ float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
 }
 
 float3 applyFog(float3 color, float fogDepth, constant ShadingParams& params) {
-    if (params.fogParams.w == 1.0) {
-        float fogFactor = smoothstep(params.fogParams.x, params.fogParams.y, fogDepth);
-        return mix(color, params.fogColor.rgb, fogFactor);
-    }
-    if (params.fogParams.w == 2.0) {
-        float density = params.fogParams.z;
-        float fogFactor = 1.0 - exp(-density * density * fogDepth * fogDepth);
-        return mix(color, params.fogColor.rgb, clamp(fogFactor, 0.0, 1.0));
-    }
-    return color;
+    return applyFog(color, fogDepth, params.fogColor, params.fogParams);
 }
 
 float3 perturbNormalFromMap(float3 n, float3 tangent, float3 bitangent, float2 uv, texture2d<float> normalMap, sampler mapSampler) {
@@ -971,12 +980,15 @@ struct PointUniforms {
     float toneMappingExposure;
     uint toneMapped;
     float2 padding;
+    float4 fogColor;
+    float4 fogParams;
 };
 
 struct PointVertexOutput {
     float4 position [[position]];
     float4 color;
     float pointSize [[point_size]];
+    float fogDepth;
 };
 
 vertex PointVertexOutput points_vertex(
@@ -987,11 +999,16 @@ vertex PointVertexOutput points_vertex(
     PointVertexOutput out;
     float4 projected = uniforms.mvp * float4(in.position, 1.0);
     out.position = projected;
+    // 透视投影下 projected.w 等于视图空间 -Z；正交投影下 projected.w 恒为 1.0，
+    // 因此正交相机的 points 雾化深度会退化为常量。
+    out.fogDepth = projected.w;
     out.pointSize = uniforms.pointSize;
     if (uniforms.sizeAttenuation != 0) {
         // 对齐透视点大小衰减，同时钳制裁剪空间 w，避免贴近相机平面时除零。
         out.pointSize *= uniforms.scale / max(projected.w, 0.0001);
     }
+    // GL 会把透视衰减后的点尺寸钳制到实现支持的最小点尺寸；Metal 需要显式保持同等覆盖。
+    out.pointSize = max(out.pointSize, 1.0);
 #if USE_VERTEX_COLORS
     out.color = float4(in.color, 1.0) * uniforms.color;
 #else
@@ -1009,6 +1026,7 @@ struct PointFragmentInput {
     float4 position [[position]];
     float4 color;
     float pointSize [[point_size]];
+    float fogDepth;
 };
 
 fragment float4 points_fragment(
@@ -1020,6 +1038,7 @@ fragment float4 points_fragment(
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
+    color.rgb = applyFog(color.rgb, in.fogDepth, uniforms.fogColor, uniforms.fogParams);
     return color;
 }
 )metal";
@@ -1448,16 +1467,7 @@ float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
 }
 
 float3 applyFog(float3 color, float fogDepth, constant WaterUniforms& uniforms) {
-    if (uniforms.fogParams.w == 1.0) {
-        float fogFactor = smoothstep(uniforms.fogParams.x, uniforms.fogParams.y, fogDepth);
-        return mix(color, uniforms.fogColor.rgb, fogFactor);
-    }
-    if (uniforms.fogParams.w == 2.0) {
-        float density = uniforms.fogParams.z;
-        float fogFactor = 1.0 - exp(-density * density * fogDepth * fogDepth);
-        return mix(color, uniforms.fogColor.rgb, clamp(fogFactor, 0.0, 1.0));
-    }
-    return color;
+    return applyFog(color, fogDepth, uniforms.fogColor, uniforms.fogParams);
 }
 
 float4 waterNoise(texture2d<float> normalSampler, sampler mapSampler, float2 uv, float time) {

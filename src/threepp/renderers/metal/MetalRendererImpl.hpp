@@ -264,6 +264,7 @@ namespace threepp {
         float pointScale() const;
 
         void renderPoints(id<MTLRenderCommandEncoder> encoder,
+                          Scene& scene,
                           Points& points,
                           Material& material,
                           Camera& camera,

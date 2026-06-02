@@ -817,7 +817,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             }
 
             if (auto* points = dynamic_cast<Points*>(obj)) {
-                renderPoints(encoder, *points, *material, camera, colorPixelFormat, item.group);
+                renderPoints(encoder, scene, *points, *material, camera, colorPixelFormat, item.group);
                 continue;
             }
 
@@ -862,7 +862,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;
             const bool useNormal = normAttr != nullptr;
-            const bool useLights = useNormal && isLightingMaterial(*material);
+            const bool useLights = useNormal && (isLightingMaterial(*material) || isShadowMaterial(*material));
             const bool useSkinning = skinnedMesh && skinnedMesh->skeleton && hasSkinningAttributes(*geometry);
             const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
             const bool useInstanceColor = useInstancing && instancedMesh->instanceColor() != nullptr;

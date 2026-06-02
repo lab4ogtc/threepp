@@ -299,11 +299,12 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
 }
 
 float MetalRenderer::Impl::pointScale() const {
-    const auto viewportHeight = renderTarget ? renderTarget->viewport.w : viewport.w * pixelRatio;
+    const auto viewportHeight = renderTarget ? renderTarget->viewport.w : viewport.w;
     return std::max(viewportHeight, 1.f) * 0.5f;
 }
 
 void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
+                                       Scene& scene,
                                        Points& points,
                                        Material& material,
                                        Camera& camera,
@@ -344,8 +345,9 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
 
     PointUniforms uniforms{};
     const bool useSizeAttenuation = pointsMaterial->sizeAttenuation && dynamic_cast<PerspectiveCamera*>(&camera) != nullptr;
-    computePointUniforms(camera, points, *pointsMaterial, pointScale(), useSizeAttenuation, uniforms);
+    computePointUniforms(camera, points, *pointsMaterial, pointScale(), useSizeAttenuation, pixelRatio, uniforms);
     fillToneMappingUniforms(renderer, *pointsMaterial, uniforms);
+    fillFogUniforms(scene, *pointsMaterial, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 

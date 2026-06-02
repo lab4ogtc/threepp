@@ -53,6 +53,7 @@ namespace threepp::metal {
             source += key.doubleSided ? "1\n" : "0\n";
             source += "#define USE_FLIP_SIDED ";
             source += key.flipSided ? "1\n" : "0\n";
+            source += fog_functions;
             source += basic_vertex;
             source += basic_fragment;
             return source;
@@ -85,6 +86,7 @@ namespace threepp::metal {
             source += "#define USE_VERTEX_COLORS ";
             source += useVertexColors ? "1\n" : "0\n";
             source += tone_mapping_functions;
+            source += fog_functions;
             source += points_vertex;
             source += points_fragment;
             return source;
@@ -352,7 +354,10 @@ namespace threepp::metal {
     }
 
     void* MetalShaderManager::getOrCreateWaterFragmentFunction() {
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("water_fragment", water_fragment, "water_fragment");
+        std::string source;
+        source += fog_functions;
+        source += water_fragment;
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("water_fragment", source, "water_fragment");
     }
 
     void* MetalShaderManager::getOrCreateReflectorVertexFunction() {

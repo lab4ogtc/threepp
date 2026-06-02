@@ -7,7 +7,7 @@ using namespace threepp;
 
 int main() {
 
-    GlfwWindow canvas("Points (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
+    GlfwWindow canvas("Points (Metal)", {{"aa", 8}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
 
     auto scene = Scene::create();

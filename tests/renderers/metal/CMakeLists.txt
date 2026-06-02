@@ -2,6 +2,11 @@ add_test_executable(MetalP1_test)
 add_test_executable(MetalRenderList_test)
 target_include_directories(MetalRenderList_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
 
+add_executable(MetalRenderObjects_test MetalRenderObjects_test.mm)
+target_link_libraries(MetalRenderObjects_test PRIVATE threepp Catch2::Catch2WithMain)
+target_include_directories(MetalRenderObjects_test PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/external/glfw/include")
+add_test(NAME MetalRenderObjects_test COMMAND MetalRenderObjects_test)
+
 add_executable(MetalShaderCompile_test MetalShaderCompile_test.mm)
 target_link_libraries(MetalShaderCompile_test PRIVATE threepp Catch2::Catch2WithMain)
 target_include_directories(MetalShaderCompile_test PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/external/glfw/include")

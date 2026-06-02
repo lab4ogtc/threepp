@@ -182,6 +182,8 @@ namespace threepp {
         float toneMappingExposure;
         std::uint32_t toneMapped;
         float padding[2];
+        float fogColor[4];
+        float fogParams[4];
     };
 
     struct alignas(16) RawShaderUniforms {
@@ -372,7 +374,7 @@ namespace threepp {
         out.color[3] = material.opacity;
     }
 
-    inline void computePointUniforms(const Camera& camera, const Points& points, const PointsMaterial& material, float scale, bool sizeAttenuation, PointUniforms& out) {
+    inline void computePointUniforms(const Camera& camera, const Points& points, const PointsMaterial& material, float scale, bool sizeAttenuation, float pixelRatio, PointUniforms& out) {
         Matrix4 mvp;
         computeMVP(camera, points, mvp);
         copyMatrix(mvp, out.mvp);
@@ -380,7 +382,7 @@ namespace threepp {
         out.color[1] = material.color.g;
         out.color[2] = material.color.b;
         out.color[3] = material.opacity;
-        out.pointSize = material.size;
+        out.pointSize = material.size * pixelRatio;
         out.scale = scale;
         out.sizeAttenuation = sizeAttenuation ? 1u : 0u;
     }
