@@ -1,5 +1,7 @@
 #import "MetalRendererImpl.hpp"
 
+#include "threepp/geometries/BoxGeometry.hpp"
+
 using namespace threepp;
 
 void MetalRenderer::Impl::OnRenderTargetDispose::onEvent(Event& event) {
@@ -86,6 +88,7 @@ MetalRenderer::Impl::~Impl() {
     for (auto& [geometry, _] : geometries) {
         geometry->removeEventListener("dispose", onGeometryDispose);
     }
+    backgroundCubeGeometry.reset();
 }
 
 void MetalRenderer::Impl::removeAttribute(BufferAttribute* attribute) {
@@ -608,6 +611,69 @@ void MetalRenderer::Impl::bindPassLightResources(id<MTLRenderCommandEncoder> enc
     [encoder setFragmentSamplerState:shadowSampler atIndex:1];
 }
 
+void MetalRenderer::Impl::renderBackgroundCube(id<MTLRenderCommandEncoder> encoder, CubeTexture& cubeTexture, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    if (!backgroundCubeGeometry) {
+        backgroundCubeGeometry = BoxGeometry::create(1, 1, 1);
+        backgroundCubeGeometry->deleteAttribute("normal");
+        backgroundCubeGeometry->deleteAttribute("uv");
+    }
+
+    trackGeometry(*backgroundCubeGeometry);
+
+    auto* posAttr = getFloatAttribute(*backgroundCubeGeometry, "position");
+    if (!posAttr) return;
+
+    metal::PipelineKey pipelineKey;
+    pipelineKey.vertexFunction = shaderManager->getOrCreateBackgroundCubeVertexFunction();
+    pipelineKey.fragmentFunction = shaderManager->getOrCreateBackgroundCubeFragmentFunction();
+    pipelineKey.alphaBlending = false;
+    pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+    id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+    [encoder setRenderPipelineState:pso];
+
+    id<MTLDepthStencilState> backgroundDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+            false,
+            false,
+            DepthFunc::Always);
+    [encoder setDepthStencilState:backgroundDepthStencilState];
+
+    const auto faceCullingState = metal::computeFaceCullingState(Side::Back, false, false);
+    [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+    bindDrawAttributes(encoder, *backgroundCubeGeometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+
+    Matrix4 modelMatrix;
+    modelMatrix.copyPosition(*camera.matrixWorld);
+
+    Matrix4 mvp;
+    mvp.copy(metal::convertProjectionToMetalClipSpace(camera.projectionMatrix));
+    mvp.multiply(camera.matrixWorldInverse);
+    mvp.multiply(modelMatrix);
+
+    BackgroundCubeUniforms uniforms{};
+    copyMatrix(mvp, uniforms.mvp);
+    copyMatrix(modelMatrix, uniforms.modelMatrix);
+    uniforms.opacity = 1.f;
+    uniforms.flipEnvMap = cubeTexture._needsFlipEnvMap ? 1.f : -1.f;
+    uniforms.toneMappingType = static_cast<std::uint32_t>(renderer.toneMapping);
+    uniforms.toneMappingExposure = renderer.toneMappingExposure;
+    uniforms.toneMapped = 1u;
+
+    [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+    [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+    id<MTLTexture> metalTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(cubeTexture);
+    [encoder setFragmentTexture:metalTexture atIndex:0];
+    [encoder setFragmentSamplerState:samplerForTexture(&cubeTexture) atIndex:0];
+
+    drawGeometry(encoder, *backgroundCubeGeometry, *posAttr, MTLPrimitiveTypeTriangle);
+}
+
 void MetalRenderer::Impl::generateRenderTargetMipmapsIfNeeded(RenderTarget& target, id<MTLTexture> colorTexture) {
     if (!target.texture || !target.texture->generateMipmaps || !colorTexture || colorTexture.mipmapLevelCount <= 1) return;
 
@@ -782,6 +848,12 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     } else {
         applyViewport(encoder);
         applyScissor(encoder);
+    }
+
+    if (!scene.background.empty() && scene.background.isTexture()) {
+        if (auto cubeTexture = std::dynamic_pointer_cast<CubeTexture>(scene.background.texture())) {
+            renderBackgroundCube(encoder, *cubeTexture, camera, colorPixelFormat);
+        }
     }
 
     std::vector<Object3D*> collectedRenderables;

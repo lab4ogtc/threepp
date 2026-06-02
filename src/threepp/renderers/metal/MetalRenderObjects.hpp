@@ -205,6 +205,17 @@ namespace threepp {
         float padding;
     };
 
+    struct alignas(16) BackgroundCubeUniforms {
+        float mvp[16];
+        float modelMatrix[16];
+        float opacity;
+        float flipEnvMap;
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        float padding[3];
+    };
+
     struct alignas(16) WaterUniforms {
         float mvp[16];
         float modelMatrix[16];

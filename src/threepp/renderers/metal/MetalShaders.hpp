@@ -765,8 +765,13 @@ fragment float4 basic_fragment(
 #endif
     if (params.textureFlags1.z != 0) {
         float3 reflected = reflect(-v, n);
-        float lod = roughness * 8.0;
-        color += envMap.sample(mapSampler, reflected, level(lod)).rgb * envMapIntensity;
+        if (params.materialType == 2 || params.materialType == 3) {
+            float3 envColor = envMap.sample(mapSampler, reflected).rgb;
+            color = mix(color, color * envColor, saturateFloat(envMapIntensity));
+        } else {
+            float lod = roughness * 8.0;
+            color += envMap.sample(mapSampler, reflected, level(lod)).rgb * envMapIntensity;
+        }
     }
 
     color += emissive;
@@ -1359,6 +1364,83 @@ fragment float4 sky_fragment(
         retColor = toneMapping(retColor, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
     return float4(retColor, 1.0);
+}
+)metal";
+
+    constexpr auto background_cube_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct BackgroundCubeVertexInput {
+    float3 position [[attribute(0)]];
+};
+
+struct BackgroundCubeUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float opacity;
+    float flipEnvMap;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding[3];
+};
+
+struct BackgroundCubeVertexOutput {
+    float4 position [[position]];
+    float3 worldDirection;
+};
+
+vertex BackgroundCubeVertexOutput background_cube_vertex(
+    BackgroundCubeVertexInput in [[stage_in]],
+    constant BackgroundCubeUniforms& uniforms [[buffer(4)]]
+)
+{
+    BackgroundCubeVertexOutput out;
+    out.worldDirection = normalize((uniforms.modelMatrix * float4(in.position, 0.0)).xyz);
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    out.position.z = out.position.w;
+    return out;
+}
+)metal";
+
+    constexpr auto background_cube_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct BackgroundCubeVertexOutput {
+    float4 position [[position]];
+    float3 worldDirection;
+};
+
+struct BackgroundCubeUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float opacity;
+    float flipEnvMap;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float padding[3];
+};
+
+fragment float4 background_cube_fragment(
+    BackgroundCubeVertexOutput in [[stage_in]],
+    constant BackgroundCubeUniforms& uniforms [[buffer(4)]],
+    texturecube<float> envMap [[texture(0)]],
+    sampler envMapSampler [[sampler(0)]]
+)
+{
+    float3 reflectVec = in.worldDirection;
+    reflectVec.x *= uniforms.flipEnvMap;
+    float4 envColor = envMap.sample(envMapSampler, reflectVec);
+    envColor.a *= uniforms.opacity;
+
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        envColor.rgb = toneMapping(envColor.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+
+    return envColor;
 }
 )metal";
 

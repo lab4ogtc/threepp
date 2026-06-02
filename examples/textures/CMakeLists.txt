@@ -8,6 +8,7 @@ add_example(NAME "texture2d" WEB WEB_EMBED
 )
 if (APPLE)
     add_example(NAME "texture2d_metal")
+    add_example(NAME "cubemap_metal")
 endif ()
 add_example(NAME "data_texture" WEB WEB_EMBED
         "${PROJECT_SOURCE_DIR}/data/textures/checker.png@data/textures/checker.png"

@@ -62,6 +62,7 @@ namespace threepp {
         };
         std::unordered_map<BufferAttribute*, ConvertedSkinIndexBuffer> convertedSkinIndexBuffers;
         std::unordered_map<BufferGeometry*, bool> geometries;
+        std::shared_ptr<BufferGeometry> backgroundCubeGeometry;
         std::vector<unsigned int> lineLoopIndices;
 
         struct MetalRenderTargetResources {
@@ -281,6 +282,8 @@ namespace threepp {
         void renderSprite(id<MTLRenderCommandEncoder> encoder, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, Camera& camera, MTLPixelFormat colorPixelFormat);
+
+        void renderBackgroundCube(id<MTLRenderCommandEncoder> encoder, CubeTexture& cubeTexture, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat);
 

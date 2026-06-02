@@ -97,6 +97,10 @@ namespace threepp::metal {
 
         void* getOrCreateSkyFragmentFunction();
 
+        void* getOrCreateBackgroundCubeVertexFunction();
+
+        void* getOrCreateBackgroundCubeFragmentFunction();
+
         void* getOrCreateWaterVertexFunction();
 
         void* getOrCreateWaterFragmentFunction();

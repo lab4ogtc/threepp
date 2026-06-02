@@ -349,6 +349,17 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sky_fragment", source, "sky_fragment");
     }
 
+    void* MetalShaderManager::getOrCreateBackgroundCubeVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("background_cube_vertex", background_cube_vertex, "background_cube_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateBackgroundCubeFragmentFunction() {
+        std::string source;
+        source += tone_mapping_functions;
+        source += background_cube_fragment;
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("background_cube_fragment", source, "background_cube_fragment");
+    }
+
     void* MetalShaderManager::getOrCreateWaterVertexFunction() {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("water_vertex", water_vertex, "water_vertex");
     }
