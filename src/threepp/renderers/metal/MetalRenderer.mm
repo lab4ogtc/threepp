@@ -145,10 +145,16 @@ void MetalRenderer::Impl::ensureFrameStarted() {
 }
 
 bool MetalRenderer::Impl::ensureDrawable() {
-    if (currentDrawable) return true;
+    if (currentDrawable) {
+        syncDrawableSize(currentDrawable.texture.width, currentDrawable.texture.height);
+        return true;
+    }
 
     updateMetalLayerPixelFormat();
     currentDrawable = [metalLayer nextDrawable];
+    if (currentDrawable) {
+        syncDrawableSize(currentDrawable.texture.width, currentDrawable.texture.height);
+    }
     return currentDrawable != nil;
 }
 
@@ -163,6 +169,41 @@ void MetalRenderer::Impl::updateMetalLayerPixelFormat() {
     metalLayer.pixelFormat = targetPixelFormat;
     multisampleColorPixelFormat = MTLPixelFormatInvalid;
     multisampleColorTexture = nil;
+}
+
+void MetalRenderer::Impl::syncDrawableSize(NSUInteger width, NSUInteger height) {
+    if (renderTarget || width == 0 || height == 0) return;
+
+    const auto clampedWidth = std::min<NSUInteger>(width, static_cast<NSUInteger>(std::numeric_limits<int>::max()));
+    const auto clampedHeight = std::min<NSUInteger>(height, static_cast<NSUInteger>(std::numeric_limits<int>::max()));
+    const auto nextFbWidth = static_cast<int>(clampedWidth);
+    const auto nextFbHeight = static_cast<int>(clampedHeight);
+    const auto logicalSize = window.size();
+
+    float nextPixelRatio = 1;
+    if (logicalSize.width() > 0) {
+        nextPixelRatio = static_cast<float>(nextFbWidth) / static_cast<float>(logicalSize.width());
+    } else if (logicalSize.height() > 0) {
+        nextPixelRatio = static_cast<float>(nextFbHeight) / static_cast<float>(logicalSize.height());
+    }
+
+    const auto framebufferChanged = fbWidth != nextFbWidth || fbHeight != nextFbHeight;
+    const auto layerChanged = metalLayer.contentsScale != nextPixelRatio ||
+                              metalLayer.drawableSize.width != static_cast<CGFloat>(nextFbWidth) ||
+                              metalLayer.drawableSize.height != static_cast<CGFloat>(nextFbHeight);
+    if (!framebufferChanged && pixelRatio == nextPixelRatio && !layerChanged) return;
+
+    fbWidth = nextFbWidth;
+    fbHeight = nextFbHeight;
+    pixelRatio = nextPixelRatio;
+    metalLayer.contentsScale = pixelRatio;
+    metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
+
+    if (framebufferChanged) {
+        multisampleColorTexture = nil;
+        multisampleColorPixelFormat = MTLPixelFormatInvalid;
+        createDepthTexture();
+    }
 }
 
 void MetalRenderer::Impl::updatePixelRatio(const WindowSize& size) {

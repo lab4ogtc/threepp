@@ -135,6 +135,18 @@ namespace {
         return samples > 0 ? total / static_cast<float>(samples) : 0.f;
     }
 
+    std::pair<int, int> inferPixelDimensions(const std::vector<unsigned char>& pixels, int logicalWidth, int logicalHeight) {
+        if (pixels.empty() || logicalWidth <= 0 || logicalHeight <= 0) {
+            return {0, 0};
+        }
+
+        const auto pixelCount = pixels.size() / 3u;
+        const auto aspect = static_cast<double>(logicalWidth) / static_cast<double>(logicalHeight);
+        const auto width = static_cast<int>(std::lround(std::sqrt(static_cast<double>(pixelCount) * aspect)));
+        const auto height = width > 0 ? static_cast<int>(pixelCount / static_cast<std::size_t>(width)) : 0;
+        return {width, height};
+    }
+
     float centerLuma(const std::vector<unsigned char>& pixels, int width, int height, int radius = 3) {
         return lumaAt(pixels, width, height, width / 2, height / 2, radius);
     }
@@ -890,9 +902,15 @@ TEST_CASE("Metal point shadow lands at the light-to-caster projection") {
             return metalRenderer->readRGBPixels();
         };
 
-        const auto [width, height] = canvas.size();
         const auto withoutShadow = renderPixels(false);
         const auto withShadow = renderPixels(true);
+        REQUIRE(withoutShadow.size() == withShadow.size());
+
+        const auto [logicalWidth, logicalHeight] = canvas.size();
+        const auto [width, height] = inferPixelDimensions(withShadow, logicalWidth, logicalHeight);
+        REQUIRE(width > 0);
+        REQUIRE(height > 0);
+        REQUIRE(withShadow.size() == static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u);
 
         const auto expectedShadowX = static_cast<int>((-0.5f + 2.f) * static_cast<float>(width) / 4.f);
         const auto expectedShadowY = static_cast<int>((2.f - -0.5f) * static_cast<float>(height) / 4.f);
@@ -920,7 +938,7 @@ TEST_CASE("Metal point shadow lands at the light-to-caster projection") {
             }
         }
 
-        CAPTURE(expectedShadowX, expectedShadowY, litLuma, shadowedLuma, drop, maxDrop, maxDropX, maxDropY);
+        CAPTURE(logicalWidth, logicalHeight, width, height, expectedShadowX, expectedShadowY, litLuma, shadowedLuma, drop, maxDrop, maxDropX, maxDropY);
         REQUIRE(litLuma > 20.f);
         REQUIRE(drop > 10.f);
 

@@ -136,6 +136,8 @@ namespace threepp {
 
         void updateMetalLayerPixelFormat();
 
+        void syncDrawableSize(NSUInteger width, NSUInteger height);
+
         void updatePixelRatio(const WindowSize& size);
 
         void createDepthTexture();

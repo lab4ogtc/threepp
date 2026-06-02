@@ -119,7 +119,7 @@ vertex VertexOutput basic_vertex(
     , uint instanceId [[instance_id]]
 #endif
 #if USE_INSTANCE_COLOR
-    , constant float3* instanceColors [[buffer(10)]]
+    , constant packed_float3* instanceColors [[buffer(10)]]
 #endif
 )
 {
@@ -177,7 +177,7 @@ vertex VertexOutput basic_vertex(
     vertexColor *= float4(in.color, 1.0);
 #endif
 #if USE_INSTANCE_COLOR
-    vertexColor *= float4(instanceColors[instanceId], 1.0);
+    vertexColor *= float4(float3(instanceColors[instanceId]), 1.0);
 #endif
     out.color = vertexColor;
 #endif
