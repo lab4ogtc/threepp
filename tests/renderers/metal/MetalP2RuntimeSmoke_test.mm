@@ -1,5 +1,6 @@
 #import <Metal/Metal.h>
 
+#include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/geometries/TorusKnotGeometry.hpp"
 #include "threepp/lights/LightProbe.hpp"
 #include "threepp/materials/RawShaderMaterial.hpp"
@@ -828,6 +829,100 @@ TEST_CASE("Metal directional shadows sample the updated LightShadow matrix") {
         CAPTURE(litCenterLuma, normalCenterLuma, offsetCenterLuma, normalDrop, offsetDrop);
         REQUIRE(normalDrop > 12.f);
         REQUIRE(offsetDrop < normalDrop * 0.35f);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal point shadow lands at the light-to-caster projection") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal point shadow projection smoke")
+                                  .size(128, 128)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+        metalRenderer->shadowMap().enabled = true;
+
+        auto renderPixels = [&](bool castShadow) {
+            auto scene = Scene::create();
+            scene->background = Color::black;
+
+            auto camera = OrthographicCamera::create(-2.f, 2.f, 2.f, -2.f, 0.1f, 10.f);
+            camera->position.z = 5.f;
+            camera->lookAt(0.f, 0.f, 0.f);
+
+            auto planeMaterial = MeshLambertMaterial::create({{"color", Color::white},
+                                                              {"side", Side::Double}});
+            auto plane = Mesh::create(PlaneGeometry::create(4.f, 4.f), planeMaterial);
+            plane->receiveShadow = true;
+            scene->add(plane);
+
+            auto casterMaterial = MeshLambertMaterial::create({{"color", Color::white},
+                                                               {"side", Side::Double}});
+            auto caster = Mesh::create(BoxGeometry::create(0.55f, 0.55f, 0.55f), casterMaterial);
+            caster->position.set(0.f, 0.f, 1.f);
+            caster->castShadow = castShadow;
+            caster->frustumCulled = false;
+            scene->add(caster);
+
+            auto light = PointLight::create(Color::white, 2.f, 8.f, 2.f);
+            light->position.set(1.f, 1.f, 3.f);
+            light->castShadow = true;
+            light->shadow->mapSize.set(256, 256);
+            light->shadow->bias = -0.001f;
+            scene->add(light);
+
+            metalRenderer->shadowMap().needsUpdate = true;
+            renderer->autoClear = false;
+            renderer->setClearColor(Color::black);
+            REQUIRE_NOTHROW(renderer->clear());
+            REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+            return metalRenderer->readRGBPixels();
+        };
+
+        const auto [width, height] = canvas.size();
+        const auto withoutShadow = renderPixels(false);
+        const auto withShadow = renderPixels(true);
+
+        const auto expectedShadowX = static_cast<int>((-0.5f + 2.f) * static_cast<float>(width) / 4.f);
+        const auto expectedShadowY = static_cast<int>((2.f - -0.5f) * static_cast<float>(height) / 4.f);
+        const auto litLuma = lumaAt(withoutShadow, width, height, expectedShadowX, expectedShadowY, 4);
+        const auto shadowedLuma = lumaAt(withShadow, width, height, expectedShadowX, expectedShadowY, 4);
+        const auto drop = litLuma - shadowedLuma;
+        auto maxDrop = 0.f;
+        auto maxDropX = 0;
+        auto maxDropY = 0;
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3u;
+                const auto beforeLuma = 0.2126f * static_cast<float>(withoutShadow[offset]) +
+                                        0.7152f * static_cast<float>(withoutShadow[offset + 1u]) +
+                                        0.0722f * static_cast<float>(withoutShadow[offset + 2u]);
+                const auto afterLuma = 0.2126f * static_cast<float>(withShadow[offset]) +
+                                       0.7152f * static_cast<float>(withShadow[offset + 1u]) +
+                                       0.0722f * static_cast<float>(withShadow[offset + 2u]);
+                const auto currentDrop = beforeLuma - afterLuma;
+                if (currentDrop > maxDrop) {
+                    maxDrop = currentDrop;
+                    maxDropX = x;
+                    maxDropY = y;
+                }
+            }
+        }
+
+        CAPTURE(expectedShadowX, expectedShadowY, litLuma, shadowedLuma, drop, maxDrop, maxDropX, maxDropY);
+        REQUIRE(litLuma > 20.f);
+        REQUIRE(drop > 10.f);
 
         canvas.close();
     }

@@ -253,12 +253,27 @@ TEST_CASE("Metal P4 point light shadows use tiled depth maps without reusing att
     REQUIRE(pointDepthFragment.find("length(in.worldPosition - transforms.lightPosition.xyz)") != std::string_view::npos);
 }
 
-TEST_CASE("Metal P4 point light shadows sample GL cube atlas without a whole-texture y flip") {
+TEST_CASE("Metal P4 point light shadows sample Metal texture y orientation") {
 
     const std::string_view source{metal::basic_fragment};
-    REQUIRE(source.find("float2 pointShadowUV(") == std::string_view::npos);
-    REQUIRE(source.find("return float2(uv.x, 1.0 - uv.y);") == std::string_view::npos);
-    REQUIRE(source.find("sample_compare(shadowSampler, cubeToUV(bd3D, texelSize.y), dp)") != std::string_view::npos);
+    REQUIRE(source.find("float2 pointShadowUV(") != std::string_view::npos);
+    REQUIRE(source.find("return float2(uv.x, 1.0 - uv.y);") != std::string_view::npos);
+    REQUIRE(source.find("sample_compare(shadowSampler, pointShadowUV(bd3D, texelSize.y), dp)") != std::string_view::npos);
+}
+
+TEST_CASE("Metal P4 point light shadow atlas writes flip GL viewport rows for Metal") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+
+    REQUIRE(source.find("frameExtents.y - viewport.y - viewport.w") != std::string::npos);
+}
+
+TEST_CASE("Metal P4 point light shadow atlas pass uses per-face scissor and fresh depth bias state") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+
+    REQUIRE(source.find("resetDepthBiasCache();\n        [encoder setDepthStencilState:depthStencilState];\n\n        const auto frameExtents = shadow.getFrameExtents();") != std::string::npos);
+    REQUIRE(source.find("[encoder setScissorRect:metalScissor];") != std::string::npos);
 }
 
 TEST_CASE("Metal point light example mirrors GL shadow receiver and bias setup") {

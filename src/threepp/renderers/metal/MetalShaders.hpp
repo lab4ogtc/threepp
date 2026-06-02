@@ -440,6 +440,11 @@ float2 cubeToUV(float3 v, float texelSizeY) {
     return float2(0.125, 0.25) * planar + float2(0.375, 0.75);
 }
 
+float2 pointShadowUV(float3 v, float texelSizeY) {
+    float2 uv = cubeToUV(v, texelSizeY);
+    return float2(uv.x, 1.0 - uv.y);
+}
+
 float samplePointShadowTexture(depth2d<float> shadowMap,
                                sampler shadowSampler,
                                float3 lightToPosition,
@@ -453,20 +458,22 @@ float samplePointShadowTexture(depth2d<float> shadowMap,
     float2 texelSize = 1.0 / max(shadowMapSize * float2(4.0, 2.0), float2(1.0));
     float dp = (length(lightToPosition) - nearPlane) / (farPlane - nearPlane);
     dp += bias;
+    if (dp > 1.0) return 0.0;
+    if (dp < 0.0) return 1.0;
 
     float3 bd3D = normalize(lightToPosition);
     float2 offset = float2(-1.0, 1.0) * radius * texelSize.y;
 
     return (
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xyy, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yyy, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xyx, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yyx, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xxy, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yxy, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.xxx, texelSize.y), dp) +
-        shadowMap.sample_compare(shadowSampler, cubeToUV(bd3D + offset.yxx, texelSize.y), dp)
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.xyy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.yyy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.xyx, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.yyx, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.xxy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.yxy, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.xxx, texelSize.y), dp) +
+        shadowMap.sample_compare(shadowSampler, pointShadowUV(bd3D + offset.yxx, texelSize.y), dp)
     ) / 9.0;
 }
 

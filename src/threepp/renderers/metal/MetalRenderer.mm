@@ -2349,10 +2349,12 @@ struct MetalRenderer::Impl {
         passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
         id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
+        resetDepthBiasCache();
         [encoder setDepthStencilState:depthStencilState];
 
-        const auto faceWidth = static_cast<double>(std::max(1.f, shadow.mapSize.x));
-        const auto faceHeight = static_cast<double>(std::max(1.f, shadow.mapSize.y));
+        const auto frameExtents = shadow.getFrameExtents();
+        const auto faceWidth = static_cast<double>(std::max<NSUInteger>(shadowTexture.width, 1)) / static_cast<double>(std::max(1.f, frameExtents.x));
+        const auto faceHeight = static_cast<double>(std::max<NSUInteger>(shadowTexture.height, 1)) / static_cast<double>(std::max(1.f, frameExtents.y));
         Vector3 lightPosition;
         lightPosition.setFromMatrixPosition(*light.matrixWorld);
         for (std::size_t i = 0; i < shadow.getViewportCount(); ++i) {
@@ -2360,12 +2362,20 @@ struct MetalRenderer::Impl {
             const auto& viewport = shadow.getViewport(i);
             const MTLViewport metalViewport{
                     static_cast<double>(viewport.x) * faceWidth,
-                    static_cast<double>(viewport.y) * faceHeight,
+                    static_cast<double>(frameExtents.y - viewport.y - viewport.w) * faceHeight,
                     static_cast<double>(viewport.z) * faceWidth,
                     static_cast<double>(viewport.w) * faceHeight,
                     0.0,
                     1.0};
             [encoder setViewport:metalViewport];
+
+            const MTLScissorRect metalScissor{
+                    static_cast<NSUInteger>(std::floor(metalViewport.originX)),
+                    static_cast<NSUInteger>(std::floor(metalViewport.originY)),
+                    static_cast<NSUInteger>(std::ceil(metalViewport.width)),
+                    static_cast<NSUInteger>(std::ceil(metalViewport.height))};
+            [encoder setScissorRect:metalScissor];
+
             renderPointDepthObject(encoder, scene, *shadow.camera, shadow.getFrustum(), lightPosition, shadow.camera->nearPlane, shadow.camera->farPlane);
         }
 
