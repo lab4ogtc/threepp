@@ -239,6 +239,9 @@ set(privateHeaders
         "threepp/animation/PropertyMixer.hpp"
 
         "threepp/renderers/metal/MetalShaders.hpp"
+        "threepp/renderers/metal/MetalRenderObjects.hpp"
+        "threepp/renderers/metal/MetalRendererImpl.hpp"
+        "threepp/renderers/metal/MetalRenderList.hpp"
         "threepp/renderers/metal/MetalCameraUtils.hpp"
         "threepp/renderers/metal/MetalRenderStateUtils.hpp"
         "threepp/renderers/metal/MetalPipelineCache.hpp"
@@ -564,6 +567,8 @@ endif ()
 if (APPLE)
     list(APPEND sources
             "threepp/renderers/metal/MetalRenderer.mm"
+            "threepp/renderers/metal/MetalShadowRenderer.mm"
+            "threepp/renderers/metal/MetalObjectsRenderer.mm"
             "threepp/renderers/metal/MetalPipelineCache.mm"
             "threepp/renderers/metal/MetalBufferManager.mm"
             "threepp/renderers/metal/MetalShaderManager.mm"

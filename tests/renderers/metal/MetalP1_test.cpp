@@ -263,16 +263,26 @@ TEST_CASE("Metal P4 point light shadows sample Metal texture y orientation") {
 
 TEST_CASE("Metal P4 point light shadow atlas writes flip GL viewport rows for Metal") {
 
-    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalShadowRenderer.mm");
 
     REQUIRE(source.find("frameExtents.y - viewport.y - viewport.w") != std::string::npos);
 }
 
 TEST_CASE("Metal P4 point light shadow atlas pass uses per-face scissor and fresh depth bias state") {
 
-    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalShadowRenderer.mm");
+    const auto methodStart = source.find("renderPointLightShadow");
+    REQUIRE(methodStart != std::string::npos);
 
-    REQUIRE(source.find("resetDepthBiasCache();\n        [encoder setDepthStencilState:depthStencilState];\n\n        const auto frameExtents = shadow.getFrameExtents();") != std::string::npos);
+    const auto resetDepthBias = source.find("resetDepthBiasCache();", methodStart);
+    const auto depthStencil = source.find("[encoder setDepthStencilState:depthStencilState];", methodStart);
+    const auto frameExtents = source.find("const auto frameExtents = shadow.getFrameExtents();", methodStart);
+
+    REQUIRE(resetDepthBias != std::string::npos);
+    REQUIRE(depthStencil != std::string::npos);
+    REQUIRE(frameExtents != std::string::npos);
+    REQUIRE(resetDepthBias < depthStencil);
+    REQUIRE(depthStencil < frameExtents);
     REQUIRE(source.find("[encoder setScissorRect:metalScissor];") != std::string::npos);
 }
 
