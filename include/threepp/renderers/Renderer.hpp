@@ -23,6 +23,13 @@ namespace threepp {
         Vulkan
     };
 
+    struct RendererShadowMap {
+        bool enabled = false;
+        bool autoUpdate = true;
+        bool needsUpdate = false;
+        ShadowMap type = ShadowMap::PFC;
+    };
+
     class Renderer {
 
     public:
@@ -54,6 +61,10 @@ namespace threepp {
         [[nodiscard]] virtual RenderTarget* getRenderTarget() = 0;
 
         virtual void addPreRenderJob(const RenderJob& job) = 0;
+
+        virtual RendererShadowMap& shadowMap() = 0;
+
+        [[nodiscard]] virtual const RendererShadowMap& shadowMap() const = 0;
 
         bool autoClear = true;
 

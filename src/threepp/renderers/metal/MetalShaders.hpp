@@ -367,11 +367,12 @@ float sampleShadowTexture(depth2d<float> shadowMap, sampler shadowSampler, float
     }
 
     float2 texelSize = 1.0 / max(shadowMapSize, float2(1.0));
+    float2 uv = float2(coord.x, 1.0 - coord.y);
     float shadow = 0.0;
     for (int y = -1; y <= 1; ++y) {
         for (int x = -1; x <= 1; ++x) {
             float2 offset = float2(float(x), float(y)) * texelSize * max(radius, 1.0);
-            shadow += shadowMap.sample_compare(shadowSampler, coord.xy + offset, coord.z);
+            shadow += shadowMap.sample_compare(shadowSampler, uv + offset, coord.z);
         }
     }
     return shadow / 9.0;

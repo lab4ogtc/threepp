@@ -11,6 +11,11 @@ using namespace threepp;
 
 namespace {
 
+    constexpr float lightOrbitCenterX = -30.f;
+    constexpr float lightOrbitCenterY = 50.f;
+    constexpr float lightOrbitCenterZ = -30.f;
+    constexpr float lightOrbitRadius = 20.f;
+
     auto createSky(const Vector3& lightPosition) {
 
         auto sky = Sky::create();
@@ -68,7 +73,7 @@ int main() {
     camera->position.set(-5, 2, -5);
 
     auto light = DirectionalLight::create();
-    light->position.set(150, 50, 150);
+    light->position.set(lightOrbitCenterX, lightOrbitCenterY, lightOrbitCenterZ + lightOrbitRadius);
     light->castShadow = true;
     scene->add(light);
 
@@ -100,8 +105,9 @@ int main() {
 
         torusKnot->rotation.y -= 0.5f * dt;
 
-        light->position.x = 100 * std::sin(clock.elapsedTime);
-        light->position.z = 100 * std::cos(clock.elapsedTime);
+        light->position.x = lightOrbitCenterX + lightOrbitRadius * std::sin(clock.elapsedTime);
+        light->position.y = lightOrbitCenterY;
+        light->position.z = lightOrbitCenterZ + lightOrbitRadius * std::cos(clock.elapsedTime);
 
         sunPositionUniform.copy(light->position);
 

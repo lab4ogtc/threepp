@@ -3,7 +3,6 @@
 #include "threepp/loaders/AssimpLoader.hpp"
 #include "threepp/materials/LineBasicMaterial.hpp"
 #include "threepp/renderers/Renderer.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 using namespace threepp;
@@ -12,9 +11,8 @@ int main() {
 
     GlfwWindow canvas("Assimp bones / simple animation", {{"aa", 8}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
-    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
-    metalRenderer.shadowMap().enabled = true;
-    metalRenderer.shadowMap().type = ShadowMap::PFCSoft;
+    renderer->shadowMap().enabled = true;
+    renderer->shadowMap().type = ShadowMap::PFCSoft;
 
     PerspectiveCamera camera(45, canvas.aspect(), 0.1, 10000);
     camera.position.set(0, 6, -10);

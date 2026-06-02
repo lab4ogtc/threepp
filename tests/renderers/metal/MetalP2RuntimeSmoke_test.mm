@@ -1,5 +1,6 @@
 #import <Metal/Metal.h>
 
+#include "threepp/geometries/TorusKnotGeometry.hpp"
 #include "threepp/lights/LightProbe.hpp"
 #include "threepp/materials/RawShaderMaterial.hpp"
 #include "threepp/objects/InstancedMesh.hpp"
@@ -20,6 +21,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <memory>
 #include <utility>
@@ -34,6 +36,27 @@ namespace {
     public:
         explicit TestLightProbe(SphericalHarmonis3 sh, float intensity)
             : LightProbe(std::move(sh), intensity) {}
+    };
+
+    class MatrixOffsetShadow: public LightShadow {
+
+    public:
+        static std::shared_ptr<MatrixOffsetShadow> create() {
+
+            return std::shared_ptr<MatrixOffsetShadow>(new MatrixOffsetShadow());
+        }
+
+        void updateMatrices(Light& light) override {
+
+            LightShadow::updateMatrices(light);
+            Matrix4 offset;
+            offset.makeTranslation(2.f, 0.f, 0.f);
+            matrix.premultiply(offset);
+        }
+
+    private:
+        MatrixOffsetShadow()
+            : LightShadow(std::make_unique<OrthographicCamera>(-5.f, 5.f, 5.f, -5.f, 0.5f, 500.f)) {}
     };
 
     std::shared_ptr<CubeTexture> makeCubeTexture() {
@@ -92,6 +115,62 @@ namespace {
 
         texture->needsUpdate();
         return texture;
+    }
+
+    float lumaAt(const std::vector<unsigned char>& pixels, int width, int height, int centerX, int centerY, int radius = 3) {
+        float total = 0.f;
+        int samples = 0;
+
+        for (int y = std::max(0, centerY - radius); y <= std::min(height - 1, centerY + radius); ++y) {
+            for (int x = std::max(0, centerX - radius); x <= std::min(width - 1, centerX + radius); ++x) {
+                const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3u;
+                total += 0.2126f * static_cast<float>(pixels[offset]) +
+                         0.7152f * static_cast<float>(pixels[offset + 1u]) +
+                         0.0722f * static_cast<float>(pixels[offset + 2u]);
+                ++samples;
+            }
+        }
+
+        return samples > 0 ? total / static_cast<float>(samples) : 0.f;
+    }
+
+    float centerLuma(const std::vector<unsigned char>& pixels, int width, int height, int radius = 3) {
+        return lumaAt(pixels, width, height, width / 2, height / 2, radius);
+    }
+
+    float minLuma(const std::vector<unsigned char>& pixels) {
+        auto minValue = 255.f;
+        for (std::size_t i = 0; i + 2u < pixels.size(); i += 3u) {
+            const auto value = 0.2126f * static_cast<float>(pixels[i]) +
+                               0.7152f * static_cast<float>(pixels[i + 1u]) +
+                               0.0722f * static_cast<float>(pixels[i + 2u]);
+            minValue = std::min(minValue, value);
+        }
+        return minValue;
+    }
+
+    unsigned int maxPixelDelta(const std::vector<unsigned char>& a, const std::vector<unsigned char>& b) {
+        unsigned int maxDelta = 0;
+        const auto size = std::min(a.size(), b.size());
+        for (std::size_t i = 0; i < size; ++i) {
+            maxDelta = std::max<unsigned int>(maxDelta, std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i])));
+        }
+        return maxDelta;
+    }
+
+    float maxLumaDrop(const std::vector<unsigned char>& before, const std::vector<unsigned char>& after) {
+        auto maxDrop = 0.f;
+        const auto size = std::min(before.size(), after.size());
+        for (std::size_t i = 0; i + 2u < size; i += 3u) {
+            const auto beforeLuma = 0.2126f * static_cast<float>(before[i]) +
+                                    0.7152f * static_cast<float>(before[i + 1u]) +
+                                    0.0722f * static_cast<float>(before[i + 2u]);
+            const auto afterLuma = 0.2126f * static_cast<float>(after[i]) +
+                                   0.7152f * static_cast<float>(after[i + 1u]) +
+                                   0.0722f * static_cast<float>(after[i + 2u]);
+            maxDrop = std::max(maxDrop, beforeLuma - afterLuma);
+        }
+        return maxDrop;
     }
 
     enum class SkinIndexStorage {
@@ -435,6 +514,368 @@ TEST_CASE("Metal renderer draws MeshNormalMaterial with normal-derived colors") 
 
         REQUIRE(b > r + 40);
         REQUIRE(b > g + 40);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal directional shadow compare leaves empty shadow map lit") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal empty directional shadow smoke")
+                                  .size(96, 96)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+        metalRenderer->shadowMap().enabled = true;
+        metalRenderer->shadowMap().type = ShadowMap::PFCSoft;
+        metalRenderer->shadowMap().needsUpdate = true;
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+        camera->lookAt(0.f, 0.f, 0.f);
+
+        auto planeGeometry = PlaneGeometry::create(1.5f, 1.5f);
+        auto planeMaterial = MeshLambertMaterial::create({{"color", Color::white},
+                                                          {"side", Side::Double}});
+        auto plane = Mesh::create(planeGeometry, planeMaterial);
+        plane->receiveShadow = true;
+        scene->add(plane);
+
+        auto light = DirectionalLight::create(Color::white, 1.f);
+        light->position.set(0.f, 0.f, 2.f);
+        light->castShadow = true;
+        scene->add(light);
+
+        renderer->autoClear = false;
+        renderer->setClearColor(Color::black);
+        REQUIRE_NOTHROW(renderer->clear());
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        const auto [width, height] = canvas.size();
+        REQUIRE(centerLuma(pixels, width, height) > 40.f);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal directional shadow darkens the receiving plane") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal directional shadow receiver smoke")
+                                  .size(96, 96)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+        metalRenderer->shadowMap().enabled = true;
+        metalRenderer->shadowMap().type = ShadowMap::PFCSoft;
+
+        auto renderPixels = [&](bool addCaster) {
+            auto scene = Scene::create();
+            scene->background = Color::black;
+
+            auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+            camera->position.z = 4.f;
+            camera->lookAt(0.f, 0.f, 0.f);
+
+            auto planeMaterial = MeshLambertMaterial::create({{"color", Color::white},
+                                                              {"side", Side::Double}});
+            auto plane = Mesh::create(PlaneGeometry::create(2.f, 2.f), planeMaterial);
+            plane->receiveShadow = true;
+            scene->add(plane);
+
+            auto target = Object3D::create();
+            scene->add(target);
+
+            auto light = DirectionalLight::create(Color::white, 1.f);
+            light->position.set(-5.f, 0.f, 5.f);
+            light->castShadow = true;
+            light->shadow->mapSize.set(256, 256);
+            light->setTarget(*target);
+            scene->add(light);
+
+            if (addCaster) {
+                auto casterMaterial = MeshLambertMaterial::create({{"color", Color::white}});
+                auto caster = Mesh::create(TorusKnotGeometry::create(0.75f, 0.2f, 128, 64), casterMaterial);
+                caster->position.set(-2.f, 0.f, 2.f);
+                caster->castShadow = true;
+                scene->add(caster);
+            }
+
+            metalRenderer->shadowMap().needsUpdate = true;
+            renderer->autoClear = false;
+            renderer->setClearColor(Color::black);
+            REQUIRE_NOTHROW(renderer->clear());
+            REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+            return metalRenderer->readRGBPixels();
+        };
+
+        const auto [width, height] = canvas.size();
+        const auto litPixels = renderPixels(false);
+        const auto shadowedPixels = renderPixels(true);
+        const auto litLuma = centerLuma(litPixels, width, height, 4);
+        const auto shadowedLuma = centerLuma(shadowedPixels, width, height, 4);
+        const auto shadowedMinLuma = minLuma(shadowedPixels);
+        const auto maxDelta = maxPixelDelta(litPixels, shadowedPixels);
+
+        CAPTURE(litLuma, shadowedLuma, shadowedMinLuma, maxDelta);
+        REQUIRE(litLuma > 40.f);
+        REQUIRE(shadowedLuma < litLuma - 12.f);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal directional shadows sample the updated LightShadow matrix") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal directional shadow matrix smoke")
+                                  .size(96, 96)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+        metalRenderer->shadowMap().enabled = true;
+        metalRenderer->shadowMap().type = ShadowMap::PFCSoft;
+
+        auto renderPixels = [&](bool addCaster, bool offsetShadowMatrix) {
+            auto scene = Scene::create();
+            scene->background = Color::black;
+
+            auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+            camera->position.z = 4.f;
+            camera->lookAt(0.f, 0.f, 0.f);
+
+            auto planeMaterial = MeshLambertMaterial::create({{"color", Color::white},
+                                                              {"side", Side::Double}});
+            auto plane = Mesh::create(PlaneGeometry::create(2.f, 2.f), planeMaterial);
+            plane->receiveShadow = true;
+            scene->add(plane);
+
+            auto target = Object3D::create();
+            scene->add(target);
+
+            auto light = DirectionalLight::create(Color::white, 1.f);
+            light->position.set(-5.f, 0.f, 5.f);
+            light->castShadow = true;
+            light->shadow->mapSize.set(256, 256);
+            if (offsetShadowMatrix) {
+                light->shadow = MatrixOffsetShadow::create();
+                light->shadow->mapSize.set(256, 256);
+            }
+            light->setTarget(*target);
+            scene->add(light);
+
+            if (addCaster) {
+                auto casterMaterial = MeshLambertMaterial::create({{"color", Color::white}});
+                auto caster = Mesh::create(TorusKnotGeometry::create(0.75f, 0.2f, 128, 64), casterMaterial);
+                caster->position.set(-2.f, 0.f, 2.f);
+                caster->castShadow = true;
+                scene->add(caster);
+            }
+
+            metalRenderer->shadowMap().needsUpdate = true;
+            renderer->autoClear = false;
+            renderer->setClearColor(Color::black);
+            REQUIRE_NOTHROW(renderer->clear());
+            REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+            return metalRenderer->readRGBPixels();
+        };
+
+        const auto litPixels = renderPixels(false, false);
+        const auto normalShadowPixels = renderPixels(true, false);
+        const auto offsetMatrixPixels = renderPixels(true, true);
+        const auto [width, height] = canvas.size();
+
+        const auto litCenterLuma = centerLuma(litPixels, width, height, 4);
+        const auto normalCenterLuma = centerLuma(normalShadowPixels, width, height, 4);
+        const auto offsetCenterLuma = centerLuma(offsetMatrixPixels, width, height, 4);
+        const auto normalDrop = litCenterLuma - normalCenterLuma;
+        const auto offsetDrop = litCenterLuma - offsetCenterLuma;
+
+        CAPTURE(litCenterLuma, normalCenterLuma, offsetCenterLuma, normalDrop, offsetDrop);
+        REQUIRE(normalDrop > 12.f);
+        REQUIRE(offsetDrop < normalDrop * 0.35f);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal directional light example caster changes receiver lighting") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal directional example shadow smoke")
+                                  .size(160, 120)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+        metalRenderer->shadowMap().enabled = true;
+        metalRenderer->shadowMap().type = ShadowMap::PFCSoft;
+        renderer->toneMapping = ToneMapping::ACESFilmic;
+
+        auto renderExamplePixels = [&](bool castShadow) {
+            auto scene = Scene::create();
+            scene->background = Color::aliceblue;
+
+            auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000.f);
+            camera->position.set(-5.f, 2.f, -5.f);
+            camera->lookAt(0.f, 0.f, 0.f);
+
+            auto light = DirectionalLight::create(Color::white, 1.f);
+            light->position.set(-30.f, 50.f, -10.f);
+            light->castShadow = true;
+            scene->add(light);
+
+            auto planeMaterial = MeshLambertMaterial::create();
+            planeMaterial->color = Color::gray;
+            planeMaterial->side = Side::Double;
+            auto plane = Mesh::create(PlaneGeometry::create(100.f, 100.f), planeMaterial);
+            plane->rotateX(math::degToRad(90.f));
+            plane->receiveShadow = true;
+            scene->add(plane);
+
+            auto material = MeshStandardMaterial::create();
+            material->roughness = 0.1f;
+            material->metalness = 0.1f;
+            material->color = 0xff0000;
+            auto torus = Mesh::create(TorusKnotGeometry::create(0.75f, 0.2f, 128, 64), material);
+            torus->castShadow = castShadow;
+            torus->position.y = 2.f;
+            scene->add(torus);
+
+            metalRenderer->shadowMap().needsUpdate = true;
+            renderer->autoClear = false;
+            renderer->setClearColor(Color::aliceblue);
+            REQUIRE_NOTHROW(renderer->clear());
+            REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+            return metalRenderer->readRGBPixels();
+        };
+
+        const auto withoutShadow = renderExamplePixels(false);
+        const auto withShadow = renderExamplePixels(true);
+        const auto receiverDrop = maxLumaDrop(withoutShadow, withShadow);
+        const auto exampleMaxDelta = maxPixelDelta(withoutShadow, withShadow);
+
+        CAPTURE(receiverDrop, exampleMaxDelta);
+        REQUIRE(receiverDrop > 12.f);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal directional light example shadow remains visible while the light rotates") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal directional example rotating shadow smoke")
+                                  .size(160, 120)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+        metalRenderer->shadowMap().enabled = true;
+        metalRenderer->shadowMap().type = ShadowMap::PFCSoft;
+        renderer->toneMapping = ToneMapping::ACESFilmic;
+
+        auto renderExamplePixels = [&](const Vector3& lightPosition, bool castShadow) {
+            auto scene = Scene::create();
+            scene->background = Color::aliceblue;
+
+            auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000.f);
+            camera->position.set(-5.f, 2.f, -5.f);
+            camera->lookAt(0.f, 0.f, 0.f);
+
+            auto light = DirectionalLight::create(Color::white, 1.f);
+            light->position.copy(lightPosition);
+            light->castShadow = true;
+            scene->add(light);
+
+            auto planeMaterial = MeshLambertMaterial::create();
+            planeMaterial->color = Color::gray;
+            planeMaterial->side = Side::Double;
+            auto plane = Mesh::create(PlaneGeometry::create(100.f, 100.f), planeMaterial);
+            plane->rotateX(math::degToRad(90.f));
+            plane->receiveShadow = true;
+            scene->add(plane);
+
+            auto material = MeshStandardMaterial::create();
+            material->roughness = 0.1f;
+            material->metalness = 0.1f;
+            material->color = 0xff0000;
+            auto torus = Mesh::create(TorusKnotGeometry::create(0.75f, 0.2f, 128, 64), material);
+            torus->castShadow = castShadow;
+            torus->position.y = 2.f;
+            scene->add(torus);
+
+            metalRenderer->shadowMap().needsUpdate = true;
+            renderer->autoClear = false;
+            renderer->setClearColor(Color::aliceblue);
+            REQUIRE_NOTHROW(renderer->clear());
+            REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+            return metalRenderer->readRGBPixels();
+        };
+
+        constexpr float lightOrbitCenterX = -30.f;
+        constexpr float lightOrbitCenterY = 50.f;
+        constexpr float lightOrbitCenterZ = -30.f;
+        constexpr float lightOrbitRadius = 20.f;
+        const std::array<float, 4> lightAngles{0.f, math::PI / 2.f, math::PI, math::PI * 1.5f};
+
+        for (const auto angle : lightAngles) {
+            const Vector3 lightPosition{
+                    lightOrbitCenterX + lightOrbitRadius * std::sin(angle),
+                    lightOrbitCenterY,
+                    lightOrbitCenterZ + lightOrbitRadius * std::cos(angle)};
+            const auto withoutShadow = renderExamplePixels(lightPosition, false);
+            const auto withShadow = renderExamplePixels(lightPosition, true);
+            const auto receiverDrop = maxLumaDrop(withoutShadow, withShadow);
+
+            CAPTURE(angle, receiverDrop);
+            REQUIRE(receiverDrop > 12.f);
+        }
 
         canvas.close();
     }

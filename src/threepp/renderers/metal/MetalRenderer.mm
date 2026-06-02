@@ -446,21 +446,6 @@ namespace {
         out.params[1] = farPlane;
     }
 
-    Matrix4 computeShadowTextureMatrix(const Camera& shadowCamera) {
-        Matrix4 textureBias;
-        textureBias.set(
-                0.5f, 0.0f, 0.0f, 0.5f,
-                0.0f, 0.5f, 0.0f, 0.5f,
-                0.0f, 0.0f, 1.0f, 0.0f,
-                0.0f, 0.0f, 0.0f, 1.0f);
-
-        Matrix4 out;
-        out.copy(textureBias);
-        out.multiply(metal::convertProjectionToMetalClipSpace(shadowCamera.projectionMatrix));
-        out.multiply(shadowCamera.matrixWorldInverse);
-        return out;
-    }
-
     void collectRenderables(Object3D& object, std::vector<Object3D*>& out) {
         if (!object.visible) return;
 
@@ -1260,7 +1245,7 @@ struct MetalRenderer::Impl {
         shadowSamplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
         shadowSamplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
         shadowSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
-        shadowSamplerDesc.compareFunction = MTLCompareFunctionGreaterEqual;
+        shadowSamplerDesc.compareFunction = MTLCompareFunctionLessEqual;
         shadowSampler = [device newSamplerStateWithDescriptor:shadowSamplerDesc];
     }
 
@@ -2396,8 +2381,7 @@ struct MetalRenderer::Impl {
                 dst.shadowMapSize[0] = light->shadow->mapSize.x;
                 dst.shadowMapSize[1] = light->shadow->mapSize.y;
                 dst.shadowMapSize[2] = light->shadow->normalBias;
-                const auto shadowMatrix = computeShadowTextureMatrix(*light->shadow->camera);
-                copyMatrix(shadowMatrix, dst.shadowMatrix);
+                copyMatrix(light->shadow->matrix, dst.shadowMatrix);
             } else {
                 copyIdentityMatrix(dst.shadowMatrix);
             }
@@ -2452,8 +2436,7 @@ struct MetalRenderer::Impl {
                 dst.shadowMapSize[0] = light->shadow->mapSize.x;
                 dst.shadowMapSize[1] = light->shadow->mapSize.y;
                 dst.shadowMapSize[2] = light->shadow->normalBias;
-                const auto shadowMatrix = computeShadowTextureMatrix(*light->shadow->camera);
-                copyMatrix(shadowMatrix, dst.shadowMatrix);
+                copyMatrix(light->shadow->matrix, dst.shadowMatrix);
             } else {
                 copyIdentityMatrix(dst.shadowMatrix);
             }

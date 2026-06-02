@@ -1,7 +1,6 @@
 #include "threepp/geometries/TorusKnotGeometry.hpp"
 #include "threepp/helpers/PointLightHelper.hpp"
 #include "threepp/renderers/Renderer.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <cmath>
@@ -76,9 +75,8 @@ int main() {
 
     GlfwWindow canvas("PointLight (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
-    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
-    metalRenderer.shadowMap().enabled = true;
-    metalRenderer.shadowMap().type = ShadowMap::PFCSoft;
+    renderer->shadowMap().enabled = true;
+    renderer->shadowMap().type = ShadowMap::PFCSoft;
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 100);

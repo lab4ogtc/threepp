@@ -1,7 +1,8 @@
 #include "threepp/geometries/TorusKnotGeometry.hpp"
 #include "threepp/helpers/DirectionalLightHelper.hpp"
+#include "threepp/materials/ShaderMaterial.hpp"
+#include "threepp/objects/Sky.hpp"
 #include "threepp/renderers/Renderer.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <cmath>
@@ -9,6 +10,25 @@
 using namespace threepp;
 
 namespace {
+
+    constexpr float lightOrbitCenterX = -30.f;
+    constexpr float lightOrbitCenterY = 50.f;
+    constexpr float lightOrbitCenterZ = -30.f;
+    constexpr float lightOrbitRadius = 20.f;
+
+    auto createSky(const Vector3& lightPosition) {
+
+        auto sky = Sky::create();
+        sky->scale.setScalar(1000);
+        auto& skyUniforms = sky->material()->as<ShaderMaterial>()->uniforms;
+        skyUniforms.at("turbidity").value<float>() = 10;
+        skyUniforms.at("rayleigh").value<float>() = 1;
+        skyUniforms.at("mieCoefficient").value<float>() = 0.005f;
+        skyUniforms.at("mieDirectionalG").value<float>() = 0.8f;
+        skyUniforms.at("sunPosition").value<Vector3>().copy(lightPosition);
+
+        return sky;
+    }
 
     auto createPlane() {
 
@@ -44,19 +64,23 @@ int main() {
 
     GlfwWindow canvas("DirectionalLight (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
-    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
-    metalRenderer.shadowMap().enabled = true;
-    metalRenderer.shadowMap().type = ShadowMap::PFCSoft;
+    renderer->shadowMap().enabled = true;
+    renderer->shadowMap().type = ShadowMap::PFCSoft;
+    renderer->toneMapping = ToneMapping::ACESFilmic;
 
     auto scene = Scene::create();
-    scene->background = Color::aliceblue;
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000);
     camera->position.set(-5, 2, -5);
 
     auto light = DirectionalLight::create();
-    light->position.set(150, 50, 150);
+    light->position.set(lightOrbitCenterX, lightOrbitCenterY, lightOrbitCenterZ + lightOrbitRadius);
     light->castShadow = true;
     scene->add(light);
+
+    auto sky = createSky(light->position);
+    auto shaderMaterial = sky->material()->as<ShaderMaterial>();
+    auto& sunPositionUniform = shaderMaterial->uniforms.at("sunPosition").value<Vector3>();
+    scene->add(sky);
 
     OrbitControls controls{*camera, canvas};
 
@@ -81,8 +105,11 @@ int main() {
 
         torusKnot->rotation.y -= 0.5f * dt;
 
-        light->position.x = 100 * std::sin(clock.elapsedTime);
-        light->position.z = 100 * std::cos(clock.elapsedTime);
+        light->position.x = lightOrbitCenterX + lightOrbitRadius * std::sin(clock.elapsedTime);
+        light->position.y = lightOrbitCenterY;
+        light->position.z = lightOrbitCenterZ + lightOrbitRadius * std::cos(clock.elapsedTime);
+
+        sunPositionUniform.copy(light->position);
 
         light->updateMatrixWorld();
         helper->update();

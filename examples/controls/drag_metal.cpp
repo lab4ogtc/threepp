@@ -1,6 +1,5 @@
 #include "threepp/controls/DragControls.hpp"
 #include "threepp/renderers/Renderer.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <iostream>
@@ -11,9 +10,8 @@ int main() {
 
     GlfwWindow canvas("Drag controls (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
-    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
-    metalRenderer.shadowMap().enabled = true;
-    metalRenderer.shadowMap().type = ShadowMap::PFC;
+    renderer->shadowMap().enabled = true;
+    renderer->shadowMap().type = ShadowMap::PFC;
 
     PerspectiveCamera camera(60, canvas.aspect());
     camera.position.z = 25;

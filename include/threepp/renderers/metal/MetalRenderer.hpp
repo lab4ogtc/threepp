@@ -15,12 +15,7 @@ namespace threepp {
 
     class Window;
 
-    struct MetalShadowMap {
-        bool enabled = false;
-        bool autoUpdate = true;
-        bool needsUpdate = false;
-        ShadowMap type = ShadowMap::PFC;
-    };
+    struct MetalShadowMap: public RendererShadowMap {};
 
     class MetalRenderer: public Renderer {
 
@@ -75,9 +70,9 @@ namespace threepp {
          */
         [[nodiscard]] std::vector<unsigned char> readRGBPixels();
 
-        MetalShadowMap& shadowMap();
+        MetalShadowMap& shadowMap() override;
 
-        [[nodiscard]] const MetalShadowMap& shadowMap() const;
+        [[nodiscard]] const MetalShadowMap& shadowMap() const override;
 
         ~MetalRenderer() override;
 

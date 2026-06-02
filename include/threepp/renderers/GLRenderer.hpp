@@ -84,9 +84,9 @@ namespace threepp {
 
         const gl::GLInfo& info();
 
-        gl::GLShadowMap& shadowMap();
+        gl::GLShadowMap& shadowMap() override;
 
-        [[nodiscard]] const gl::GLShadowMap& shadowMap() const;
+        [[nodiscard]] const gl::GLShadowMap& shadowMap() const override;
 
         gl::GLState& state();
 

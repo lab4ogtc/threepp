@@ -1,7 +1,6 @@
 #include "threepp/helpers/SkeletonHelper.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/renderers/Renderer.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <cmath>
@@ -135,8 +134,7 @@ int main() {
 
     GlfwWindow canvas("Bones (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
-    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
-    metalRenderer.shadowMap().enabled = true;
+    renderer->shadowMap().enabled = true;
 
     Scene scene;
     scene.background = Color(0x444444);

@@ -264,6 +264,13 @@ TEST_CASE("Metal P2 shadow bias follows GL shadow depth convention") {
     REQUIRE(source.find("coord.z += bias;") != std::string_view::npos);
 }
 
+TEST_CASE("Metal P2 directional and spot shadows sample Metal texture y orientation") {
+
+    const std::string_view source{metal::basic_fragment};
+    REQUIRE(source.find("float2 uv = float2(coord.x, 1.0 - coord.y);") != std::string_view::npos);
+    REQUIRE(source.find("sample_compare(shadowSampler, uv + offset, coord.z)") != std::string_view::npos);
+}
+
 TEST_CASE("Metal P2 skinning applies bind matrices like GL") {
 
     const std::string_view vertexSource{metal::basic_vertex};

@@ -1,7 +1,6 @@
 #include "threepp/helpers/SkeletonHelper.hpp"
 #include "threepp/loaders/GLTFLoader.hpp"
 #include "threepp/renderers/Renderer.hpp"
-#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <iostream>
@@ -11,8 +10,7 @@ using namespace threepp;
 int main() {
     GlfwWindow canvas("GLTF Demo (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
-    auto& metalRenderer = static_cast<MetalRenderer&>(*renderer);
-    metalRenderer.shadowMap().enabled = true;
+    renderer->shadowMap().enabled = true;
 
     auto scene = Scene::create();
     scene->background = Color::aliceblue;
