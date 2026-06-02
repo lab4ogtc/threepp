@@ -660,8 +660,9 @@ fragment float4 basic_fragment(
         }
         float shadow = 1.0;
         if (params.textureFlags1.w != 0 && light.shadowParams.x > 0.5 && light.shadowParams.y >= 0.0) {
+            float3 offsetWorldPos = in.worldPosition + n * light.params.z;
             shadow = getPointShadow(uint(light.shadowParams.y),
-                                    in.worldPosition - light.position.xyz,
+                                    offsetWorldPos - light.position.xyz,
                                     light.shadowParams.z,
                                     light.shadowParams.w,
                                     light.shadowMapSize.xy,
