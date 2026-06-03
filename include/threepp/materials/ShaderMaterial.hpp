@@ -6,7 +6,17 @@
 #include "interfaces.hpp"
 #include "threepp/materials/Material.hpp"
 
+#include <vector>
+
 namespace threepp {
+
+    /**
+     * @brief Source language used by a shader material.
+     */
+    enum class ShaderLanguage {
+        GLSL,
+        SLANG,
+    };
 
     class ShaderMaterial: public virtual Material,
                           public MaterialWithClipping,
@@ -20,6 +30,8 @@ namespace threepp {
         std::string vertexShader;
         std::string fragmentShader;
         UniformMap uniforms;
+        ShaderLanguage shaderLanguage = ShaderLanguage::GLSL;
+        std::vector<std::string> uniformLayout;
 
         std::optional<std::string> index0AttributeName;
         bool uniformsNeedUpdate = false;
@@ -32,6 +44,8 @@ namespace threepp {
         ShaderMaterial();
 
         std::shared_ptr<Material> createDefault() const override;
+
+        void copyInto(Material& material) const override;
     };
 
 }// namespace threepp

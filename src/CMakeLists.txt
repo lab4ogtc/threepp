@@ -223,10 +223,17 @@ set(publicHeaders
         "threepp/renderers/gl/GLState.hpp"
 
         "threepp/renderers/shaders/ShaderChunk.hpp"
+        "threepp/renderers/shaders/ShaderCompiler.hpp"
         "threepp/renderers/shaders/ShaderLib.hpp"
         "threepp/renderers/shaders/UniformsLib.hpp"
 
 )
+
+if (THREEPP_WITH_SLANG)
+    list(APPEND publicHeaders
+            "threepp/renderers/shaders/SlangShaderCompiler.hpp"
+    )
+endif ()
 
 set(publicHeadersFull)
 foreach (header IN LISTS publicHeaders)
@@ -244,6 +251,7 @@ set(privateHeaders
         "threepp/renderers/metal/MetalRenderList.hpp"
         "threepp/renderers/metal/MetalCameraUtils.hpp"
         "threepp/renderers/metal/MetalRenderStateUtils.hpp"
+        "threepp/renderers/metal/MetalDynamicShaderCache.hpp"
         "threepp/renderers/metal/MetalPipelineCache.hpp"
         "threepp/renderers/metal/MetalBufferManager.hpp"
         "threepp/renderers/metal/MetalShaderManager.hpp"
@@ -484,6 +492,12 @@ set(sources
 
 )
 
+if (THREEPP_WITH_SLANG)
+    list(APPEND sources
+            "threepp/renderers/shaders/SlangShaderCompiler.cpp"
+    )
+endif ()
+
 if (THREEPP_WITH_SVG)
     list(APPEND publicHeaders
             "threepp/loaders/SVGLoader.hpp"
@@ -569,6 +583,7 @@ if (APPLE)
             "threepp/renderers/metal/MetalRenderer.mm"
             "threepp/renderers/metal/MetalShadowRenderer.mm"
             "threepp/renderers/metal/MetalObjectsRenderer.mm"
+            "threepp/renderers/metal/MetalDynamicShaderCache.mm"
             "threepp/renderers/metal/MetalPipelineCache.mm"
             "threepp/renderers/metal/MetalBufferManager.mm"
             "threepp/renderers/metal/MetalShaderManager.mm"
@@ -624,6 +639,11 @@ endif ()
 
 if (UNIX)
     target_link_libraries(threepp PRIVATE pthread dl)
+endif ()
+
+if (THREEPP_WITH_SLANG)
+    target_compile_definitions(threepp PUBLIC THREEPP_HAS_SLANG=1)
+    target_link_libraries(threepp PRIVATE slang::slang)
 endif ()
 
 target_include_directories(threepp

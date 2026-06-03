@@ -12,6 +12,12 @@ option(THREEPP_WITH_AUDIO "Build with Audio" ON)
 option(THREEPP_WITH_GL "Build OpenGL renderer" ON)
 option(THREEPP_TREAT_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 
+if (APPLE)
+    option(THREEPP_WITH_SLANG "Build Slang shader compiler support" ON)
+else ()
+    option(THREEPP_WITH_SLANG "Build Slang shader compiler support" OFF)
+endif ()
+
 
 # Force THREEPP_WITH_GLFW ON when targeting Emscripten
 cmake_dependent_option(THREEPP_WITH_GLFW "Build with GLFW frontend" ON "NOT DEFINED EMSCRIPTEN" ON)
@@ -57,6 +63,11 @@ else ()
 
 endif ()
 
+if (THREEPP_WITH_SLANG)
+    find_package(slang CONFIG REQUIRED)
+endif ()
+
+include(cmake/ThreeppSlangRuntime.cmake)
 
 # ==============================================================================
 # Targets

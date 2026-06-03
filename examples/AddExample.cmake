@@ -23,6 +23,7 @@ function(add_example)
     endif ()
 
     target_link_libraries("${arg_NAME}" PRIVATE threepp)
+    threepp_configure_slang_runtime("${arg_NAME}")
 
     if (arg_LINK_IMGUI)
         target_link_libraries("${arg_NAME}" PRIVATE imgui::imgui)

@@ -75,6 +75,7 @@ int main() {
 
     GlfwWindow canvas("CatmullRoomCurve (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->shadowMap().enabled = true;
 
     auto scene = Scene::create();
     scene->background = 0xf0f0f0;

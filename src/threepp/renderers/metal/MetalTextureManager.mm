@@ -3,12 +3,14 @@
 #import "threepp/constants.hpp"
 #import "threepp/core/EventDispatcher.hpp"
 #import "threepp/textures/CubeTexture.hpp"
+#import "threepp/textures/DataTexture3D.hpp"
 #import "threepp/textures/Texture.hpp"
 
 #import <Metal/Metal.h>
 
 #include <algorithm>
 #include <any>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
@@ -62,12 +64,13 @@ namespace threepp::metal {
         struct SamplerKey {
             TextureWrapping wrapS;
             TextureWrapping wrapT;
+            TextureWrapping wrapR;
             Filter magFilter;
             Filter minFilter;
             bool mipmapped;
 
             bool operator==(const SamplerKey& other) const {
-                return wrapS == other.wrapS && wrapT == other.wrapT && magFilter == other.magFilter && minFilter == other.minFilter && mipmapped == other.mipmapped;
+                return wrapS == other.wrapS && wrapT == other.wrapT && wrapR == other.wrapR && magFilter == other.magFilter && minFilter == other.minFilter && mipmapped == other.mipmapped;
             }
         };
 
@@ -75,15 +78,29 @@ namespace threepp::metal {
             std::size_t operator()(const SamplerKey& key) const {
                 auto h1 = std::hash<int>{}(as_integer(key.wrapS));
                 auto h2 = std::hash<int>{}(as_integer(key.wrapT));
-                auto h3 = std::hash<int>{}(as_integer(key.magFilter));
-                auto h4 = std::hash<int>{}(as_integer(key.minFilter));
-                auto h5 = std::hash<bool>{}(key.mipmapped);
-                return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4);
+                auto h3 = std::hash<int>{}(as_integer(key.wrapR));
+                auto h4 = std::hash<int>{}(as_integer(key.magFilter));
+                auto h5 = std::hash<int>{}(as_integer(key.minFilter));
+                auto h6 = std::hash<bool>{}(key.mipmapped);
+                return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
             }
         };
 
+        TextureWrapping wrapR(const Texture& texture) {
+            if (auto* dataTexture3D = dynamic_cast<const DataTexture3D*>(&texture)) {
+                return dataTexture3D->wrapR;
+            }
+
+            return TextureWrapping::ClampToEdge;
+        }
+
         bool wantsMipmaps(const Texture& texture) {
             return texture.generateMipmaps || !texture.mipmaps().empty();
+        }
+
+        NSUInteger mipLevelCount(NSUInteger width, NSUInteger height, NSUInteger depth) {
+            const auto maxDimension = std::max({width, height, depth});
+            return static_cast<NSUInteger>(std::floor(std::log2(static_cast<double>(maxDimension)))) + 1u;
         }
 
         unsigned int sourceChannelCount(Format format) {
@@ -175,7 +192,7 @@ namespace threepp::metal {
         template<class T>
         UploadableData<T> getUploadableDataImpl(const Image& image, Texture& texture) {
             const auto& source = image.data<T>();
-            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+            const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * static_cast<std::size_t>(std::max(1u, image.depth));
             const auto sourceChannels = sourceChannelCount(texture.format);
             const auto uploadChannels = uploadChannelCount(texture.format);
             const auto expectedSize = pixelCount * static_cast<std::size_t>(sourceChannels);
@@ -211,7 +228,7 @@ namespace threepp::metal {
 
         bool hasUploadableImageData(const Texture& texture, const Image& image) {
             try {
-                const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height);
+                const auto pixelCount = static_cast<std::size_t>(image.width) * static_cast<std::size_t>(image.height) * static_cast<std::size_t>(std::max(1u, image.depth));
                 const auto sourceChannels = sourceChannelCount(texture.format);
                 const auto expectedSize = pixelCount * static_cast<std::size_t>(sourceChannels);
 
@@ -255,6 +272,33 @@ namespace threepp::metal {
             }
         }
 
+        void replace3DRegion(id<MTLTexture> mtlTexture, Texture& texture, const Image& image, NSUInteger level) {
+            switch (texture.type) {
+                case Type::UnsignedByte: {
+                    const auto upload = getUploadableDataImpl<unsigned char>(image, texture);
+                    [mtlTexture replaceRegion:MTLRegionMake3D(0, 0, 0, image.width, image.height, std::max(1u, image.depth))
+                                  mipmapLevel:level
+                                        slice:0
+                                    withBytes:upload.bytes
+                                  bytesPerRow:upload.bytesPerRow
+                                bytesPerImage:upload.bytesPerImage];
+                    return;
+                }
+                case Type::Float: {
+                    const auto upload = getUploadableDataImpl<float>(image, texture);
+                    [mtlTexture replaceRegion:MTLRegionMake3D(0, 0, 0, image.width, image.height, std::max(1u, image.depth))
+                                  mipmapLevel:level
+                                        slice:0
+                                    withBytes:upload.bytes
+                                  bytesPerRow:upload.bytesPerRow
+                                bytesPerImage:upload.bytesPerImage];
+                    return;
+                }
+                default:
+                    throw std::runtime_error("MetalTextureManager supports only unsigned byte and float texture uploads");
+            }
+        }
+
         void uploadMipmaps(id<MTLTexture> mtlTexture, Texture& texture, NSUInteger slice = 0) {
             const auto& mipmaps = texture.mipmaps();
             const auto maxManualLevels = mtlTexture.mipmapLevelCount > 0 ? mtlTexture.mipmapLevelCount - 1u : 0u;
@@ -262,6 +306,16 @@ namespace threepp::metal {
 
             for (NSUInteger i = 0; i < manualLevelCount; ++i) {
                 replace2DRegion(mtlTexture, texture, mipmaps[i], i + 1u, slice);
+            }
+        }
+
+        void upload3DMipmaps(id<MTLTexture> mtlTexture, Texture& texture) {
+            const auto& mipmaps = texture.mipmaps();
+            const auto maxManualLevels = mtlTexture.mipmapLevelCount > 0 ? mtlTexture.mipmapLevelCount - 1u : 0u;
+            const auto manualLevelCount = std::min<NSUInteger>(static_cast<NSUInteger>(mipmaps.size()), maxManualLevels);
+
+            for (NSUInteger i = 0; i < manualLevelCount; ++i) {
+                replace3DRegion(mtlTexture, texture, mipmaps[i], i + 1u);
             }
         }
 
@@ -386,6 +440,41 @@ namespace threepp::metal {
                 return mtlTexture;
             }
 
+            if (dynamic_cast<DataTexture3D*>(&texture)) {
+                const auto mipmapped = wantsMipmaps(texture);
+                MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+                desc.textureType = MTLTextureType3D;
+                desc.pixelFormat = toColorPixelFormat(texture);
+                desc.width = image.width;
+                desc.height = image.height;
+                desc.depth = std::max(1u, image.depth);
+                desc.mipmapLevelCount = mipmapped ? mipLevelCount(desc.width, desc.height, desc.depth) : 1u;
+                desc.usage = MTLTextureUsageShaderRead;
+
+                id<MTLTexture> mtlTexture = [device newTextureWithDescriptor:desc];
+                if (!mtlTexture) {
+                    throw std::runtime_error("Failed to create Metal 3D texture");
+                }
+
+                replace3DRegion(mtlTexture, texture, image, 0);
+                upload3DMipmaps(mtlTexture, texture);
+
+                if (mipmapped && texture.generateMipmaps && texture.mipmaps().empty()) {
+                    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+                    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+                    [blitEncoder generateMipmapsForTexture:mtlTexture];
+                    [blitEncoder endEncoding];
+                    [commandBuffer commit];
+                }
+
+                if (!texture.hasEventListener("dispose", onTextureDispose)) {
+                    texture.addEventListener("dispose", onTextureDispose);
+                }
+
+                textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+                return mtlTexture;
+            }
+
             const auto mipmapped = wantsMipmaps(texture);
             MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:toColorPixelFormat(texture)
                                                                                             width:image.width
@@ -419,7 +508,7 @@ namespace threepp::metal {
 
         id<MTLSamplerState> getOrCreateSampler(Texture& texture) {
             const auto mipmapped = wantsMipmaps(texture);
-            const SamplerKey key{texture.wrapS, texture.wrapT, texture.magFilter, texture.minFilter, mipmapped};
+            const SamplerKey key{texture.wrapS, texture.wrapT, wrapR(texture), texture.magFilter, texture.minFilter, mipmapped};
             auto it = samplers.find(key);
             if (it != samplers.end()) {
                 return it->second;
@@ -428,6 +517,7 @@ namespace threepp::metal {
             MTLSamplerDescriptor* desc = [[MTLSamplerDescriptor alloc] init];
             desc.sAddressMode = toAddressMode(texture.wrapS);
             desc.tAddressMode = toAddressMode(texture.wrapT);
+            desc.rAddressMode = toAddressMode(wrapR(texture));
             desc.magFilter = toMinMagFilter(texture.magFilter);
             desc.minFilter = toMinMagFilter(texture.minFilter);
             desc.mipFilter = mipmapped ? toMipFilter(texture.minFilter) : MTLSamplerMipFilterNotMipmapped;

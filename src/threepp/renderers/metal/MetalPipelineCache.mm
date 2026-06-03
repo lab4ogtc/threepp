@@ -237,6 +237,24 @@ namespace threepp::metal {
             depthStencilStates[key] = state;
             return state;
         }
+
+        void removePipelineStatesReferencing(void* function) {
+            for (auto it = pipelineStates.begin(); it != pipelineStates.end();) {
+                if (it->first.vertexFunction == function || it->first.fragmentFunction == function) {
+                    it = pipelineStates.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            for (auto it = depthOnlyPipelineStates.begin(); it != depthOnlyPipelineStates.end();) {
+                if (it->first.vertexFunction == function || it->first.fragmentFunction == function) {
+                    it = depthOnlyPipelineStates.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
     };
 
     MetalPipelineCache::MetalPipelineCache(void* device)
@@ -262,6 +280,10 @@ namespace threepp::metal {
 
     void* MetalPipelineCache::getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc) {
         return (__bridge void*) pimpl_->getOrCreateDepthStencilState(depthTest, depthWrite, depthFunc);
+    }
+
+    void MetalPipelineCache::removePipelineStatesReferencing(void* function) {
+        pimpl_->removePipelineStatesReferencing(function);
     }
 
 }// namespace threepp::metal

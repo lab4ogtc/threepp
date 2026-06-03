@@ -2,11 +2,17 @@
 
 #include "threepp/core/BufferAttribute.hpp"
 #include "threepp/renderers/metal/MetalBufferManager.hpp"
+#include "threepp/renderers/metal/MetalDynamicShaderCache.hpp"
+#include "threepp/renderers/metal/MetalPipelineCache.hpp"
 #include "threepp/renderers/metal/MetalRenderObjects.hpp"
 #include "threepp/renderers/metal/MetalShaderManager.hpp"
 #include "threepp/renderers/metal/MetalShaders.hpp"
 #include "threepp/renderers/metal/MetalTextureManager.hpp"
+#ifdef THREEPP_HAS_SLANG
+#include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
+#endif
 #include "threepp/textures/CubeTexture.hpp"
+#include "threepp/textures/DataTexture3D.hpp"
 #include "threepp/textures/Image.hpp"
 #include "threepp/textures/Texture.hpp"
 
@@ -52,6 +58,41 @@ namespace {
     bool contains(std::string_view source, std::string_view token) {
         return source.find(token) != std::string_view::npos;
     }
+
+    class CountingShaderCompiler: public ShaderCompiler {
+
+    public:
+        int calls = 0;
+
+        CompileResult compile(std::string_view source, ShaderStage, TargetLanguage) override {
+            ++calls;
+            return {std::string(source) + "\n// compiled", {}, true};
+        }
+    };
+
+#ifdef THREEPP_HAS_SLANG
+    constexpr const char* simpleSlangShader = R"(
+struct VertexInput {
+    float3 position : POSITION;
+};
+
+struct VertexOutput {
+    float4 position : SV_Position;
+};
+
+[shader("vertex")]
+VertexOutput vertexMain(VertexInput input) {
+    VertexOutput output;
+    output.position = float4(input.position, 1.0);
+    return output;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VertexOutput input) : SV_Target {
+    return float4(1.0, 0.0, 0.0, 1.0);
+}
+)";
+#endif
 
 }// namespace
 
@@ -201,6 +242,25 @@ TEST_CASE("Metal P3 buffer manager rotates only dynamic buffers across frames") 
     }
 }
 
+TEST_CASE("Metal dynamic shader cache reuses compile results") {
+
+    metal::MetalDynamicShaderCache cache(nullptr, 2);
+    CountingShaderCompiler compiler;
+
+    const auto first = cache.compile(compiler, "source-a", ShaderStage::Vertex, TargetLanguage::MSL);
+    const auto second = cache.compile(compiler, "source-a", ShaderStage::Vertex, TargetLanguage::MSL);
+
+    REQUIRE(first.success);
+    REQUIRE(second.success);
+    CHECK(first.code == second.code);
+    CHECK(compiler.calls == 1);
+
+    static_cast<void>(cache.compile(compiler, "source-b", ShaderStage::Vertex, TargetLanguage::MSL));
+    static_cast<void>(cache.compile(compiler, "source-c", ShaderStage::Vertex, TargetLanguage::MSL));
+    static_cast<void>(cache.compile(compiler, "source-a", ShaderStage::Vertex, TargetLanguage::MSL));
+    CHECK(compiler.calls == 4);
+}
+
 TEST_CASE("Metal buffer manager refreshes reused attribute addresses") {
 
     @autoreleasepool {
@@ -229,6 +289,168 @@ TEST_CASE("Metal buffer manager refreshes reused attribute addresses") {
         secondAttribute->~TestBufferAttribute();
     }
 }
+
+TEST_CASE("Metal texture manager uploads DataTexture3D as 3D texture") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+
+        metal::MetalTextureManager textureManager((__bridge void*) device, (__bridge void*) queue);
+
+        std::vector<unsigned char> data(4u * 4u * 4u);
+        auto texture = DataTexture3D::create(data, 4, 4, 4);
+        texture->format = Format::Red;
+        texture->type = Type::UnsignedByte;
+        texture->unpackAlignment = 1;
+
+        auto* mtlTexture = (__bridge id<MTLTexture>) textureManager.getOrCreateTexture(*texture);
+
+        REQUIRE(mtlTexture != nil);
+        CHECK(mtlTexture.textureType == MTLTextureType3D);
+        CHECK(mtlTexture.width == 4);
+        CHECK(mtlTexture.height == 4);
+        CHECK(mtlTexture.depth == 4);
+        CHECK(mtlTexture.pixelFormat == MTLPixelFormatR8Unorm);
+    }
+}
+
+TEST_CASE("Metal texture manager uploads manual DataTexture3D mipmaps") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+
+        metal::MetalTextureManager textureManager((__bridge void*) device, (__bridge void*) queue);
+
+        std::vector<unsigned char> data(4u * 4u * 4u, 1u);
+        auto texture = DataTexture3D::create(data, 4, 4, 4);
+        texture->format = Format::Red;
+        texture->type = Type::UnsignedByte;
+        texture->generateMipmaps = false;
+        texture->unpackAlignment = 1;
+        texture->mipmaps().emplace_back(std::vector<unsigned char>(2u * 2u * 2u, 123u), 2, 2, 2);
+
+        auto* mtlTexture = (__bridge id<MTLTexture>) textureManager.getOrCreateTexture(*texture);
+
+        REQUIRE(mtlTexture != nil);
+        REQUIRE(mtlTexture.mipmapLevelCount >= 2);
+
+        std::vector<unsigned char> uploaded(2u * 2u * 2u);
+        [mtlTexture getBytes:uploaded.data()
+                 bytesPerRow:2u
+               bytesPerImage:4u
+                  fromRegion:MTLRegionMake3D(0, 0, 0, 2, 2, 2)
+                 mipmapLevel:1
+                       slice:0];
+        CHECK(uploaded.front() == 123u);
+        CHECK(uploaded.back() == 123u);
+    }
+}
+
+#ifdef THREEPP_HAS_SLANG
+TEST_CASE("Metal can load dynamic MSL emitted by SlangShaderCompiler") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        SlangShaderCompiler compiler;
+        const auto vertex = compiler.compile(simpleSlangShader, ShaderStage::Vertex, TargetLanguage::MSL);
+        const auto fragment = compiler.compile(simpleSlangShader, ShaderStage::Fragment, TargetLanguage::MSL);
+
+        REQUIRE(vertex.success);
+        REQUIRE(fragment.success);
+
+        NSError* vertexError = nil;
+        id<MTLLibrary> vertexLibrary = [device newLibraryWithSource:[NSString stringWithUTF8String:vertex.code.c_str()] options:nil error:&vertexError];
+        REQUIRE(vertexLibrary != nil);
+        REQUIRE([vertexLibrary newFunctionWithName:@"vertexMain"] != nil);
+
+        NSError* fragmentError = nil;
+        id<MTLLibrary> fragmentLibrary = [device newLibraryWithSource:[NSString stringWithUTF8String:fragment.code.c_str()] options:nil error:&fragmentError];
+        REQUIRE(fragmentLibrary != nil);
+        REQUIRE([fragmentLibrary newFunctionWithName:@"fragmentMain"] != nil);
+    }
+}
+
+TEST_CASE("Metal dynamic shader cache reuses functions and evicts least-recently-used entries") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        SlangShaderCompiler compiler;
+        const auto vertex = compiler.compile(simpleSlangShader, ShaderStage::Vertex, TargetLanguage::MSL);
+        REQUIRE(vertex.success);
+
+        metal::MetalDynamicShaderCache cache((__bridge void*) device, 2);
+        int evictedFunctions = 0;
+        cache.setEvictFunctionCallback([&](void* function) {
+            if (function) {
+                ++evictedFunctions;
+            }
+        });
+
+        const auto msl0 = vertex.code + "\n// cache-entry-0\n";
+        const auto msl1 = vertex.code + "\n// cache-entry-1\n";
+        const auto msl2 = vertex.code + "\n// cache-entry-2\n";
+
+        auto first = cache.getFunction(msl0, @"vertexMain");
+        auto firstAgain = cache.getFunction(msl0, @"vertexMain");
+        REQUIRE(first != nil);
+        CHECK(first == firstAgain);
+
+        REQUIRE(cache.getFunction(msl1, @"vertexMain") != nil);
+        REQUIRE(cache.getFunction(msl2, @"vertexMain") != nil);
+        CHECK(evictedFunctions > 0);
+        REQUIRE(cache.getFunction(msl0, @"vertexMain") != nil);
+    }
+}
+
+TEST_CASE("Metal pipeline cache can remove states referencing dynamic functions") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        SlangShaderCompiler compiler;
+        const auto vertex = compiler.compile(simpleSlangShader, ShaderStage::Vertex, TargetLanguage::MSL);
+        const auto fragment = compiler.compile(simpleSlangShader, ShaderStage::Fragment, TargetLanguage::MSL);
+
+        REQUIRE(vertex.success);
+        REQUIRE(fragment.success);
+
+        metal::MetalDynamicShaderCache shaderCache((__bridge void*) device, 4);
+        auto vertexFunction = shaderCache.getFunction(vertex.code, @"vertexMain");
+        auto fragmentFunction = shaderCache.getFunction(fragment.code, @"fragmentMain");
+        REQUIRE(vertexFunction != nil);
+        REQUIRE(fragmentFunction != nil);
+
+        metal::MetalPipelineCache pipelineCache((__bridge void*) device);
+        metal::PipelineKey key;
+        key.vertexFunction = (__bridge void*) vertexFunction;
+        key.fragmentFunction = (__bridge void*) fragmentFunction;
+        key.colorPixelFormat = static_cast<std::uint64_t>(MTLPixelFormatBGRA8Unorm);
+
+        REQUIRE(pipelineCache.getOrCreatePipelineState(key) != nullptr);
+        REQUIRE_NOTHROW(pipelineCache.removePipelineStatesReferencing((__bridge void*) vertexFunction));
+        REQUIRE(pipelineCache.getOrCreatePipelineState(key) != nullptr);
+    }
+}
+#endif
 
 TEST_CASE("Metal buffer manager drops removed static buffers") {
 
@@ -416,7 +638,7 @@ TEST_CASE("Metal P4 texture manager requires explicit placeholder fallback for i
     }
 }
 
-TEST_CASE("Metal P4 texture manager checks texture type before reading unsigned byte image data") {
+TEST_CASE("Metal P4 texture manager uploads float texture data without reading unsigned byte data") {
 
     @autoreleasepool {
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -430,13 +652,10 @@ TEST_CASE("Metal P4 texture manager checks texture type before reading unsigned 
         auto texture = Texture::create(Image{std::vector<float>(4, 1.f), 1, 1});
         texture->type = Type::Float;
 
-        bool sawExpectedError = false;
-        try {
-            textureManager.getOrCreateTexture(*texture);
-        } catch (const std::runtime_error& e) {
-            sawExpectedError = std::string{e.what()} == "MetalTextureManager currently supports unsigned byte textures";
-        }
-        REQUIRE(sawExpectedError);
+        auto* mtlTexture = (__bridge id<MTLTexture>) textureManager.getOrCreateTexture(*texture);
+
+        REQUIRE(mtlTexture != nil);
+        CHECK(mtlTexture.pixelFormat == MTLPixelFormatRGBA32Float);
     }
 }
 

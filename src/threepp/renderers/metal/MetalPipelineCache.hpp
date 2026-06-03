@@ -42,6 +42,8 @@ namespace threepp::metal {
 
         void* getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc);
 
+        void removePipelineStatesReferencing(void* function);
+
     private:
         struct Impl;
         std::unique_ptr<Impl> pimpl_;

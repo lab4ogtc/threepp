@@ -1,6 +1,287 @@
 #import "MetalRendererImpl.hpp"
 
+#include "threepp/renderers/shaders/ShaderCompiler.hpp"
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
 using namespace threepp;
+
+namespace {
+
+    bool isTextureUniform(Uniform& uniform) {
+        if (!uniform.hasValue()) return false;
+
+        auto& value = uniform.value();
+        return std::holds_alternative<Texture*>(value) || std::holds_alternative<std::vector<Texture*>>(value);
+    }
+
+    std::vector<std::string> uniformOrder(const RawShaderMaterial& material) {
+        if (!material.uniformLayout.empty()) return material.uniformLayout;
+
+        std::vector<std::string> keys;
+        keys.reserve(material.uniforms.size());
+        for (const auto& [key, uniform] : material.uniforms) {
+            if (uniform.hasValue()) {
+                keys.push_back(key);
+            }
+        }
+        std::sort(keys.begin(), keys.end());
+        return keys;
+    }
+
+    void alignBytes(std::vector<std::uint8_t>& bytes, std::size_t alignment) {
+        const auto padding = (alignment - (bytes.size() % alignment)) % alignment;
+        bytes.insert(bytes.end(), padding, 0u);
+    }
+
+    template<class T>
+    void appendValue(std::vector<std::uint8_t>& bytes, const T& value, std::size_t alignment = alignof(T)) {
+        alignBytes(bytes, alignment);
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(&value);
+        bytes.insert(bytes.end(), raw, raw + sizeof(T));
+    }
+
+    void appendFloat4(std::vector<std::uint8_t>& bytes, float x, float y, float z, float w) {
+        alignBytes(bytes, 16);
+        const float values[4]{x, y, z, w};
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(values);
+        bytes.insert(bytes.end(), raw, raw + sizeof(values));
+    }
+
+    void appendMatrix3(std::vector<std::uint8_t>& bytes, const Matrix3& value) {
+        alignBytes(bytes, 16);
+        for (int column = 0; column < 3; ++column) {
+            const float values[4]{
+                    value.elements[column * 3 + 0],
+                    value.elements[column * 3 + 1],
+                    value.elements[column * 3 + 2],
+                    0.f};
+            const auto* raw = reinterpret_cast<const std::uint8_t*>(values);
+            bytes.insert(bytes.end(), raw, raw + sizeof(values));
+        }
+    }
+
+    void appendMatrix4(std::vector<std::uint8_t>& bytes, const Matrix4& value) {
+        alignBytes(bytes, 16);
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(value.elements.data());
+        bytes.insert(bytes.end(), raw, raw + value.elements.size() * sizeof(float));
+    }
+
+    std::string uniformValueTypeName(const UniformValue& value) {
+        if (std::holds_alternative<bool>(value)) return "bool";
+        if (std::holds_alternative<int>(value)) return "int";
+        if (std::holds_alternative<float>(value)) return "float";
+        if (std::holds_alternative<Color>(value)) return "Color";
+        if (std::holds_alternative<Vector2>(value)) return "Vector2";
+        if (std::holds_alternative<Vector3>(value)) return "Vector3";
+        if (std::holds_alternative<Vector3*>(value)) return "Vector3*";
+        if (std::holds_alternative<Vector4>(value)) return "Vector4";
+        if (std::holds_alternative<Matrix3>(value)) return "Matrix3";
+        if (std::holds_alternative<Matrix4>(value)) return "Matrix4";
+        if (std::holds_alternative<Matrix4*>(value)) return "Matrix4*";
+        if (std::holds_alternative<Texture*>(value)) return "Texture*";
+        if (std::holds_alternative<std::vector<float>>(value)) return "std::vector<float>";
+        if (std::holds_alternative<std::vector<Vector2>>(value)) return "std::vector<Vector2>";
+        if (std::holds_alternative<std::vector<Vector3>>(value)) return "std::vector<Vector3>";
+        if (std::holds_alternative<std::vector<Matrix3>>(value)) return "std::vector<Matrix3>";
+        if (std::holds_alternative<std::vector<Matrix4>>(value)) return "std::vector<Matrix4>";
+        if (std::holds_alternative<std::vector<Matrix4*>>(value)) return "std::vector<Matrix4*>";
+        if (std::holds_alternative<std::vector<Texture*>>(value)) return "std::vector<Texture*>";
+        if (std::holds_alternative<std::unordered_map<std::string, NestedUniformValue>>(value)) return "nested uniform object";
+        if (std::holds_alternative<std::vector<std::unordered_map<std::string, NestedUniformValue>*>>(value)) return "nested uniform object array";
+        return "unknown";
+    }
+
+    void appendDiagnostic(std::string& diagnostics, const std::string& message) {
+        if (!diagnostics.empty() && diagnostics.back() != '\n') {
+            diagnostics.push_back('\n');
+        }
+        diagnostics += message;
+    }
+
+    bool appendUniformValue(std::vector<std::uint8_t>& bytes, UniformValue& value) {
+        if (auto* v = std::get_if<bool>(&value)) {
+            const auto asInt = *v ? 1 : 0;
+            appendValue(bytes, asInt, 4);
+        } else if (auto* v = std::get_if<int>(&value)) {
+            appendValue(bytes, *v, 4);
+        } else if (auto* v = std::get_if<float>(&value)) {
+            appendValue(bytes, *v, 4);
+        } else if (auto* v = std::get_if<Color>(&value)) {
+            appendFloat4(bytes, v->r, v->g, v->b, 1.f);
+        } else if (auto* v = std::get_if<Vector2>(&value)) {
+            alignBytes(bytes, 8);
+            const float values[2]{v->x, v->y};
+            const auto* raw = reinterpret_cast<const std::uint8_t*>(values);
+            bytes.insert(bytes.end(), raw, raw + sizeof(values));
+        } else if (auto* v = std::get_if<Vector3>(&value)) {
+            appendFloat4(bytes, v->x, v->y, v->z, 0.f);
+        } else if (auto* v = std::get_if<Vector3*>(&value); v && *v) {
+            appendFloat4(bytes, (*v)->x, (*v)->y, (*v)->z, 0.f);
+        } else if (auto* v = std::get_if<Vector4>(&value)) {
+            appendFloat4(bytes, v->x, v->y, v->z, v->w);
+        } else if (auto* v = std::get_if<Matrix3>(&value)) {
+            appendMatrix3(bytes, *v);
+        } else if (auto* v = std::get_if<Matrix4>(&value)) {
+            appendMatrix4(bytes, *v);
+        } else if (auto* v = std::get_if<Matrix4*>(&value); v && *v) {
+            appendMatrix4(bytes, **v);
+        } else {
+            return false;
+        }
+
+        return true;
+    }
+
+    struct UniformPackResult {
+        std::vector<std::uint8_t> bytes;
+        std::string diagnostics;
+        bool success = true;
+    };
+
+    UniformPackResult packCustomUniforms(RawShaderMaterial& material, const std::vector<std::string>& order) {
+        UniformPackResult result;
+        const auto explicitLayout = !material.uniformLayout.empty();
+
+        for (const auto& key : order) {
+            auto it = material.uniforms.find(key);
+            if (it == material.uniforms.end()) {
+                if (explicitLayout) {
+                    result.success = false;
+                    appendDiagnostic(result.diagnostics, "uniformLayout references missing uniform '" + key + "'");
+                }
+                continue;
+            }
+
+            if (!it->second.hasValue()) {
+                if (explicitLayout) {
+                    result.success = false;
+                    appendDiagnostic(result.diagnostics, "uniform '" + key + "' has no value");
+                }
+                continue;
+            }
+
+            if (isTextureUniform(it->second)) continue;
+
+            auto& value = it->second.value();
+            if (!appendUniformValue(result.bytes, value)) {
+                result.success = false;
+                appendDiagnostic(result.diagnostics, "uniform '" + key + "' has unsupported type " + uniformValueTypeName(value));
+            }
+        }
+
+        alignBytes(result.bytes, 16);
+        return result;
+    }
+
+    std::vector<Texture*> collectUniformTextures(RawShaderMaterial& material, const std::vector<std::string>& order) {
+        std::vector<Texture*> textures;
+
+        for (const auto& key : order) {
+            auto it = material.uniforms.find(key);
+            if (it == material.uniforms.end() || !it->second.hasValue()) continue;
+
+            auto& value = it->second.value();
+            if (auto* texture = std::get_if<Texture*>(&value)) {
+                textures.push_back(*texture);
+            } else if (auto* textureVector = std::get_if<std::vector<Texture*>>(&value)) {
+                for (auto* texture : *textureVector) {
+                    textures.push_back(texture);
+                }
+            }
+        }
+
+        return textures;
+    }
+
+    std::uint8_t rawShaderVertexLayout(BufferGeometry& geometry) {
+        auto bitmask = vertexLayoutPosition;
+
+        if (auto* normal = getFloatAttribute(geometry, "normal"); normal && normal->itemSize() == 3) {
+            bitmask |= vertexLayoutNormal;
+        }
+        if (auto* uv = getFloatAttribute(geometry, "uv"); uv && uv->itemSize() == 2) {
+            bitmask |= vertexLayoutUv;
+        }
+        if (auto* color = getFloatAttribute(geometry, "color")) {
+            if (color->itemSize() == 4) {
+                bitmask |= vertexLayoutColor4;
+            } else if (color->itemSize() == 3) {
+                bitmask |= vertexLayoutColor;
+            }
+        }
+        if (auto* tangent = getFloatAttribute(geometry, "tangent"); tangent && tangent->itemSize() == 4) {
+            bitmask |= vertexLayoutTangent;
+        }
+
+        return bitmask;
+    }
+
+    struct RawShaderProfileScope {
+        std::string_view label;
+        bool enabled;
+        std::chrono::steady_clock::time_point start;
+
+        RawShaderProfileScope(std::string_view label, bool enabled)
+            : label(label),
+              enabled(enabled),
+              start(std::chrono::steady_clock::now()) {}
+
+        ~RawShaderProfileScope() {
+            if (!enabled) return;
+
+            const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - start);
+            std::cerr << "MetalRenderer raw shader " << label << ": "
+                      << elapsed.count() << "us\n";
+        }
+    };
+
+    void warnSlangCompilerUnavailableOnce() {
+        static std::once_flag flag;
+        std::call_once(flag, [] {
+            std::cerr << "MetalRenderer: Slang shader compiler is unavailable; "
+                      << "Slang RawShaderMaterial draw calls will be skipped.\n";
+        });
+    }
+
+    template<class SystemUniforms>
+    void fillSystemUniforms(const Camera& camera, const Mesh& mesh, RawShaderMaterial& material, SystemUniforms& out) {
+        copyMatrix(*mesh.matrixWorld, out.modelMatrix);
+        Matrix4 modelMatrixInverse;
+        modelMatrixInverse.copy(*mesh.matrixWorld).invert();
+        copyMatrix(modelMatrixInverse, out.modelMatrixInverse);
+
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *mesh.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
+
+        const auto projection = metal::convertProjectionToMetalClipSpace(camera.projectionMatrix);
+        copyMatrix(projection, out.projectionMatrix);
+
+        Vector3 cameraPosition;
+        cameraPosition.setFromMatrixPosition(*camera.matrixWorld);
+        out.cameraPos[0] = cameraPosition.x;
+        out.cameraPos[1] = cameraPosition.y;
+        out.cameraPos[2] = cameraPosition.z;
+        out.cameraPos[3] = 1.f;
+        out.time = uniformFloat(material.uniforms, "time", 0.f);
+        out.padding[0] = 0.f;
+        out.padding[1] = 0.f;
+        out.padding[2] = 0.f;
+    }
+
+}// namespace
 
 id<MTLBuffer> MetalRenderer::Impl::getDefaultTangentBuffer(std::size_t vertexCount) {
     if (defaultTangentBuffer && defaultTangentVertexCount >= vertexCount) {
@@ -366,8 +647,133 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
     trackGeometry(*geometry);
 
     auto* posAttr = getFloatAttribute(*geometry, "position");
+    if (!posAttr) return;
+
+    if (rawMaterial->shaderLanguage == ShaderLanguage::SLANG) {
+        if (!rawShaderProfileEnvChecked) {
+            rawShaderProfileEnvChecked = true;
+            profileRawShader = std::getenv("THREEPP_METAL_PROFILE_RAW_SHADER") != nullptr;
+        }
+
+        if (!shaderCompiler) {
+            warnSlangCompilerUnavailableOnce();
+            return;
+        }
+        if (!dynamicShaderCache) return;
+
+        CompileResult vertexCompile;
+        CompileResult fragmentCompile;
+        {
+            RawShaderProfileScope profileCompile{"slang compile", profileRawShader};
+            vertexCompile = dynamicShaderCache->compile(*shaderCompiler, rawMaterial->vertexShader, ShaderStage::Vertex, TargetLanguage::MSL);
+            fragmentCompile = dynamicShaderCache->compile(*shaderCompiler, rawMaterial->fragmentShader, ShaderStage::Fragment, TargetLanguage::MSL);
+        }
+        if (!vertexCompile.success) {
+            std::cerr << "MetalRenderer: Slang vertex shader compilation failed:\n"
+                      << vertexCompile.diagnostics << "\n";
+            return;
+        }
+
+        if (!fragmentCompile.success) {
+            std::cerr << "MetalRenderer: Slang fragment shader compilation failed:\n"
+                      << fragmentCompile.diagnostics << "\n";
+            return;
+        }
+
+        id<MTLFunction> vertexFunction = nil;
+        id<MTLFunction> fragmentFunction = nil;
+        {
+            RawShaderProfileScope profileFunction{"dynamic function", profileRawShader};
+            vertexFunction = dynamicShaderCache->getFunction(vertexCompile.code, @"vertexMain");
+            fragmentFunction = dynamicShaderCache->getFunction(fragmentCompile.code, @"fragmentMain");
+        }
+        if (!vertexFunction || !fragmentFunction) return;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = (__bridge void*) vertexFunction;
+        pipelineKey.fragmentFunction = (__bridge void*) fragmentFunction;
+        pipelineKey.alphaBlending = rawMaterial->transparent || rawMaterial->opacity < 1.f;
+        pipelineKey.vertexLayoutBitmask = rawShaderVertexLayout(*geometry);
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+        id<MTLRenderPipelineState> pso = nil;
+        try {
+            RawShaderProfileScope profilePso{"pipeline state", profileRawShader};
+            pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        } catch (const std::exception& e) {
+            std::cerr << "MetalRenderer: failed to create dynamic Slang PSO: " << e.what() << "\n";
+            return;
+        }
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                rawMaterial->depthTest,
+                rawMaterial->depthWrite,
+                rawMaterial->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+
+        const auto frontFaceCW = mesh.matrixWorld->determinant() < 0;
+        const auto faceCullingState = metal::computeFaceCullingState(rawMaterial->side, frontFaceCW, false);
+        [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+        [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *rawMaterial);
+
+        auto* normalAttr = getFloatAttribute(*geometry, "normal");
+        auto* uvAttr = getFloatAttribute(*geometry, "uv");
+        auto* colorAttr = getFloatAttribute(*geometry, "color");
+        const auto useNormal = normalAttr && normalAttr->itemSize() == 3;
+        const auto useUv = uvAttr && uvAttr->itemSize() == 2;
+        const auto useVertexColors = colorAttr && (colorAttr->itemSize() == 3 || colorAttr->itemSize() == 4);
+        auto* tangentAttr = getFloatAttribute(*geometry, "tangent");
+        const auto useTangent = tangentAttr && tangentAttr->itemSize() == 4;
+        bindDrawAttributes(encoder, *geometry, *posAttr, normalAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent);
+
+        SystemUniforms systemUniforms{};
+        fillSystemUniforms(camera, mesh, *rawMaterial, systemUniforms);
+        [encoder setVertexBytes:&systemUniforms length:sizeof(systemUniforms) atIndex:4];
+        [encoder setFragmentBytes:&systemUniforms length:sizeof(systemUniforms) atIndex:4];
+
+        const auto order = uniformOrder(*rawMaterial);
+        auto customUniforms = packCustomUniforms(*rawMaterial, order);
+        if (!customUniforms.success) {
+            std::cerr << "MetalRenderer: failed to pack dynamic Slang uniforms:\n"
+                      << customUniforms.diagnostics << "\n";
+            return;
+        }
+        if (!customUniforms.bytes.empty()) {
+            [encoder setVertexBytes:customUniforms.bytes.data() length:customUniforms.bytes.size() atIndex:11];
+            [encoder setFragmentBytes:customUniforms.bytes.data() length:customUniforms.bytes.size() atIndex:11];
+        }
+
+        auto textures = collectUniformTextures(*rawMaterial, order);
+        for (NSUInteger i = 0; i < textures.size(); ++i) {
+            auto* texture = textures[i];
+            id<MTLTexture> metalTexture = whiteTexture;
+            id<MTLSamplerState> sampler = defaultSampler;
+            if (texture) {
+                try {
+                    if (auto tex = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture, true)) {
+                        metalTexture = tex;
+                        sampler = (__bridge id<MTLSamplerState>) textureManager->getOrCreateSampler(*texture);
+                    }
+                } catch (const std::exception& e) {
+                    std::cerr << "MetalRenderer: failed to bind dynamic Slang texture '" << texture->id << "': " << e.what() << "\n";
+                    return;
+                }
+            }
+            [encoder setVertexTexture:metalTexture atIndex:i];
+            [encoder setVertexSamplerState:sampler atIndex:i];
+            [encoder setFragmentTexture:metalTexture atIndex:i];
+            [encoder setFragmentSamplerState:sampler atIndex:i];
+        }
+
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
+        return;
+    }
+
     auto* colorAttr = getFloatAttribute(*geometry, "color");
-    if (!posAttr || !colorAttr || colorAttr->itemSize() != 4) return;
+    if (!colorAttr || colorAttr->itemSize() != 4) return;
 
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateRawShaderVertexFunction();

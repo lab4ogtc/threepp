@@ -2,6 +2,7 @@
 #define THREEPP_METAL_RENDERER_IMPL_HPP
 
 #import "MetalBufferManager.hpp"
+#import "MetalDynamicShaderCache.hpp"
 #import "MetalPipelineCache.hpp"
 #import "MetalRenderList.hpp"
 #import "MetalRenderObjects.hpp"
@@ -23,6 +24,8 @@
 
 namespace threepp {
 
+    class ShaderCompiler;
+
     struct MetalRenderer::Impl {
 
         MetalRenderer& renderer;
@@ -43,6 +46,8 @@ namespace threepp {
         std::unique_ptr<metal::MetalBufferManager> bufferManager;
         std::unique_ptr<metal::MetalShaderManager> shaderManager;
         std::unique_ptr<metal::MetalTextureManager> textureManager;
+        std::unique_ptr<metal::MetalDynamicShaderCache> dynamicShaderCache;
+        std::unique_ptr<ShaderCompiler> shaderCompiler;
 
         MetalShadowMap shadowMapState;
         std::unordered_map<unsigned int, id<MTLTexture>> shadowTextures;
@@ -104,9 +109,21 @@ namespace threepp {
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool renderingPrePass = false;
+        bool profileRawShader = false;
+        bool rawShaderProfileEnvChecked = false;
         std::vector<RenderJob> preRenderJobs;
         std::optional<float> currentDepthBiasFactor;
         std::optional<float> currentDepthBiasUnits;
+
+        struct alignas(16) SystemUniforms {
+            float modelMatrix[16];
+            float modelMatrixInverse[16];
+            float modelViewMatrix[16];
+            float projectionMatrix[16];
+            float cameraPos[4];
+            float time;
+            float padding[3];
+        };
 
         int fbWidth = 0;
         int fbHeight = 0;

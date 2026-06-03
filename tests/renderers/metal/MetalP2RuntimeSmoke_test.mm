@@ -13,6 +13,7 @@
 #include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/DataTexture.hpp"
+#include "threepp/textures/DataTexture3D.hpp"
 #include "threepp/textures/DepthTexture.hpp"
 #include "threepp/textures/Image.hpp"
 #include "threepp/threepp.hpp"
@@ -117,6 +118,50 @@ namespace {
         texture->needsUpdate();
         return texture;
     }
+
+#ifdef THREEPP_HAS_SLANG
+    constexpr const char* slangRawShaderSmokeSource = R"(
+struct SystemUniforms {
+    float4x4 modelMatrix;
+    float4x4 modelMatrixInverse;
+    float4x4 modelViewMatrix;
+    float4x4 projectionMatrix;
+    float4 cameraPos;
+    float time;
+};
+
+struct CustomUniforms {
+    float4 tint;
+};
+
+ConstantBuffer<SystemUniforms> sysUniforms : register(b4);
+ConstantBuffer<CustomUniforms> customUniforms : register(b11);
+Texture3D<float> volumeTexture : register(t0);
+SamplerState volumeSampler : register(s0);
+
+struct VertexInput {
+    float3 position : POSITION;
+};
+
+struct VertexOutput {
+    float4 position : SV_Position;
+    float sampleValue;
+};
+
+[shader("vertex")]
+VertexOutput vertexMain(VertexInput input) {
+    VertexOutput output;
+    output.position = mul(sysUniforms.projectionMatrix, mul(sysUniforms.modelViewMatrix, float4(input.position, 1.0)));
+    output.sampleValue = volumeTexture.SampleLevel(volumeSampler, float3(0.5, 0.5, 0.5), 0.0);
+    return output;
+}
+
+[shader("fragment")]
+float4 fragmentMain(VertexOutput input) : SV_Target {
+    return float4(customUniforms.tint.rgb * input.sampleValue, 1.0);
+}
+)";
+#endif
 
     float lumaAt(const std::vector<unsigned char>& pixels, int width, int height, int centerX, int centerY, int radius = 3) {
         float total = 0.f;
@@ -355,6 +400,77 @@ TEST_CASE("Metal P2 renderer renders a lit shadowed skinned scene") {
         canvas.close();
     }
 }
+
+#ifdef THREEPP_HAS_SLANG
+TEST_CASE("Metal renderer draws a Slang RawShaderMaterial with custom uniforms and 3D texture") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal Slang raw shader smoke")
+                                  .size(160, 120)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        MetalRenderer renderer(canvas);
+        renderer.autoClear = false;
+        renderer.setClearColor(Color::black);
+
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto scene = Scene::create();
+        scene->background = Color::black;
+
+        std::vector<unsigned char> volumeData(2u * 2u * 2u, 255u);
+        auto volumeTexture = DataTexture3D::create(volumeData, 2, 2, 2);
+        volumeTexture->format = Format::Red;
+        volumeTexture->type = Type::UnsignedByte;
+        volumeTexture->minFilter = Filter::Nearest;
+        volumeTexture->magFilter = Filter::Nearest;
+        volumeTexture->generateMipmaps = false;
+        volumeTexture->unpackAlignment = 1;
+
+        auto material = RawShaderMaterial::create();
+        material->vertexShader = slangRawShaderSmokeSource;
+        material->fragmentShader = slangRawShaderSmokeSource;
+        material->shaderLanguage = ShaderLanguage::SLANG;
+        material->uniformLayout = {"tint", "map"};
+        material->side = Side::Double;
+        material->uniforms = {
+                {"tint", Uniform(Vector4(0.f, 1.f, 0.f, 1.f))},
+                {"map", Uniform(volumeTexture.get())}};
+
+        scene->add(Mesh::create(PlaneGeometry::create(1.4f, 1.4f), material));
+
+        renderer.clear();
+        REQUIRE_NOTHROW(renderer.render(*scene, *camera));
+        const auto pixels = renderer.readRGBPixels();
+        const auto [logicalWidth, logicalHeight] = canvas.size();
+        const auto [width, height] = inferPixelDimensions(pixels, logicalWidth, logicalHeight);
+        REQUIRE(width > 0);
+        REQUIRE(height > 0);
+
+        std::size_t greenPixels = 0;
+        for (int y = height / 3; y < (height * 2) / 3; ++y) {
+            for (int x = width / 3; x < (width * 2) / 3; ++x) {
+                const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3u;
+                const auto r = pixels[offset];
+                const auto g = pixels[offset + 1u];
+                const auto b = pixels[offset + 2u];
+                if (g > 160 && r < 80 && b < 80) ++greenPixels;
+            }
+        }
+
+        CAPTURE(greenPixels);
+        REQUIRE(greenPixels > 100);
+        canvas.close();
+    }
+}
+#endif
 
 TEST_CASE("Metal renderer skins meshes with integer skin indices") {
 

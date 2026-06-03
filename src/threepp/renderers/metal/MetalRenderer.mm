@@ -1,8 +1,15 @@
 #import "MetalRendererImpl.hpp"
 
 #include "threepp/geometries/BoxGeometry.hpp"
+#include "threepp/renderers/shaders/ShaderCompiler.hpp"
+
+#ifdef THREEPP_HAS_SLANG
+#include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
+#endif
 
 #include <cmath>
+#include <exception>
+#include <iostream>
 
 using namespace threepp;
 
@@ -69,6 +76,22 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
     bufferManager = std::make_unique<metal::MetalBufferManager>((__bridge void*) device);
     shaderManager = std::make_unique<metal::MetalShaderManager>((__bridge void*) device);
     textureManager = std::make_unique<metal::MetalTextureManager>((__bridge void*) device, (__bridge void*) commandQueue);
+#ifdef THREEPP_HAS_SLANG
+    try {
+        shaderCompiler = std::make_unique<SlangShaderCompiler>();
+    } catch (const std::exception& e) {
+        std::cerr << "MetalRenderer: SlangShaderCompiler failed to initialize: "
+                  << e.what()
+                  << ". Slang materials will be disabled.\n";
+        shaderCompiler = nullptr;
+    }
+#endif
+    dynamicShaderCache = std::make_unique<metal::MetalDynamicShaderCache>((__bridge void*) device);
+    dynamicShaderCache->setEvictFunctionCallback([this](void* function) {
+        if (pipelineCache) {
+            pipelineCache->removePipelineStatesReferencing(function);
+        }
+    });
 
     depthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState();
     createPlaceholderResources();
