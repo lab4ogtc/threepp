@@ -1,0 +1,133 @@
+#include "threepp/renderers/Renderer.hpp"
+#include "threepp/threepp.hpp"
+
+#include <iostream>
+
+using namespace threepp;
+using namespace std::string_literals;
+
+namespace {
+
+    void createHudSprites(HUD& hud) {
+        TextureLoader tl;
+        const auto hudMaterial = SpriteMaterial::create();
+        hudMaterial->map = tl.load(std::string(DATA_FOLDER) + "/textures/sprite0.png");
+        hudMaterial->map->offset.set(0.5, 0.5);
+
+        const auto hudSprite1 = Sprite::create(hudMaterial);
+        hudSprite1->center.set(0, 0);
+        hudSprite1->scale.set(75, 75, 1);
+
+        const auto hudSprite2 = Sprite::create(hudMaterial);
+        hudSprite2->center.set(0, 0);
+        hudSprite2->scale.set(75, 75, 1);
+
+        const auto hudSprite3 = Sprite::create(hudMaterial);
+        hudSprite3->center.set(0, 0);
+        hudSprite3->scale.set(75, 75, 1);
+
+        const auto hudSprite4 = Sprite::create(hudMaterial);
+        hudSprite4->center.set(0, 0);
+        hudSprite4->scale.set(75, 75, 1);
+
+        hud.add(hudSprite1).setNormalizedPosition({0, 1}).setHorizontalAlignment(HUD::HorizontalAlignment::LEFT).setVerticalAlignment(HUD::VerticalAlignment::BELOW).setMargin({}).onMouseUp([](int) {
+            std::cout << "Clicked on sprite 1" << std::endl;
+        });
+        hud.add(hudSprite2).setNormalizedPosition({1, 1}).setHorizontalAlignment(HUD::HorizontalAlignment::RIGHT).setVerticalAlignment(HUD::VerticalAlignment::BELOW).setMargin({}).onMouseUp([](int) {
+            std::cout << "Clicked on sprite 2" << std::endl;
+        });
+        hud.add(hudSprite3).setNormalizedPosition({0, 0}).setHorizontalAlignment(HUD::HorizontalAlignment::LEFT).setVerticalAlignment(HUD::VerticalAlignment::ABOVE).setMargin({}).onMouseUp([](int) {
+            std::cout << "Clicked on sprite 3" << std::endl;
+        });
+        hud.add(hudSprite4).setNormalizedPosition({1, 0}).setHorizontalAlignment(HUD::HorizontalAlignment::RIGHT).setVerticalAlignment(HUD::VerticalAlignment::ABOVE).setMargin({}).onMouseUp([](int) {
+            std::cout << "Clicked on sprite 4" << std::endl;
+        });
+    }
+
+    auto createSprites(const std::shared_ptr<SpriteMaterial>& material) {
+        auto sprites = Group::create();
+        for (int x = -4; x <= 4; x++) {
+            for (int y = -4; y <= 4; y++) {
+                auto sprite = Sprite::create(material);
+                sprite->position.x = static_cast<float>(x);
+                sprite->position.y = static_cast<float>(y);
+                sprites->add(sprite);
+            }
+        }
+        return sprites;
+    }
+
+}// namespace
+
+int main() {
+
+    GlfwWindow canvas{"Sprite (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}, {"favicon", std::string(DATA_FOLDER) + "/textures/three.png"s}}};
+    auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->autoClear = false;
+    renderer->setClearColor(Color::aliceblue);
+
+    auto scene = Scene::create();
+    auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000);
+    camera->position.z = 8;
+
+    OrbitControls controls{*camera, canvas};
+
+    TextureLoader loader;
+    auto material = SpriteMaterial::create();
+    material->map = loader.load(std::string(DATA_FOLDER) + "/textures/three.png");
+    material->map->offset.set(0.5, 0.5);
+
+    auto pickMaterial = material->clone<SpriteMaterial>();
+
+    auto sprites = createSprites(material);
+    scene->add(sprites);
+
+    auto helper = Mesh::create(SphereGeometry::create(0.1));
+    scene->add(helper);
+
+    HUD hud(*renderer, &canvas);
+    createHudSprites(hud);
+
+    canvas.onWindowResize([&](WindowSize newSize) {
+        camera->aspect = newSize.aspect();
+        camera->updateProjectionMatrix();
+        renderer->setSize(newSize);
+    });
+
+    Vector2 mouse{-Infinity<float>, -Infinity<float>};
+    MouseMoveListener l([&](auto& pos) {
+        const auto size = canvas.size();
+        mouse.x = (pos.x / static_cast<float>(size.width())) * 2 - 1;
+        mouse.y = -(pos.y / static_cast<float>(size.height())) * 2 + 1;
+    });
+    canvas.addMouseListener(l);
+
+    Clock clock;
+    Raycaster raycaster;
+    Sprite* lastPicked = nullptr;
+    canvas.animate([&]() {
+        if (lastPicked) {
+            lastPicked->setMaterial(material);
+            lastPicked->scale.set(1, 1, 1);
+        }
+
+        helper->visible = false;
+        material->rotation += clock.getDelta();
+
+        raycaster.setFromCamera(mouse, *camera);
+        const auto intersects = raycaster.intersectObjects(sprites->children, true);
+        if (!intersects.empty()) {
+            const auto& intersection = intersects.front();
+            helper->position.copy(intersection.point);
+            helper->visible = true;
+
+            lastPicked = intersection.object->as<Sprite>();
+            lastPicked->setMaterial(pickMaterial);
+            lastPicked->scale.set(1.2, 1.2, 1.2);
+        }
+
+        renderer->clear();
+        renderer->render(*scene, *camera);
+        hud.render();
+    });
+}

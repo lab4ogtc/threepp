@@ -808,7 +808,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
     drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
 }
 
-void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat) {
+void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat) {
     auto* material = sprite.material()->as<SpriteMaterial>();
     if (!material || !material->visible) return;
 
@@ -818,14 +818,20 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Spri
             -0.5f, 0.5f, 0.f,
             0.5f, 0.5f, 0.f};
     static constexpr float uvs[] = {
-            0.f, 0.f,
-            1.f, 0.f,
-            0.f, 1.f,
-            1.f, 1.f};
+            -0.5f, -0.5f,
+            0.5f, -0.5f,
+            -0.5f, 0.5f,
+            0.5f, 0.5f};
+
+    metal::SpriteShaderKey shaderKey;
+    shaderKey.useSizeAttenuation = material->sizeAttenuation;
+    shaderKey.useAlphaMap = static_cast<bool>(material->alphaMap);
+    shaderKey.useAlphaTest = material->alphaTest > 0.f;
+    shaderKey.useFog = material->fog && scene.fog.has_value();
 
     metal::PipelineKey pipelineKey;
-    pipelineKey.vertexFunction = shaderManager->getOrCreateSpriteVertexFunction();
-    pipelineKey.fragmentFunction = shaderManager->getOrCreateSpriteFragmentFunction();
+    pipelineKey.vertexFunction = shaderManager->getOrCreateSpriteVertexFunction(shaderKey);
+    pipelineKey.fragmentFunction = shaderManager->getOrCreateSpriteFragmentFunction(shaderKey);
     pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
@@ -851,11 +857,15 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Spri
     SpriteUniforms uniforms{};
     computeSpriteUniforms(camera, sprite, *material, uniforms);
     fillToneMappingUniforms(renderer, *material, uniforms);
+    fillFogUniforms(scene, *material, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
     bindTextureOrPlaceholder(encoder, material->map, whiteTexture, 0);
-    [encoder setFragmentSamplerState:defaultSampler atIndex:0];
+    if (material->alphaMap) {
+        bindTextureOrPlaceholder(encoder, material->alphaMap, whiteTexture, 1);
+        [encoder setFragmentSamplerState:samplerForTexture(material->alphaMap.get()) atIndex:1];
+    }
 
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 }

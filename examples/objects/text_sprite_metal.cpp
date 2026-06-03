@@ -1,0 +1,93 @@
+#include "threepp/extras/imgui/ImguiContext.hpp"
+#include "threepp/objects/TextSprite.hpp"
+#include "threepp/renderers/Renderer.hpp"
+#include "threepp/threepp.hpp"
+
+using namespace threepp;
+
+int main() {
+
+    GlfwWindow canvas("TextSprite (Metal)", {{"clientAPI", "Metal"}});
+    auto renderer = Renderer::create(canvas, Backend::Metal);
+
+    Scene scene;
+    PerspectiveCamera camera(75, canvas.aspect(), 0.1f, 100);
+    camera.position.set(0, 0, 10);
+
+    FontLoader fontLoader;
+    auto font = fontLoader.load(std::string(DATA_FOLDER) + "/fonts/typeface/gentilis_regular.typeface.json");
+
+    auto text = TextSprite::create(*font);
+    text->setColor(Color::white);
+
+    constexpr int bufSize = 128;
+    char buf[bufSize] = "Hello world!";
+    text->setText(buf);
+
+    scene.add(text);
+
+    auto grid = AxesHelper::create(1);
+    scene.add(grid);
+
+    ImguiFunctionalContext ui(canvas, *renderer, [&] {
+        ImGui::SetNextWindowPos({});
+        ImGui::SetNextWindowSize({});
+
+        ImGui::Begin("Controls");
+        if (ImGui::Button("Random color")) {
+            text->setColor(Color().randomize());
+        }
+
+        ImGui::SameLine();
+
+        if (ImGui::InputText("Text", buf, bufSize)) {
+            text->setText(buf);
+        }
+
+        ImGui::Text("Horizontal alignment:");
+        ImGui::SameLine();
+        if (ImGui::Button("Align left")) {
+            text->setHorizontalAlignment(TextSprite::HorizontalAlignment::Left);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Align center##h")) {
+            text->setHorizontalAlignment(TextSprite::HorizontalAlignment::Center);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Align right")) {
+            text->setHorizontalAlignment(TextSprite::HorizontalAlignment::Right);
+        }
+
+        ImGui::Text("Vertical alignment:");
+        ImGui::SameLine();
+        if (ImGui::Button("Align above")) {
+            text->setVerticalAlignment(TextSprite::VerticalAlignment::Above);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Align center##v")) {
+            text->setVerticalAlignment(TextSprite::VerticalAlignment::Center);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Align below")) {
+            text->setVerticalAlignment(TextSprite::VerticalAlignment::Below);
+        }
+
+        static float scale = 1.f;
+        if (ImGui::SliderFloat("Scale", &scale, 0.1f, 5.f)) {
+            text->setWorldScale(scale);
+        }
+
+        ImGui::End();
+    });
+
+    canvas.onWindowResize([&](WindowSize newSize) {
+        renderer->setSize(newSize);
+        camera.aspect = canvas.aspect();
+        camera.updateProjectionMatrix();
+    });
+
+    canvas.animate([&] {
+        renderer->render(scene, camera);
+        ui.render();
+    });
+}

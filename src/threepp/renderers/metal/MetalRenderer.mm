@@ -997,7 +997,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             }
 
             if (auto* sprite = dynamic_cast<Sprite*>(obj)) {
-                renderSprite(encoder, *sprite, camera, colorPixelFormat);
+                renderSprite(encoder, scene, *sprite, camera, colorPixelFormat);
                 continue;
             }
 

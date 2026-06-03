@@ -2,8 +2,8 @@
 #include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
 #include "threepp/geometries/PlaneGeometry.hpp"
-#include "threepp/math/MathUtils.hpp"
 #include "threepp/materials/ShaderMaterial.hpp"
+#include "threepp/math/MathUtils.hpp"
 #include "threepp/objects/Reflector.hpp"
 #include "threepp/objects/Water.hpp"
 #include "threepp/renderers/RenderJob.hpp"
@@ -203,10 +203,32 @@ TEST_CASE("Metal P2 shader keys include skinning and lighting variants") {
     REQUIRE(metal::ShaderProgramKeyHash{}(skinned) != metal::ShaderProgramKeyHash{}(lit));
 }
 
+TEST_CASE("Metal sprite shader keys cover all sprite feature variants") {
+
+    metal::SpriteShaderKey alphaMap{};
+    alphaMap.useAlphaMap = true;
+
+    metal::SpriteShaderKey alphaTest{};
+    alphaTest.useAlphaTest = true;
+
+    metal::SpriteShaderKey fog{};
+    fog.useFog = true;
+
+    metal::SpriteShaderKey sizeAttenuation{};
+    sizeAttenuation.useSizeAttenuation = true;
+
+    REQUIRE_FALSE(alphaMap == alphaTest);
+    REQUIRE_FALSE(alphaMap == fog);
+    REQUIRE_FALSE(sizeAttenuation == fog);
+    REQUIRE(metal::SpriteShaderKeyHash{}(alphaMap) != metal::SpriteShaderKeyHash{}(alphaTest));
+    REQUIRE(metal::SpriteShaderKeyHash{}(alphaMap) != metal::SpriteShaderKeyHash{}(fog));
+    REQUIRE(metal::SpriteShaderKeyHash{}(sizeAttenuation) != metal::SpriteShaderKeyHash{}(fog));
+}
+
 TEST_CASE("Metal P4 shader manager exposes dedicated built-in material entry points") {
 
-    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteVertexFunction())>);
-    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteFragmentFunction())>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteVertexFunction(std::declval<const metal::SpriteShaderKey&>()))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSpriteFragmentFunction(std::declval<const metal::SpriteShaderKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateLineVertexFunction(false))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateLineFragmentFunction(false))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointsVertexFunction(false))>);
@@ -231,8 +253,18 @@ TEST_CASE("Metal P4 sprite shader keeps billboard expansion outside the PBR vari
     REQUIRE(vertexSource.find("length(uniforms.modelMatrix[0].xyz)") != std::string_view::npos);
     REQUIRE(vertexSource.find("uniforms.center") != std::string_view::npos);
     REQUIRE(vertexSource.find("uniforms.rotation") != std::string_view::npos);
+    REQUIRE(vertexSource.find("#if USE_FOG") != std::string_view::npos);
+    REQUIRE(vertexSource.find("float3 transformedUv = uniforms.uvTransform * float3(in.uv, 1.0)") != std::string_view::npos);
+    REQUIRE(vertexSource.find("out.fogDepth = -mvPosition.z") != std::string_view::npos);
     REQUIRE(fragmentSource.find("fragment float4 sprite_fragment") != std::string_view::npos);
     REQUIRE(fragmentSource.find("texture2d<float> map [[texture(0)]]") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("texture2d<float> alphaMap [[texture(1)]]") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("sampler alphaMapSampler [[sampler(1)]]") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("#if USE_ALPHAMAP") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("alphaMap.sample(alphaMapSampler, in.uv).g") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("#if USE_ALPHATEST") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("discard_fragment()") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("applyFog(color.rgb, in.fogDepth") != std::string_view::npos);
 }
 
 TEST_CASE("Metal P4 line and points shaders use dedicated primitive outputs") {

@@ -161,7 +161,11 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding;
+        float alphaTest;
+        float uvTransform[12];
+        float fogColor[4];
+        float fogParams[4];
+        float padding[4];
     };
 
     struct alignas(16) LineUniforms {
@@ -309,6 +313,15 @@ namespace threepp {
         std::copy(source.elements.begin(), source.elements.end(), target);
     }
 
+    inline void copyMatrix3Columns(const Matrix3& source, float* target) {
+        for (std::size_t column = 0; column < 3; ++column) {
+            target[column * 4 + 0] = source.elements[column * 3 + 0];
+            target[column * 4 + 1] = source.elements[column * 3 + 1];
+            target[column * 4 + 2] = source.elements[column * 3 + 2];
+            target[column * 4 + 3] = 0.f;
+        }
+    }
+
     inline void copyIdentityMatrix(float* target) {
         std::fill(target, target + 16, 0.f);
         target[0] = 1.f;
@@ -374,6 +387,17 @@ namespace threepp {
         out.center[1] = sprite.center.y;
         out.rotation = material.rotation;
         out.scaleAttenuation = material.sizeAttenuation ? 1.f : 0.f;
+        out.alphaTest = material.alphaTest;
+
+        Matrix3 uvTransform;
+        const auto uvScaleMap = material.map ? material.map : material.alphaMap;
+        if (uvScaleMap) {
+            if (uvScaleMap->matrixAutoUpdate) {
+                uvScaleMap->updateMatrix();
+            }
+            uvTransform.copy(uvScaleMap->matrix);
+        }
+        copyMatrix3Columns(uvTransform, out.uvTransform);
     }
 
     inline void computeLineUniforms(const Camera& camera, const Line& line, const LineBasicMaterial& material, LineUniforms& out) {

@@ -60,6 +60,29 @@ namespace threepp::metal {
         }
     };
 
+    struct SpriteShaderKey {
+        bool useSizeAttenuation = false;
+        bool useAlphaMap = false;
+        bool useAlphaTest = false;
+        bool useFog = false;
+
+        bool operator==(const SpriteShaderKey& other) const {
+            return useSizeAttenuation == other.useSizeAttenuation &&
+                   useAlphaMap == other.useAlphaMap &&
+                   useAlphaTest == other.useAlphaTest &&
+                   useFog == other.useFog;
+        }
+    };
+
+    struct SpriteShaderKeyHash {
+        std::size_t operator()(const SpriteShaderKey& key) const {
+            return (key.useSizeAttenuation ? 1u : 0u) |
+                   ((key.useAlphaMap ? 1u : 0u) << 1u) |
+                   ((key.useAlphaTest ? 1u : 0u) << 2u) |
+                   ((key.useFog ? 1u : 0u) << 3u);
+        }
+    };
+
     class MetalShaderManager {
 
     public:
@@ -77,9 +100,9 @@ namespace threepp::metal {
 
         void* getOrCreatePointDepthFragmentFunction(bool useSkinning, bool useInstancing = false);
 
-        void* getOrCreateSpriteVertexFunction();
+        void* getOrCreateSpriteVertexFunction(const SpriteShaderKey& key);
 
-        void* getOrCreateSpriteFragmentFunction();
+        void* getOrCreateSpriteFragmentFunction(const SpriteShaderKey& key);
 
         void* getOrCreateLineVertexFunction(bool useVertexColors = false);
 

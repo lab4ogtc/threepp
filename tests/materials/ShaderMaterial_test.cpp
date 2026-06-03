@@ -1,5 +1,6 @@
 
 #include "threepp/materials/RawShaderMaterial.hpp"
+#include "threepp/materials/SpriteMaterial.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -27,4 +28,12 @@ TEST_CASE("ShaderMaterial clone preserves shader source and uniforms") {
     REQUIRE(clone->uniforms.contains("steps"));
     CHECK(clone->uniforms.at("time").value<float>() == 1.25f);
     CHECK(clone->uniforms.at("steps").value<int>() == 64);
+}
+
+TEST_CASE("SpriteMaterial setValues updates size attenuation") {
+
+    auto material = SpriteMaterial::create({{"sizeAttenuation", false}});
+
+    REQUIRE_FALSE(material->sizeAttenuation);
+    REQUIRE(material->rotation == 0.f);
 }

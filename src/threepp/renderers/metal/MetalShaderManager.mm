@@ -92,6 +92,23 @@ namespace threepp::metal {
             return source;
         }
 
+        std::string buildSpriteShaderSource(const SpriteShaderKey& key) {
+            std::string source;
+            source += "#define USE_SIZEATTENUATION ";
+            source += key.useSizeAttenuation ? "1\n" : "0\n";
+            source += "#define USE_ALPHAMAP ";
+            source += key.useAlphaMap ? "1\n" : "0\n";
+            source += "#define USE_ALPHATEST ";
+            source += key.useAlphaTest ? "1\n" : "0\n";
+            source += "#define USE_FOG ";
+            source += key.useFog ? "1\n" : "0\n";
+            source += tone_mapping_functions;
+            source += fog_functions;
+            source += sprite_vertex;
+            source += sprite_fragment;
+            return source;
+        }
+
     }// namespace
 
     struct MetalShaderManager::Impl {
@@ -108,6 +125,7 @@ namespace threepp::metal {
         std::unordered_map<DepthShaderKey, id<MTLFunction>, DepthShaderKeyHash> depthVertexFunctions;
         std::unordered_map<DepthShaderKey, id<MTLLibrary>, DepthShaderKeyHash> pointDepthLibraries;
         std::unordered_map<DepthShaderKey, ShaderProgramInstance, DepthShaderKeyHash> pointDepthPrograms;
+        std::unordered_map<SpriteShaderKey, ShaderProgramInstance, SpriteShaderKeyHash> spritePrograms;
         std::unordered_map<std::string, id<MTLLibrary>> builtInLibraries;
         std::unordered_map<std::string, id<MTLFunction>> builtInFunctions;
 
@@ -219,6 +237,37 @@ namespace threepp::metal {
             return inserted->second;
         }
 
+        ShaderProgramInstance& getOrCreateSpriteProgram(const SpriteShaderKey& key) {
+            auto it = spritePrograms.find(key);
+            if (it != spritePrograms.end()) {
+                return it->second;
+            }
+
+            const auto sourceText = buildSpriteShaderSource(key);
+            NSString* source = [NSString stringWithUTF8String:sourceText.c_str()];
+
+            NSError* error = nil;
+            id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+            if (!library) {
+                std::cerr << "=== MSL Sprite Compilation Failed ===\n"
+                          << sourceText
+                          << "\n=====================================\n";
+                NSString* msg = [NSString stringWithFormat:@"MSL sprite compilation failed: %@", error.localizedDescription];
+                throw std::runtime_error([msg UTF8String]);
+            }
+
+            ShaderProgramInstance instance;
+            instance.library = library;
+            instance.vertexFunction = [library newFunctionWithName:@"sprite_vertex"];
+            instance.fragmentFunction = [library newFunctionWithName:@"sprite_fragment"];
+            if (!instance.vertexFunction || !instance.fragmentFunction) {
+                throw std::runtime_error("Failed to find MSL sprite shader functions");
+            }
+
+            auto [inserted, _] = spritePrograms.emplace(key, instance);
+            return inserted->second;
+        }
+
         id<MTLFunction> getOrCreateBuiltInFunction(const std::string& cacheKey, const char* sourceText, const char* functionName) {
             auto functionIt = builtInFunctions.find(cacheKey);
             if (functionIt != builtInFunctions.end()) {
@@ -299,15 +348,12 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(DepthShaderKey{useSkinning, useInstancing}).fragmentFunction;
     }
 
-    void* MetalShaderManager::getOrCreateSpriteVertexFunction() {
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_vertex", sprite_vertex, "sprite_vertex");
+    void* MetalShaderManager::getOrCreateSpriteVertexFunction(const SpriteShaderKey& key) {
+        return (__bridge void*) pimpl_->getOrCreateSpriteProgram(key).vertexFunction;
     }
 
-    void* MetalShaderManager::getOrCreateSpriteFragmentFunction() {
-        std::string source;
-        source += tone_mapping_functions;
-        source += sprite_fragment;
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sprite_fragment", source, "sprite_fragment");
+    void* MetalShaderManager::getOrCreateSpriteFragmentFunction(const SpriteShaderKey& key) {
+        return (__bridge void*) pimpl_->getOrCreateSpriteProgram(key).fragmentFunction;
     }
 
     void* MetalShaderManager::getOrCreateLineVertexFunction(bool useVertexColors) {

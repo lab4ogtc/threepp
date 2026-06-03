@@ -160,8 +160,16 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(false, true));
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(false, true));
 
-        REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteVertexFunction());
-        REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteFragmentFunction());
+        for (unsigned int mask = 0; mask < 16; ++mask) {
+            metal::SpriteShaderKey key;
+            key.useSizeAttenuation = (mask & 1u) != 0u;
+            key.useAlphaMap = (mask & 2u) != 0u;
+            key.useAlphaTest = (mask & 4u) != 0u;
+            key.useFog = (mask & 8u) != 0u;
+
+            REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteVertexFunction(key));
+            REQUIRE_NOTHROW(shaderManager.getOrCreateSpriteFragmentFunction(key));
+        }
         REQUIRE_NOTHROW(shaderManager.getOrCreateLineVertexFunction(false));
         REQUIRE_NOTHROW(shaderManager.getOrCreateLineFragmentFunction(false));
         REQUIRE_NOTHROW(shaderManager.getOrCreateLineVertexFunction(true));
@@ -344,11 +352,11 @@ TEST_CASE("Metal texture manager uploads manual DataTexture3D mipmaps") {
 
         std::vector<unsigned char> uploaded(2u * 2u * 2u);
         [mtlTexture getBytes:uploaded.data()
-                 bytesPerRow:2u
-               bytesPerImage:4u
-                  fromRegion:MTLRegionMake3D(0, 0, 0, 2, 2, 2)
-                 mipmapLevel:1
-                       slice:0];
+                  bytesPerRow:2u
+                bytesPerImage:4u
+                   fromRegion:MTLRegionMake3D(0, 0, 0, 2, 2, 2)
+                  mipmapLevel:1
+                        slice:0];
         CHECK(uploaded.front() == 123u);
         CHECK(uploaded.back() == 123u);
     }

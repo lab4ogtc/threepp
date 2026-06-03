@@ -1150,12 +1150,19 @@ struct SpriteUniforms {
     uint toneMappingType;
     float toneMappingExposure;
     uint toneMapped;
-    float padding;
+    float alphaTest;
+    float3x3 uvTransform;
+    float4 fogColor;
+    float4 fogParams;
+    float4 padding;
 };
 
 struct SpriteVertexOutput {
     float4 position [[position]];
     float2 uv;
+#if USE_FOG
+    float fogDepth;
+#endif
 };
 
 vertex SpriteVertexOutput sprite_vertex(
@@ -1166,9 +1173,12 @@ vertex SpriteVertexOutput sprite_vertex(
     SpriteVertexOutput out;
     float4 mvPosition = uniforms.modelViewMatrix * float4(0.0, 0.0, 0.0, 1.0);
     float2 scale = float2(length(uniforms.modelMatrix[0].xyz), length(uniforms.modelMatrix[1].xyz));
-    if (uniforms.scaleAttenuation < 0.5) {
+#if !USE_SIZEATTENUATION
+    bool isPerspective = uniforms.projectionMatrix[2][3] < 0.0;
+    if (isPerspective) {
         scale *= -mvPosition.z;
     }
+#endif
 
     float2 alignedPosition = (in.position.xy - (uniforms.center - float2(0.5))) * scale;
     float c = cos(uniforms.rotation);
@@ -1180,7 +1190,11 @@ vertex SpriteVertexOutput sprite_vertex(
 
     mvPosition.xy += rotatedPosition;
     out.position = uniforms.projectionMatrix * mvPosition;
-    out.uv = in.uv;
+    float3 transformedUv = uniforms.uvTransform * float3(in.uv, 1.0);
+    out.uv = transformedUv.xy;
+#if USE_FOG
+    out.fogDepth = -mvPosition.z;
+#endif
     return out;
 }
 )metal";
@@ -1189,37 +1203,33 @@ vertex SpriteVertexOutput sprite_vertex(
 #include <metal_stdlib>
 using namespace metal;
 
-struct SpriteVertexOutput {
-    float4 position [[position]];
-    float2 uv;
-};
-
-struct SpriteUniforms {
-    float4x4 projectionMatrix;
-    float4x4 modelViewMatrix;
-    float4x4 modelMatrix;
-    float4 color;
-    float2 center;
-    float rotation;
-    float scaleAttenuation;
-    uint toneMappingType;
-    float toneMappingExposure;
-    uint toneMapped;
-    float padding;
-};
-
 fragment float4 sprite_fragment(
     SpriteVertexOutput in [[stage_in]],
     constant SpriteUniforms& uniforms [[buffer(4)]],
     texture2d<float> map [[texture(0)]],
     sampler mapSampler [[sampler(0)]]
+#if USE_ALPHAMAP
+    , texture2d<float> alphaMap [[texture(1)]]
+    , sampler alphaMapSampler [[sampler(1)]]
+#endif
 )
 {
     float4 texel = map.sample(mapSampler, in.uv);
     float4 color = texel * uniforms.color;
+#if USE_ALPHAMAP
+    color.a *= alphaMap.sample(alphaMapSampler, in.uv).g;
+#endif
+#if USE_ALPHATEST
+    if (color.a < uniforms.alphaTest) {
+        discard_fragment();
+    }
+#endif
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
+#if USE_FOG
+    color.rgb = applyFog(color.rgb, in.fogDepth, uniforms.fogColor, uniforms.fogParams);
+#endif
     return color;
 }
 )metal";

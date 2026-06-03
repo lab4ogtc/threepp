@@ -69,7 +69,7 @@ bool SpriteMaterial::setValue(const std::string& key, const MaterialValue& value
 
     } else if (key == "sizeAttenuation") {
 
-        rotation = std::get<bool>(value);
+        sizeAttenuation = std::get<bool>(value);
         return true;
     }
 
