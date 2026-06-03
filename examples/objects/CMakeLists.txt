@@ -36,6 +36,7 @@ if (APPLE)
     add_example(NAME "points_metal" LINK_IMGUI WEB)
     add_example(NAME "lod_metal")
     add_example(NAME "bones_metal" LINK_IMGUI)
+    add_example(NAME "decal_metal" LINK_IMGUI LINK_ASSIMP)
     add_example(NAME "water_metal" LINK_IMGUI WEB WEB_EMBED
             "${PROJECT_SOURCE_DIR}/data/textures/waternormals.jpg@data/textures/waternormals.jpg"
     )
