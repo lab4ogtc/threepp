@@ -1,4 +1,5 @@
 #include "threepp/threepp.hpp"
+#include "threepp/renderers/Renderer.hpp"
 
 #include <cmath>
 #include <algorithm>
@@ -45,7 +46,7 @@ private:
 
 int main() {
 
-    GlfwWindow canvas("Multiple Scenes", {{"aa", 4}});
+    GlfwWindow canvas("Multiple Scenes (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
 
     Scene sceneLeft;
     sceneLeft.background = Color(0xBCD48F);
@@ -76,14 +77,14 @@ int main() {
 
     OrbitControls controls(*camera, canvas);
 
-    GLRenderer renderer(canvas);
-    renderer.setScissorTest(true);
-    renderer.setClearColor(Color(0, 0, 0), 0.f);
+    auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->setScissorTest(true);
+    renderer->setClearColor(Color(0, 0, 0), 0.f);
 
     canvas.onWindowResize([&](WindowSize size) {
         camera->aspect = size.aspect();
         camera->updateProjectionMatrix();
-        renderer.setSize(size);
+        renderer->setSize(size);
     });
 
     int sliderPos = canvas.size().width() / 2;
@@ -95,10 +96,11 @@ int main() {
     canvas.animate([&]() {
         const auto size = canvas.size();
 
-        renderer.setScissor(0, 0, sliderPos, size.height());
-        renderer.render(sceneLeft, *camera);
+        renderer->setScissor(0, 0, sliderPos, size.height());
+        renderer->render(sceneLeft, *camera);
 
-        renderer.setScissor(sliderPos, 0, size.width() - sliderPos, size.height());
-        renderer.render(sceneRight, *camera);
+        renderer->setScissor(sliderPos, 0, size.width() - sliderPos, size.height());
+        renderer->render(sceneRight, *camera);
+        renderer->endFrame();
     });
 }

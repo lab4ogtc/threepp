@@ -13,6 +13,60 @@
 
 using namespace threepp;
 
+namespace {
+
+    constexpr float frameBoundaryThresholdMs = 1.5f;
+
+    constexpr const char* scissorClearShaderSource = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct VertexOut {
+    float4 position [[position]];
+};
+
+struct ClearUniforms {
+    float4 color;
+};
+
+vertex VertexOut scissorClearVertex(uint vertexID [[vertex_id]]) {
+    constexpr float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2( 3.0, -1.0),
+        float2(-1.0,  3.0)
+    };
+
+    VertexOut out;
+    out.position = float4(positions[vertexID], 1.0, 1.0);
+    return out;
+}
+
+struct FragmentOut {
+    float4 color [[color(0)]];
+    float depth [[depth(any)]];
+};
+
+fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buffer(0)]]) {
+    FragmentOut out;
+    out.color = uniforms.color;
+    out.depth = 1.0;
+    return out;
+}
+)metal";
+
+    struct alignas(16) ScissorClearUniforms {
+        float color[4];
+    };
+
+    id<MTLDepthStencilState> createScissorClearDepthStencilState(id<MTLDevice> device, bool clearDepth) {
+        MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
+        desc.depthCompareFunction = MTLCompareFunctionAlways;
+        desc.depthWriteEnabled = clearDepth ? YES : NO;
+        return [device newDepthStencilStateWithDescriptor:desc];
+    }
+
+}// namespace
+
 void MetalRenderer::Impl::OnRenderTargetDispose::onEvent(Event& event) {
     RenderTarget* target = nullptr;
     if (auto** renderTargetPtr = std::any_cast<RenderTarget*>(&event.target)) {
@@ -155,6 +209,7 @@ void MetalRenderer::Impl::commitPendingFrame() {
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
+    isFirstRenderOfFrame = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
     currentCommandBufferExternallyAccessed = false;
 }
@@ -166,6 +221,7 @@ void MetalRenderer::Impl::ensureFrameStarted() {
     bufferManager->beginFrame();
 
     currentCommandBuffer = [commandQueue commandBuffer];
+    isFirstRenderOfFrame = true;
     auto semaphore = inFlightSemaphore;
     [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
       dispatch_semaphore_signal(semaphore);
@@ -610,6 +666,7 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
+    isFirstRenderOfFrame = false;
     return rgb;
 }
 
@@ -644,6 +701,77 @@ void MetalRenderer::Impl::applyScissor(id<MTLRenderCommandEncoder> encoder) cons
 
     const MTLScissorRect rect{x, y, maxX > x ? maxX - x : 0, maxY > y ? maxY - y : 0};
     [encoder setScissorRect:rect];
+}
+
+id<MTLRenderPipelineState> MetalRenderer::Impl::getOrCreateScissorClearPipelineState(MTLPixelFormat format, NSUInteger sampleCount, bool clearColor, bool clearDepth) {
+    const auto clampedSampleCount = std::max<NSUInteger>(sampleCount, 1u);
+    const auto key = static_cast<std::uint64_t>(format) ^
+                     (static_cast<std::uint64_t>(clampedSampleCount) << 16u) ^
+                     (clearColor ? (1ull << 32u) : 0ull) ^
+                     (clearDepth ? (1ull << 33u) : 0ull);
+
+    auto it = scissorClearPipelineStates.find(key);
+    if (it != scissorClearPipelineStates.end()) {
+        return it->second;
+    }
+
+    NSError* error = nil;
+    NSString* source = [NSString stringWithUTF8String:scissorClearShaderSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create scissor clear library: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    id<MTLFunction> vertexFunction = [library newFunctionWithName:@"scissorClearVertex"];
+    id<MTLFunction> fragmentFunction = [library newFunctionWithName:@"scissorClearFragment"];
+    if (!vertexFunction || !fragmentFunction) {
+        throw std::runtime_error("Failed to create scissor clear shader functions");
+    }
+
+    MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
+    desc.vertexFunction = vertexFunction;
+    desc.fragmentFunction = fragmentFunction;
+    desc.colorAttachments[0].pixelFormat = format;
+    desc.colorAttachments[0].writeMask = clearColor ? MTLColorWriteMaskAll : MTLColorWriteMaskNone;
+    desc.depthAttachmentPixelFormat = depthPixelFormat;
+    desc.rasterSampleCount = clampedSampleCount;
+
+    id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
+    if (!pso) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create scissor clear PSO: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    scissorClearPipelineStates[key] = pso;
+    return pso;
+}
+
+void MetalRenderer::Impl::performScissorClear(id<MTLRenderCommandEncoder> encoder, const Color& color, float alpha, MTLPixelFormat colorPixelFormat, bool clearColor, bool clearDepth) {
+    if (!clearColor && !clearDepth) return;
+
+    auto pso = getOrCreateScissorClearPipelineState(colorPixelFormat, activeRenderSampleCount, clearColor, clearDepth);
+    [encoder setRenderPipelineState:pso];
+
+    if (clearDepth) {
+        if (!scissorClearDepthStencilState) {
+            scissorClearDepthStencilState = createScissorClearDepthStencilState(device, true);
+        }
+        [encoder setDepthStencilState:scissorClearDepthStencilState];
+    } else {
+        if (!scissorClearNoDepthStencilState) {
+            scissorClearNoDepthStencilState = createScissorClearDepthStencilState(device, false);
+        }
+        [encoder setDepthStencilState:scissorClearNoDepthStencilState];
+    }
+
+    const ScissorClearUniforms uniforms{{color.r, color.g, color.b, alpha}};
+    [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
+    [encoder setFrontFacingWinding:MTLWindingCounterClockwise];
+    [encoder setCullMode:MTLCullModeNone];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+    [encoder setDepthBias:0.f slopeScale:0.f clamp:0.f];
+    [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 }
 
 void MetalRenderer::Impl::resetDepthBiasCache() {
@@ -824,6 +952,7 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
     const auto previousClearDepthFlag = clearDepthFlag;
     const auto previousExplicitFrameInProgress = explicitFrameInProgress;
     const auto previousRenderingPrePass = renderingPrePass;
+    const auto previousIsFirstRenderOfFrame = isFirstRenderOfFrame;
 
     renderingPrePass = true;
 
@@ -840,6 +969,7 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
             clearDepthFlag = previousClearDepthFlag;
             explicitFrameInProgress = previousExplicitFrameInProgress;
             renderingPrePass = previousRenderingPrePass;
+            isFirstRenderOfFrame = previousIsFirstRenderOfFrame;
         };
 
         job.initiator->visible = false;
@@ -864,11 +994,33 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
 }
 
 void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
-    if (currentCommandBuffer && !explicitFrameInProgress) {
-        commitPendingFrame();
+    if (currentCommandBuffer) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto hasPreviousRender = lastRenderTime.time_since_epoch().count() != 0;
+        if (hasPreviousRender) {
+            const auto elapsed = std::chrono::duration<float, std::milli>(now - lastRenderTime).count();
+            const auto isOrderedScissorContinuation = scissorTest && (scissor.x > lastScissor.x || scissor.y > lastScissor.y);
+            if (elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation) {
+                commitPendingFrame();
+            }
+        }
+
+        if (currentCommandBuffer && !explicitFrameInProgress) {
+            bool isNewFrame = false;
+            if (scissorTest) {
+                if (scissor.x < lastScissor.x || scissor.y < lastScissor.y) {
+                    isNewFrame = true;
+                }
+            } else {
+                isNewFrame = true;
+            }
+
+            if (isNewFrame) {
+                commitPendingFrame();
+            }
+        }
     }
     updateMetalLayerPixelFormat();
-    lastRenderTime = std::chrono::steady_clock::now();
 
     scene.updateMatrixWorld(false);
     metal::prepareCameraForRender(camera);
@@ -921,10 +1073,12 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     }
 
     const auto shouldClear = autoClear || clearRequested;
+    const auto activeScissorTest = renderTarget ? renderTarget->scissorTest : scissorTest;
+    const auto canUseMetalClear = shouldClear && !activeScissorTest && isFirstRenderOfFrame;
 
     MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
     passDesc.colorAttachments[0].texture = colorTexture;
-    passDesc.colorAttachments[0].loadAction = shouldClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
+    passDesc.colorAttachments[0].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
     passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
     if (!renderTarget && activeRenderSampleCount > 1) {
         passDesc.colorAttachments[0].resolveTexture = currentDrawable.texture;
@@ -934,7 +1088,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     }
 
     passDesc.depthAttachment.texture = passDepthTexture;
-    passDesc.depthAttachment.loadAction = shouldClear && clearDepthFlag ? MTLLoadActionClear : MTLLoadActionLoad;
+    passDesc.depthAttachment.loadAction = canUseMetalClear && clearDepthFlag ? MTLLoadActionClear : MTLLoadActionLoad;
     passDesc.depthAttachment.clearDepth = 1.0;
     passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
@@ -961,6 +1115,30 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     } else {
         applyViewport(encoder);
         applyScissor(encoder);
+    }
+
+    if (shouldClear && !canUseMetalClear) {
+        const MTLViewport clearViewport{
+                0.0,
+                0.0,
+                static_cast<double>(colorTexture.width),
+                static_cast<double>(colorTexture.height),
+                0.0,
+                1.0};
+        [encoder setViewport:clearViewport];
+        performScissorClear(encoder, effectiveClearColor, effectiveClearAlpha, colorPixelFormat, clearColorFlag, clearDepthFlag);
+        if (renderTarget) {
+            const MTLViewport targetViewport{
+                    renderTarget->viewport.x,
+                    renderTarget->viewport.y,
+                    renderTarget->viewport.z,
+                    renderTarget->viewport.w,
+                    0.0,
+                    1.0};
+            [encoder setViewport:targetViewport];
+        } else {
+            applyViewport(encoder);
+        }
     }
 
     if (!scene.background.empty() && scene.background.isTexture()) {
@@ -1153,9 +1331,15 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     clearColorFlag = true;
     clearDepthFlag = true;
 
+    lastScissor = scissor;
+    lastRenderTime = std::chrono::steady_clock::now();
+    isFirstRenderOfFrame = false;
+
     if (autoClear) {
         if (!lastFrameWasExternallyAccessed) {
-            commitPendingFrame();
+            if (!scissorTest) {
+                commitPendingFrame();
+            }
         }
     }
 }
@@ -1164,6 +1348,10 @@ MetalRenderer::MetalRenderer(Window& window)
 
 void MetalRenderer::render(Scene& scene, Camera& camera) {
     pimpl_->render(scene, camera, autoClear);
+}
+
+void MetalRenderer::endFrame() {
+    pimpl_->commitPendingFrame();
 }
 
 void MetalRenderer::setSize(std::pair<int, int> size) {

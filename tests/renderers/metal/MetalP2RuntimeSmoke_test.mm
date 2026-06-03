@@ -401,6 +401,81 @@ TEST_CASE("Metal P2 renderer renders a lit shadowed skinned scene") {
     }
 }
 
+TEST_CASE("Metal renderer keeps scissor clears local until endFrame") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal scissor clear smoke")
+                                  .size(96, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto leftScene = Scene::create();
+        leftScene->background = Color::red;
+        auto rightScene = Scene::create();
+        rightScene->background = Color::blue;
+
+        const auto logicalSize = canvas.size();
+        const auto split = logicalSize.width() / 2;
+        renderer->setScissorTest(true);
+
+        renderer->setScissor(0, 0, split, logicalSize.height());
+        REQUIRE_NOTHROW(renderer->render(*leftScene, *camera));
+
+        renderer->setScissor(split, 0, logicalSize.width() - split, logicalSize.height());
+        REQUIRE_NOTHROW(renderer->render(*rightScene, *camera));
+
+        const auto pixels = metalRenderer->readRGBPixels();
+        const auto [width, height] = inferPixelDimensions(pixels, logicalSize.width(), logicalSize.height());
+        REQUIRE(width > 0);
+        REQUIRE(height > 0);
+
+        const auto sampleAt = [&](int x, int y, int channel) {
+            const auto offset = (static_cast<std::size_t>(y) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * 3u;
+            REQUIRE(offset + 2u < pixels.size());
+            return pixels[offset + static_cast<std::size_t>(channel)];
+        };
+
+        const auto leftX = width / 4;
+        const auto rightX = (width * 3) / 4;
+        const auto centerY = height / 2;
+        const auto leftR = sampleAt(leftX, centerY, 0);
+        const auto leftG = sampleAt(leftX, centerY, 1);
+        const auto leftB = sampleAt(leftX, centerY, 2);
+        const auto rightR = sampleAt(rightX, centerY, 0);
+        const auto rightG = sampleAt(rightX, centerY, 1);
+        const auto rightB = sampleAt(rightX, centerY, 2);
+
+        CAPTURE(leftR, leftG, leftB, rightR, rightG, rightB);
+        REQUIRE(leftR > 180);
+        REQUIRE(leftG < 80);
+        REQUIRE(leftB < 80);
+        REQUIRE(rightR < 80);
+        REQUIRE(rightG < 80);
+        REQUIRE(rightB > 180);
+
+        renderer->setScissor(0, 0, split, logicalSize.height());
+        REQUIRE_NOTHROW(renderer->render(*leftScene, *camera));
+
+        renderer->setScissor(split, 0, logicalSize.width() - split, logicalSize.height());
+        REQUIRE_NOTHROW(renderer->render(*rightScene, *camera));
+        REQUIRE_NOTHROW(renderer->endFrame());
+        REQUIRE_THROWS_AS(metalRenderer->readRGBPixels(), std::runtime_error);
+        canvas.close();
+    }
+}
+
 #ifdef THREEPP_HAS_SLANG
 TEST_CASE("Metal renderer draws a Slang RawShaderMaterial with custom uniforms and 3D texture") {
 

@@ -27,6 +27,8 @@ namespace threepp {
 
         void render(Scene& scene, Camera& camera) override;
 
+        void endFrame() override;
+
         void setSize(std::pair<int, int> size) override;
 
         [[nodiscard]] WindowSize size() const override;

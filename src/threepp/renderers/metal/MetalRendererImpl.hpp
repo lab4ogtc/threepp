@@ -109,11 +109,15 @@ namespace threepp {
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool renderingPrePass = false;
+        bool isFirstRenderOfFrame = false;
         bool profileRawShader = false;
         bool rawShaderProfileEnvChecked = false;
         std::vector<RenderJob> preRenderJobs;
         std::optional<float> currentDepthBiasFactor;
         std::optional<float> currentDepthBiasUnits;
+        std::unordered_map<std::uint64_t, id<MTLRenderPipelineState>> scissorClearPipelineStates;
+        id<MTLDepthStencilState> scissorClearDepthStencilState = nil;
+        id<MTLDepthStencilState> scissorClearNoDepthStencilState = nil;
 
         struct alignas(16) SystemUniforms {
             float modelMatrix[16];
@@ -134,6 +138,7 @@ namespace threepp {
         Vector4 scissor;
         bool scissorTest = false;
         std::chrono::steady_clock::time_point lastRenderTime{};
+        Vector4 lastScissor;
 
         RenderTarget* renderTarget = nullptr;
         explicit Impl(MetalRenderer& r, Window& w);
@@ -203,6 +208,10 @@ namespace threepp {
         void applyViewport(id<MTLRenderCommandEncoder> encoder) const;
 
         void applyScissor(id<MTLRenderCommandEncoder> encoder) const;
+
+        void performScissorClear(id<MTLRenderCommandEncoder> encoder, const Color& color, float alpha, MTLPixelFormat colorPixelFormat, bool clearColor, bool clearDepth);
+
+        id<MTLRenderPipelineState> getOrCreateScissorClearPipelineState(MTLPixelFormat format, NSUInteger sampleCount, bool clearColor, bool clearDepth);
 
         void resetDepthBiasCache();
 

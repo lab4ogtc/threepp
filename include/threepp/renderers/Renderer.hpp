@@ -42,6 +42,8 @@ namespace threepp {
 
         virtual void render(Scene& scene, Camera& camera) = 0;
 
+        virtual void endFrame() {}
+
         virtual void setSize(std::pair<int, int> size) = 0;
 
         [[nodiscard]] virtual WindowSize size() const = 0;
