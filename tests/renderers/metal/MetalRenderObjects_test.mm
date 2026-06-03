@@ -41,6 +41,26 @@ TEST_CASE("Metal point uniforms scale point size by renderer pixel ratio") {
     REQUIRE(uniforms.sizeAttenuation == 1u);
 }
 
+TEST_CASE("Metal shading params expose 16-byte aligned texture flag fields") {
+
+    STATIC_REQUIRE(alignof(ShadingParams) == 16);
+    STATIC_REQUIRE(sizeof(ShadingParams) == 176);
+    STATIC_REQUIRE(offsetof(ShadingParams, textureFlags0) == 48);
+    STATIC_REQUIRE(offsetof(ShadingParams, textureFlags1) == 64);
+    STATIC_REQUIRE(offsetof(ShadingParams, cameraPosition) == 80);
+    STATIC_REQUIRE(offsetof(ShadingParams, specularColor) == 112);
+    STATIC_REQUIRE(offsetof(ShadingParams, fogColor) == 128);
+    STATIC_REQUIRE(offsetof(ShadingParams, fogParams) == 144);
+    STATIC_REQUIRE(offsetof(ShadingParams, textureFlags2) == 160);
+    STATIC_REQUIRE(offsetof(ShadingParams, textureFlags0) % 16 == 0);
+    STATIC_REQUIRE(offsetof(ShadingParams, textureFlags1) % 16 == 0);
+    STATIC_REQUIRE(offsetof(ShadingParams, cameraPosition) % 16 == 0);
+    STATIC_REQUIRE(offsetof(ShadingParams, specularColor) % 16 == 0);
+    STATIC_REQUIRE(offsetof(ShadingParams, fogColor) % 16 == 0);
+    STATIC_REQUIRE(offsetof(ShadingParams, fogParams) % 16 == 0);
+    STATIC_REQUIRE(offsetof(ShadingParams, textureFlags2) % 16 == 0);
+}
+
 TEST_CASE("Metal point uniforms expose 16-byte aligned fog fields") {
 
     STATIC_REQUIRE(alignof(PointUniforms) == 16);

@@ -9,4 +9,5 @@ add_example(NAME "fly" WEB WEB_EMBED
 
 if (APPLE)
     add_example(NAME "drag_metal")
+    add_example(NAME "fly_metal")
 endif ()

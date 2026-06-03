@@ -227,6 +227,7 @@ struct ShadingParams {
     float4 specularColor;
     float4 fogColor;
     float4 fogParams;
+    uint4 textureFlags2;
 };
 
 struct DirectionalLightUniform {
@@ -527,7 +528,7 @@ float3 blinnPhongFresnel(float3 specularColor, float dotLH) {
     return (1.0 - specularColor) * fresnel + specularColor;
 }
 
-float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float3 specularColor, float shininess) {
+float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float3 specularColor, float shininess, float specularMapStrength) {
     float nDotL = max(dot(n, l), 0.0);
     float3 irradiance = radiance * nDotL;
     float3 diffuse = irradiance * albedo;
@@ -535,7 +536,7 @@ float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 al
     float dotNH = max(dot(n, halfDir), 0.0);
     float dotLH = max(dot(l, halfDir), 0.0);
     float3 fresnel = blinnPhongFresnel(specularColor, dotLH);
-    float specularStrength = 0.25 * (shininess * 0.5 + 1.0) * pow(dotNH, shininess);
+    float specularStrength = 0.25 * (shininess * 0.5 + 1.0) * pow(dotNH, shininess) * specularMapStrength;
     return diffuse + irradiance * fresnel * specularStrength;
 }
 
@@ -552,6 +553,9 @@ fragment float4 basic_fragment(
     , texture2d<float> metalnessMap [[texture(3)]]
     , texture2d<float> aoMap [[texture(4)]]
     , texture2d<float> emissiveMap [[texture(5)]]
+#if USE_LIGHTS
+    , texture2d<float> specularMap [[texture(19)]]
+#endif
 #endif
 #if USE_MAP || USE_LIGHTS
     , sampler mapSampler [[sampler(0)]]
@@ -637,6 +641,13 @@ fragment float4 basic_fragment(
     }
 
 #if USE_LIGHTS
+    float specularStrength = 1.0;
+#if USE_MAP
+    if (params.textureFlags2.x != 0) {
+        specularStrength = specularMap.sample(mapSampler, in.uv).r;
+    }
+#endif
+
     float shadowMask = 1.0;
     float3 v = normalize(params.cameraPosition.xyz - in.worldPosition);
     float3 color = lights.ambientColor.rgb * albedo;
@@ -662,7 +673,7 @@ fragment float4 basic_fragment(
             continue;
         }
         if (params.materialType == 2) {
-            color += directBlinnPhong(light.color.rgb, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
+            color += directBlinnPhong(light.color.rgb, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength) * shadow;
         } else if (params.materialType == 3) {
             color += directLambert(light.color.rgb, n, l, albedo) * shadow;
         } else {
@@ -701,7 +712,7 @@ fragment float4 basic_fragment(
         }
         float3 radiance = light.color.rgb * attenuation;
         if (params.materialType == 2) {
-            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
+            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength) * shadow;
         } else if (params.materialType == 3) {
             color += directLambert(radiance, n, l, albedo) * shadow;
         } else {
@@ -741,7 +752,7 @@ fragment float4 basic_fragment(
         }
         float3 radiance = light.color.rgb * attenuation;
         if (params.materialType == 2) {
-            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a) * shadow;
+            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength) * shadow;
         } else if (params.materialType == 3) {
             color += directLambert(radiance, n, l, albedo) * shadow;
         } else {
@@ -767,7 +778,7 @@ fragment float4 basic_fragment(
         float3 reflected = reflect(-v, n);
         if (params.materialType == 2 || params.materialType == 3) {
             float3 envColor = envMap.sample(mapSampler, reflected).rgb;
-            color = mix(color, color * envColor, saturateFloat(envMapIntensity));
+            color = mix(color, color * envColor, saturateFloat(envMapIntensity * specularStrength));
         } else {
             float lod = roughness * 8.0;
             color += envMap.sample(mapSampler, reflected, level(lod)).rgb * envMapIntensity;

@@ -148,6 +148,7 @@ namespace threepp {
         float specularColor[4];
         float fogColor[4];
         float fogParams[4];
+        std::uint32_t textureFlags2[4];
     };
 
     struct alignas(16) SpriteUniforms {
@@ -807,6 +808,9 @@ namespace threepp {
         if (auto* normal = dynamic_cast<MaterialWithNormalMap*>(&material)) {
             params.textureFlags0[1] = hasTexture(normal->normalMap) ? 1u : 0u;
         }
+        if (auto* specular = dynamic_cast<MaterialWithSpecularMap*>(&material)) {
+            params.textureFlags2[0] = hasTexture(specular->specularMap) ? 1u : 0u;
+        }
         if (auto* ao = dynamic_cast<MaterialWithAoMap*>(&material)) {
             params.textureFlags1[0] = hasTexture(ao->aoMap) ? 1u : 0u;
             params.pbrParams[2] = ao->aoMapIntensity;
@@ -847,7 +851,7 @@ namespace threepp {
     }
 
     inline bool needsUv(const ShadingParams& params) {
-        return params.textureFlags0[0] != 0u || params.textureFlags0[1] != 0u || params.textureFlags0[2] != 0u || params.textureFlags0[3] != 0u || params.textureFlags1[0] != 0u || params.textureFlags1[1] != 0u;
+        return params.textureFlags0[0] != 0u || params.textureFlags0[1] != 0u || params.textureFlags0[2] != 0u || params.textureFlags0[3] != 0u || params.textureFlags1[0] != 0u || params.textureFlags1[1] != 0u || params.textureFlags2[0] != 0u;
     }
 
     inline NSUInteger clampToSize(float value, NSUInteger maxValue) {

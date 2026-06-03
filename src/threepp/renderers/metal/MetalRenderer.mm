@@ -1121,12 +1121,14 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 auto* metalnessMaterial = dynamic_cast<MaterialWithMetalness*>(material);
                 auto* aoMaterial = dynamic_cast<MaterialWithAoMap*>(material);
                 auto* emissiveMaterial = dynamic_cast<MaterialWithEmissive*>(material);
+                auto* specularMaterial = dynamic_cast<MaterialWithSpecularMap*>(material);
                 bindTextureOrPlaceholder(encoder, mapMaterial ? mapMaterial->map : nullptr, whiteTexture, 0);
                 bindTextureOrPlaceholder(encoder, normalMaterial ? normalMaterial->normalMap : nullptr, normalTexture, 1);
                 bindTextureOrPlaceholder(encoder, roughnessMaterial ? roughnessMaterial->roughnessMap : nullptr, whiteTexture, 2);
                 bindTextureOrPlaceholder(encoder, metalnessMaterial ? metalnessMaterial->metalnessMap : nullptr, blackTexture, 3);
                 bindTextureOrPlaceholder(encoder, aoMaterial ? aoMaterial->aoMap : nullptr, whiteTexture, 4);
                 bindTextureOrPlaceholder(encoder, emissiveMaterial ? emissiveMaterial->emissiveMap : nullptr, whiteTexture, 5);
+                bindTextureOrPlaceholder(encoder, specularMaterial ? specularMaterial->specularMap : nullptr, whiteTexture, 19);
             }
             if (useLights) {
                 bindCubeTextureOrPlaceholder(encoder, envMaterial ? envMaterial->envMap : nullptr, 6);
