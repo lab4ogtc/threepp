@@ -562,18 +562,25 @@ namespace threepp {
         resetMorphTargetUniforms(out);
     }
 
-    inline void collectRenderables(Object3D& object, std::vector<Object3D*>& out) {
+    inline void collectRenderables(Object3D& object, Camera& camera, const Frustum& frustum, std::vector<Object3D*>& out) {
         if (!object.visible) return;
 
-        if (dynamic_cast<Mesh*>(&object) ||
-            dynamic_cast<Line*>(&object) ||
-            dynamic_cast<Points*>(&object) ||
-            dynamic_cast<Sprite*>(&object)) {
-            out.push_back(&object);
+        if (object.layers.test(camera.layers)) {
+            if (auto* sprite = dynamic_cast<Sprite*>(&object)) {
+                if (!object.frustumCulled || frustum.intersectsSprite(*sprite)) {
+                    out.push_back(&object);
+                }
+            } else if (dynamic_cast<Mesh*>(&object) ||
+                       dynamic_cast<Line*>(&object) ||
+                       dynamic_cast<Points*>(&object)) {
+                if (!object.frustumCulled || frustum.intersectsObject(object)) {
+                    out.push_back(&object);
+                }
+            }
         }
 
         for (const auto& child : object.children) {
-            collectRenderables(*child, out);
+            collectRenderables(*child, camera, frustum, out);
         }
     }
 
@@ -610,16 +617,18 @@ namespace threepp {
 
         Vector3 projectedPosition;
         for (auto* object : renderables) {
+            const auto geometry = object->geometry();
+            if (!geometry) continue;
+
             projectedPosition
                     .setFromMatrixPosition(*object->matrixWorld)
                     .applyMatrix4(projScreenMatrix);
 
             if (auto* withMaterials = object->as<ObjectWithMaterials>()) {
-                const auto geometry = object->geometry();
-                if (geometry && withMaterials->materials().size() > 1) {
+                if (withMaterials->materials().size() > 1) {
                     forEachMaterialGroup(*withMaterials, *geometry, [&](Material& material, std::optional<GeometryGroup> group) {
                         if (material.visible) {
-                            renderList.push(*object, material, projectedPosition.z, group);
+                            renderList.push(*object, geometry.get(), material, projectedPosition.z, group);
                         }
                     });
                     continue;
@@ -628,7 +637,7 @@ namespace threepp {
 
             auto* material = materialForRenderOrder(*object);
             if (!material || !material->visible) continue;
-            renderList.push(*object, *material, projectedPosition.z, std::nullopt);
+            renderList.push(*object, geometry.get(), *material, projectedPosition.z, std::nullopt);
         }
 
         renderList.sort();

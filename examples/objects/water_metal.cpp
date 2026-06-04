@@ -13,6 +13,7 @@ int main() {
 
     GlfwWindow canvas("Water (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->toneMapping = ToneMapping::ACESFilmic;
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(55, canvas.aspect(), 1, 2000);

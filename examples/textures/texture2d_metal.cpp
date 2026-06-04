@@ -6,7 +6,7 @@ using namespace threepp;
 
 int main() {
 
-    GlfwWindow canvas("Texture2D (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
+    GlfwWindow canvas("Texture2D (Metal)", {{"aa", 8}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
     renderer->setClearColor(Color::aliceblue);
 

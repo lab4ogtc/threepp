@@ -299,6 +299,7 @@ namespace threepp {
 
         void renderLine(id<MTLRenderCommandEncoder> encoder,
                         Line& line,
+                        BufferGeometry& geometry,
                         Material& material,
                         Camera& camera,
                         MTLPixelFormat colorPixelFormat,
@@ -309,6 +310,7 @@ namespace threepp {
         void renderPoints(id<MTLRenderCommandEncoder> encoder,
                           Scene& scene,
                           Points& points,
+                          BufferGeometry& geometry,
                           Material& material,
                           Camera& camera,
                           MTLPixelFormat colorPixelFormat,
@@ -316,6 +318,7 @@ namespace threepp {
 
         void renderRawShader(id<MTLRenderCommandEncoder> encoder,
                              Mesh& mesh,
+                             BufferGeometry& geometry,
                              Material& material,
                              Camera& camera,
                              MTLPixelFormat colorPixelFormat,
@@ -323,20 +326,21 @@ namespace threepp {
 
         void renderDepthTexture(id<MTLRenderCommandEncoder> encoder,
                                 Mesh& mesh,
+                                BufferGeometry& geometry,
                                 ShaderMaterial& material,
                                 Camera& camera,
                                 MTLPixelFormat colorPixelFormat,
                                 std::optional<GeometryGroup> group = std::nullopt);
 
-        void renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat);
+        void renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 
-        void renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, Camera& camera, MTLPixelFormat colorPixelFormat);
+        void renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderBackgroundCube(id<MTLRenderCommandEncoder> encoder, CubeTexture& cubeTexture, Camera& camera, MTLPixelFormat colorPixelFormat);
 
-        void renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat);
+        void renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 
-        void renderReflector(id<MTLRenderCommandEncoder> encoder, Scene& scene, Reflector& reflector, Camera& camera, MTLPixelFormat colorPixelFormat);
+        void renderReflector(id<MTLRenderCommandEncoder> encoder, Scene& scene, Reflector& reflector, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         bool shouldUpdateShadow(LightShadow& shadow) const;
 

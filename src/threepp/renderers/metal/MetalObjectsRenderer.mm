@@ -657,19 +657,19 @@ void MetalRenderer::Impl::drawLineLoopGeometry(id<MTLRenderCommandEncoder> encod
 
 void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
                                      Line& line,
+                                     BufferGeometry& geometry,
                                      Material& material,
                                      Camera& camera,
                                      MTLPixelFormat colorPixelFormat,
                                      std::optional<GeometryGroup> group) {
     auto* lineMaterial = material.as<LineBasicMaterial>();
-    auto geometry = line.geometry();
-    if (!lineMaterial || !geometry || !lineMaterial->visible) return;
-    trackGeometry(*geometry);
+    if (!lineMaterial || !lineMaterial->visible) return;
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
+    auto* posAttr = getFloatAttribute(geometry, "position");
     if (!posAttr) return;
 
-    auto* colorAttr = getFloatAttribute(*geometry, "color");
+    auto* colorAttr = getFloatAttribute(geometry, "color");
     const bool useVertexColors = lineMaterial->vertexColors && colorAttr && colorAttr->itemSize() == 3;
 
     static bool linewidthWarningPrinted = false;
@@ -698,7 +698,7 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *lineMaterial);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
 
     LineUniforms uniforms{};
     computeLineUniforms(camera, line, *lineMaterial, uniforms);
@@ -707,10 +707,10 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
     if (dynamic_cast<LineLoop*>(&line)) {
-        drawLineLoopGeometry(encoder, *geometry, *posAttr, group);
+        drawLineLoopGeometry(encoder, geometry, *posAttr, group);
     } else {
         const auto primitiveType = dynamic_cast<LineSegments*>(&line) ? MTLPrimitiveTypeLine : MTLPrimitiveTypeLineStrip;
-        drawGeometry(encoder, *geometry, *posAttr, primitiveType, 1, group);
+        drawGeometry(encoder, geometry, *posAttr, primitiveType, 1, group);
     }
 }
 
@@ -722,22 +722,20 @@ float MetalRenderer::Impl::pointScale() const {
 void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
                                        Scene& scene,
                                        Points& points,
+                                       BufferGeometry& geometry,
                                        Material& material,
                                        Camera& camera,
                                        MTLPixelFormat colorPixelFormat,
                                        std::optional<GeometryGroup> group) {
-    auto geometry = points.geometry();
-    if (!geometry) return;
-
     if (auto* particleMaterial = material.as<ParticleMaterial>()) {
         if (!particleMaterial->visible) return;
-        trackGeometry(*geometry);
+        trackGeometry(geometry);
 
-        auto* posAttr = getFloatAttribute(*geometry, "position");
+        auto* posAttr = getFloatAttribute(geometry, "position");
         if (!posAttr || posAttr->itemSize() != 3) return;
 
         auto bindParticleAttribute = [&](const std::string& name, NSUInteger index, int itemSize) {
-            auto* attr = getFloatAttribute(*geometry, name);
+            auto* attr = getFloatAttribute(geometry, name);
             if (!attr || attr->itemSize() != itemSize) return false;
 
             auto* buffer = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
@@ -792,22 +790,22 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
 
         bindTextureOrPlaceholder(encoder, map, whiteTexture, 0);
 
-        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
+        drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
         return;
     }
 
     auto* pointsMaterial = material.as<PointsMaterial>();
     if (!pointsMaterial || !pointsMaterial->visible) return;
-    trackGeometry(*geometry);
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
+    auto* posAttr = getFloatAttribute(geometry, "position");
     if (!posAttr) return;
 
-    auto* colorAttr = getFloatAttribute(*geometry, "color");
+    auto* colorAttr = getFloatAttribute(geometry, "color");
     const bool useVertexColors = pointsMaterial->vertexColors && colorAttr && colorAttr->itemSize() == 3;
-    const bool useMorphTargets = wantsMorphTargets(*pointsMaterial, *geometry);
+    const bool useMorphTargets = wantsMorphTargets(*pointsMaterial, geometry);
     if (useMorphTargets && morphTargets) {
-        morphTargets->update(&points, geometry.get(), pointsMaterial, false);
+        morphTargets->update(&points, &geometry, pointsMaterial, false);
     }
 
     metal::PipelineKey pipelineKey;
@@ -831,7 +829,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *pointsMaterial);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false, useMorphTargets, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false, useMorphTargets, false);
 
     PointUniforms uniforms{};
     const bool useSizeAttenuation = pointsMaterial->sizeAttenuation && dynamic_cast<PerspectiveCamera*>(&camera) != nullptr;
@@ -848,21 +846,21 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     bindTextureOrPlaceholder(encoder, pointsMaterial->alphaMap, whiteTexture, 1);
     [encoder setFragmentSamplerState:samplerForTexture(pointsMaterial->alphaMap.get()) atIndex:1];
 
-    drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
 }
 
 void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
                                           Mesh& mesh,
+                                          BufferGeometry& geometry,
                                           Material& material,
                                           Camera& camera,
                                           MTLPixelFormat colorPixelFormat,
                                           std::optional<GeometryGroup> group) {
     auto* rawMaterial = material.as<RawShaderMaterial>();
-    auto geometry = mesh.geometry();
-    if (!rawMaterial || !geometry || !rawMaterial->visible) return;
-    trackGeometry(*geometry);
+    if (!rawMaterial || !rawMaterial->visible) return;
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
+    auto* posAttr = getFloatAttribute(geometry, "position");
     if (!posAttr) return;
 
     if (rawMaterial->shaderLanguage == ShaderLanguage::SLANG) {
@@ -909,7 +907,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
         pipelineKey.vertexFunction = (__bridge void*) vertexFunction;
         pipelineKey.fragmentFunction = (__bridge void*) fragmentFunction;
         configurePipelineBlending(pipelineKey, *rawMaterial);
-        pipelineKey.vertexLayoutBitmask = rawShaderVertexLayout(*geometry);
+        pipelineKey.vertexLayoutBitmask = rawShaderVertexLayout(geometry);
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
         pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
@@ -935,15 +933,15 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
         [encoder setTriangleFillMode:MTLTriangleFillModeFill];
         applyDepthBias(encoder, *rawMaterial);
 
-        auto* normalAttr = getFloatAttribute(*geometry, "normal");
-        auto* uvAttr = getFloatAttribute(*geometry, "uv");
-        auto* colorAttr = getFloatAttribute(*geometry, "color");
+        auto* normalAttr = getFloatAttribute(geometry, "normal");
+        auto* uvAttr = getFloatAttribute(geometry, "uv");
+        auto* colorAttr = getFloatAttribute(geometry, "color");
         const auto useNormal = normalAttr && normalAttr->itemSize() == 3;
         const auto useUv = uvAttr && uvAttr->itemSize() == 2;
         const auto useVertexColors = colorAttr && (colorAttr->itemSize() == 3 || colorAttr->itemSize() == 4);
-        auto* tangentAttr = getFloatAttribute(*geometry, "tangent");
+        auto* tangentAttr = getFloatAttribute(geometry, "tangent");
         const auto useTangent = tangentAttr && tangentAttr->itemSize() == 4;
-        bindDrawAttributes(encoder, *geometry, *posAttr, normalAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent);
+        bindDrawAttributes(encoder, geometry, *posAttr, normalAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent);
 
         SystemUniforms systemUniforms{};
         fillSystemUniforms(camera, mesh, *rawMaterial, systemUniforms);
@@ -984,11 +982,11 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
             [encoder setFragmentSamplerState:sampler atIndex:i];
         }
 
-        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
+        drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
         return;
     }
 
-    auto* colorAttr = getFloatAttribute(*geometry, "color");
+    auto* colorAttr = getFloatAttribute(geometry, "color");
     if (!colorAttr || colorAttr->itemSize() != 4) return;
 
     metal::PipelineKey pipelineKey;
@@ -1014,29 +1012,29 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *rawMaterial);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, true, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, true, false);
 
     RawShaderUniforms uniforms{};
     computeRawShaderUniforms(camera, mesh, uniformFloat(rawMaterial->uniforms, "time", 0.f), uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
-    drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
 }
 
 void MetalRenderer::Impl::renderDepthTexture(id<MTLRenderCommandEncoder> encoder,
                                              Mesh& mesh,
+                                             BufferGeometry& geometry,
                                              ShaderMaterial& material,
                                              Camera& camera,
                                              MTLPixelFormat colorPixelFormat,
                                              std::optional<GeometryGroup> group) {
     auto* depthMaterial = &material;
-    auto geometry = mesh.geometry();
-    if (!geometry || !depthMaterial->visible) return;
-    trackGeometry(*geometry);
+    if (!depthMaterial->visible) return;
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
-    auto* uvAttr = getFloatAttribute(*geometry, "uv");
+    auto* posAttr = getFloatAttribute(geometry, "position");
+    auto* uvAttr = getFloatAttribute(geometry, "uv");
     if (!posAttr || posAttr->itemSize() != 3 || !uvAttr || uvAttr->itemSize() != 2) return;
 
     metal::PipelineKey pipelineKey;
@@ -1059,7 +1057,7 @@ void MetalRenderer::Impl::renderDepthTexture(id<MTLRenderCommandEncoder> encoder
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *depthMaterial);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, uvAttr, nullptr, false, true, false, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, uvAttr, nullptr, false, true, false, false);
 
     DepthTextureUniforms uniforms{};
     Matrix4 mvp;
@@ -1102,12 +1100,13 @@ void MetalRenderer::Impl::renderDepthTexture(id<MTLRenderCommandEncoder> encoder
     [encoder setFragmentTexture:depthTexture atIndex:1];
     [encoder setFragmentSamplerState:depthSampler atIndex:1];
 
-    drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
 }
 
-void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat) {
-    auto* material = sprite.material()->as<SpriteMaterial>();
+void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, BufferGeometry& geometry, Material& itemMaterial, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    auto* material = itemMaterial.as<SpriteMaterial>();
     if (!material || !material->visible) return;
+    trackGeometry(geometry);
 
     static constexpr float positions[] = {
             -0.5f, -0.5f, 0.f,
@@ -1167,14 +1166,12 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scen
     [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
 }
 
-void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, Camera& camera, MTLPixelFormat colorPixelFormat) {
-    auto materialPtr = sky.material();
-    auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
-    auto geometry = sky.geometry();
-    if (!material || !geometry || !material->visible) return;
-    trackGeometry(*geometry);
+void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, BufferGeometry& geometry, Material& itemMaterial, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    auto* material = itemMaterial.as<ShaderMaterial>();
+    if (!material || !material->visible) return;
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
+    auto* posAttr = getFloatAttribute(geometry, "position");
     if (!posAttr) return;
 
     metal::PipelineKey pipelineKey;
@@ -1200,7 +1197,7 @@ void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sk
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *material);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
 
     SkyUniforms uniforms{};
     Matrix4 mvp;
@@ -1217,17 +1214,15 @@ void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sk
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
-    drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle);
 }
 
-void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, Camera& camera, MTLPixelFormat colorPixelFormat) {
-    auto materialPtr = water.material();
-    auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
-    auto geometry = water.geometry();
-    if (!material || !geometry || !material->visible) return;
-    trackGeometry(*geometry);
+void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, BufferGeometry& geometry, Material& itemMaterial, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    auto* material = itemMaterial.as<ShaderMaterial>();
+    if (!material || !material->visible) return;
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
+    auto* posAttr = getFloatAttribute(geometry, "position");
     if (!posAttr) return;
 
     metal::PipelineKey pipelineKey;
@@ -1253,7 +1248,7 @@ void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *material);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
 
     WaterUniforms uniforms{};
     Matrix4 mvp;
@@ -1296,17 +1291,15 @@ void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene
     [encoder setFragmentSamplerState:samplerForTexture(normalSamplerTexture) atIndex:0];
     [encoder setFragmentSamplerState:samplerForTexture(mirrorSamplerTexture) atIndex:1];
 
-    drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle);
 }
 
-void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, Scene&, Reflector& reflector, Camera& camera, MTLPixelFormat colorPixelFormat) {
-    auto materialPtr = reflector.material();
-    auto* material = materialPtr ? materialPtr->as<ShaderMaterial>() : nullptr;
-    auto geometry = reflector.geometry();
-    if (!material || !geometry || !material->visible) return;
-    trackGeometry(*geometry);
+void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, Scene&, Reflector& reflector, BufferGeometry& geometry, Material& itemMaterial, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    auto* material = itemMaterial.as<ShaderMaterial>();
+    if (!material || !material->visible) return;
+    trackGeometry(geometry);
 
-    auto* posAttr = getFloatAttribute(*geometry, "position");
+    auto* posAttr = getFloatAttribute(geometry, "position");
     if (!posAttr) return;
 
     metal::PipelineKey pipelineKey;
@@ -1332,7 +1325,7 @@ void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, S
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *material);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
 
     ReflectorUniforms uniforms{};
     Matrix4 mvp;
@@ -1358,5 +1351,5 @@ void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, S
     auto mirrorSamplerTexture = uniformTexture(material->uniforms, "tDiffuse");
     bindTextureOrPlaceholder(encoder, mirrorSamplerTexture, whiteTexture, 0, true);
 
-    drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle);
 }

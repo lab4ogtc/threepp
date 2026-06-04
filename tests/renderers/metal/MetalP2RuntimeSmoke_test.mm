@@ -7,7 +7,9 @@
 #include "threepp/objects/InstancedMesh.hpp"
 #include "threepp/objects/LineLoop.hpp"
 #include "threepp/objects/LOD.hpp"
+#include "threepp/objects/Reflector.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
+#include "threepp/objects/Water.hpp"
 #include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
@@ -26,6 +28,8 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -1890,6 +1894,487 @@ TEST_CASE("Metal P3 renderer releases RenderTarget resources on dispose") {
         REQUIRE_NOTHROW(target->dispose());
         target.reset();
         renderer.reset();
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer runs Water and Reflector pre-render jobs") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal reflection callbacks smoke")
+                                  .size(96, 96)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto renderReflectiveObject = [&](const std::shared_ptr<Object3D>& reflectiveObject) {
+            auto scene = Scene::create();
+            auto camera = PerspectiveCamera::create(60.f, 1.f, 0.1f, 100.f);
+            camera->position.set(0.f, 2.f, 5.f);
+            camera->lookAt(0.f, 0.f, 0.f);
+
+            auto box = Mesh::create(
+                    BoxGeometry::create(0.5f, 0.5f, 0.5f),
+                    MeshBasicMaterial::create({{"color", Color::red}}));
+            box->position.y = 0.5f;
+            scene->add(box);
+            scene->add(reflectiveObject);
+
+            REQUIRE_FALSE(reflectiveObject->onBeforeRender.has_value());
+            REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+            REQUIRE(renderer->getRenderTarget() == nullptr);
+        };
+
+        auto water = Water::create(PlaneGeometry::create(4.f, 4.f));
+        water->rotateX(-math::PI / 2.f);
+        renderReflectiveObject(water);
+
+        auto reflector = Reflector::create(PlaneGeometry::create(4.f, 4.f));
+        renderReflectiveObject(reflector);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer triggers onBeforeRender and onAfterRender callbacks for standard and special objects") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal callbacks smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto meshGeometry = PlaneGeometry::create(1.f, 1.f);
+        auto meshMaterial = MeshBasicMaterial::create({{"color", Color::red}});
+        auto mesh = Mesh::create(meshGeometry, meshMaterial);
+        scene->add(mesh);
+
+        int meshBeforeCount = 0;
+        int meshAfterCount = 0;
+
+        mesh->onBeforeRender = [&](void* r, Object3D* s, Camera* c, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE(r == renderer.get());
+            REQUIRE(s == scene.get());
+            REQUIRE(c == camera.get());
+            REQUIRE(g == meshGeometry.get());
+            REQUIRE(m == meshMaterial.get());
+            meshBeforeCount++;
+        };
+
+        mesh->onAfterRender = [&](void* r, Object3D* s, Camera* c, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE(r == renderer.get());
+            REQUIRE(s == scene.get());
+            REQUIRE(c == camera.get());
+            REQUIRE(g == meshGeometry.get());
+            REQUIRE(m == meshMaterial.get());
+            meshAfterCount++;
+        };
+
+        auto lineGeometry = BufferGeometry::create();
+        lineGeometry->setFromPoints(std::vector<Vector3>{{-0.5f, -0.5f, 0.f}, {0.5f, 0.5f, 0.f}});
+        auto lineMaterial = LineBasicMaterial::create();
+        auto line = Line::create(lineGeometry, lineMaterial);
+        scene->add(line);
+
+        int lineBeforeCount = 0;
+        int lineAfterCount = 0;
+
+        line->onBeforeRender = [&](void* r, Object3D* s, Camera* c, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE(r == renderer.get());
+            REQUIRE(s == scene.get());
+            REQUIRE(c == camera.get());
+            REQUIRE(g == lineGeometry.get());
+            REQUIRE(m == lineMaterial.get());
+            lineBeforeCount++;
+        };
+
+        line->onAfterRender = [&](void* r, Object3D* s, Camera* c, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE(r == renderer.get());
+            REQUIRE(s == scene.get());
+            REQUIRE(c == camera.get());
+            REQUIRE(g == lineGeometry.get());
+            REQUIRE(m == lineMaterial.get());
+            lineAfterCount++;
+        };
+
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        REQUIRE(meshBeforeCount == 1);
+        REQUIRE(meshAfterCount == 1);
+        REQUIRE(lineBeforeCount == 1);
+        REQUIRE(lineAfterCount == 1);
+
+        // 验证递归调用运行时守卫
+        mesh->onBeforeRender = [&](void* r, Object3D* s, Camera* c, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE_THROWS_AS(renderer->render(*scene, *camera), std::runtime_error);
+        };
+        mesh->onAfterRender = std::nullopt;
+        line->onBeforeRender = std::nullopt;
+        line->onAfterRender = std::nullopt;
+
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer follows GL render-list prerequisites for callbacks") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal callback render-list prerequisites smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto makeMesh = [] {
+            return Mesh::create(
+                    PlaneGeometry::create(0.2f, 0.2f),
+                    MeshBasicMaterial::create({{"color", Color::white}}));
+        };
+
+        auto visibleMesh = makeMesh();
+        int visibleBeforeCount = 0;
+        int visibleAfterCount = 0;
+        visibleMesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            visibleBeforeCount++;
+        };
+        visibleMesh->onAfterRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            visibleAfterCount++;
+        };
+        scene->add(visibleMesh);
+
+        auto hiddenMesh = makeMesh();
+        hiddenMesh->visible = false;
+        int hiddenCount = 0;
+        hiddenMesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            hiddenCount++;
+        };
+        scene->add(hiddenMesh);
+
+        auto layerMismatchMesh = makeMesh();
+        layerMismatchMesh->layers.set(1);
+        int layerMismatchCount = 0;
+        layerMismatchMesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            layerMismatchCount++;
+        };
+        scene->add(layerMismatchMesh);
+
+        auto frustumCulledMesh = makeMesh();
+        frustumCulledMesh->position.x = 100.f;
+        int frustumCulledCount = 0;
+        frustumCulledMesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            frustumCulledCount++;
+        };
+        scene->add(frustumCulledMesh);
+
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        REQUIRE(visibleBeforeCount == 1);
+        REQUIRE(visibleAfterCount == 1);
+        REQUIRE(hiddenCount == 0);
+        REQUIRE(layerMismatchCount == 0);
+        REQUIRE(frustumCulledCount == 0);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer passes override material to render callbacks") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal callback override material smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = PlaneGeometry::create(1.f, 1.f);
+        auto originalMaterial = MeshBasicMaterial::create({{"color", Color::red}});
+        auto overrideMaterial = MeshBasicMaterial::create({{"color", Color::blue}});
+        auto mesh = Mesh::create(geometry, originalMaterial);
+        scene->overrideMaterial = overrideMaterial;
+        scene->add(mesh);
+
+        int beforeCount = 0;
+        int afterCount = 0;
+        mesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material* m, std::optional<GeometryGroup>) {
+            REQUIRE(m == overrideMaterial.get());
+            beforeCount++;
+        };
+        mesh->onAfterRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material* m, std::optional<GeometryGroup>) {
+            REQUIRE(m == overrideMaterial.get());
+            afterCount++;
+        };
+
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        REQUIRE(beforeCount == 1);
+        REQUIRE(afterCount == 1);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer passes multi-material group data to callbacks") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal callback material groups smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-2.f, 2.f, 2.f, -2.f, 0.1f, 10.f);
+        camera->position.z = 4.f;
+
+        auto geometry = BoxGeometry::create(1.f, 1.f, 1.f);
+        std::vector<std::shared_ptr<Material>> materials;
+        materials.reserve(geometry->groups.size());
+        for (std::size_t i = 0; i < geometry->groups.size(); ++i) {
+            materials.emplace_back(MeshBasicMaterial::create({{"color", Color::white}}));
+        }
+        auto mesh = Mesh::create(geometry, materials);
+        scene->add(mesh);
+
+        int beforeCount = 0;
+        int afterCount = 0;
+        mesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE(g == geometry.get());
+            REQUIRE(grp.has_value());
+            REQUIRE(grp->materialIndex < materials.size());
+            REQUIRE(m == materials.at(grp->materialIndex).get());
+            beforeCount++;
+        };
+        mesh->onAfterRender = [&](void*, Object3D*, Camera*, BufferGeometry* g, Material* m, std::optional<GeometryGroup> grp) {
+            REQUIRE(g == geometry.get());
+            REQUIRE(grp.has_value());
+            REQUIRE(grp->materialIndex < materials.size());
+            REQUIRE(m == materials.at(grp->materialIndex).get());
+            afterCount++;
+        };
+
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
+        REQUIRE(beforeCount == static_cast<int>(geometry->groups.size()));
+        REQUIRE(afterCount == static_cast<int>(geometry->groups.size()));
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer rejects renderer operations from render callbacks") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal callback guard smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+        auto* metalRenderer = dynamic_cast<MetalRenderer*>(renderer.get());
+        REQUIRE(metalRenderer != nullptr);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = PlaneGeometry::create(1.f, 1.f);
+        auto material = MeshBasicMaterial::create({{"color", Color::green}});
+        auto mesh = Mesh::create(geometry, material);
+        scene->add(mesh);
+
+        int beforeCount = 0;
+        int afterCount = 0;
+
+        mesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            beforeCount++;
+            REQUIRE_THROWS_AS(metalRenderer->currentCommandBuffer(), std::runtime_error);
+            REQUIRE_THROWS_AS(metalRenderer->setSize({64, 64}), std::runtime_error);
+            REQUIRE_THROWS_AS(metalRenderer->endFrame(), std::runtime_error);
+            REQUIRE_THROWS_AS(renderer->render(*scene, *camera), std::runtime_error);
+        };
+        mesh->onAfterRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            afterCount++;
+            REQUIRE_THROWS_AS(metalRenderer->currentCommandBuffer(), std::runtime_error);
+            REQUIRE_THROWS_AS(metalRenderer->setSize({64, 64}), std::runtime_error);
+            REQUIRE_THROWS_AS(metalRenderer->endFrame(), std::runtime_error);
+            REQUIRE_THROWS_AS(renderer->render(*scene, *camera), std::runtime_error);
+        };
+
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+        REQUIRE(beforeCount == 1);
+        REQUIRE(afterCount == 1);
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer propagates recursive render errors from onAfterRender callbacks") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal after callback recursion smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = PlaneGeometry::create(1.f, 1.f);
+        auto material = MeshBasicMaterial::create({{"color", Color::blue}});
+        auto mesh = Mesh::create(geometry, material);
+        scene->add(mesh);
+
+        mesh->onAfterRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            renderer->render(*scene, *camera);
+        };
+
+        try {
+            renderer->render(*scene, *camera);
+            FAIL("Expected recursive render guard to throw");
+        } catch (const std::runtime_error& e) {
+            REQUIRE(std::string{e.what()}.find("Recursive render calls") != std::string::npos);
+        }
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer propagates onAfterRender callback exceptions") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal after callback exception smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = PlaneGeometry::create(1.f, 1.f);
+        auto material = MeshBasicMaterial::create({{"color", Color::white}});
+        auto mesh = Mesh::create(geometry, material);
+        scene->add(mesh);
+
+        mesh->onAfterRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            throw std::runtime_error("after callback error");
+        };
+
+        try {
+            renderer->render(*scene, *camera);
+            FAIL("Expected onAfterRender exception to propagate");
+        } catch (const std::runtime_error& e) {
+            REQUIRE(std::string{e.what()} == "after callback error");
+        }
+
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal renderer ends active encoder when callback exceptions escape") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal callback exception recovery smoke")
+                                  .size(64, 64)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        auto renderer = Renderer::create(canvas, Backend::Metal);
+
+        auto scene = Scene::create();
+        auto camera = OrthographicCamera::create(-1.f, 1.f, 1.f, -1.f, 0.1f, 10.f);
+        camera->position.z = 2.f;
+
+        auto geometry = PlaneGeometry::create(1.f, 1.f);
+        auto material = MeshBasicMaterial::create({{"color", Color::yellow}});
+        auto mesh = Mesh::create(geometry, material);
+        scene->add(mesh);
+
+        mesh->onBeforeRender = [&](void*, Object3D*, Camera*, BufferGeometry*, Material*, std::optional<GeometryGroup>) {
+            throw std::runtime_error("before callback error");
+        };
+
+        try {
+            renderer->render(*scene, *camera);
+            FAIL("Expected onBeforeRender exception to propagate");
+        } catch (const std::runtime_error& e) {
+            REQUIRE(std::string{e.what()} == "before callback error");
+        }
+
+        mesh->onBeforeRender = std::nullopt;
+        REQUIRE_NOTHROW(renderer->render(*scene, *camera));
+
         canvas.close();
     }
 }

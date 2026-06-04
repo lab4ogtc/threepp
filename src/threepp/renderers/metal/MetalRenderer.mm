@@ -10,6 +10,7 @@
 #include <cmath>
 #include <exception>
 #include <iostream>
+#include <stdexcept>
 
 using namespace threepp;
 
@@ -147,6 +148,69 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
                 break;
         }
     }
+
+    constexpr const char* recursiveRenderCallbackMessage = "MetalRenderer: Recursive render calls inside onBeforeRender or onAfterRender callbacks are not supported.";
+    constexpr const char* rendererCallbackOperationMessage = "MetalRenderer: Renderer command buffer operations inside onBeforeRender or onAfterRender callbacks are not supported.";
+
+    thread_local bool inRendererCallback = false;
+
+    void throwIfRendererCallbackOperation(const char* message) {
+        if (inRendererCallback) {
+            throw std::runtime_error(message);
+        }
+    }
+
+    class RenderCallbackScope {
+
+    public:
+        RenderCallbackScope()
+            : previous_(inRendererCallback) {
+            inRendererCallback = true;
+        }
+
+        ~RenderCallbackScope() {
+            inRendererCallback = previous_;
+        }
+
+    private:
+        bool previous_;
+    };
+
+    void invokeRenderCallback(const RenderCallback& callback, MetalRenderer& renderer, Scene& scene, Camera& camera, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
+        RenderCallbackScope scope;
+        callback(static_cast<Renderer*>(&renderer), &scene, &camera, geometry, material, group);
+    }
+
+    void invokeOnBeforeRender(Object3D& obj, MetalRenderer& renderer, Scene& scene, Camera& camera, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
+        if (obj.onBeforeRender) {
+            invokeRenderCallback(obj.onBeforeRender.value(), renderer, scene, camera, geometry, material, group);
+        }
+    }
+
+    void invokeOnAfterRender(Object3D& obj, MetalRenderer& renderer, Scene& scene, Camera& camera, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
+        if (obj.onAfterRender) {
+            invokeRenderCallback(obj.onAfterRender.value(), renderer, scene, camera, geometry, material, group);
+        }
+    }
+
+    struct RenderCommandEncoderScope {
+        id<MTLRenderCommandEncoder> encoder = nil;
+        bool ended = false;
+
+        explicit RenderCommandEncoderScope(id<MTLRenderCommandEncoder> renderEncoder)
+            : encoder(renderEncoder) {}
+
+        ~RenderCommandEncoderScope() {
+            end();
+        }
+
+        void end() {
+            if (encoder && !ended) {
+                [encoder endEncoding];
+                ended = true;
+            }
+        }
+    };
 
 }// namespace
 
@@ -1081,6 +1145,7 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
 }
 
 void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
+    throwIfRendererCallbackOperation(recursiveRenderCallbackMessage);
     if (currentCommandBuffer) {
         const auto now = std::chrono::steady_clock::now();
         const auto hasPreviousRender = lastRenderTime.time_since_epoch().count() != 0;
@@ -1179,30 +1244,36 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     passDesc.depthAttachment.clearDepth = 1.0;
     passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
-    id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
-    resetDepthBiasCache();
-    [encoder setDepthStencilState:depthStencilState];
-    if (renderTarget) {
-        const MTLViewport targetViewport{
-                renderTarget->viewport.x,
-                renderTarget->viewport.y,
-                renderTarget->viewport.z,
-                renderTarget->viewport.w,
-                0.0,
-                1.0};
-        [encoder setViewport:targetViewport];
-        if (renderTarget->scissorTest) {
-            const auto x = clampToSize(renderTarget->scissor.x, activeRenderTargetResources->width);
-            const auto y = clampToSize(renderTarget->scissor.y, activeRenderTargetResources->height);
-            const auto maxX = clampToSize(renderTarget->scissor.x + renderTarget->scissor.z, activeRenderTargetResources->width);
-            const auto maxY = clampToSize(renderTarget->scissor.y + renderTarget->scissor.w, activeRenderTargetResources->height);
-            const MTLScissorRect rect{x, y, maxX > x ? maxX - x : 0, maxY > y ? maxY - y : 0};
-            [encoder setScissorRect:rect];
+    RenderCommandEncoderScope encoderScope{[currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc]};
+    id<MTLRenderCommandEncoder> encoder = encoderScope.encoder;
+
+    auto configureActiveEncoder = [&] {
+        resetDepthBiasCache();
+        [encoder setDepthStencilState:depthStencilState];
+        if (renderTarget) {
+            const MTLViewport targetViewport{
+                    renderTarget->viewport.x,
+                    renderTarget->viewport.y,
+                    renderTarget->viewport.z,
+                    renderTarget->viewport.w,
+                    0.0,
+                    1.0};
+            [encoder setViewport:targetViewport];
+            if (renderTarget->scissorTest && activeRenderTargetResources) {
+                const auto x = clampToSize(renderTarget->scissor.x, activeRenderTargetResources->width);
+                const auto y = clampToSize(renderTarget->scissor.y, activeRenderTargetResources->height);
+                const auto maxX = clampToSize(renderTarget->scissor.x + renderTarget->scissor.z, activeRenderTargetResources->width);
+                const auto maxY = clampToSize(renderTarget->scissor.y + renderTarget->scissor.w, activeRenderTargetResources->height);
+                const MTLScissorRect rect{x, y, maxX > x ? maxX - x : 0, maxY > y ? maxY - y : 0};
+                [encoder setScissorRect:rect];
+            }
+        } else {
+            applyViewport(encoder);
+            applyScissor(encoder);
         }
-    } else {
-        applyViewport(encoder);
-        applyScissor(encoder);
-    }
+    };
+
+    configureActiveEncoder();
 
     if (shouldClear && !canUseMetalClear) {
         const MTLViewport clearViewport{
@@ -1234,83 +1305,114 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         }
     }
 
+    Matrix4 projScreenMatrix;
+    projScreenMatrix.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    Frustum frustum;
+    frustum.setFromProjectionMatrix(projScreenMatrix);
     std::vector<Object3D*> collectedRenderables;
-    collectRenderables(scene, collectedRenderables);
+    collectRenderables(scene, camera, frustum, collectedRenderables);
     metal::MetalRenderList renderList;
     buildRenderList(collectedRenderables, camera, renderList);
     bindPassLightResources(encoder, lightUniforms, shadowResources);
 
+    auto invokeBeforeRenderCallback = [&](Object3D& obj, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
+        if (!obj.onBeforeRender) return;
+
+        invokeOnBeforeRender(obj, renderer, scene, camera, geometry, material, group);
+    };
+
+    auto invokeAfterRenderCallback = [&](Object3D& obj, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
+        if (!obj.onAfterRender) return;
+
+        invokeOnAfterRender(obj, renderer, scene, camera, geometry, material, group);
+    };
+
     auto renderItems = [&](const std::vector<metal::MetalRenderItem>& items) {
+        Material* overrideMaterial = scene.overrideMaterial ? scene.overrideMaterial.get() : nullptr;
+        const bool hasOverrideMaterial = overrideMaterial != nullptr;
         for (const auto& item : items) {
             auto* obj = item.object;
-            auto* material = item.material;
-            if (!obj || !material || !material->visible) continue;
+            auto* geometry = item.geometry;
+            auto* material = overrideMaterial ? overrideMaterial : item.material;
+            if (!obj || !geometry || !material || !material->visible) continue;
 
-            if (auto* sky = dynamic_cast<Sky*>(obj)) {
-                renderSky(encoder, *sky, camera, colorPixelFormat);
+            invokeBeforeRenderCallback(*obj, geometry, material, item.group);
+
+            if (auto* sky = hasOverrideMaterial ? nullptr : dynamic_cast<Sky*>(obj)) {
+                renderSky(encoder, *sky, *geometry, *material, camera, colorPixelFormat);
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
 
-            if (auto* water = dynamic_cast<Water*>(obj)) {
-                renderWater(encoder, scene, *water, camera, colorPixelFormat);
+            if (auto* water = hasOverrideMaterial ? nullptr : dynamic_cast<Water*>(obj)) {
+                renderWater(encoder, scene, *water, *geometry, *material, camera, colorPixelFormat);
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
 
-            if (auto* reflector = dynamic_cast<Reflector*>(obj)) {
-                renderReflector(encoder, scene, *reflector, camera, colorPixelFormat);
+            if (auto* reflector = hasOverrideMaterial ? nullptr : dynamic_cast<Reflector*>(obj)) {
+                renderReflector(encoder, scene, *reflector, *geometry, *material, camera, colorPixelFormat);
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
 
-            if (auto* sprite = dynamic_cast<Sprite*>(obj)) {
-                renderSprite(encoder, scene, *sprite, camera, colorPixelFormat);
+            if (auto* sprite = hasOverrideMaterial ? nullptr : dynamic_cast<Sprite*>(obj)) {
+                renderSprite(encoder, scene, *sprite, *geometry, *material, camera, colorPixelFormat);
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
 
             if (auto* points = dynamic_cast<Points*>(obj)) {
-                renderPoints(encoder, scene, *points, *material, camera, colorPixelFormat, item.group);
+                renderPoints(encoder, scene, *points, *geometry, *material, camera, colorPixelFormat, item.group);
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
 
             if (auto* line = dynamic_cast<Line*>(obj)) {
-                renderLine(encoder, *line, *material, camera, colorPixelFormat, item.group);
+                renderLine(encoder, *line, *geometry, *material, camera, colorPixelFormat, item.group);
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
 
             if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
                 if (material->is<RawShaderMaterial>()) {
-                    renderRawShader(encoder, *mesh, *material, camera, colorPixelFormat, item.group);
+                    renderRawShader(encoder, *mesh, *geometry, *material, camera, colorPixelFormat, item.group);
+                    invokeAfterRenderCallback(*obj, geometry, material, item.group);
                     continue;
                 }
                 if (auto* shaderMaterial = material->as<ShaderMaterial>()) {
                     if (shaderMaterial->uniforms.count("tDepth") > 0 &&
                         shaderMaterial->uniforms.count("cameraNear") > 0 &&
                         shaderMaterial->uniforms.count("cameraFar") > 0) {
-                        renderDepthTexture(encoder, *mesh, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        invokeAfterRenderCallback(*obj, geometry, material, item.group);
                         continue;
                     }
                 }
             }
 
-            BufferGeometry* geometry = nullptr;
             bool isWireframe = false;
             if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
-                geometry = mesh->geometry().get();
-
                 if (auto* wf = dynamic_cast<MaterialWithWireframe*>(material)) {
                     isWireframe = wf->wireframe;
                 }
             }
 
-            if (!geometry || !material || !material->visible) continue;
             trackGeometry(*geometry);
 
             auto* posAttr = getFloatAttribute(*geometry, "position");
-            if (!posAttr) continue;
+            if (!posAttr) {
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
+                continue;
+            }
             auto* normAttr = getFloatAttribute(*geometry, "normal");
             auto* uvAttr = getFloatAttribute(*geometry, "uv");
             auto* colorAttr = getFloatAttribute(*geometry, "color");
             auto* instancedMesh = dynamic_cast<InstancedMesh*>(obj);
-            if (instancedMesh && instancedMesh->count() == 0) continue;
+            if (instancedMesh && instancedMesh->count() == 0) {
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
+                continue;
+            }
             auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
 
             const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow);
@@ -1329,6 +1431,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             const bool useMorphNormals = wantsMorphNormals(*material, *geometry, useNormal, useMorphTargets);
             if (useInstancing && useSkinning) {
                 std::cerr << "MetalRenderer: skipping unsupported instanced skinned renderable " << obj->id << "\n";
+                invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }
             if (useMorphTargets && morphTargets) {
@@ -1425,13 +1528,14 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             }
 
             drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount, item.group);
+            invokeAfterRenderCallback(*obj, geometry, material, item.group);
         }
     };
 
     renderItems(renderList.opaque);
     renderItems(renderList.transparent);
 
-    [encoder endEncoding];
+    encoderScope.end();
     if (activeRenderTargetResources) {
         generateRenderTargetMipmapsIfNeeded(*renderTarget, activeRenderTargetResources->colorTexture);
     }
@@ -1460,10 +1564,12 @@ void MetalRenderer::render(Scene& scene, Camera& camera) {
 }
 
 void MetalRenderer::endFrame() {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->commitPendingFrame();
 }
 
 void MetalRenderer::setSize(std::pair<int, int> size) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->setSize(size);
 }
 
@@ -1476,12 +1582,14 @@ void* MetalRenderer::device() const {
 }
 
 void* MetalRenderer::currentCommandBuffer() const {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->ensureFrameStarted();
     pimpl_->currentCommandBufferExternallyAccessed = true;
     return (__bridge void*) pimpl_->currentCommandBuffer;
 }
 
 void* MetalRenderer::currentDrawableTexture() const {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->ensureFrameStarted();
     pimpl_->currentCommandBufferExternallyAccessed = true;
     if (!pimpl_->ensureDrawable()) return nullptr;
@@ -1493,10 +1601,12 @@ void MetalRenderer::setClearColor(const Color& color, float alpha) {
 }
 
 void MetalRenderer::clear(bool color, bool depth, bool stencil) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->clear(color, depth, stencil);
 }
 
 void MetalRenderer::clearDepth() {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->clear(false, true, false);
 }
 
@@ -1529,6 +1639,7 @@ void MetalRenderer::setScissorTest(bool boolean) {
 }
 
 void MetalRenderer::setRenderTarget(RenderTarget* renderTarget) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->renderTarget = renderTarget;
 }
 
@@ -1541,6 +1652,7 @@ void MetalRenderer::addPreRenderJob(const RenderJob& job) {
 }
 
 void MetalRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->copyFramebufferToTexture(position, texture, level);
 }
 
@@ -1551,6 +1663,7 @@ std::optional<void*> MetalRenderer::getMetalTexture(Texture& texture) const {
 }
 
 std::vector<unsigned char> MetalRenderer::readRGBPixels() {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     return pimpl_->readRGBPixels();
 }
 

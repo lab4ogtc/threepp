@@ -277,14 +277,14 @@ TEST_CASE("Metal depth texture ShaderMaterial path is wired as a dedicated built
     REQUIRE(intercept != std::string::npos);
     REQUIRE(rendererSource.find("shaderMaterial->uniforms.count(\"cameraNear\") > 0", intercept) != std::string::npos);
     REQUIRE(rendererSource.find("shaderMaterial->uniforms.count(\"cameraFar\") > 0", intercept) != std::string::npos);
-    REQUIRE(rendererSource.find("renderDepthTexture(encoder, *mesh, *shaderMaterial", intercept) != std::string::npos);
+    REQUIRE(rendererSource.find("renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial", intercept) != std::string::npos);
 
     const auto objectsSource = readProjectFile("src/threepp/renderers/metal/MetalObjectsRenderer.mm");
     const auto method = objectsSource.find("void MetalRenderer::Impl::renderDepthTexture");
     REQUIRE(method != std::string::npos);
     REQUIRE(objectsSource.find("vertexLayoutPosition | vertexLayoutUv", method) != std::string::npos);
     REQUIRE(objectsSource.find("pipelineCache->getOrCreateDepthStencilState(false, false", method) != std::string::npos);
-    REQUIRE(objectsSource.find("bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, uvAttr", method) != std::string::npos);
+    REQUIRE(objectsSource.find("bindDrawAttributes(encoder, geometry, *posAttr, nullptr, uvAttr", method) != std::string::npos);
     REQUIRE(objectsSource.find("uniformTexture(depthMaterial->uniforms, \"tDiffuse\")", method) != std::string::npos);
     REQUIRE(objectsSource.find("uniformTexture(depthMaterial->uniforms, \"tDepth\")", method) != std::string::npos);
     REQUIRE(objectsSource.find("whiteDepthTexture", method) != std::string::npos);
@@ -643,6 +643,7 @@ TEST_CASE("Water shader samples the GL reflection target in native orientation")
 
     REQUIRE(material->fragmentShader.find("texture2D( mirrorSampler, mirrorCoord.xy / mirrorCoord.w + distortion )") != std::string::npos);
     REQUIRE(material->fragmentShader.find("mirrorUv.y = 1.0 - mirrorUv.y;") == std::string::npos);
+    REQUIRE(std::string_view{metal::water_fragment}.find("mirrorUv.y = 1.0 - mirrorUv.y") != std::string_view::npos);
 }
 
 TEST_CASE("Reflector registers a pre-render job without renderer-specific callbacks") {
@@ -661,6 +662,29 @@ TEST_CASE("Reflector registers a pre-render job without renderer-specific callba
     REQUIRE(job->initiator == reflector.get());
     REQUIRE(job->camera == &reflector->reflectionCamera());
     REQUIRE(job->renderTarget == reflector->reflectionRenderTarget());
+}
+
+TEST_CASE("Metal reflector shader samples the GL reflection target in native orientation") {
+
+    REQUIRE(std::string_view{metal::reflector_fragment}.find("uv.y = 1.0 - uv.y") != std::string_view::npos);
+}
+
+TEST_CASE("Metal water example matches GL tone mapping") {
+
+    const auto glSource = readProjectFile("examples/objects/water.cpp");
+    const auto metalSource = readProjectFile("examples/objects/water_metal.cpp");
+
+    REQUIRE(glSource.find("renderer.toneMapping = ToneMapping::ACESFilmic") != std::string::npos);
+    REQUIRE(metalSource.find("renderer->toneMapping = ToneMapping::ACESFilmic") != std::string::npos);
+}
+
+TEST_CASE("Metal reflector example matches GL antialiasing") {
+
+    const auto glSource = readProjectFile("examples/textures/texture2d.cpp");
+    const auto metalSource = readProjectFile("examples/textures/texture2d_metal.cpp");
+
+    REQUIRE(glSource.find("{{\"aa\", 8}}") != std::string::npos);
+    REQUIRE(metalSource.find("{{\"aa\", 8}, {\"clientAPI\", \"Metal\"}}") != std::string::npos);
 }
 
 TEST_CASE("Metal projection maps OpenGL depth clip range to Metal depth clip range") {

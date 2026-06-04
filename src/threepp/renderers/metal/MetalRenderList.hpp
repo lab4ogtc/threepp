@@ -14,6 +14,7 @@ namespace threepp::metal {
     struct MetalRenderItem {
 
         Object3D* object = nullptr;
+        BufferGeometry* geometry = nullptr;
         Material* material = nullptr;
         std::optional<GeometryGroup> group;
         unsigned int renderOrder = 0;
@@ -31,13 +32,17 @@ namespace threepp::metal {
             transparent.clear();
         }
 
-        void push(Object3D& object, Material& material, float z, std::optional<GeometryGroup> group = std::nullopt) {
-            MetalRenderItem item{&object, &material, group, object.renderOrder, z};
+        void push(Object3D& object, BufferGeometry* geometry, Material& material, float z, std::optional<GeometryGroup> group = std::nullopt) {
+            MetalRenderItem item{&object, geometry, &material, group, object.renderOrder, z};
             if (material.transparent) {
                 transparent.emplace_back(item);
             } else {
                 opaque.emplace_back(item);
             }
+        }
+
+        void push(Object3D& object, Material& material, float z, std::optional<GeometryGroup> group = std::nullopt) {
+            push(object, object.geometry().get(), material, z, group);
         }
 
         void sort() {
