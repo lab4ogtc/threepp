@@ -15,6 +15,7 @@
 #include "threepp/textures/Image.hpp"
 
 #include "threepp/math/Vector4.hpp"
+#include "threepp/math/Plane.hpp"
 #include "threepp/renderers/metal/MetalBufferManager.hpp"
 #include "threepp/renderers/metal/MetalCameraUtils.hpp"
 #include "threepp/renderers/metal/MetalPipelineCache.hpp"
@@ -30,6 +31,7 @@
 #include <functional>
 #include <string>
 #include <type_traits>
+#include <vector>
 
 using namespace threepp;
 
@@ -67,6 +69,14 @@ namespace {
     concept HasBaseOutputEncoding = requires(T& renderer) {
         renderer.outputEncoding = Encoding::sRGB;
         { renderer.outputEncoding } -> std::same_as<Encoding&>;
+    };
+
+    template<class T>
+    concept HasBaseClippingState = requires(T& renderer) {
+        renderer.clippingPlanes.emplace_back(Vector3(1, 0, 0), 0.f);
+        renderer.localClippingEnabled = true;
+        { renderer.clippingPlanes } -> std::same_as<std::vector<Plane>&>;
+        { renderer.localClippingEnabled } -> std::same_as<bool&>;
     };
 
     template<class T>
@@ -148,6 +158,12 @@ TEST_CASE("Renderer base exposes backend-independent output encoding") {
     STATIC_REQUIRE(HasBaseOutputEncoding<MetalRenderer>);
 }
 
+TEST_CASE("Renderer base exposes backend-independent clipping state") {
+
+    STATIC_REQUIRE(HasBaseClippingState<Renderer>);
+    STATIC_REQUIRE(HasBaseClippingState<MetalRenderer>);
+}
+
 TEST_CASE("Image exposes const pixel data for read-only texture upload") {
 
     Image image{{std::vector<unsigned char>{1, 2, 3, 4}}, 1, 1};
@@ -203,6 +219,23 @@ TEST_CASE("Metal P2 shader keys include skinning and lighting variants") {
     REQUIRE(metal::ShaderProgramKeyHash{}(skinned) != metal::ShaderProgramKeyHash{}(lit));
 }
 
+TEST_CASE("Metal shader keys include clipping variants") {
+
+    metal::ShaderProgramKey unclipped{};
+    metal::ShaderProgramKey clipped{};
+    clipped.useClipping = true;
+
+    REQUIRE_FALSE(unclipped == clipped);
+    REQUIRE(metal::ShaderProgramKeyHash{}(unclipped) != metal::ShaderProgramKeyHash{}(clipped));
+
+    metal::DepthShaderKey unclippedDepth{};
+    metal::DepthShaderKey clippedDepth{};
+    clippedDepth.useClipping = true;
+
+    REQUIRE_FALSE(unclippedDepth == clippedDepth);
+    REQUIRE(metal::DepthShaderKeyHash{}(unclippedDepth) != metal::DepthShaderKeyHash{}(clippedDepth));
+}
+
 TEST_CASE("Metal sprite shader keys cover all sprite feature variants") {
 
     metal::SpriteShaderKey alphaMap{};
@@ -235,8 +268,10 @@ TEST_CASE("Metal P4 shader manager exposes dedicated built-in material entry poi
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointsFragmentFunction(false))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateRawShaderVertexFunction())>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateRawShaderFragmentFunction())>);
-    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthVertexFunction(false))>);
-    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthFragmentFunction(false))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthVertexFunction(std::declval<const metal::DepthShaderKey&>()))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthFragmentFunction(std::declval<const metal::DepthShaderKey&>()))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthVertexFunction(std::declval<const metal::DepthShaderKey&>()))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreatePointDepthFragmentFunction(std::declval<const metal::DepthShaderKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSkyVertexFunction())>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateSkyFragmentFunction())>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateWaterVertexFunction())>);
@@ -428,7 +463,7 @@ TEST_CASE("Metal P1 managers keep Objective-C types hidden behind void pointers"
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalBufferManager&>().getTransientBuffer(std::size_t{}, nullptr))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateVertexFunction(std::declval<const metal::ShaderProgramKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateFragmentFunction(std::declval<const metal::ShaderProgramKey&>()))>);
-    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthVertexFunction(true))>);
+    STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalShaderManager&>().getOrCreateDepthVertexFunction(std::declval<const metal::DepthShaderKey&>()))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalPipelineCache&>().getOrCreateDepthOnlyPipelineState(nullptr, std::uint8_t{0b0001}))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalPipelineCache&>().getOrCreateDepthOnlyPipelineState(nullptr, nullptr, std::uint8_t{0b0001}))>);
     STATIC_REQUIRE(std::is_same_v<void*, decltype(std::declval<metal::MetalTextureManager&>().getOrCreateTexture(std::declval<Texture&>()))>);

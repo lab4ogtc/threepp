@@ -319,9 +319,9 @@ namespace threepp {
 
         bool shouldUpdateShadow(LightShadow& shadow) const;
 
-        void renderDepthObject(id<MTLRenderCommandEncoder> encoder, Object3D& object, Camera& shadowCamera, const Frustum& frustum);
+        void renderDepthObject(id<MTLRenderCommandEncoder> encoder, Scene& scene, Object3D& object, Camera& shadowCamera, const Frustum& frustum);
 
-        void renderPointDepthObject(id<MTLRenderCommandEncoder> encoder, Object3D& object, Camera& shadowCamera, const Frustum& frustum, const Vector3& lightPosition, float nearPlane, float farPlane);
+        void renderPointDepthObject(id<MTLRenderCommandEncoder> encoder, Scene& scene, Object3D& object, Camera& shadowCamera, const Frustum& frustum, const Vector3& lightPosition, float nearPlane, float farPlane);
 
         void renderShadowForLight(Scene& scene, Light& light, LightShadow& shadow, id<MTLTexture> shadowTexture);
 

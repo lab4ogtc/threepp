@@ -111,6 +111,9 @@ struct VertexOutput {
     float4 position [[position]];
     float3 worldPosition;
     float fogDepth;
+#if USE_CLIPPING
+    float3 viewPosition;
+#endif
 #if USE_NORMAL
     float3 normal;
 #endif
@@ -172,6 +175,9 @@ vertex VertexOutput basic_vertex(
     out.worldPosition = worldPosition.xyz;
     float4 modelViewPosition = transforms.modelViewMatrix * localPosition;
     out.fogDepth = -modelViewPosition.z;
+#if USE_CLIPPING
+    out.viewPosition = -(transforms.modelViewMatrix * localPosition).xyz;
+#endif
 #if USE_INSTANCING
     out.position = transforms.mvp * worldPosition;
 #else
@@ -228,6 +234,11 @@ struct ShadingParams {
     float4 fogColor;
     float4 fogParams;
     uint4 textureFlags2;
+    float4 clippingPlanes[8];
+    uint numClippingPlanes;
+    uint numUnionClippingPlanes;
+    uint clipIntersection;
+    uint pad;
 };
 
 struct DirectionalLightUniform {
@@ -363,6 +374,31 @@ float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
 
 float3 applyFog(float3 color, float fogDepth, constant ShadingParams& params) {
     return applyFog(color, fogDepth, params.fogColor, params.fogParams);
+}
+
+bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
+    uint totalPlanes = min(params.numClippingPlanes, uint(8));
+    uint unionPlanes = min(params.numUnionClippingPlanes, totalPlanes);
+
+    for (uint i = 0; i < unionPlanes; ++i) {
+        float4 plane = params.clippingPlanes[i];
+        if (dot(viewPosition, plane.xyz) > plane.w) {
+            return true;
+        }
+    }
+
+    if (params.clipIntersection != 0 && unionPlanes < totalPlanes) {
+        bool clipped = true;
+        for (uint i = unionPlanes; i < totalPlanes; ++i) {
+            float4 plane = params.clippingPlanes[i];
+            clipped = clipped && (dot(viewPosition, plane.xyz) > plane.w);
+        }
+        if (clipped) {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 float3 perturbNormalFromMap(float3 n, float3 tangent, float3 bitangent, float2 uv, texture2d<float> normalMap, sampler mapSampler) {
@@ -581,6 +617,12 @@ fragment float4 basic_fragment(
 #endif
 )
 {
+#if USE_CLIPPING
+    if (applyClipping(in.viewPosition, params)) {
+        discard_fragment();
+    }
+#endif
+
     float4 baseColor = params.baseColor;
 #if USE_VERTEX_COLORS || USE_INSTANCE_COLOR
     baseColor *= in.color;
@@ -824,11 +866,23 @@ struct DepthVertexInput {
 
 struct DepthTransformUniforms {
     float4x4 shadowMatrix;
+    float4x4 modelViewMatrix;
     float4x4 bindMatrix;
     float4x4 bindMatrixInverse;
 };
 
+#if USE_CLIPPING
+struct DepthVertexOutput {
+    float4 position [[position]];
+    float3 viewPosition;
+};
+#endif
+
+#if USE_CLIPPING
+vertex DepthVertexOutput depth_vertex(
+#else
 vertex float4 depth_vertex(
+#endif
     DepthVertexInput in [[stage_in]],
     constant DepthTransformUniforms& transforms [[buffer(4)]]
 #if USE_SKINNING
@@ -853,7 +907,75 @@ vertex float4 depth_vertex(
 #if USE_INSTANCING
     localPosition = instanceMatrices[instanceId] * localPosition;
 #endif
+#if USE_CLIPPING
+    DepthVertexOutput out;
+    out.position = transforms.shadowMatrix * localPosition;
+    out.viewPosition = -(transforms.modelViewMatrix * localPosition).xyz;
+    return out;
+#else
     return transforms.shadowMatrix * localPosition;
+#endif
+}
+)metal";
+
+    constexpr auto depth_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ShadingParams {
+    float4 baseColor;
+    float4 emissiveColor;
+    float4 pbrParams;
+    uint4 textureFlags0;
+    uint4 textureFlags1;
+    float4 cameraPosition;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    uint materialType;
+    float4 specularColor;
+    float4 fogColor;
+    float4 fogParams;
+    uint4 textureFlags2;
+    float4 clippingPlanes[8];
+    uint numClippingPlanes;
+    uint numUnionClippingPlanes;
+    uint clipIntersection;
+    uint pad;
+};
+
+bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
+    uint totalPlanes = min(params.numClippingPlanes, uint(8));
+    uint unionPlanes = min(params.numUnionClippingPlanes, totalPlanes);
+
+    for (uint i = 0; i < unionPlanes; ++i) {
+        float4 plane = params.clippingPlanes[i];
+        if (dot(viewPosition, plane.xyz) > plane.w) {
+            return true;
+        }
+    }
+
+    if (params.clipIntersection != 0 && unionPlanes < totalPlanes) {
+        bool clipped = true;
+        for (uint i = unionPlanes; i < totalPlanes; ++i) {
+            float4 plane = params.clippingPlanes[i];
+            clipped = clipped && (dot(viewPosition, plane.xyz) > plane.w);
+        }
+        if (clipped) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fragment void depth_fragment(
+    DepthVertexOutput in [[stage_in]],
+    constant ShadingParams& params [[buffer(0)]]
+) {
+    if (applyClipping(in.viewPosition, params)) {
+        discard_fragment();
+    }
 }
 )metal";
 
@@ -872,6 +994,7 @@ struct PointDepthVertexInput {
 struct PointDepthTransformUniforms {
     float4x4 shadowMatrix;
     float4x4 modelMatrix;
+    float4x4 modelViewMatrix;
     float4x4 bindMatrix;
     float4x4 bindMatrixInverse;
     float4 lightPosition;
@@ -881,6 +1004,9 @@ struct PointDepthTransformUniforms {
 struct PointDepthVertexOutput {
     float4 position [[position]];
     float3 worldPosition;
+#if USE_CLIPPING
+    float3 viewPosition;
+#endif
 };
 
 vertex PointDepthVertexOutput point_depth_vertex(
@@ -910,12 +1036,62 @@ vertex PointDepthVertexOutput point_depth_vertex(
     localPosition = instanceMatrices[instanceId] * localPosition;
 #endif
     out.worldPosition = (transforms.modelMatrix * localPosition).xyz;
+#if USE_CLIPPING
+    out.viewPosition = -(transforms.modelViewMatrix * localPosition).xyz;
+#endif
     out.position = transforms.shadowMatrix * localPosition;
     return out;
 }
 )metal";
 
     constexpr auto point_depth_fragment = R"metal(
+struct ShadingParams {
+    float4 baseColor;
+    float4 emissiveColor;
+    float4 pbrParams;
+    uint4 textureFlags0;
+    uint4 textureFlags1;
+    float4 cameraPosition;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    uint materialType;
+    float4 specularColor;
+    float4 fogColor;
+    float4 fogParams;
+    uint4 textureFlags2;
+    float4 clippingPlanes[8];
+    uint numClippingPlanes;
+    uint numUnionClippingPlanes;
+    uint clipIntersection;
+    uint pad;
+};
+
+bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
+    uint totalPlanes = min(params.numClippingPlanes, uint(8));
+    uint unionPlanes = min(params.numUnionClippingPlanes, totalPlanes);
+
+    for (uint i = 0; i < unionPlanes; ++i) {
+        float4 plane = params.clippingPlanes[i];
+        if (dot(viewPosition, plane.xyz) > plane.w) {
+            return true;
+        }
+    }
+
+    if (params.clipIntersection != 0 && unionPlanes < totalPlanes) {
+        bool clipped = true;
+        for (uint i = unionPlanes; i < totalPlanes; ++i) {
+            float4 plane = params.clippingPlanes[i];
+            clipped = clipped && (dot(viewPosition, plane.xyz) > plane.w);
+        }
+        if (clipped) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 struct PointDepthFragmentOutput {
     float depth [[depth(any)]];
 };
@@ -923,8 +1099,16 @@ struct PointDepthFragmentOutput {
 fragment PointDepthFragmentOutput point_depth_fragment(
     PointDepthVertexOutput in [[stage_in]],
     constant PointDepthTransformUniforms& transforms [[buffer(4)]]
+#if USE_CLIPPING
+    , constant ShadingParams& params [[buffer(0)]]
+#endif
 )
 {
+#if USE_CLIPPING
+    if (applyClipping(in.viewPosition, params)) {
+        discard_fragment();
+    }
+#endif
     float nearPlane = transforms.params.x;
     float farPlane = max(transforms.params.y, nearPlane + 0.0001);
     PointDepthFragmentOutput out;

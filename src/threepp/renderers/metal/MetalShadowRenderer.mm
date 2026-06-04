@@ -33,7 +33,7 @@ bool MetalRenderer::Impl::shouldUpdateShadow(LightShadow& shadow) const {
     return shadowMapState.autoUpdate || shadowMapState.needsUpdate || shadow.autoUpdate || shadow.needsUpdate;
 }
 
-void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder, Object3D& object, Camera& shadowCamera, const Frustum& frustum) {
+void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder, Scene& scene, Object3D& object, Camera& shadowCamera, const Frustum& frustum) {
     if (!object.visible) return;
 
     if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
@@ -56,10 +56,6 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                         std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
                         if (useSkinning) vertexLayoutBitmask |= vertexLayoutSkinning;
 
-                        auto* vertexFunction = shaderManager->getOrCreateDepthVertexFunction(useSkinning, useInstancing);
-                        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, vertexLayoutBitmask);
-                        [encoder setRenderPipelineState:pso];
-
                         auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
                                 *posAttr,
                                 posAttr->count() * posAttr->itemSize() * sizeof(float),
@@ -78,6 +74,20 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                         const auto frontFaceCW = object.matrixWorld->determinant() < 0;
                         forEachMaterialGroup(*materials, *geometry, [&](Material& material, std::optional<GeometryGroup> group) {
                             if (!material.visible) return;
+
+                            ClippingExtractionOptions clippingOptions;
+                            clippingOptions.includeGlobal = false;
+                            clippingOptions.includeLocal = material.clipShadows;
+                            const auto shadingParams = extractShadingParams(renderer, scene, material, shadowCamera, false, clippingOptions);
+                            const bool useClipping = shadingParams.numClippingPlanes > 0u;
+                            const metal::DepthShaderKey shaderKey{useSkinning, useInstancing, useClipping};
+                            auto* vertexFunction = shaderManager->getOrCreateDepthVertexFunction(shaderKey);
+                            auto* fragmentFunction = shaderManager->getOrCreateDepthFragmentFunction(shaderKey);
+                            id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);
+                            [encoder setRenderPipelineState:pso];
+                            if (useClipping) {
+                                [encoder setFragmentBytes:&shadingParams length:sizeof(shadingParams) atIndex:0];
+                            }
 
                             const auto* wf = dynamic_cast<MaterialWithWireframe*>(&material);
                             const bool isWireframe = wf && wf->wireframe;
@@ -100,11 +110,11 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
     }
 
     for (const auto& child : object.children) {
-        renderDepthObject(encoder, *child, shadowCamera, frustum);
+        renderDepthObject(encoder, scene, *child, shadowCamera, frustum);
     }
 }
 
-void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> encoder, Object3D& object, Camera& shadowCamera, const Frustum& frustum, const Vector3& lightPosition, float nearPlane, float farPlane) {
+void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> encoder, Scene& scene, Object3D& object, Camera& shadowCamera, const Frustum& frustum, const Vector3& lightPosition, float nearPlane, float farPlane) {
     if (!object.visible) return;
 
     if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
@@ -127,11 +137,6 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                         std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
                         if (useSkinning) vertexLayoutBitmask |= vertexLayoutSkinning;
 
-                        auto* vertexFunction = shaderManager->getOrCreatePointDepthVertexFunction(useSkinning, useInstancing);
-                        auto* fragmentFunction = shaderManager->getOrCreatePointDepthFragmentFunction(useSkinning, useInstancing);
-                        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);
-                        [encoder setRenderPipelineState:pso];
-
                         auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
                                 *posAttr,
                                 posAttr->count() * posAttr->itemSize() * sizeof(float),
@@ -151,6 +156,20 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                         const auto frontFaceCW = object.matrixWorld->determinant() < 0;
                         forEachMaterialGroup(*materials, *geometry, [&](Material& material, std::optional<GeometryGroup> group) {
                             if (!material.visible) return;
+
+                            ClippingExtractionOptions clippingOptions;
+                            clippingOptions.includeGlobal = false;
+                            clippingOptions.includeLocal = material.clipShadows;
+                            const auto shadingParams = extractShadingParams(renderer, scene, material, shadowCamera, false, clippingOptions);
+                            const bool useClipping = shadingParams.numClippingPlanes > 0u;
+                            const metal::DepthShaderKey shaderKey{useSkinning, useInstancing, useClipping};
+                            auto* vertexFunction = shaderManager->getOrCreatePointDepthVertexFunction(shaderKey);
+                            auto* fragmentFunction = shaderManager->getOrCreatePointDepthFragmentFunction(shaderKey);
+                            id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);
+                            [encoder setRenderPipelineState:pso];
+                            if (useClipping) {
+                                [encoder setFragmentBytes:&shadingParams length:sizeof(shadingParams) atIndex:0];
+                            }
 
                             const auto* wf = dynamic_cast<MaterialWithWireframe*>(&material);
                             const bool isWireframe = wf && wf->wireframe;
@@ -173,7 +192,7 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
     }
 
     for (const auto& child : object.children) {
-        renderPointDepthObject(encoder, *child, shadowCamera, frustum, lightPosition, nearPlane, farPlane);
+        renderPointDepthObject(encoder, scene, *child, shadowCamera, frustum, lightPosition, nearPlane, farPlane);
     }
 }
 
@@ -191,7 +210,7 @@ void MetalRenderer::Impl::renderShadowForLight(Scene& scene, Light& light, Light
     id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
     resetDepthBiasCache();
     [encoder setDepthStencilState:depthStencilState];
-    renderDepthObject(encoder, scene, *shadow.camera, shadow.getFrustum());
+    renderDepthObject(encoder, scene, scene, *shadow.camera, shadow.getFrustum());
     [encoder endEncoding];
 
     shadow.needsUpdate = false;
@@ -234,7 +253,7 @@ void MetalRenderer::Impl::renderPointLightShadow(Scene& scene, PointLight& light
                 static_cast<NSUInteger>(std::ceil(metalViewport.height))};
         [encoder setScissorRect:metalScissor];
 
-        renderPointDepthObject(encoder, scene, *shadow.camera, shadow.getFrustum(), lightPosition, shadow.camera->nearPlane, shadow.camera->farPlane);
+        renderPointDepthObject(encoder, scene, scene, *shadow.camera, shadow.getFrustum(), lightPosition, shadow.camera->nearPlane, shadow.camera->farPlane);
     }
 
     [encoder endEncoding];

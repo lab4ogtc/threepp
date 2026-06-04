@@ -57,11 +57,6 @@ namespace threepp {
 
         bool sortObjects = true;
 
-        // user-defined clipping
-
-        std::vector<Plane> clippingPlanes;
-        bool localClippingEnabled = false;
-
         // physically based shading
 
         float gammaFactor = 2.0f;// for backwards compatibility

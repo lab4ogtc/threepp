@@ -77,6 +77,7 @@ namespace threepp {
     inline constexpr std::size_t maxSpotLights = 4;
     inline constexpr std::size_t maxHemisphereLights = 4;
     inline constexpr std::size_t maxShadowMapsPerLightType = 4;
+    inline constexpr std::size_t maxClippingPlanes = 8;
 
     inline constexpr std::uint8_t vertexLayoutPosition = 1u << 0u;
     inline constexpr std::uint8_t vertexLayoutNormal = 1u << 1u;
@@ -121,6 +122,7 @@ namespace threepp {
 
     struct alignas(16) DepthTransformUniforms {
         float shadowMatrix[16];
+        float modelViewMatrix[16];
         float bindMatrix[16];
         float bindMatrixInverse[16];
     };
@@ -128,6 +130,7 @@ namespace threepp {
     struct alignas(16) PointDepthTransformUniforms {
         float shadowMatrix[16];
         float modelMatrix[16];
+        float modelViewMatrix[16];
         float bindMatrix[16];
         float bindMatrixInverse[16];
         float lightPosition[4];
@@ -149,6 +152,11 @@ namespace threepp {
         float fogColor[4];
         float fogParams[4];
         std::uint32_t textureFlags2[4];
+        float clippingPlanes[maxClippingPlanes][4];
+        std::uint32_t numClippingPlanes;
+        std::uint32_t numUnionClippingPlanes;
+        std::uint32_t clipIntersection;
+        std::uint32_t pad;
     };
 
     struct alignas(16) SpriteUniforms {
@@ -445,6 +453,10 @@ namespace threepp {
         computeShadowMVP(shadowCamera, object, shadowMVP);
         copyMatrix(shadowMVP, out.shadowMatrix);
 
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(shadowCamera.matrixWorldInverse, *object.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
+
         if (const auto* skinnedMesh = dynamic_cast<const SkinnedMesh*>(&object)) {
             copyMatrix(skinnedMesh->bindMatrix, out.bindMatrix);
             copyMatrix(skinnedMesh->bindMatrixInverse, out.bindMatrixInverse);
@@ -459,6 +471,10 @@ namespace threepp {
         computeShadowMVP(shadowCamera, object, shadowMVP);
         copyMatrix(shadowMVP, out.shadowMatrix);
         copyMatrix(*object.matrixWorld, out.modelMatrix);
+
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(shadowCamera.matrixWorldInverse, *object.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
 
         if (const auto* skinnedMesh = dynamic_cast<const SkinnedMesh*>(&object)) {
             copyMatrix(skinnedMesh->bindMatrix, out.bindMatrix);
@@ -757,7 +773,39 @@ namespace threepp {
         }
     }
 
-    inline ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow) {
+    inline void appendClippingPlanes(const std::vector<Plane>& planes,
+                                     const Camera& camera,
+                                     ShadingParams& params,
+                                     std::uint32_t& count) {
+        if (planes.empty() || count >= maxClippingPlanes) return;
+
+        Matrix3 viewNormalMatrix;
+        viewNormalMatrix.getNormalMatrix(camera.matrixWorldInverse);
+        Plane projectedPlane;
+
+        for (const auto& plane : planes) {
+            if (count >= maxClippingPlanes) break;
+
+            projectedPlane.copy(plane).applyMatrix4(camera.matrixWorldInverse, viewNormalMatrix);
+            params.clippingPlanes[count][0] = projectedPlane.normal.x;
+            params.clippingPlanes[count][1] = projectedPlane.normal.y;
+            params.clippingPlanes[count][2] = projectedPlane.normal.z;
+            params.clippingPlanes[count][3] = projectedPlane.constant;
+            ++count;
+        }
+    }
+
+    struct ClippingExtractionOptions {
+        bool includeGlobal = true;
+        bool includeLocal = true;
+    };
+
+    inline bool hasActiveClipping(const Renderer& renderer, const Material& material, const ClippingExtractionOptions& options = {}) {
+        return (options.includeGlobal && !renderer.clippingPlanes.empty()) ||
+               (options.includeLocal && renderer.localClippingEnabled && !material.clippingPlanes.empty());
+    }
+
+    inline ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow, const ClippingExtractionOptions& clippingOptions = {}) {
         ShadingParams params{};
         params.baseColor[0] = 1.f;
         params.baseColor[1] = 1.f;
@@ -836,6 +884,22 @@ namespace threepp {
         params.cameraPosition[3] = 1.f;
         fillToneMappingUniforms(renderer, material, params);
         fillFogUniforms(scene, material, params);
+        std::uint32_t numClippingPlanes = 0;
+        if (clippingOptions.includeGlobal) {
+            appendClippingPlanes(renderer.clippingPlanes, camera, params, numClippingPlanes);
+        }
+        const auto numGlobalClippingPlanes = numClippingPlanes;
+
+        const bool useLocalClipping = clippingOptions.includeLocal && renderer.localClippingEnabled && !material.clippingPlanes.empty();
+        if (useLocalClipping) {
+            appendClippingPlanes(material.clippingPlanes, camera, params, numClippingPlanes);
+        }
+
+        const auto numLocalClippingPlanes = numClippingPlanes - numGlobalClippingPlanes;
+        const bool useClipIntersection = useLocalClipping && material.clipIntersection && numLocalClippingPlanes > 0;
+        params.numClippingPlanes = numClippingPlanes;
+        params.numUnionClippingPlanes = useClipIntersection ? numGlobalClippingPlanes : numClippingPlanes;
+        params.clipIntersection = useClipIntersection ? 1u : 0u;
         if (dynamic_cast<MeshNormalMaterial*>(&material)) {
             params.materialType = 1u;
         } else if (dynamic_cast<MeshPhongMaterial*>(&material)) {

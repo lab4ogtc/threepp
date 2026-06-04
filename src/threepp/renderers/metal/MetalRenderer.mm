@@ -1222,6 +1222,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
 
             const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow);
+            const bool useClipping = shadingParams.numClippingPlanes > 0u;
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;
             const bool useNormal = normAttr != nullptr;
@@ -1245,6 +1246,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             shaderKey.useInstanceColor = useInstanceColor;
             shaderKey.doubleSided = material->side == Side::Double;
             shaderKey.flipSided = material->side == Side::Back;
+            shaderKey.useClipping = useClipping;
 
             std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
             if (useNormal) vertexLayoutBitmask |= vertexLayoutNormal;

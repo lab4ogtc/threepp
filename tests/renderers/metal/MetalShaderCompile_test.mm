@@ -128,7 +128,7 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
 
         metal::MetalShaderManager shaderManager((__bridge void*) device);
 
-        for (unsigned int mask = 0; mask < 512; ++mask) {
+        for (unsigned int mask = 0; mask < 1024; ++mask) {
             metal::ShaderProgramKey key;
             key.useMap = (mask & 1u) != 0u;
             key.useVertexColors = (mask & 2u) != 0u;
@@ -139,6 +139,7 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
             key.useInstanceColor = (mask & 64u) != 0u;
             key.doubleSided = (mask & 128u) != 0u;
             key.flipSided = (mask & 256u) != 0u;
+            key.useClipping = (mask & 512u) != 0u;
 
             if ((key.useInstancing && key.useSkinning) ||
                 (key.useInstanceColor && !key.useInstancing) ||
@@ -150,15 +151,18 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
             REQUIRE_NOTHROW(shaderManager.getOrCreateFragmentFunction(key));
         }
 
-        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false, false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(true, false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(false, true));
-        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(false, false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(false, false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(true, false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(true, false));
-        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(false, true));
-        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(false, true));
+        for (unsigned int mask = 0; mask < 8; ++mask) {
+            metal::DepthShaderKey key;
+            key.useSkinning = (mask & 1u) != 0u;
+            key.useInstancing = (mask & 2u) != 0u;
+            key.useClipping = (mask & 4u) != 0u;
+            if (key.useSkinning && key.useInstancing) continue;
+
+            REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(key));
+            REQUIRE_NOTHROW(shaderManager.getOrCreateDepthFragmentFunction(key));
+            REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(key));
+            REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(key));
+        }
 
         for (unsigned int mask = 0; mask < 16; ++mask) {
             metal::SpriteShaderKey key;
@@ -213,7 +217,10 @@ TEST_CASE("Metal P3 shader manager rejects invalid instancing variants") {
         conflictingSide.flipSided = true;
         REQUIRE_THROWS_AS(shaderManager.getOrCreateFragmentFunction(conflictingSide), std::runtime_error);
 
-        REQUIRE_THROWS_AS(shaderManager.getOrCreateDepthVertexFunction(true, true), std::runtime_error);
+        metal::DepthShaderKey instancedSkinningDepth;
+        instancedSkinningDepth.useSkinning = true;
+        instancedSkinningDepth.useInstancing = true;
+        REQUIRE_THROWS_AS(shaderManager.getOrCreateDepthVertexFunction(instancedSkinningDepth), std::runtime_error);
     }
 }
 

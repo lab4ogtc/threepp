@@ -53,6 +53,8 @@ namespace threepp::metal {
             source += key.doubleSided ? "1\n" : "0\n";
             source += "#define USE_FLIP_SIDED ";
             source += key.flipSided ? "1\n" : "0\n";
+            source += "#define USE_CLIPPING ";
+            source += key.useClipping ? "1\n" : "0\n";
             source += fog_functions;
             source += basic_vertex;
             source += basic_fragment;
@@ -67,7 +69,12 @@ namespace threepp::metal {
             source += key.useSkinning ? "1\n" : "0\n";
             source += "#define USE_INSTANCING ";
             source += key.useInstancing ? "1\n" : "0\n";
+            source += "#define USE_CLIPPING ";
+            source += key.useClipping ? "1\n" : "0\n";
             source += depth_vertex;
+            if (key.useClipping) {
+                source += depth_fragment;
+            }
             return source;
         }
 
@@ -123,6 +130,7 @@ namespace threepp::metal {
         std::unordered_map<ShaderProgramKey, ShaderProgramInstance, ShaderProgramKeyHash> programs;
         std::unordered_map<DepthShaderKey, id<MTLLibrary>, DepthShaderKeyHash> depthLibraries;
         std::unordered_map<DepthShaderKey, id<MTLFunction>, DepthShaderKeyHash> depthVertexFunctions;
+        std::unordered_map<DepthShaderKey, id<MTLFunction>, DepthShaderKeyHash> depthFragmentFunctions;
         std::unordered_map<DepthShaderKey, id<MTLLibrary>, DepthShaderKeyHash> pointDepthLibraries;
         std::unordered_map<DepthShaderKey, ShaderProgramInstance, DepthShaderKeyHash> pointDepthPrograms;
         std::unordered_map<SpriteShaderKey, ShaderProgramInstance, SpriteShaderKeyHash> spritePrograms;
@@ -196,6 +204,30 @@ namespace threepp::metal {
             return function;
         }
 
+        id<MTLFunction> getOrCreateDepthFragmentFunction(const DepthShaderKey& key) {
+            validateDepthShaderKey(key);
+            if (!key.useClipping) return nil;
+
+            auto functionIt = depthFragmentFunctions.find(key);
+            if (functionIt != depthFragmentFunctions.end()) {
+                return functionIt->second;
+            }
+
+            getOrCreateDepthVertexFunction(key);
+            auto libraryIt = depthLibraries.find(key);
+            if (libraryIt == depthLibraries.end()) {
+                throw std::runtime_error("Failed to find MSL depth library for clipping fragment");
+            }
+
+            id<MTLFunction> function = [libraryIt->second newFunctionWithName:@"depth_fragment"];
+            if (!function) {
+                throw std::runtime_error("Failed to find MSL depth fragment function");
+            }
+
+            depthFragmentFunctions.emplace(key, function);
+            return function;
+        }
+
         ShaderProgramInstance& getOrCreatePointDepthProgram(const DepthShaderKey& key) {
             validateDepthShaderKey(key);
 
@@ -209,6 +241,8 @@ namespace threepp::metal {
             sourceText += key.useSkinning ? "1\n" : "0\n";
             sourceText += "#define USE_INSTANCING ";
             sourceText += key.useInstancing ? "1\n" : "0\n";
+            sourceText += "#define USE_CLIPPING ";
+            sourceText += key.useClipping ? "1\n" : "0\n";
             sourceText += point_depth_vertex;
             sourceText += point_depth_fragment;
 
@@ -336,16 +370,20 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreateProgram(key).fragmentFunction;
     }
 
-    void* MetalShaderManager::getOrCreateDepthVertexFunction(bool useSkinning, bool useInstancing) {
-        return (__bridge void*) pimpl_->getOrCreateDepthVertexFunction(DepthShaderKey{useSkinning, useInstancing});
+    void* MetalShaderManager::getOrCreateDepthVertexFunction(const DepthShaderKey& key) {
+        return (__bridge void*) pimpl_->getOrCreateDepthVertexFunction(key);
     }
 
-    void* MetalShaderManager::getOrCreatePointDepthVertexFunction(bool useSkinning, bool useInstancing) {
-        return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(DepthShaderKey{useSkinning, useInstancing}).vertexFunction;
+    void* MetalShaderManager::getOrCreateDepthFragmentFunction(const DepthShaderKey& key) {
+        return (__bridge void*) pimpl_->getOrCreateDepthFragmentFunction(key);
     }
 
-    void* MetalShaderManager::getOrCreatePointDepthFragmentFunction(bool useSkinning, bool useInstancing) {
-        return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(DepthShaderKey{useSkinning, useInstancing}).fragmentFunction;
+    void* MetalShaderManager::getOrCreatePointDepthVertexFunction(const DepthShaderKey& key) {
+        return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(key).vertexFunction;
+    }
+
+    void* MetalShaderManager::getOrCreatePointDepthFragmentFunction(const DepthShaderKey& key) {
+        return (__bridge void*) pimpl_->getOrCreatePointDepthProgram(key).fragmentFunction;
     }
 
     void* MetalShaderManager::getOrCreateSpriteVertexFunction(const SpriteShaderKey& key) {

@@ -16,6 +16,7 @@ namespace threepp::metal {
         bool useInstanceColor = false;
         bool doubleSided = false;
         bool flipSided = false;
+        bool useClipping = false;
 
         bool operator==(const ShaderProgramKey& other) const {
             return useMap == other.useMap &&
@@ -26,7 +27,8 @@ namespace threepp::metal {
                    useInstancing == other.useInstancing &&
                    useInstanceColor == other.useInstanceColor &&
                    doubleSided == other.doubleSided &&
-                   flipSided == other.flipSided;
+                   flipSided == other.flipSided &&
+                   useClipping == other.useClipping;
         }
     };
 
@@ -40,23 +42,28 @@ namespace threepp::metal {
                    ((key.useInstancing ? 1u : 0u) << 5u) |
                    ((key.useInstanceColor ? 1u : 0u) << 6u) |
                    ((key.doubleSided ? 1u : 0u) << 7u) |
-                   ((key.flipSided ? 1u : 0u) << 8u);
+                   ((key.flipSided ? 1u : 0u) << 8u) |
+                   ((key.useClipping ? 1u : 0u) << 9u);
         }
     };
 
     struct DepthShaderKey {
         bool useSkinning = false;
         bool useInstancing = false;
+        bool useClipping = false;
 
         bool operator==(const DepthShaderKey& other) const {
-            return useSkinning == other.useSkinning && useInstancing == other.useInstancing;
+            return useSkinning == other.useSkinning &&
+                   useInstancing == other.useInstancing &&
+                   useClipping == other.useClipping;
         }
     };
 
     struct DepthShaderKeyHash {
         std::size_t operator()(const DepthShaderKey& key) const {
             return (key.useSkinning ? 1u : 0u) |
-                   ((key.useInstancing ? 1u : 0u) << 1u);
+                   ((key.useInstancing ? 1u : 0u) << 1u) |
+                   ((key.useClipping ? 1u : 0u) << 2u);
         }
     };
 
@@ -94,11 +101,13 @@ namespace threepp::metal {
 
         void* getOrCreateFragmentFunction(const ShaderProgramKey& key);
 
-        void* getOrCreateDepthVertexFunction(bool useSkinning, bool useInstancing = false);
+        void* getOrCreateDepthVertexFunction(const DepthShaderKey& key);
 
-        void* getOrCreatePointDepthVertexFunction(bool useSkinning, bool useInstancing = false);
+        void* getOrCreateDepthFragmentFunction(const DepthShaderKey& key);
 
-        void* getOrCreatePointDepthFragmentFunction(bool useSkinning, bool useInstancing = false);
+        void* getOrCreatePointDepthVertexFunction(const DepthShaderKey& key);
+
+        void* getOrCreatePointDepthFragmentFunction(const DepthShaderKey& key);
 
         void* getOrCreateSpriteVertexFunction(const SpriteShaderKey& key);
 

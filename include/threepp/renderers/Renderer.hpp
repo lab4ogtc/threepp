@@ -4,9 +4,11 @@
 
 #include <memory>
 #include <utility>
+#include <vector>
 
 #include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
+#include "threepp/math/Plane.hpp"
 
 namespace threepp {
 
@@ -73,6 +75,9 @@ namespace threepp {
         ToneMapping toneMapping{ToneMapping::None};
         float toneMappingExposure = 1.0f;
         Encoding outputEncoding{Encoding::Linear};
+
+        std::vector<Plane> clippingPlanes;
+        bool localClippingEnabled = false;
 
         virtual ~Renderer() = default;
     };
