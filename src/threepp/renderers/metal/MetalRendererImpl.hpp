@@ -321,6 +321,13 @@ namespace threepp {
                              MTLPixelFormat colorPixelFormat,
                              std::optional<GeometryGroup> group = std::nullopt);
 
+        void renderDepthTexture(id<MTLRenderCommandEncoder> encoder,
+                                Mesh& mesh,
+                                ShaderMaterial& material,
+                                Camera& camera,
+                                MTLPixelFormat colorPixelFormat,
+                                std::optional<GeometryGroup> group = std::nullopt);
+
         void renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, Camera& camera, MTLPixelFormat colorPixelFormat);

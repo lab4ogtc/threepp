@@ -2,7 +2,7 @@
 
 > 生成日期: 2026-05-31
 >
-> 统计: 总共 70 个 GL 示例，23 对已对齐，12 个因引擎缺口阻塞，35 个待移植
+> 统计: 总共 70 个 GL 示例，24 对已对齐，11 个因引擎缺口阻塞，35 个待移植
 
 ---
 
@@ -143,7 +143,7 @@
 | `texture2d.cpp` | ✅ | ✅ | ✅ 已对齐 | 2D 纹理加载，双版本一致 |
 | `cubemap.cpp` | ✅ | — | 📋 待移植 | Metal 已支持 `CubeTexture` (`MetalTextureManager.mm:221`) |
 | `data_texture.cpp` | ✅ | — | 🚫 **引擎缺口** | 依赖 `copyFramebufferToTexture()` + `clearDepth()`，Metal 均缺失 |
-| `depth_texture.cpp` | ✅ | — | 🚫 **引擎缺口** | 使用 `GLRenderTarget` + 自定义 `ShaderMaterial` GLSL + `#include <packing>` |
+| `depth_texture.cpp` | ✅ | ✅ | ✅ 已对齐 | 深度纹理后处理 ShaderMaterial 由 MetalRenderer 内置 MSL 接管（替换式接管用户 GLSL） |
 | `texture3d.cpp` | ✅ | — | 🚫 **引擎缺口** | 使用 `DataTexture3D` + `RawShaderMaterial` + `sampler3D` GLSL |
 | `imgui_framebuffer.cpp` | ✅ | — | 🚫 **引擎缺口** | 依赖 `getGlTextureId()` + `copyFramebufferToTexture()` |
 
@@ -185,8 +185,8 @@
 
 | 状态 | 数量 | 占比 |
 |------|------|------|
-| ✅ 已对齐 | 23 对 | ~33% |
-| 🚫 引擎缺口 | **12 个** | ~17% |
+| ✅ 已对齐 | 24 对 | ~34% |
+| 🚫 引擎缺口 | **11 个** | ~16% |
 | 📋 待移植 | **35 个** | ~50% |
 | ➖ 不适用 | 2 个 | — |
 
@@ -194,7 +194,7 @@
 
 | 缺口 | 阻塞示例数 | 修复方向 |
 |------|-----------|---------|
-| 自定义 ShaderMaterial / RawShaderMaterial 动态编译 | 3 (particle_system, depth_texture, seascape_demo, texture3d) | Metal 需要 MSL 编译管道 + uniform 反射 |
+| 自定义 ShaderMaterial / RawShaderMaterial 动态编译 | 3 (particle_system, seascape_demo, texture3d) | Metal 仍缺通用 MSL 编译管道 + uniform 反射；`depth_texture` 仅通过严格 uniform 过滤后的内置 MSL 替换式接管支持 |
 | copyFramebufferToTexture | 2 (data_texture, imgui_framebuffer) | Metal 端实现纹理拷贝管线 |
 | 裁剪平面 (clippingPlanes) | 1 (clipping) | MetalRenderer 添加裁剪 uniform + 片段着色器 discard |
 | MorphTargets | 2 (morphtargets, morphtargets_sphere) | Metal 顶点着色器添加 morph 混合计算 |

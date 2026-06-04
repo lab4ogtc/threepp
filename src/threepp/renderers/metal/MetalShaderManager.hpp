@@ -141,6 +141,10 @@ namespace threepp::metal {
 
         void* getOrCreateRawShaderFragmentFunction();
 
+        void* getOrCreateDepthTextureVertexFunction();
+
+        void* getOrCreateDepthTextureFragmentFunction();
+
         void* getOrCreateSkyVertexFunction();
 
         void* getOrCreateSkyFragmentFunction();

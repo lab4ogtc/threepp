@@ -98,6 +98,9 @@ float4 fragmentMain(VertexOutput input) : SV_Target {
 
 TEST_CASE("Metal special shaders bind uniforms away from vertex attributes") {
 
+    STATIC_REQUIRE(sizeof(DepthTextureUniforms) == 80);
+    STATIC_REQUIRE(alignof(DepthTextureUniforms) == 16);
+
     CHECK(contains(metal::sky_vertex, "constant SkyUniforms& uniforms [[buffer(4)]]"));
     CHECK(contains(metal::sky_fragment, "constant SkyUniforms& uniforms [[buffer(4)]]"));
     CHECK(contains(metal::water_vertex, "constant WaterUniforms& uniforms [[buffer(4)]]"));
@@ -246,6 +249,8 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreateParticleFragmentFunction(true));
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderFragmentFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthTextureVertexFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthTextureFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateWaterVertexFunction());

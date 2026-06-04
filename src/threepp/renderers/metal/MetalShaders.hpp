@@ -1554,6 +1554,79 @@ fragment float4 raw_shader_fragment(
 }
 )metal";
 
+    constexpr auto depth_texture_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DepthTextureVertexInput {
+    float3 position [[attribute(0)]];
+    float2 uv [[attribute(2)]];
+};
+
+struct DepthTextureUniforms {
+    float4x4 mvp;
+    float cameraNear;
+    float cameraFar;
+};
+
+struct DepthTextureVertexOutput {
+    float4 position [[position]];
+    float2 uv;
+};
+
+vertex DepthTextureVertexOutput depth_texture_vertex(
+    DepthTextureVertexInput in [[stage_in]],
+    constant DepthTextureUniforms& uniforms [[buffer(4)]]
+)
+{
+    DepthTextureVertexOutput out;
+    out.uv = in.uv;
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    return out;
+}
+)metal";
+
+    constexpr auto depth_texture_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DepthTextureVertexOutput {
+    float4 position [[position]];
+    float2 uv;
+};
+
+struct DepthTextureUniforms {
+    float4x4 mvp;
+    float cameraNear;
+    float cameraFar;
+};
+
+float perspectiveDepthToViewZ(float invClipZ, float nearPlane, float farPlane) {
+    return (nearPlane * farPlane) / ((farPlane - nearPlane) * invClipZ - farPlane);
+}
+
+float viewZToOrthographicDepth(float viewZ, float nearPlane, float farPlane) {
+    return (viewZ + nearPlane) / (nearPlane - farPlane);
+}
+
+fragment float4 depth_texture_fragment(
+    DepthTextureVertexOutput in [[stage_in]],
+    constant DepthTextureUniforms& uniforms [[buffer(4)]],
+    texture2d<float> tDiffuse [[texture(0)]],
+    sampler tDiffuseSampler [[sampler(0)]],
+    depth2d<float> tDepth [[texture(1)]],
+    sampler tDepthSampler [[sampler(1)]]
+)
+{
+    float unusedDiffuse = tDiffuse.sample(tDiffuseSampler, in.uv).r;
+    float fragCoordZ = tDepth.sample(tDepthSampler, in.uv);
+    float viewZ = perspectiveDepthToViewZ(fragCoordZ, uniforms.cameraNear, uniforms.cameraFar);
+    float depth = viewZToOrthographicDepth(viewZ, uniforms.cameraNear, uniforms.cameraFar);
+    float color = 1.0 - depth + unusedDiffuse * 0.0;
+    return float4(float3(color), 1.0);
+}
+)metal";
+
     constexpr auto sprite_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;

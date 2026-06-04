@@ -1281,6 +1281,14 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                     renderRawShader(encoder, *mesh, *material, camera, colorPixelFormat, item.group);
                     continue;
                 }
+                if (auto* shaderMaterial = material->as<ShaderMaterial>()) {
+                    if (shaderMaterial->uniforms.count("tDepth") > 0 &&
+                        shaderMaterial->uniforms.count("cameraNear") > 0 &&
+                        shaderMaterial->uniforms.count("cameraFar") > 0) {
+                        renderDepthTexture(encoder, *mesh, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        continue;
+                    }
+                }
             }
 
             BufferGeometry* geometry = nullptr;

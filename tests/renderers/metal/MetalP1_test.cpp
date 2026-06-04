@@ -252,6 +252,59 @@ TEST_CASE("Metal particle points bind dedicated attributes and uniform slot") {
     CHECK(source.find("[encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:6]") != std::string::npos);
 }
 
+TEST_CASE("Metal depth texture ShaderMaterial path is wired as a dedicated built-in shader") {
+
+    const std::string_view vertexSource{metal::depth_texture_vertex};
+    REQUIRE(vertexSource.find("float3 position [[attribute(0)]]") != std::string_view::npos);
+    REQUIRE(vertexSource.find("float2 uv [[attribute(2)]]") != std::string_view::npos);
+    REQUIRE(vertexSource.find("constant DepthTextureUniforms& uniforms [[buffer(4)]]") != std::string_view::npos);
+
+    const std::string_view fragmentSource{metal::depth_texture_fragment};
+    REQUIRE(fragmentSource.find("depth2d<float> tDepth [[texture(1)]]") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("float fragCoordZ = tDepth.sample(tDepthSampler, in.uv);") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("perspectiveDepthToViewZ") != std::string_view::npos);
+    REQUIRE(fragmentSource.find("viewZToOrthographicDepth") != std::string_view::npos);
+
+    const auto implHeader = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    REQUIRE(implHeader.find("void renderDepthTexture(id<MTLRenderCommandEncoder> encoder,") != std::string::npos);
+
+    const auto shaderManagerHeader = readProjectFile("src/threepp/renderers/metal/MetalShaderManager.hpp");
+    REQUIRE(shaderManagerHeader.find("void* getOrCreateDepthTextureVertexFunction();") != std::string::npos);
+    REQUIRE(shaderManagerHeader.find("void* getOrCreateDepthTextureFragmentFunction();") != std::string::npos);
+
+    const auto rendererSource = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto intercept = rendererSource.find("shaderMaterial->uniforms.count(\"tDepth\") > 0");
+    REQUIRE(intercept != std::string::npos);
+    REQUIRE(rendererSource.find("shaderMaterial->uniforms.count(\"cameraNear\") > 0", intercept) != std::string::npos);
+    REQUIRE(rendererSource.find("shaderMaterial->uniforms.count(\"cameraFar\") > 0", intercept) != std::string::npos);
+    REQUIRE(rendererSource.find("renderDepthTexture(encoder, *mesh, *shaderMaterial", intercept) != std::string::npos);
+
+    const auto objectsSource = readProjectFile("src/threepp/renderers/metal/MetalObjectsRenderer.mm");
+    const auto method = objectsSource.find("void MetalRenderer::Impl::renderDepthTexture");
+    REQUIRE(method != std::string::npos);
+    REQUIRE(objectsSource.find("vertexLayoutPosition | vertexLayoutUv", method) != std::string::npos);
+    REQUIRE(objectsSource.find("pipelineCache->getOrCreateDepthStencilState(false, false", method) != std::string::npos);
+    REQUIRE(objectsSource.find("bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, uvAttr", method) != std::string::npos);
+    REQUIRE(objectsSource.find("uniformTexture(depthMaterial->uniforms, \"tDiffuse\")", method) != std::string::npos);
+    REQUIRE(objectsSource.find("uniformTexture(depthMaterial->uniforms, \"tDepth\")", method) != std::string::npos);
+    REQUIRE(objectsSource.find("whiteDepthTexture", method) != std::string::npos);
+    REQUIRE(objectsSource.find("[encoder setFragmentTexture:depthTexture atIndex:1]", method) != std::string::npos);
+    REQUIRE(objectsSource.find("[encoder setFragmentSamplerState:depthSampler atIndex:1]", method) != std::string::npos);
+
+    const auto exampleSource = readProjectFile("examples/textures/depth_texture_metal.cpp");
+    REQUIRE(exampleSource.find("MetalRenderer renderer") != std::string::npos);
+    REQUIRE(exampleSource.find("RenderTarget::create") != std::string::npos);
+    REQUIRE(exampleSource.find("GLRenderTarget") == std::string::npos);
+    REQUIRE(exampleSource.find("postMaterial->uniforms.at(\"tDepth\").setValue(target->depthTexture.get())") != std::string::npos);
+
+    const auto cmakeSource = readProjectFile("examples/textures/CMakeLists.txt");
+    REQUIRE(cmakeSource.find("add_example(NAME \"depth_texture_metal\")") != std::string::npos);
+
+    const auto alignmentDoc = readProjectFile("docs/examples_metal_alignment.md");
+    REQUIRE(alignmentDoc.find("depth_texture.cpp` | ✅ | ✅ | ✅ 已对齐") != std::string::npos);
+    REQUIRE(alignmentDoc.find("深度纹理后处理 ShaderMaterial 由 MetalRenderer 内置 MSL 接管") != std::string::npos);
+}
+
 TEST_CASE("Metal P2 shader keys include skinning and lighting variants") {
 
     metal::ShaderProgramKey skinned{};

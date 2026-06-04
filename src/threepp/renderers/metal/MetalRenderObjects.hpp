@@ -237,6 +237,12 @@ namespace threepp {
         float padding[3];
     };
 
+    struct alignas(16) DepthTextureUniforms {
+        float mvp[16];
+        float cameraNear;
+        float cameraFar;
+    };
+
     struct alignas(16) SkyUniforms {
         float mvp[16];
         float modelMatrix[16];
