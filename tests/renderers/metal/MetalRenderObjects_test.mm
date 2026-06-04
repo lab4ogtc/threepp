@@ -52,6 +52,8 @@ namespace {
             return nullptr;
         }
 
+        void copyTextureToImage(Texture&) override {}
+
         void addPreRenderJob(const RenderJob&) override {}
 
         RendererShadowMap& shadowMap() override {

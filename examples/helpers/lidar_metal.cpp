@@ -4,6 +4,7 @@
 #include "threepp/helpers/DepthSensor.hpp"
 #include "threepp/helpers/LidarSensor.hpp"
 #include "threepp/objects/Points.hpp"
+#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <cmath>
@@ -76,8 +77,8 @@ namespace {
 
 int main() {
 
-    GlfwWindow canvas("Lidar", {{"antialiasing", 4}});
-    GLRenderer renderer(canvas);
+    GlfwWindow canvas("Lidar (Metal)", {{"antialiasing", 4}, {"clientAPI", "Metal"}});
+    MetalRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color(0x111122);
@@ -122,7 +123,7 @@ int main() {
     };
 
     bool senorDataOnly = false;
-    ImguiFunctionalContext ui(canvas, [&] {
+    ImguiFunctionalContext ui(canvas, renderer, [&] {
         ImGui::SetNextWindowPos({});
         ImGui::SetNextWindowSize({});
         ImGui::Begin("Settings");
@@ -182,7 +183,12 @@ int main() {
             camera->layers.enableAll();
         }
 
+        const auto previousAutoClear = renderer.autoClear;
+        renderer.autoClear = false;
+        renderer.clear();
         renderer.render(*scene, *camera);
         ui.render();
+        renderer.endFrame();
+        renderer.autoClear = previousAutoClear;
     });
 }

@@ -163,7 +163,7 @@ namespace threepp {
         void readPixels(const Vector2& position, const std::pair<int, int>& size, Format format, unsigned char* data);
 
         // Experimental threepp function
-        void copyTextureToImage(Texture& texture);
+        void copyTextureToImage(Texture& texture) override;
 
         void resetState();
 

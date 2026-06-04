@@ -16,6 +16,7 @@ namespace threepp {
     class Scene;
     class Camera;
     class RenderTarget;
+    class Texture;
     struct RenderJob;
     class Color;
 
@@ -63,6 +64,21 @@ namespace threepp {
         virtual void setRenderTarget(RenderTarget* renderTarget) = 0;
 
         [[nodiscard]] virtual RenderTarget* getRenderTarget() = 0;
+
+        virtual void copyTextureToImage(Texture& texture) = 0;
+
+        /**
+         * 批量同步纹理数据到各自的 CPU Image。
+         *
+         * 默认实现逐个调用 copyTextureToImage()；支持批量 GPU 读回的后端可覆写以减少同步等待。
+         *
+         * @param textures 需要读回的纹理指针列表；空指针会被忽略。
+         */
+        virtual void copyTexturesToImages(const std::vector<Texture*>& textures) {
+            for (auto* texture : textures) {
+                if (texture) copyTextureToImage(*texture);
+            }
+        }
 
         virtual void addPreRenderJob(const RenderJob& job) = 0;
 

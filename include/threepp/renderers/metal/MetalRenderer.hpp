@@ -61,6 +61,16 @@ namespace threepp {
 
         void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0);
 
+        void copyTextureToImage(Texture& texture) override;
+
+        /**
+         * 使用单个 Metal blit command encoder 批量读回纹理，并只等待一次 GPU 完成。
+         *
+         * @param textures 需要同步到 CPU Image 的纹理指针列表；空指针会被忽略。
+         * @throws std::runtime_error 当纹理或读回缓冲创建失败时抛出。
+         */
+        void copyTexturesToImages(const std::vector<Texture*>& textures) override;
+
         [[nodiscard]] void* device() const;
 
         [[nodiscard]] void* currentCommandBuffer() const;

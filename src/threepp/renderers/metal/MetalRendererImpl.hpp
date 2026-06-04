@@ -23,6 +23,7 @@
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace threepp {
 
@@ -65,6 +66,13 @@ namespace threepp {
         std::size_t defaultTangentVertexCount = 0;
         id<MTLBuffer> defaultMorphTargetBuffer = nil;
         std::size_t defaultMorphTargetVertexCount = 0;
+
+        struct ReadbackBuffer {
+            id<MTLBuffer> buffer = nil;
+            NSUInteger size = 0;
+            bool inUse = false;
+        };
+        std::vector<ReadbackBuffer> readbackBufferPool;
 
         struct ConvertedSkinIndexBuffer {
             unsigned int lastVersion = std::numeric_limits<unsigned int>::max();
@@ -184,6 +192,10 @@ namespace threepp {
 
         MetalRenderTargetResources& getOrCreateRenderTargetResources(RenderTarget& target);
 
+        id<MTLBuffer> acquireReadbackBuffer(NSUInteger size);
+
+        void releaseAllReadbackBuffers();
+
         void deallocateRenderTarget(RenderTarget* target);
 
         void clearDepthTextureToOne(id<MTLTexture> texture) const;
@@ -205,6 +217,16 @@ namespace threepp {
         void clear(bool color, bool depth, bool stencil);
 
         void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level);
+
+        void copyTextureToImage(Texture& texture);
+
+        void copyTexturesToImages(const std::vector<Texture*>& textures);
+
+        void readPixelsFromTextureReadback(Texture& texture,
+                                           id<MTLTexture> sourceTexture,
+                                           id<MTLBuffer> readbackBuffer,
+                                           NSUInteger sourceBytesPerRow,
+                                           NSUInteger sourceBytesPerPixel);
 
         std::vector<unsigned char> readRGBPixels();
 
@@ -332,6 +354,14 @@ namespace threepp {
                                 Camera& camera,
                                 MTLPixelFormat colorPixelFormat,
                                 std::optional<GeometryGroup> group = std::nullopt);
+
+        void renderLinearDepthTexture(id<MTLRenderCommandEncoder> encoder,
+                                      Mesh& mesh,
+                                      BufferGeometry& geometry,
+                                      ShaderMaterial& material,
+                                      Camera& camera,
+                                      MTLPixelFormat colorPixelFormat,
+                                      std::optional<GeometryGroup> group = std::nullopt);
 
         void renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 

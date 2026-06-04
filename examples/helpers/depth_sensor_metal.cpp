@@ -2,8 +2,8 @@
 #include "threepp/extras/imgui/ImguiContext.hpp"
 #include "threepp/helpers/AxesHelper.hpp"
 #include "threepp/helpers/DepthSensor.hpp"
-#include "threepp/helpers/LidarSensor.hpp"
 #include "threepp/objects/Points.hpp"
+#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 #include <cmath>
@@ -45,7 +45,7 @@ namespace {
 
     // Update a Points object's position and color attributes from a point cloud.
     // Colors are mapped by distance: near=green, far=red.
-    void updatePointCloud(const Points& points, const std::vector<Vector3>& cloud,
+    void updatePointCloud(const Points& points, const std::vector<Vector3>& cloud, const std::vector<Color>& colors,
                           const Vector3& sensorPos, float maxDist) {
 
         auto& geom = *points.geometry();
@@ -56,18 +56,16 @@ namespace {
         int i = 0;
         for (const auto& p : cloud) {
             posAttr->setXYZ(i, p.x, p.y, p.z);
-
-            c.setHSL(0.33f * (1.f - std::min(p.distanceTo(sensorPos) / maxDist, 1.f)), 1.f, 0.5f);
+            if (colors.empty()) {
+                c.setHSL(0.33f * (1.f - std::min(p.distanceTo(sensorPos) / maxDist, 1.f)), 1.f, 0.5f);
+            } else {
+                c.copy(colors[i]);
+            }
             colAttr->setXYZ(i, c.r, c.g, c.b);
-
             ++i;
         }
 
         geom.setDrawRange(0, i);
-        posAttr->updateRange.offset = 0;
-        posAttr->updateRange.count = i * posAttr->itemSize();
-        colAttr->updateRange.offset = 0;
-        colAttr->updateRange.count = i * colAttr->itemSize();
         posAttr->needsUpdate();
         colAttr->needsUpdate();
     }
@@ -76,8 +74,8 @@ namespace {
 
 int main() {
 
-    GlfwWindow canvas("Lidar", {{"antialiasing", 4}});
-    GLRenderer renderer(canvas);
+    GlfwWindow canvas("Depth sensor (Metal)", {{"antialiasing", 4}, {"clientAPI", "Metal"}});
+    MetalRenderer renderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color(0x111122);
@@ -88,14 +86,14 @@ int main() {
     setupScene(*scene);
 
     // --- Lidar sensor ---
-    auto lidar = std::make_unique<LidarSensor>(LidarModel::OS0_128(),  512, 0.5f, 20.f);
-    lidar->position.set(0, 2, 0);
-    scene->add(*lidar);
+    DepthSensor lidar(50.f, 512, 256, 0.5f, 20.f);
+    lidar.position.set(0, 2, 0);
+    scene->add(lidar);
 
     OrbitControls controls{*camera, canvas};
 
     // --- Point cloud visualisation ---
-    const size_t maxPoints = 6 * std::pow(lidar->faceSize(), 2);
+    const size_t maxPoints = lidar.width() * lidar.height();
     auto pcGeom = BufferGeometry::create();
     pcGeom->setAttribute("position", FloatBufferAttribute::create(std::vector<float>(maxPoints * 3), 3));
     pcGeom->setAttribute("color", FloatBufferAttribute::create(std::vector<float>(maxPoints * 3), 3));
@@ -108,38 +106,20 @@ int main() {
     points->frustumCulled = false;
     scene->add(points);
 
+    auto helper = CameraHelper::create(lidar.getCamera());
+    helper->visible = true;
+    scene->add(helper);
 
-    const char* modeNames[] = {"Dense Grid", "VLP-16", "HDL-32E", "OS1-64", "OS0-128"};
-    int currentMode = 4;// start on OS0-128
-
-    auto changeLidar = [&](std::unique_ptr<LidarSensor> newLidar) {
-        scene->remove(*lidar);
-        newLidar->rangeNoise = lidar->rangeNoise;
-        newLidar->position.copy(lidar->position);
-        newLidar->rotation.copy(lidar->rotation);
-        lidar = std::move(newLidar);
-        scene->add(*lidar);
-    };
-
-    bool senorDataOnly = false;
-    ImguiFunctionalContext ui(canvas, [&] {
+    bool sensorOnly = false;
+    bool withColors = false;
+    ImguiFunctionalContext ui(canvas, renderer, [&] {
         ImGui::SetNextWindowPos({});
         ImGui::SetNextWindowSize({});
         ImGui::Begin("Settings");
-        ImGui::Checkbox("Show senor data only", &senorDataOnly);
-        ImGui::SliderFloat("Range noise", &lidar->rangeNoise, 0.f, 0.1f);
-
-        int prevMode = currentMode;
-        ImGui::Combo("Mode", &currentMode, modeNames, 5);
-        if (currentMode != prevMode) {
-            switch (currentMode) {
-                case 0: changeLidar(std::make_unique<LidarSensor>(64, 0.5f, 20.f)); break;
-                case 1: changeLidar(std::make_unique<LidarSensor>(LidarModel::VLP16(), 512, 0.5f, 20.f)); break;
-                case 2: changeLidar(std::make_unique<LidarSensor>(LidarModel::HDL32E(), 512, 0.5f, 20.f)); break;
-                case 3: changeLidar(std::make_unique<LidarSensor>(LidarModel::OS1_64(), 512, 0.5f, 20.f)); break;
-                case 4: changeLidar(std::make_unique<LidarSensor>(LidarModel::OS0_128(), 512, 0.5f, 20.f)); break;
-            }
-        }
+        ImGui::SliderFloat("Range noise", &lidar.rangeNoise, 0.f, 0.1f);
+        ImGui::Checkbox("Show sensor helper", &helper->visible);
+        ImGui::Checkbox("Sample colors", &withColors);
+        ImGui::Checkbox("Show sensor data only", &sensorOnly);
 
         ImGui::End();
     });
@@ -163,26 +143,38 @@ int main() {
         const float t = clock.getElapsedTime();
 
         // Slowly sweep the sensor in yaw and pitch
-        lidar->rotation.y = t * 0.4f;
-        lidar->rotation.x = -0.4f + 0.25f * std::sin(t * 0.3f);
+        lidar.rotation.y = t * 0.4f;
+        lidar.rotation.x = -0.4f + 0.25f * std::sin(t * 0.3f);
 
         // Scan the scene and update the visualised point cloud
+        const auto wasHelperVisible = helper->visible;
+        helper->visible = false;
         points->visible = false;
-        colors.clear();
-        lidar->scan(renderer, *scene, cloud);
+        if (!withColors) {
+            colors.clear();
+            lidar.scan(renderer, *scene, cloud);
+        } else {
+            lidar.scan(renderer, *scene, cloud, colors);
+        }
         points->visible = true;
+        helper->visible = wasHelperVisible;
 
         Vector3 sensorWorld;
-        lidar->getWorldPosition(sensorWorld);
-        updatePointCloud(*points, cloud, sensorWorld, lidar->far());
+        lidar.getWorldPosition(sensorWorld);
+        updatePointCloud(*points, cloud, colors, sensorWorld, lidar.far());
 
-        if (senorDataOnly) {
+        if (sensorOnly) {
             camera->layers.set(1);
         } else {
             camera->layers.enableAll();
         }
 
+        const auto previousAutoClear = renderer.autoClear;
+        renderer.autoClear = false;
+        renderer.clear();
         renderer.render(*scene, *camera);
         ui.render();
+        renderer.endFrame();
+        renderer.autoClear = previousAutoClear;
     });
 }

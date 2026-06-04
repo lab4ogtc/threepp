@@ -5,7 +5,7 @@
 #include "threepp/cameras/OrthographicCamera.hpp"
 #include "threepp/cameras/PerspectiveCamera.hpp"
 #include "threepp/core/Object3D.hpp"
-#include "threepp/renderers/GLRenderTarget.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/scenes/Scene.hpp"
 
 #include <array>
@@ -14,7 +14,7 @@
 namespace threepp {
 
     class ShaderMaterial;
-    class GLRenderer;
+    class Renderer;
 
     /**
      * Simulates a full 360-degree LiDAR sensor using six 90-degree perspective
@@ -57,7 +57,7 @@ namespace threepp {
          * Performs a scan and returns hit points in world space.
          * The renderer's active render target is restored to nullptr after the scan.
          */
-        void scan(GLRenderer& renderer, Scene& scene, std::vector<Vector3>& cloud);
+        void scan(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud);
 
         [[nodiscard]] unsigned int faceSize() const { return faceSize_; }
         [[nodiscard]] float near() const { return near_; }
@@ -76,8 +76,8 @@ namespace threepp {
 
         // Non-owning pointers into the children list for fast per-face access
         std::array<PerspectiveCamera*, kNumFaces> cameras_{};
-        std::array<std::unique_ptr<GLRenderTarget>, kNumFaces> sceneTargets_;
-        std::array<std::unique_ptr<GLRenderTarget>, kNumFaces> readbackTargets_;
+        std::array<std::shared_ptr<RenderTarget>, kNumFaces> sceneTargets_;
+        std::array<std::shared_ptr<RenderTarget>, kNumFaces> readbackTargets_;
 
         // Dense-grid mode: shared ray direction factors (tan(90°/2) = 1, so just NDC coords)
         std::vector<float> dir_;
@@ -93,7 +93,7 @@ namespace threepp {
         void init(float near, float far);
         void buildBeamTable(const LidarModel& model);
 
-        void renderFaces(GLRenderer& renderer, Scene& scene);
+        void renderFaces(Renderer& renderer, Scene& scene);
         void unprojectDense(std::vector<Vector3>& points) const;
         void unprojectBeams(std::vector<Vector3>& points) const;
     };

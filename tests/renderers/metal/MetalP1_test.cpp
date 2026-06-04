@@ -9,10 +9,12 @@
 #include "threepp/renderers/RenderJob.hpp"
 #include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
+#include "threepp/renderers/GLRenderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/renderers/metal/MetalShaders.hpp"
 #include "threepp/textures/DepthTexture.hpp"
 #include "threepp/textures/Image.hpp"
+#include "threepp/textures/Texture.hpp"
 
 #include "threepp/math/Vector4.hpp"
 #include "threepp/math/Plane.hpp"
@@ -80,6 +82,16 @@ namespace {
     };
 
     template<class T>
+    concept HasTextureReadback = requires(T& renderer, Texture& texture) {
+        { renderer.copyTextureToImage(texture) } -> std::same_as<void>;
+    };
+
+    template<class T>
+    concept HasBatchTextureReadback = requires(T& renderer, const std::vector<Texture*>& textures) {
+        { renderer.copyTexturesToImages(textures) } -> std::same_as<void>;
+    };
+
+    template<class T>
     concept HasMetalShadowMap = requires(T& renderer) {
         renderer.shadowMap().enabled = true;
         renderer.shadowMap().autoUpdate = false;
@@ -126,6 +138,76 @@ TEST_CASE("Renderer base exposes backend-independent pre-render job API") {
     STATIC_REQUIRE(HasBasePreRenderQueue<Renderer>);
 }
 
+TEST_CASE("Renderer backends expose texture readback API") {
+
+    STATIC_REQUIRE(HasTextureReadback<Renderer>);
+    STATIC_REQUIRE(HasTextureReadback<GLRenderer>);
+    STATIC_REQUIRE(HasTextureReadback<MetalRenderer>);
+    STATIC_REQUIRE(HasBatchTextureReadback<Renderer>);
+    STATIC_REQUIRE(HasBatchTextureReadback<GLRenderer>);
+    STATIC_REQUIRE(HasBatchTextureReadback<MetalRenderer>);
+}
+
+TEST_CASE("LidarSensor batches cube-face texture readbacks") {
+
+    const auto source = readProjectFile("src/threepp/helpers/LidarSensor.cpp");
+    const auto renderFaces = source.find("void LidarSensor::renderFaces");
+    REQUIRE(renderFaces != std::string::npos);
+    REQUIRE(source.find("std::vector<Texture*> readbackTextures", renderFaces) != std::string::npos);
+    REQUIRE(source.find("renderer.copyTexturesToImages(readbackTextures)", renderFaces) != std::string::npos);
+}
+
+TEST_CASE("Metal texture readback matches GL row order and batches GPU waits") {
+
+    const auto header = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto batchMethod = source.find("void MetalRenderer::Impl::copyTexturesToImages");
+    REQUIRE(batchMethod != std::string::npos);
+    const auto batchMethodEnd = source.find("void MetalRenderer::Impl::readPixelsFromTextureReadback", batchMethod);
+    REQUIRE(batchMethodEnd != std::string::npos);
+
+    const auto batchBody = source.substr(batchMethod, batchMethodEnd - batchMethod);
+    REQUIRE(countOccurrences(batchBody, "waitUntilCompleted") == 1);
+
+    const auto readPixelsMethodEnd = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels", batchMethodEnd);
+    REQUIRE(readPixelsMethodEnd != std::string::npos);
+    const auto readPixelsBody = source.substr(batchMethodEnd, readPixelsMethodEnd - batchMethodEnd);
+    REQUIRE(readPixelsBody.find("height - 1u - y") == std::string::npos);
+    REQUIRE(readPixelsBody.find("const auto dstY = y;") != std::string::npos);
+
+    REQUIRE(header.find("struct ReadbackBuffer") != std::string::npos);
+    REQUIRE(header.find("std::vector<ReadbackBuffer> readbackBufferPool") != std::string::npos);
+    REQUIRE(header.find("id<MTLBuffer> acquireReadbackBuffer(NSUInteger size)") != std::string::npos);
+    REQUIRE(header.find("void releaseAllReadbackBuffers()") != std::string::npos);
+    REQUIRE(batchBody.find("acquireReadbackBuffer(byteLength)") != std::string::npos);
+    REQUIRE(batchBody.find("[device newBufferWithLength:byteLength") == std::string::npos);
+    REQUIRE(batchBody.find("releaseAllReadbackBuffers();") != std::string::npos);
+}
+
+TEST_CASE("Metal texture readback fast path is format-exact and excludes BGRA") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto readPixelsMethod = source.find("void MetalRenderer::Impl::readPixelsFromTextureReadback");
+    REQUIRE(readPixelsMethod != std::string::npos);
+    const auto readPixelsMethodEnd = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels", readPixelsMethod);
+    REQUIRE(readPixelsMethodEnd != std::string::npos);
+    const auto readPixelsBody = source.substr(readPixelsMethod, readPixelsMethodEnd - readPixelsMethod);
+
+    REQUIRE(readPixelsBody.find("canUseFastReadbackPath") != std::string::npos);
+    REQUIRE(readPixelsBody.find("texture.format != Format::BGRA") != std::string::npos);
+    REQUIRE(readPixelsBody.find("reinterpret_cast<unsigned char*>") != std::string::npos);
+    REQUIRE(readPixelsBody.find("std::memcpy(dstBytes") != std::string::npos);
+}
+
+TEST_CASE("Metal render-target passes stay in the current command buffer") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    REQUIRE(source.find("if (!renderTarget && elapsed > frameBoundaryThresholdMs") != std::string::npos);
+    const auto autoClearCommit = source.find("if (autoClear && !renderTarget)");
+    REQUIRE(autoClearCommit != std::string::npos);
+    REQUIRE(source.find("commitPendingFrame();", autoClearCommit) != std::string::npos);
+}
+
 TEST_CASE("RenderTarget factory creates backend-neutral targets") {
 
     RenderTarget::Options options;
@@ -144,6 +226,17 @@ TEST_CASE("RenderTarget factory creates backend-neutral targets") {
     REQUIRE(target->height == 2);
     REQUIRE(target->viewport.z == 4);
     REQUIRE(target->viewport.w == 2);
+}
+
+TEST_CASE("Metal RenderTarget color format mapping supports sensor readback targets") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderObjects.hpp");
+    const auto method = source.find("toRenderTargetColorPixelFormat");
+    REQUIRE(method != std::string::npos);
+    REQUIRE(source.find("case Format::RG:", method) != std::string::npos);
+    REQUIRE(source.find("return MTLPixelFormatRG8Unorm;", method) != std::string::npos);
+    REQUIRE(source.find("case Format::Red:", method) != std::string::npos);
+    REQUIRE(source.find("return MTLPixelFormatR8Unorm;", method) != std::string::npos);
 }
 
 TEST_CASE("Renderer base exposes backend-independent size API") {
@@ -265,19 +358,30 @@ TEST_CASE("Metal depth texture ShaderMaterial path is wired as a dedicated built
     REQUIRE(fragmentSource.find("perspectiveDepthToViewZ") != std::string_view::npos);
     REQUIRE(fragmentSource.find("viewZToOrthographicDepth") != std::string_view::npos);
 
+    const std::string_view linearReadbackFragment{metal::depth_linear_readback_fragment};
+    REQUIRE(linearReadbackFragment.find("fragment float4 depth_linear_readback_fragment") != std::string_view::npos);
+    REQUIRE(linearReadbackFragment.find("depth2d<float> tDepth [[texture(1)]]") != std::string_view::npos);
+    REQUIRE(linearReadbackFragment.find("float d = clamp(-viewZ / uniforms.cameraFar, 0.0, 1.0);") != std::string_view::npos);
+    REQUIRE(linearReadbackFragment.find("return float4(r, g, 0.0, 1.0);") != std::string_view::npos);
+
     const auto implHeader = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
     REQUIRE(implHeader.find("void renderDepthTexture(id<MTLRenderCommandEncoder> encoder,") != std::string::npos);
+    REQUIRE(implHeader.find("void renderLinearDepthTexture(id<MTLRenderCommandEncoder> encoder,") != std::string::npos);
 
     const auto shaderManagerHeader = readProjectFile("src/threepp/renderers/metal/MetalShaderManager.hpp");
     REQUIRE(shaderManagerHeader.find("void* getOrCreateDepthTextureVertexFunction();") != std::string::npos);
     REQUIRE(shaderManagerHeader.find("void* getOrCreateDepthTextureFragmentFunction();") != std::string::npos);
+    REQUIRE(shaderManagerHeader.find("void* getOrCreateDepthTextureLinearReadbackFragmentFunction();") != std::string::npos);
 
     const auto rendererSource = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
     const auto intercept = rendererSource.find("shaderMaterial->uniforms.count(\"tDepth\") > 0");
     REQUIRE(intercept != std::string::npos);
     REQUIRE(rendererSource.find("shaderMaterial->uniforms.count(\"cameraNear\") > 0", intercept) != std::string::npos);
     REQUIRE(rendererSource.find("shaderMaterial->uniforms.count(\"cameraFar\") > 0", intercept) != std::string::npos);
-    REQUIRE(rendererSource.find("renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial", intercept) != std::string::npos);
+    const auto diffuseBranch = rendererSource.find("shaderMaterial->uniforms.count(\"tDiffuse\") > 0", intercept);
+    REQUIRE(diffuseBranch != std::string::npos);
+    REQUIRE(rendererSource.find("renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial", diffuseBranch) != std::string::npos);
+    REQUIRE(rendererSource.find("renderLinearDepthTexture(encoder, *mesh, *geometry, *shaderMaterial", diffuseBranch) != std::string::npos);
 
     const auto objectsSource = readProjectFile("src/threepp/renderers/metal/MetalObjectsRenderer.mm");
     const auto method = objectsSource.find("void MetalRenderer::Impl::renderDepthTexture");
@@ -290,6 +394,11 @@ TEST_CASE("Metal depth texture ShaderMaterial path is wired as a dedicated built
     REQUIRE(objectsSource.find("whiteDepthTexture", method) != std::string::npos);
     REQUIRE(objectsSource.find("[encoder setFragmentTexture:depthTexture atIndex:1]", method) != std::string::npos);
     REQUIRE(objectsSource.find("[encoder setFragmentSamplerState:depthSampler atIndex:1]", method) != std::string::npos);
+    const auto linearMethod = objectsSource.find("void MetalRenderer::Impl::renderLinearDepthTexture");
+    REQUIRE(linearMethod != std::string::npos);
+    REQUIRE(objectsSource.find("getOrCreateDepthTextureLinearReadbackFragmentFunction()", linearMethod) != std::string::npos);
+    REQUIRE(objectsSource.find("uniformTexture(depthMaterial->uniforms, \"tDepth\")", linearMethod) != std::string::npos);
+    REQUIRE(objectsSource.find("uniformTexture(depthMaterial->uniforms, \"tDiffuse\")", linearMethod) == std::string::npos);
 
     const auto exampleSource = readProjectFile("examples/textures/depth_texture_metal.cpp");
     REQUIRE(exampleSource.find("MetalRenderer renderer") != std::string::npos);

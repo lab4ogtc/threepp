@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
+#include <stdexcept>
 #include <unordered_map>
 #include <vector>
 
@@ -25,6 +27,44 @@ namespace threepp::metal {
                                           options:MTLResourceStorageModeShared];
             }
             return [device newBufferWithLength:length options:MTLResourceStorageModeShared];
+        }
+
+        void copyUpdateRange(BufferAttribute& attribute, id<MTLBuffer> buffer, size_t byteSize, const void* data) {
+            if (byteSize == 0) return;
+            if (!data) {
+                throw std::runtime_error("MetalBufferManager updateRange requires attribute data");
+            }
+
+            const auto attributeCount = attribute.count();
+            const auto itemSize = attribute.itemSize();
+            if (attributeCount <= 0 || itemSize <= 0) {
+                throw std::runtime_error("MetalBufferManager updateRange requires a non-empty attribute layout");
+            }
+
+            const auto elementCount = static_cast<std::size_t>(attributeCount) * static_cast<std::size_t>(itemSize);
+            if (elementCount == 0 || byteSize % elementCount != 0) {
+                throw std::runtime_error("MetalBufferManager updateRange cannot derive bytes per attribute element");
+            }
+
+            const auto& updateRange = attribute.updateRange;
+            if (updateRange.offset < 0 || updateRange.count < 0) {
+                throw std::runtime_error("MetalBufferManager updateRange contains a negative element range");
+            }
+
+            const auto offsetElements = static_cast<std::size_t>(updateRange.offset);
+            const auto countElements = static_cast<std::size_t>(updateRange.count);
+            if (offsetElements > elementCount || countElements > elementCount - offsetElements) {
+                throw std::runtime_error("MetalBufferManager updateRange is outside the attribute data");
+            }
+
+            const auto bytesPerElement = byteSize / elementCount;
+            const auto offsetBytes = offsetElements * bytesPerElement;
+            const auto countBytes = countElements * bytesPerElement;
+            if (countBytes == 0) return;
+
+            auto* dst = static_cast<unsigned char*>(buffer.contents) + offsetBytes;
+            const auto* src = static_cast<const unsigned char*>(data) + offsetBytes;
+            std::memcpy(dst, src, countBytes);
         }
 
     }// namespace
@@ -60,15 +100,19 @@ namespace threepp::metal {
                 auto& cached = it->second;
                 if (cached.attributeId != attribute.id || cached.lastVersion != attribute.version || cached.byteSize != byteSize) {
                     if (byteSize > 0) {
+                        const auto sameAttribute = cached.attributeId == attribute.id;
                         if (byteSize > cached.mtlBuffer.length) {
                             cached.mtlBuffer = createSharedBuffer(device, byteSize, data);
+                        } else if (sameAttribute && attribute.updateRange.count != -1) {
+                            copyUpdateRange(attribute, cached.mtlBuffer, byteSize, data);
                         } else {
-                            memcpy(cached.mtlBuffer.contents, data, byteSize);
+                            std::memcpy(cached.mtlBuffer.contents, data, byteSize);
                         }
                     }
                     cached.attributeId = attribute.id;
                     cached.lastVersion = attribute.version;
                     cached.byteSize = byteSize;
+                    attribute.updateRange.count = -1;
                 }
                 return cached.mtlBuffer;
             }
@@ -79,6 +123,7 @@ namespace threepp::metal {
             cb.lastVersion = attribute.version;
             cb.byteSize = byteSize;
             cache[&attribute] = cb;
+            attribute.updateRange.count = -1;
             return cb.mtlBuffer;
         }
 
@@ -92,7 +137,7 @@ namespace threepp::metal {
             if (!buffer || byteSize > buffer.length) {
                 buffer = createSharedBuffer(device, byteSize, data);
             } else if (byteSize > 0) {
-                memcpy(buffer.contents, data, byteSize);
+                std::memcpy(buffer.contents, data, byteSize);
             }
             return buffer;
         }
@@ -109,7 +154,7 @@ namespace threepp::metal {
             if (!buffer || byteSize > buffer.length) {
                 buffer = createSharedBuffer(device, byteSize, data);
             } else if (byteSize > 0) {
-                memcpy(buffer.contents, data, byteSize);
+                std::memcpy(buffer.contents, data, byteSize);
             }
             return buffer;
         }

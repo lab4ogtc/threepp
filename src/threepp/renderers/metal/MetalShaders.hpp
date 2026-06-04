@@ -1627,6 +1627,41 @@ fragment float4 depth_texture_fragment(
 }
 )metal";
 
+    constexpr auto depth_linear_readback_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct DepthTextureVertexOutput {
+    float4 position [[position]];
+    float2 uv;
+};
+
+struct DepthTextureUniforms {
+    float4x4 mvp;
+    float cameraNear;
+    float cameraFar;
+};
+
+float perspectiveDepthToViewZ(float invClipZ, float nearPlane, float farPlane) {
+    return (nearPlane * farPlane) / ((farPlane - nearPlane) * invClipZ - farPlane);
+}
+
+fragment float4 depth_linear_readback_fragment(
+    DepthTextureVertexOutput in [[stage_in]],
+    constant DepthTextureUniforms& uniforms [[buffer(4)]],
+    depth2d<float> tDepth [[texture(1)]],
+    sampler tDepthSampler [[sampler(1)]]
+)
+{
+    float fragCoordZ = tDepth.sample(tDepthSampler, in.uv);
+    float viewZ = perspectiveDepthToViewZ(fragCoordZ, uniforms.cameraNear, uniforms.cameraFar);
+    float d = clamp(-viewZ / uniforms.cameraFar, 0.0, 1.0);
+    float r = floor(d * 255.0) / 255.0;
+    float g = fract(d * 255.0);
+    return float4(r, g, 0.0, 1.0);
+}
+)metal";
+
     constexpr auto sprite_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;

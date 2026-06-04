@@ -1044,8 +1044,12 @@ namespace threepp {
                 return srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
             case Format::BGRA:
                 return srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+            case Format::RG:
+                return MTLPixelFormatRG8Unorm;
+            case Format::Red:
+                return MTLPixelFormatR8Unorm;
             default:
-                throw std::runtime_error("Metal RenderTarget currently supports only RGB8, RGBA8, and BGRA8 color textures");
+                throw std::runtime_error("Metal RenderTarget currently supports only RGB8, RGBA8, BGRA8, RG8, and R8 color textures");
         }
     }
 

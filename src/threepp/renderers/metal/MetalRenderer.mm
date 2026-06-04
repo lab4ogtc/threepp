@@ -7,7 +7,9 @@
 #include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
 #endif
 
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <stdexcept>
@@ -58,6 +60,129 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
     struct alignas(16) ScissorClearUniforms {
         float color[4];
     };
+
+    unsigned int textureFormatChannelCount(Format format) {
+        switch (format) {
+            case Format::Red:
+                return 1u;
+            case Format::RG:
+                return 2u;
+            case Format::RGB:
+                return 3u;
+            case Format::RGBA:
+            case Format::BGRA:
+                return 4u;
+            default:
+                throw std::runtime_error("MetalRenderer::copyTextureToImage supports only Red, RG, RGB, RGBA, and BGRA texture formats");
+        }
+    }
+
+    NSUInteger pixelFormatBytesPerPixel(MTLPixelFormat pixelFormat) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR8Unorm:
+                return 1u;
+            case MTLPixelFormatRG8Unorm:
+                return 2u;
+            case MTLPixelFormatRGBA8Unorm:
+            case MTLPixelFormatRGBA8Unorm_sRGB:
+            case MTLPixelFormatBGRA8Unorm:
+            case MTLPixelFormatBGRA8Unorm_sRGB:
+            case MTLPixelFormatR32Float:
+                return 4u;
+            case MTLPixelFormatRG32Float:
+                return 8u;
+            case MTLPixelFormatRGBA32Float:
+                return 16u;
+            default:
+                throw std::runtime_error("MetalRenderer::copyTextureToImage encountered an unsupported Metal pixel format");
+        }
+    }
+
+    bool pixelFormatIsFloat(MTLPixelFormat pixelFormat) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR32Float:
+            case MTLPixelFormatRG32Float:
+            case MTLPixelFormatRGBA32Float:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool canUseFastReadbackPath(const Texture& texture, MTLPixelFormat pixelFormat) {
+        const auto textureFormatIsFastPathEligible = texture.format != Format::BGRA;
+        if (!textureFormatIsFastPathEligible) return false;
+
+        if (texture.type == Type::UnsignedByte) {
+            switch (texture.format) {
+                case Format::Red:
+                    return pixelFormat == MTLPixelFormatR8Unorm;
+                case Format::RG:
+                    return pixelFormat == MTLPixelFormatRG8Unorm;
+                case Format::RGBA:
+                    return pixelFormat == MTLPixelFormatRGBA8Unorm ||
+                           pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
+                default:
+                    return false;
+            }
+        }
+
+        if (texture.type == Type::Float) {
+            switch (texture.format) {
+                case Format::Red:
+                    return pixelFormat == MTLPixelFormatR32Float;
+                case Format::RG:
+                    return pixelFormat == MTLPixelFormatRG32Float;
+                case Format::RGBA:
+                    return pixelFormat == MTLPixelFormatRGBA32Float;
+                default:
+                    return false;
+            }
+        }
+
+        return false;
+    }
+
+    unsigned char readByteComponent(const unsigned char* pixel, MTLPixelFormat pixelFormat, unsigned int channel) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR8Unorm:
+                return channel == 0u ? pixel[0] : (channel == 3u ? 255u : 0u);
+            case MTLPixelFormatRG8Unorm:
+                return channel < 2u ? pixel[channel] : (channel == 3u ? 255u : 0u);
+            case MTLPixelFormatRGBA8Unorm:
+            case MTLPixelFormatRGBA8Unorm_sRGB:
+                return channel < 4u ? pixel[channel] : 0u;
+            case MTLPixelFormatBGRA8Unorm:
+            case MTLPixelFormatBGRA8Unorm_sRGB:
+                if (channel == 0u) return pixel[2];
+                if (channel == 1u) return pixel[1];
+                if (channel == 2u) return pixel[0];
+                return pixel[3];
+            default:
+                return channel == 3u ? 255u : 0u;
+        }
+    }
+
+    float readFloatComponent(const float* pixel, MTLPixelFormat pixelFormat, unsigned int channel) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR32Float:
+                return channel == 0u ? pixel[0] : (channel == 3u ? 1.f : 0.f);
+            case MTLPixelFormatRG32Float:
+                return channel < 2u ? pixel[channel] : (channel == 3u ? 1.f : 0.f);
+            case MTLPixelFormatRGBA32Float:
+                return channel < 4u ? pixel[channel] : 0.f;
+            default:
+                return channel == 3u ? 1.f : 0.f;
+        }
+    }
+
+    unsigned int destinationCanonicalChannel(Format format, unsigned int destinationChannel) {
+        if (format == Format::BGRA) {
+            static constexpr unsigned int bgraToRgba[]{2u, 1u, 0u, 3u};
+            return bgraToRgba[destinationChannel];
+        }
+        return destinationChannel;
+    }
 
     id<MTLDepthStencilState> createScissorClearDepthStencilState(id<MTLDevice> device, bool clearDepth) {
         MTLDepthStencilDescriptor* desc = [[MTLDepthStencilDescriptor alloc] init];
@@ -316,6 +441,12 @@ MetalRenderer::Impl::~Impl() {
         geometry->removeEventListener("dispose", onGeometryDispose);
     }
     backgroundCubeGeometry.reset();
+    for (auto& readbackBuffer : readbackBufferPool) {
+        readbackBuffer.buffer = nil;
+        readbackBuffer.size = 0;
+        readbackBuffer.inUse = false;
+    }
+    readbackBufferPool.clear();
 }
 
 void MetalRenderer::Impl::removeAttribute(BufferAttribute* attribute) {
@@ -598,6 +729,43 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     return resources;
 }
 
+id<MTLBuffer> MetalRenderer::Impl::acquireReadbackBuffer(NSUInteger size) {
+    const auto requestedSize = std::max<NSUInteger>(size, 1u);
+    constexpr NSUInteger maxIdleOversizeRetainedReadbackBuffer = 16u * 1024u * 1024u;
+
+    for (auto& entry : readbackBufferPool) {
+        if (entry.inUse || entry.size < requestedSize) continue;
+
+        const auto oversized = requestedSize <= std::numeric_limits<NSUInteger>::max() / 2u &&
+                               entry.size > requestedSize * 2u &&
+                               entry.size > maxIdleOversizeRetainedReadbackBuffer;
+        if (oversized) {
+            entry.buffer = [device newBufferWithLength:requestedSize options:MTLResourceStorageModeShared];
+            if (!entry.buffer) {
+                throw std::runtime_error("Failed to allocate Metal readback buffer");
+            }
+            entry.size = requestedSize;
+        }
+
+        entry.inUse = true;
+        return entry.buffer;
+    }
+
+    id<MTLBuffer> buffer = [device newBufferWithLength:requestedSize options:MTLResourceStorageModeShared];
+    if (!buffer) {
+        throw std::runtime_error("Failed to allocate Metal readback buffer");
+    }
+
+    readbackBufferPool.push_back({buffer, requestedSize, true});
+    return buffer;
+}
+
+void MetalRenderer::Impl::releaseAllReadbackBuffers() {
+    for (auto& entry : readbackBufferPool) {
+        entry.inUse = false;
+    }
+}
+
 void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
     if (!target) return;
 
@@ -768,6 +936,192 @@ void MetalRenderer::Impl::copyFramebufferToTexture(const Vector2& position, Text
     }
 }
 
+void MetalRenderer::Impl::copyTextureToImage(Texture& texture) {
+    std::vector<Texture*> textures{&texture};
+    copyTexturesToImages(textures);
+}
+
+void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& textures) {
+    struct TextureReadback {
+        Texture* texture;
+        id<MTLTexture> sourceTexture;
+        id<MTLBuffer> readbackBuffer;
+        NSUInteger sourceBytesPerRow;
+        NSUInteger sourceBytesPerPixel;
+        NSUInteger byteLength;
+    };
+
+    std::vector<TextureReadback> readbacks;
+    readbacks.reserve(textures.size());
+
+    try {
+        for (auto* texture : textures) {
+            if (!texture) continue;
+
+            id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture);
+            if (!sourceTexture) {
+                throw std::runtime_error("MetalRenderer::copyTextureToImage could not acquire the source texture");
+            }
+
+            const auto width = static_cast<NSUInteger>(sourceTexture.width);
+            const auto height = static_cast<NSUInteger>(sourceTexture.height);
+            const auto sourceBytesPerPixel = pixelFormatBytesPerPixel(sourceTexture.pixelFormat);
+            const auto sourceBytesPerRow = ((width * sourceBytesPerPixel) + 255u) & ~255u;
+            const auto byteLength = sourceBytesPerRow * height;
+
+            id<MTLBuffer> readbackBuffer = acquireReadbackBuffer(byteLength);
+
+            readbacks.push_back({texture, sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerPixel, byteLength});
+        }
+    } catch (...) {
+        releaseAllReadbackBuffers();
+        throw;
+    }
+
+    if (readbacks.empty()) return;
+
+    id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
+    const bool temporaryCommandBuffer = commandBuffer == nil;
+    if (temporaryCommandBuffer) {
+        commandBuffer = [commandQueue commandBuffer];
+    }
+    if (!commandBuffer) {
+        releaseAllReadbackBuffers();
+        throw std::runtime_error("MetalRenderer::copyTextureToImage could not create a command buffer");
+    }
+
+    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+    for (const auto& readback : readbacks) {
+        const auto width = static_cast<NSUInteger>(readback.sourceTexture.width);
+        const auto height = static_cast<NSUInteger>(readback.sourceTexture.height);
+        [blitEncoder copyFromTexture:readback.sourceTexture
+                         sourceSlice:0
+                         sourceLevel:0
+                        sourceOrigin:MTLOriginMake(0, 0, 0)
+                          sourceSize:MTLSizeMake(width, height, 1)
+                            toBuffer:readback.readbackBuffer
+                   destinationOffset:0
+              destinationBytesPerRow:readback.sourceBytesPerRow
+            destinationBytesPerImage:readback.byteLength];
+    }
+    [blitEncoder endEncoding];
+
+    if (!temporaryCommandBuffer && currentDrawable) {
+        [commandBuffer presentDrawable:currentDrawable];
+    }
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    releaseAllReadbackBuffers();
+
+    if (!temporaryCommandBuffer) {
+        currentCommandBuffer = nil;
+        currentDrawable = nil;
+        explicitFrameInProgress = false;
+        lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
+        currentCommandBufferExternallyAccessed = false;
+    }
+
+    for (const auto& readback : readbacks) {
+        readPixelsFromTextureReadback(*readback.texture,
+                                      readback.sourceTexture,
+                                      readback.readbackBuffer,
+                                      readback.sourceBytesPerRow,
+                                      readback.sourceBytesPerPixel);
+    }
+}
+
+void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
+                                                        id<MTLTexture> sourceTexture,
+                                                        id<MTLBuffer> readbackBuffer,
+                                                        NSUInteger sourceBytesPerRow,
+                                                        NSUInteger sourceBytesPerPixel) {
+    const auto width = static_cast<NSUInteger>(sourceTexture.width);
+    const auto height = static_cast<NSUInteger>(sourceTexture.height);
+
+    auto& image = texture.image();
+    image.width = static_cast<unsigned int>(width);
+    image.height = static_cast<unsigned int>(height);
+    image.depth = 0;
+
+    const auto destinationChannels = textureFormatChannelCount(texture.format);
+    const auto pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const auto sourceIsFloat = pixelFormatIsFloat(sourceTexture.pixelFormat);
+    const auto* rawBytes = static_cast<const unsigned char*>([readbackBuffer contents]);
+
+    if (texture.format != Format::BGRA && canUseFastReadbackPath(texture, sourceTexture.pixelFormat)) {
+        const auto elementSize = texture.type == Type::Float ? sizeof(float) : sizeof(unsigned char);
+        const auto rowBytes = static_cast<NSUInteger>(width * destinationChannels * elementSize);
+        unsigned char* dstBytes = nullptr;
+
+        if (texture.type == Type::Float) {
+            image.setData(std::vector<float>(pixelCount * destinationChannels));
+            dstBytes = reinterpret_cast<unsigned char*>(image.data<float>().data());
+        } else {
+            image.setData(std::vector<unsigned char>(pixelCount * destinationChannels));
+            dstBytes = reinterpret_cast<unsigned char*>(image.data<unsigned char>().data());
+        }
+
+        if (sourceBytesPerRow == rowBytes) {
+            std::memcpy(dstBytes, rawBytes, static_cast<std::size_t>(rowBytes * height));
+        } else {
+            for (NSUInteger y = 0; y < height; ++y) {
+                std::memcpy(dstBytes + static_cast<std::size_t>(y * rowBytes),
+                            rawBytes + static_cast<std::size_t>(y * sourceBytesPerRow),
+                            static_cast<std::size_t>(rowBytes));
+            }
+        }
+        return;
+    }
+
+    if (texture.type == Type::Float) {
+        image.setData(std::vector<float>(pixelCount * destinationChannels));
+        auto& out = image.data<float>();
+        for (NSUInteger y = 0; y < height; ++y) {
+            const auto* srcRow = rawBytes + y * sourceBytesPerRow;
+            const auto dstY = y;
+            for (NSUInteger x = 0; x < width; ++x) {
+                const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
+                for (unsigned int c = 0; c < destinationChannels; ++c) {
+                    const auto canonical = destinationCanonicalChannel(texture.format, c);
+                    float value = 0.f;
+                    if (sourceIsFloat) {
+                        value = readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical);
+                    } else {
+                        value = static_cast<float>(readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical)) * (1.f / 255.f);
+                    }
+                    out[(static_cast<std::size_t>(dstY) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * destinationChannels + c] = value;
+                }
+            }
+        }
+        return;
+    }
+
+    if (texture.type != Type::UnsignedByte) {
+        throw std::runtime_error("MetalRenderer::copyTextureToImage supports only UnsignedByte and Float texture readback");
+    }
+
+    image.setData(std::vector<unsigned char>(pixelCount * destinationChannels));
+    auto& out = image.data<unsigned char>();
+    for (NSUInteger y = 0; y < height; ++y) {
+        const auto* srcRow = rawBytes + y * sourceBytesPerRow;
+        const auto dstY = y;
+        for (NSUInteger x = 0; x < width; ++x) {
+            const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
+            for (unsigned int c = 0; c < destinationChannels; ++c) {
+                const auto canonical = destinationCanonicalChannel(texture.format, c);
+                unsigned char value = 0;
+                if (sourceIsFloat) {
+                    const auto floatValue = readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical);
+                    value = static_cast<unsigned char>(std::clamp(std::lround(floatValue * 255.f), 0l, 255l));
+                } else {
+                    value = readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical);
+                }
+                out[(static_cast<std::size_t>(dstY) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * destinationChannels + c] = value;
+            }
+        }
+    }
+}
+
 std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     if (!currentCommandBuffer || !currentDrawable) {
         throw std::runtime_error("MetalRenderer::readRGBPixels requires an uncommitted frame; set autoClear=false, clear, render, then read");
@@ -781,10 +1135,7 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     const auto bytesPerRow = ((width * bytesPerPixel) + 255u) & ~255u;
     const auto byteLength = bytesPerRow * height;
 
-    id<MTLBuffer> readbackBuffer = [device newBufferWithLength:byteLength options:MTLResourceStorageModeShared];
-    if (!readbackBuffer) {
-        throw std::runtime_error("Failed to allocate Metal readback buffer");
-    }
+    id<MTLBuffer> readbackBuffer = acquireReadbackBuffer(byteLength);
 
     id<MTLBlitCommandEncoder> blitEncoder = [currentCommandBuffer blitCommandEncoder];
     [blitEncoder copyFromTexture:sourceTexture
@@ -801,6 +1152,7 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     [currentCommandBuffer presentDrawable:currentDrawable];
     [currentCommandBuffer commit];
     [currentCommandBuffer waitUntilCompleted];
+    releaseAllReadbackBuffers();
 
     const auto* bgra = static_cast<const unsigned char*>([readbackBuffer contents]);
     std::vector<unsigned char> rgb(static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3u);
@@ -1149,7 +1501,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         if (hasPreviousRender) {
             const auto elapsed = std::chrono::duration<float, std::milli>(now - lastRenderTime).count();
             const auto isOrderedScissorContinuation = scissorTest && (scissor.x > lastScissor.x || scissor.y > lastScissor.y);
-            if (elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation) {
+            if (!renderTarget && elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation) {
                 commitPendingFrame();
             }
         }
@@ -1382,7 +1734,11 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                     if (shaderMaterial->uniforms.count("tDepth") > 0 &&
                         shaderMaterial->uniforms.count("cameraNear") > 0 &&
                         shaderMaterial->uniforms.count("cameraFar") > 0) {
-                        renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        if (shaderMaterial->uniforms.count("tDiffuse") > 0) {
+                            renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        } else {
+                            renderLinearDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        }
                         invokeAfterRenderCallback(*obj, geometry, material, item.group);
                         continue;
                     }
@@ -1546,7 +1902,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     lastRenderTime = std::chrono::steady_clock::now();
     clearedTargetsInFrame.insert(renderTarget);
 
-    if (autoClear) {
+    if (autoClear && !renderTarget) {
         if (!lastFrameWasExternallyAccessed) {
             if (!scissorTest) {
                 commitPendingFrame();
@@ -1652,6 +2008,16 @@ void MetalRenderer::addPreRenderJob(const RenderJob& job) {
 void MetalRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->copyFramebufferToTexture(position, texture, level);
+}
+
+void MetalRenderer::copyTextureToImage(Texture& texture) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    pimpl_->copyTextureToImage(texture);
+}
+
+void MetalRenderer::copyTexturesToImages(const std::vector<Texture*>& textures) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    pimpl_->copyTexturesToImages(textures);
 }
 
 std::optional<void*> MetalRenderer::getMetalTexture(Texture& texture) const {

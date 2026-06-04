@@ -251,6 +251,7 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateDepthTextureVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateDepthTextureFragmentFunction());
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthTextureLinearReadbackFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateWaterVertexFunction());
@@ -364,11 +365,81 @@ TEST_CASE("Metal buffer manager refreshes reused attribute addresses") {
         firstAttribute->~TestBufferAttribute();
 
         auto* secondAttribute = new (storage) TestBufferAttribute(static_cast<int>(second.size()));
+        secondAttribute->updateRange.offset = 1;
+        secondAttribute->updateRange.count = 1;
         REQUIRE(static_cast<void*>(secondAttribute) == static_cast<void*>(storage));
         auto* secondBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(*secondAttribute, second.size() * sizeof(float), second.data());
         REQUIRE(secondBuffer != nil);
         REQUIRE(static_cast<const float*>(secondBuffer.contents)[0] == 4.f);
+        REQUIRE(static_cast<const float*>(secondBuffer.contents)[1] == 5.f);
+        REQUIRE(static_cast<const float*>(secondBuffer.contents)[2] == 6.f);
+        REQUIRE(secondAttribute->updateRange.count == -1);
         secondAttribute->~TestBufferAttribute();
+    }
+}
+
+TEST_CASE("Metal buffer manager applies updateRange only while reusing attribute buffers") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalBufferManager bufferManager((__bridge void*) device);
+
+        TestBufferAttribute attribute(6);
+        std::vector<float> initial{1.f, 2.f, 3.f, 4.f, 5.f, 6.f};
+        auto* firstBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(attribute, initial.size() * sizeof(float), initial.data());
+        REQUIRE(firstBuffer != nil);
+
+        std::vector<float> next{100.f, 200.f, 30.f, 40.f, 500.f, 600.f};
+        attribute.updateRange.offset = 2;
+        attribute.updateRange.count = 2;
+        attribute.needsUpdate();
+        auto* secondBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(attribute, next.size() * sizeof(float), next.data());
+
+        REQUIRE(secondBuffer == firstBuffer);
+        const auto* values = static_cast<const float*>(secondBuffer.contents);
+        CHECK(values[0] == 1.f);
+        CHECK(values[1] == 2.f);
+        CHECK(values[2] == 30.f);
+        CHECK(values[3] == 40.f);
+        CHECK(values[4] == 5.f);
+        CHECK(values[5] == 6.f);
+        CHECK(attribute.updateRange.count == -1);
+    }
+}
+
+TEST_CASE("Metal buffer manager ignores updateRange when attribute buffers grow") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        metal::MetalBufferManager bufferManager((__bridge void*) device);
+
+        TestBufferAttribute attribute(4);
+        std::vector<float> initial{1.f, 2.f};
+        auto* firstBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(attribute, initial.size() * sizeof(float), initial.data());
+        REQUIRE(firstBuffer != nil);
+
+        std::vector<float> grown{10.f, 20.f, 30.f, 40.f};
+        attribute.updateRange.offset = 2;
+        attribute.updateRange.count = 1;
+        attribute.needsUpdate();
+        auto* grownBuffer = (__bridge id<MTLBuffer>) bufferManager.getBuffer(attribute, grown.size() * sizeof(float), grown.data());
+
+        REQUIRE(grownBuffer != nil);
+        REQUIRE(grownBuffer != firstBuffer);
+        const auto* values = static_cast<const float*>(grownBuffer.contents);
+        CHECK(values[0] == 10.f);
+        CHECK(values[1] == 20.f);
+        CHECK(values[2] == 30.f);
+        CHECK(values[3] == 40.f);
+        CHECK(attribute.updateRange.count == -1);
     }
 }
 
@@ -627,6 +698,16 @@ TEST_CASE("Metal RenderTarget color pixel format respects texture encoding") {
     hdrFallback->format = Format::RGBA;
     hdrFallback->encoding = Encoding::RGBE;
     REQUIRE(toRenderTargetColorPixelFormat(*hdrFallback) == MTLPixelFormatRGBA8Unorm);
+
+    auto rg = Texture::create();
+    rg->format = Format::RG;
+    rg->encoding = Encoding::sRGB;
+    REQUIRE(toRenderTargetColorPixelFormat(*rg) == MTLPixelFormatRG8Unorm);
+
+    auto red = Texture::create();
+    red->format = Format::Red;
+    red->encoding = Encoding::Gamma;
+    REQUIRE(toRenderTargetColorPixelFormat(*red) == MTLPixelFormatR8Unorm);
 }
 
 TEST_CASE("Metal texture manager creates sRGB Metal textures for sRGB and Gamma encodings") {

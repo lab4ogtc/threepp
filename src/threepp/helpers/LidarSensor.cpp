@@ -5,8 +5,8 @@
 #include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/math/MathUtils.hpp"
 #include "threepp/objects/Mesh.hpp"
-#include "threepp/renderers/GLRenderTarget.hpp"
-#include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/Renderer.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/textures/DepthTexture.hpp"
 
 #include <cmath>
@@ -84,7 +84,7 @@ void LidarSensor::init(float near, float far) {
         cameras_[i] = cam.get();
     }
 
-    GLRenderTarget::Options sceneOpts;
+    RenderTarget::Options sceneOpts;
     sceneOpts.format = Format::RGB;
     sceneOpts.minFilter = Filter::Nearest;
     sceneOpts.magFilter = Filter::Nearest;
@@ -92,7 +92,7 @@ void LidarSensor::init(float near, float far) {
     sceneOpts.stencilBuffer = false;
     sceneOpts.depthBuffer = true;
 
-    GLRenderTarget::Options readOpts;
+    RenderTarget::Options readOpts;
     readOpts.format = Format::RG;
     readOpts.minFilter = Filter::Nearest;
     readOpts.magFilter = Filter::Nearest;
@@ -102,8 +102,8 @@ void LidarSensor::init(float near, float far) {
 
     for (int i = 0; i < kNumFaces; ++i) {
         sceneOpts.depthTexture = DepthTexture::create(Type::Float);
-        sceneTargets_[i] = GLRenderTarget::create(faceSize_, faceSize_, sceneOpts);
-        readbackTargets_[i] = GLRenderTarget::create(faceSize_, faceSize_, readOpts);
+        sceneTargets_[i] = RenderTarget::create(faceSize_, faceSize_, sceneOpts);
+        readbackTargets_[i] = RenderTarget::create(faceSize_, faceSize_, readOpts);
     }
 
     // Post-process shader: linearize perspective depth, encode in RG for ~16-bit precision.
@@ -201,7 +201,7 @@ LidarSensor::LidarSensor(const LidarModel& model, unsigned int faceSize, float n
 // Scan
 // ---------------------------------------------------------------------------
 
-void LidarSensor::scan(GLRenderer& renderer, Scene& scene, std::vector<Vector3>& cloud) {
+void LidarSensor::scan(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud) {
     cloud.clear();
     renderFaces(renderer, scene);
 
@@ -211,8 +211,11 @@ void LidarSensor::scan(GLRenderer& renderer, Scene& scene, std::vector<Vector3>&
         unprojectBeams(cloud);
 }
 
-void LidarSensor::renderFaces(GLRenderer& renderer, Scene& scene) {
+void LidarSensor::renderFaces(Renderer& renderer, Scene& scene) {
     if (!parent) updateMatrixWorld();
+
+    std::vector<Texture*> readbackTextures;
+    readbackTextures.reserve(kNumFaces);
 
     for (int f = 0; f < kNumFaces; ++f) {
         renderer.setRenderTarget(sceneTargets_[f].get());
@@ -222,9 +225,10 @@ void LidarSensor::renderFaces(GLRenderer& renderer, Scene& scene) {
         renderer.setRenderTarget(readbackTargets_[f].get());
         renderer.render(postScene_, postCamera_);
 
-        renderer.copyTextureToImage(*readbackTargets_[f]->texture);
+        readbackTextures.push_back(readbackTargets_[f]->texture.get());
     }
 
+    renderer.copyTexturesToImages(readbackTextures);
     renderer.setRenderTarget(nullptr);
 }
 

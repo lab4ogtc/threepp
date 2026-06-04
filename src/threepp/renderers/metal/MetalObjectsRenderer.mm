@@ -1103,6 +1103,70 @@ void MetalRenderer::Impl::renderDepthTexture(id<MTLRenderCommandEncoder> encoder
     drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
 }
 
+void MetalRenderer::Impl::renderLinearDepthTexture(id<MTLRenderCommandEncoder> encoder,
+                                                   Mesh& mesh,
+                                                   BufferGeometry& geometry,
+                                                   ShaderMaterial& material,
+                                                   Camera& camera,
+                                                   MTLPixelFormat colorPixelFormat,
+                                                   std::optional<GeometryGroup> group) {
+    auto* depthMaterial = &material;
+    if (!depthMaterial->visible) return;
+    trackGeometry(geometry);
+
+    auto* posAttr = getFloatAttribute(geometry, "position");
+    auto* uvAttr = getFloatAttribute(geometry, "uv");
+    if (!posAttr || posAttr->itemSize() != 3 || !uvAttr || uvAttr->itemSize() != 2) return;
+
+    metal::PipelineKey pipelineKey;
+    pipelineKey.vertexFunction = shaderManager->getOrCreateDepthTextureVertexFunction();
+    pipelineKey.fragmentFunction = shaderManager->getOrCreateDepthTextureLinearReadbackFragmentFunction();
+    configurePipelineBlending(pipelineKey, *depthMaterial);
+    pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
+    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+    id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+    [encoder setRenderPipelineState:pso];
+    id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(false, false, DepthFunc::LessEqual);
+    [encoder setDepthStencilState:materialDepthStencilState];
+
+    const auto frontFaceCW = mesh.matrixWorld->determinant() < 0;
+    const auto faceCullingState = metal::computeFaceCullingState(depthMaterial->side, frontFaceCW, false);
+    [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+    applyDepthBias(encoder, *depthMaterial);
+
+    bindDrawAttributes(encoder, geometry, *posAttr, nullptr, uvAttr, nullptr, false, true, false, false);
+
+    DepthTextureUniforms uniforms{};
+    Matrix4 mvp;
+    computeMVP(camera, mesh, mvp);
+    copyMatrix(mvp, uniforms.mvp);
+    uniforms.cameraNear = uniformFloat(depthMaterial->uniforms, "cameraNear", camera.nearPlane);
+    uniforms.cameraFar = uniformFloat(depthMaterial->uniforms, "cameraFar", camera.farPlane);
+    [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+    [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+    id<MTLTexture> depthTexture = whiteDepthTexture;
+    id<MTLSamplerState> depthSampler = defaultSampler;
+    if (auto* depthUniform = uniformTexture(depthMaterial->uniforms, "tDepth")) {
+        try {
+            if (auto metalTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*depthUniform, true)) {
+                depthTexture = metalTexture;
+                depthSampler = (__bridge id<MTLSamplerState>) textureManager->getOrCreateSampler(*depthUniform);
+            }
+        } catch (const std::exception& e) {
+            std::cerr << "MetalRenderer: failed to bind depth texture uniform 'tDepth': " << e.what() << "\n";
+        }
+    }
+    [encoder setFragmentTexture:depthTexture atIndex:1];
+    [encoder setFragmentSamplerState:depthSampler atIndex:1];
+
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
+}
+
 void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scene& scene, Sprite& sprite, BufferGeometry& geometry, Material& itemMaterial, Camera& camera, MTLPixelFormat colorPixelFormat) {
     auto* material = itemMaterial.as<SpriteMaterial>();
     if (!material || !material->visible) return;

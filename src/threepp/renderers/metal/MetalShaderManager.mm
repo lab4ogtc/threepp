@@ -468,6 +468,10 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("depth_texture_fragment", depth_texture_fragment, "depth_texture_fragment");
     }
 
+    void* MetalShaderManager::getOrCreateDepthTextureLinearReadbackFragmentFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("depth_linear_readback_fragment", depth_linear_readback_fragment, "depth_linear_readback_fragment");
+    }
+
     void* MetalShaderManager::getOrCreateSkyVertexFunction() {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("sky_vertex", sky_vertex, "sky_vertex");
     }
