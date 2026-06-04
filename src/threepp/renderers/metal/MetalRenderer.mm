@@ -65,6 +65,89 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
         return [device newDepthStencilStateWithDescriptor:desc];
     }
 
+    void configurePipelineBlending(metal::PipelineKey& key, const Material& material) {
+        key.alphaBlending = material.blending != Blending::None &&
+                            (material.blending != Blending::Normal || material.transparent || material.opacity < 1.f);
+        key.blending = key.alphaBlending ? material.blending : Blending::Normal;
+        key.blendEquation = BlendEquation::Add;
+        key.blendEquationAlpha = BlendEquation::Add;
+        key.blendSrc = BlendFactor::SrcAlpha;
+        key.blendDst = BlendFactor::OneMinusSrcAlpha;
+        key.blendSrcAlpha = BlendFactor::One;
+        key.blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
+
+        if (!key.alphaBlending) return;
+
+        if (material.blending == Blending::Custom) {
+            key.blendEquation = material.blendEquation;
+            key.blendEquationAlpha = material.blendEquationAlpha.value_or(material.blendEquation);
+            key.blendSrc = material.blendSrc;
+            key.blendDst = material.blendDst;
+            key.blendSrcAlpha = material.blendSrcAlpha.value_or(material.blendSrc);
+            key.blendDstAlpha = material.blendDstAlpha.value_or(material.blendDst);
+            return;
+        }
+
+        if (material.premultipliedAlpha) {
+            switch (material.blending) {
+                case Blending::Normal:
+                    key.blendSrc = BlendFactor::One;
+                    key.blendDst = BlendFactor::OneMinusSrcAlpha;
+                    key.blendSrcAlpha = BlendFactor::One;
+                    key.blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
+                    break;
+                case Blending::Additive:
+                    key.blendSrc = BlendFactor::One;
+                    key.blendDst = BlendFactor::One;
+                    key.blendSrcAlpha = BlendFactor::One;
+                    key.blendDstAlpha = BlendFactor::One;
+                    break;
+                case Blending::Subtractive:
+                    key.blendSrc = BlendFactor::Zero;
+                    key.blendDst = BlendFactor::OneMinusSrcColor;
+                    key.blendSrcAlpha = BlendFactor::Zero;
+                    key.blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
+                    break;
+                case Blending::Multiply:
+                    key.blendSrc = BlendFactor::Zero;
+                    key.blendDst = BlendFactor::SrcColor;
+                    key.blendSrcAlpha = BlendFactor::Zero;
+                    key.blendDstAlpha = BlendFactor::SrcAlpha;
+                    break;
+                case Blending::None:
+                case Blending::Custom:
+                    break;
+            }
+            return;
+        }
+
+        switch (material.blending) {
+            case Blending::Normal:
+                break;
+            case Blending::Additive:
+                key.blendSrc = BlendFactor::SrcAlpha;
+                key.blendDst = BlendFactor::One;
+                key.blendSrcAlpha = BlendFactor::SrcAlpha;
+                key.blendDstAlpha = BlendFactor::One;
+                break;
+            case Blending::Subtractive:
+                key.blendSrc = BlendFactor::Zero;
+                key.blendDst = BlendFactor::OneMinusSrcColor;
+                key.blendSrcAlpha = BlendFactor::Zero;
+                key.blendDstAlpha = BlendFactor::OneMinusSrcColor;
+                break;
+            case Blending::Multiply:
+                key.blendSrc = BlendFactor::Zero;
+                key.blendDst = BlendFactor::SrcColor;
+                key.blendSrcAlpha = BlendFactor::Zero;
+                key.blendDstAlpha = BlendFactor::SrcColor;
+                break;
+            case Blending::None:
+            case Blending::Custom:
+                break;
+        }
+    }
+
 }// namespace
 
 void MetalRenderer::Impl::OnRenderTargetDispose::onEvent(Event& event) {
@@ -1202,15 +1285,12 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
             BufferGeometry* geometry = nullptr;
             bool isWireframe = false;
-            bool transparent = false;
-
             if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
                 geometry = mesh->geometry().get();
 
                 if (auto* wf = dynamic_cast<MaterialWithWireframe*>(material)) {
                     isWireframe = wf->wireframe;
                 }
-                transparent = material->transparent;
             }
 
             if (!geometry || !material || !material->visible) continue;
@@ -1274,7 +1354,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             metal::PipelineKey pipelineKey;
             pipelineKey.vertexFunction = shaderManager->getOrCreateVertexFunction(shaderKey);
             pipelineKey.fragmentFunction = shaderManager->getOrCreateFragmentFunction(shaderKey);
-            pipelineKey.alphaBlending = transparent;
+            configurePipelineBlending(pipelineKey, *material);
             pipelineKey.vertexLayoutBitmask = vertexLayoutBitmask;
             pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
             pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);

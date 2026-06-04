@@ -133,6 +133,10 @@ namespace threepp::metal {
 
         void* getOrCreatePointsFragmentFunction(bool useVertexColors = false);
 
+        void* getOrCreateParticleVertexFunction(bool useMap = false);
+
+        void* getOrCreateParticleFragmentFunction(bool useMap = false);
+
         void* getOrCreateRawShaderVertexFunction();
 
         void* getOrCreateRawShaderFragmentFunction();

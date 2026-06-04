@@ -3,7 +3,7 @@
 
 #include "threepp/constants.hpp"
 #include "threepp/core/BufferGeometry.hpp"
-#include "threepp/materials/ShaderMaterial.hpp"
+#include "threepp/materials/ParticleMaterial.hpp"
 #include "threepp/math/Color.hpp"
 #include "threepp/math/MathUtils.hpp"
 #include "threepp/objects/Points.hpp"
@@ -25,51 +25,6 @@ namespace {
     */
 
     ///////////////////////////////////////////////////////////////////////////////
-
-    /////////////
-    // SHADERS //
-    /////////////
-
-    std::string particleVertexShader =
-
-            R"(
-                in vec3  customColor;
-                in float customOpacity;
-                in float customSize;
-                in float customAngle;
-                in float customVisible;  // float used as boolean (0 = false, 1 = true)
-                out vec4  vColor;
-                out float vAngle;
-                void main()
-                {
-                    if ( customVisible > 0.5) 				                // true
-                        vColor = vec4( customColor, customOpacity ); //     set color associated to vertex; use later in fragment shader.
-                    else							                        // false
-                        vColor = vec4(0.0, 0.0, 0.0, 0.0); 		            //     make particle invisible.
-
-                    vAngle = customAngle;
-
-                    vec4 mvPosition = modelViewMatrix * vec4( position, 1.0 );
-                    gl_PointSize = customSize * ( 300.0 / length( mvPosition.xyz ) );     // scale particles as objects in 3D space
-                    gl_Position = projectionMatrix * mvPosition;
-                })";
-
-    std::string particleFragmentShader =
-            R"(
-                uniform sampler2D tex;
-                in vec4 vColor;
-                in float vAngle;
-                void main()
-                {
-                    gl_FragColor = vColor;
-
-                    float c = cos(vAngle);
-                    float s = sin(vAngle);
-                    vec2 rotatedUV = vec2(c * (gl_PointCoord.x - 0.5) + s * (gl_PointCoord.y - 0.5) + 0.5,
-                    c * (gl_PointCoord.y - 0.5) - s * (gl_PointCoord.x - 0.5) + 0.5);  // rotate UV coordinates to rotate texture
-                    vec4 rotatedTexture = texture2D( tex,  rotatedUV );
-                    gl_FragColor = gl_FragColor * rotatedTexture;    // sets an otherwise white particle texture to desired color
-                })";
 
     // helper functions for randomization
     float randomValue(float base, float spread) {
@@ -180,7 +135,7 @@ struct ParticleSystem::Impl {
     size_t particleCount{};
 
     std::shared_ptr<BufferGeometry> particleGeometry = nullptr;
-    std::shared_ptr<ShaderMaterial> particleMaterial = nullptr;
+    std::shared_ptr<ParticleMaterial> particleMaterial = nullptr;
     std::shared_ptr<Object3D> particleMesh;
 
     ParticleSystem& scope;
@@ -253,10 +208,7 @@ struct ParticleSystem::Impl {
 
         particleCount = settings.particlesPerSecond * std::min(settings.particleDeathAge, settings.emitterDeathAge);
 
-        particleMaterial = ShaderMaterial::create();
-        particleMaterial->vertexShader = particleVertexShader;
-        particleMaterial->fragmentShader = particleFragmentShader;
-        particleMaterial->transparent = true;
+        particleMaterial = ParticleMaterial::create();
 
         particleGeometry = BufferGeometry::create();
         particleGeometry->setAttribute("position", FloatBufferAttribute::create(std::vector<float>(particleCount * 3), 3));
@@ -336,41 +288,41 @@ struct ParticleSystem::Impl {
             }
         }
 
+        // check if particle emitter is still running
+        if (this->emitterAlive) {
+            // if no particles have died yet, then there are still particles to activate
+            if (this->emitterAge < settings.particleDeathAge) {
+                // determine indices of particles to activate
+                const auto startIndex = static_cast<int>(std::round(settings.particlesPerSecond * (this->emitterAge + 0)));
+                auto endIndex = static_cast<size_t>(std::round(settings.particlesPerSecond * (this->emitterAge + dt)));
+                if (endIndex > this->particleCount) {
+                    endIndex = this->particleCount;
+                }
+
+                for (unsigned i = startIndex; i < endIndex; i++)
+                    this->particleArray[i].alive = true;
+            }
+
+            // if any particles have died while the emitter is still running, we imediately recycle them
+            for (unsigned int i : recycleIndices) {
+                this->particleArray[i] = this->createParticle();
+                this->particleArray[i].alive = true;// activate right away
+                position->setXYZ(i, this->particleArray[i].position.x, this->particleArray[i].position.y, this->particleArray[i].position.z);
+            }
+
+            // stop emitter?
+            this->emitterAge += dt;
+            if (this->emitterAge > settings.emitterDeathAge) {
+                this->emitterAlive = false;
+            }
+        }
+
         customVisible->needsUpdate();
         customOpacity->needsUpdate();
         customSize->needsUpdate();
         customAngle->needsUpdate();
         customColor->needsUpdate();
-
-        // check if particle emitter is still running
-        if (!this->emitterAlive) return;
-
-        // if no particles have died yet, then there are still particles to activate
-        if (this->emitterAge < settings.particleDeathAge) {
-            // determine indices of particles to activate
-            const auto startIndex = static_cast<int>(std::round(settings.particlesPerSecond * (this->emitterAge + 0)));
-            auto endIndex = static_cast<size_t>(std::round(settings.particlesPerSecond * (this->emitterAge + dt)));
-            if (endIndex > this->particleCount) {
-                endIndex = this->particleCount;
-            }
-
-            for (unsigned i = startIndex; i < endIndex; i++)
-                this->particleArray[i].alive = true;
-        }
-
-        // if any particles have died while the emitter is still running, we imediately recycle them
-        for (unsigned int i : recycleIndices) {
-            this->particleArray[i] = this->createParticle();
-            this->particleArray[i].alive = true;// activate right away
-            position->setXYZ(i, this->particleArray[i].position.x, this->particleArray[i].position.y, this->particleArray[i].position.z);
-        }
         position->needsUpdate();
-
-        // stop emitter?
-        this->emitterAge += dt;
-        if (this->emitterAge > settings.emitterDeathAge) {
-            this->emitterAlive = false;
-        }
     }
 };
 

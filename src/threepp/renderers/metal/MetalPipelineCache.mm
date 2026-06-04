@@ -19,16 +19,29 @@ namespace threepp::metal {
         constexpr std::uint16_t VertexLayoutColor4 = 1u << 6u;
         constexpr std::uint16_t VertexLayoutMorphTargets = 1u << 7u;
         constexpr std::uint16_t VertexLayoutMorphNormals = 1u << 8u;
+        constexpr std::uint16_t VertexLayoutParticleSystem = 1u << 9u;
 
     }// namespace
 
     bool PipelineKey::operator==(const PipelineKey& other) const {
-        return vertexFunction == other.vertexFunction &&
-               fragmentFunction == other.fragmentFunction &&
-               alphaBlending == other.alphaBlending &&
-               vertexLayoutBitmask == other.vertexLayoutBitmask &&
-               colorPixelFormat == other.colorPixelFormat &&
-               rasterSampleCount == other.rasterSampleCount;
+        if (vertexFunction != other.vertexFunction ||
+            fragmentFunction != other.fragmentFunction ||
+            alphaBlending != other.alphaBlending ||
+            vertexLayoutBitmask != other.vertexLayoutBitmask ||
+            colorPixelFormat != other.colorPixelFormat ||
+            rasterSampleCount != other.rasterSampleCount) {
+            return false;
+        }
+
+        if (!alphaBlending) return true;
+
+        return blending == other.blending &&
+               blendEquation == other.blendEquation &&
+               blendEquationAlpha == other.blendEquationAlpha &&
+               blendSrc == other.blendSrc &&
+               blendDst == other.blendDst &&
+               blendSrcAlpha == other.blendSrcAlpha &&
+               blendDstAlpha == other.blendDstAlpha;
     }
 
     size_t PipelineKeyHash::operator()(const PipelineKey& key) const {
@@ -38,7 +51,19 @@ namespace threepp::metal {
         auto h4 = std::hash<std::uint16_t>{}(key.vertexLayoutBitmask);
         auto h5 = std::hash<std::uint64_t>{}(key.colorPixelFormat);
         auto h6 = std::hash<std::uint64_t>{}(key.rasterSampleCount);
-        return h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
+        auto hash = h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
+
+        if (!key.alphaBlending) return hash;
+
+        auto h7 = std::hash<int>{}(static_cast<int>(key.blending));
+        auto h8 = std::hash<int>{}(static_cast<int>(key.blendEquation));
+        auto h9 = std::hash<int>{}(static_cast<int>(key.blendEquationAlpha));
+        auto h10 = std::hash<int>{}(static_cast<int>(key.blendSrc));
+        auto h11 = std::hash<int>{}(static_cast<int>(key.blendDst));
+        auto h12 = std::hash<int>{}(static_cast<int>(key.blendSrcAlpha));
+        auto h13 = std::hash<int>{}(static_cast<int>(key.blendDstAlpha));
+        return hash ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^ (h10 << 9) ^ (h11 << 10) ^
+               (h12 << 11) ^ (h13 << 12);
     }
 
     namespace {
@@ -106,6 +131,52 @@ namespace threepp::metal {
             return MTLCompareFunctionLessEqual;
         }
 
+        MTLBlendOperation toMetalBlendOperation(BlendEquation equation) {
+            switch (equation) {
+                case BlendEquation::Add:
+                    return MTLBlendOperationAdd;
+                case BlendEquation::Subtract:
+                    return MTLBlendOperationSubtract;
+                case BlendEquation::ReverseSubtract:
+                    return MTLBlendOperationReverseSubtract;
+                case BlendEquation::Min:
+                    return MTLBlendOperationMin;
+                case BlendEquation::Max:
+                    return MTLBlendOperationMax;
+            }
+
+            return MTLBlendOperationAdd;
+        }
+
+        MTLBlendFactor toMetalBlendFactor(BlendFactor factor) {
+            switch (factor) {
+                case BlendFactor::Zero:
+                    return MTLBlendFactorZero;
+                case BlendFactor::One:
+                    return MTLBlendFactorOne;
+                case BlendFactor::SrcColor:
+                    return MTLBlendFactorSourceColor;
+                case BlendFactor::OneMinusSrcColor:
+                    return MTLBlendFactorOneMinusSourceColor;
+                case BlendFactor::SrcAlpha:
+                    return MTLBlendFactorSourceAlpha;
+                case BlendFactor::OneMinusSrcAlpha:
+                    return MTLBlendFactorOneMinusSourceAlpha;
+                case BlendFactor::DstAlpha:
+                    return MTLBlendFactorDestinationAlpha;
+                case BlendFactor::OneMinusDstAlpha:
+                    return MTLBlendFactorOneMinusDestinationAlpha;
+                case BlendFactor::DstColor:
+                    return MTLBlendFactorDestinationColor;
+                case BlendFactor::OneMinusDstColor:
+                    return MTLBlendFactorOneMinusDestinationColor;
+                case BlendFactor::SrcAlphaSaturate:
+                    return MTLBlendFactorSourceAlphaSaturated;
+            }
+
+            return MTLBlendFactorOne;
+        }
+
         void enableAttribute(MTLVertexDescriptor* descriptor, NSUInteger index, MTLVertexFormat format, NSUInteger stride, NSUInteger bufferIndex) {
             descriptor.attributes[index].format = format;
             descriptor.attributes[index].offset = 0;
@@ -158,6 +229,14 @@ namespace threepp::metal {
                 enableAttribute(descriptor, 14, MTLVertexFormatFloat3, sizeof(float) * 3, 18);
             }
 
+            if ((bitmask & VertexLayoutParticleSystem) != 0) {
+                enableAttribute(descriptor, 1, MTLVertexFormatFloat, sizeof(float));
+                enableAttribute(descriptor, 2, MTLVertexFormatFloat, sizeof(float));
+                enableAttribute(descriptor, 3, MTLVertexFormatFloat, sizeof(float));
+                enableAttribute(descriptor, 4, MTLVertexFormatFloat3, sizeof(float) * 3);
+                enableAttribute(descriptor, 5, MTLVertexFormatFloat, sizeof(float));
+            }
+
             return descriptor;
         }
 
@@ -190,12 +269,12 @@ namespace threepp::metal {
 
             if (key.alphaBlending) {
                 desc.colorAttachments[0].blendingEnabled = YES;
-                desc.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
-                desc.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
-                desc.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
-                desc.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
-                desc.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
-                desc.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+                desc.colorAttachments[0].rgbBlendOperation = toMetalBlendOperation(key.blendEquation);
+                desc.colorAttachments[0].alphaBlendOperation = toMetalBlendOperation(key.blendEquationAlpha);
+                desc.colorAttachments[0].sourceRGBBlendFactor = toMetalBlendFactor(key.blendSrc);
+                desc.colorAttachments[0].sourceAlphaBlendFactor = toMetalBlendFactor(key.blendSrcAlpha);
+                desc.colorAttachments[0].destinationRGBBlendFactor = toMetalBlendFactor(key.blendDst);
+                desc.colorAttachments[0].destinationAlphaBlendFactor = toMetalBlendFactor(key.blendDstAlpha);
             } else {
                 desc.colorAttachments[0].blendingEnabled = NO;
             }

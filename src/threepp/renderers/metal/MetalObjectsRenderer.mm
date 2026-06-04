@@ -255,6 +255,89 @@ namespace {
         });
     }
 
+    void configurePipelineBlending(metal::PipelineKey& key, const Material& material) {
+        key.alphaBlending = material.blending != Blending::None &&
+                            (material.blending != Blending::Normal || material.transparent || material.opacity < 1.f);
+        key.blending = key.alphaBlending ? material.blending : Blending::Normal;
+        key.blendEquation = BlendEquation::Add;
+        key.blendEquationAlpha = BlendEquation::Add;
+        key.blendSrc = BlendFactor::SrcAlpha;
+        key.blendDst = BlendFactor::OneMinusSrcAlpha;
+        key.blendSrcAlpha = BlendFactor::One;
+        key.blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
+
+        if (!key.alphaBlending) return;
+
+        if (material.blending == Blending::Custom) {
+            key.blendEquation = material.blendEquation;
+            key.blendEquationAlpha = material.blendEquationAlpha.value_or(material.blendEquation);
+            key.blendSrc = material.blendSrc;
+            key.blendDst = material.blendDst;
+            key.blendSrcAlpha = material.blendSrcAlpha.value_or(material.blendSrc);
+            key.blendDstAlpha = material.blendDstAlpha.value_or(material.blendDst);
+            return;
+        }
+
+        if (material.premultipliedAlpha) {
+            switch (material.blending) {
+                case Blending::Normal:
+                    key.blendSrc = BlendFactor::One;
+                    key.blendDst = BlendFactor::OneMinusSrcAlpha;
+                    key.blendSrcAlpha = BlendFactor::One;
+                    key.blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
+                    break;
+                case Blending::Additive:
+                    key.blendSrc = BlendFactor::One;
+                    key.blendDst = BlendFactor::One;
+                    key.blendSrcAlpha = BlendFactor::One;
+                    key.blendDstAlpha = BlendFactor::One;
+                    break;
+                case Blending::Subtractive:
+                    key.blendSrc = BlendFactor::Zero;
+                    key.blendDst = BlendFactor::OneMinusSrcColor;
+                    key.blendSrcAlpha = BlendFactor::Zero;
+                    key.blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
+                    break;
+                case Blending::Multiply:
+                    key.blendSrc = BlendFactor::Zero;
+                    key.blendDst = BlendFactor::SrcColor;
+                    key.blendSrcAlpha = BlendFactor::Zero;
+                    key.blendDstAlpha = BlendFactor::SrcAlpha;
+                    break;
+                case Blending::None:
+                case Blending::Custom:
+                    break;
+            }
+            return;
+        }
+
+        switch (material.blending) {
+            case Blending::Normal:
+                break;
+            case Blending::Additive:
+                key.blendSrc = BlendFactor::SrcAlpha;
+                key.blendDst = BlendFactor::One;
+                key.blendSrcAlpha = BlendFactor::SrcAlpha;
+                key.blendDstAlpha = BlendFactor::One;
+                break;
+            case Blending::Subtractive:
+                key.blendSrc = BlendFactor::Zero;
+                key.blendDst = BlendFactor::OneMinusSrcColor;
+                key.blendSrcAlpha = BlendFactor::Zero;
+                key.blendDstAlpha = BlendFactor::OneMinusSrcColor;
+                break;
+            case Blending::Multiply:
+                key.blendSrc = BlendFactor::Zero;
+                key.blendDst = BlendFactor::SrcColor;
+                key.blendSrcAlpha = BlendFactor::Zero;
+                key.blendDstAlpha = BlendFactor::SrcColor;
+                break;
+            case Blending::None:
+            case Blending::Custom:
+                break;
+        }
+    }
+
     template<class SystemUniforms>
     void fillSystemUniforms(const Camera& camera, const Mesh& mesh, RawShaderMaterial& material, SystemUniforms& out) {
         copyMatrix(*mesh.matrixWorld, out.modelMatrix);
@@ -598,7 +681,7 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateLineVertexFunction(useVertexColors);
     pipelineKey.fragmentFunction = shaderManager->getOrCreateLineFragmentFunction(useVertexColors);
-    pipelineKey.alphaBlending = lineMaterial->transparent || lineMaterial->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *lineMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
@@ -643,9 +726,78 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
                                        Camera& camera,
                                        MTLPixelFormat colorPixelFormat,
                                        std::optional<GeometryGroup> group) {
-    auto* pointsMaterial = material.as<PointsMaterial>();
     auto geometry = points.geometry();
-    if (!pointsMaterial || !geometry || !pointsMaterial->visible) return;
+    if (!geometry) return;
+
+    if (auto* particleMaterial = material.as<ParticleMaterial>()) {
+        if (!particleMaterial->visible) return;
+        trackGeometry(*geometry);
+
+        auto* posAttr = getFloatAttribute(*geometry, "position");
+        if (!posAttr || posAttr->itemSize() != 3) return;
+
+        auto bindParticleAttribute = [&](const std::string& name, NSUInteger index, int itemSize) {
+            auto* attr = getFloatAttribute(*geometry, name);
+            if (!attr || attr->itemSize() != itemSize) return false;
+
+            auto* buffer = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
+                    *attr,
+                    attr->count() * attr->itemSize() * sizeof(float),
+                    attr->array().data());
+            [encoder setVertexBuffer:buffer offset:0 atIndex:index];
+            return true;
+        };
+
+        auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
+                *posAttr,
+                posAttr->count() * posAttr->itemSize() * sizeof(float),
+                posAttr->array().data());
+        [encoder setVertexBuffer:posBuf offset:0 atIndex:0];
+
+        if (!bindParticleAttribute("customVisible", 1, 1) ||
+            !bindParticleAttribute("customAngle", 2, 1) ||
+            !bindParticleAttribute("customSize", 3, 1) ||
+            !bindParticleAttribute("customColor", 4, 3) ||
+            !bindParticleAttribute("customOpacity", 5, 1)) {
+            return;
+        }
+
+        auto* map = uniformTexture(particleMaterial->uniforms, "tex");
+        const bool useMap = map != nullptr;
+
+        metal::PipelineKey pipelineKey;
+        pipelineKey.vertexFunction = shaderManager->getOrCreateParticleVertexFunction(useMap);
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateParticleFragmentFunction(useMap);
+        configurePipelineBlending(pipelineKey, *particleMaterial);
+        pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutParticleSystem;
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+        id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+        [encoder setRenderPipelineState:pso];
+        id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+                particleMaterial->depthTest,
+                particleMaterial->depthWrite,
+                particleMaterial->depthFunc);
+        [encoder setDepthStencilState:materialDepthStencilState];
+        [encoder setCullMode:MTLCullModeNone];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        applyDepthBias(encoder, *particleMaterial);
+
+        ParticleUniforms uniforms{};
+        computeParticleUniforms(camera, points, uniforms);
+        fillToneMappingUniforms(renderer, *particleMaterial, uniforms);
+        [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:6];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:6];
+
+        bindTextureOrPlaceholder(encoder, map, whiteTexture, 0);
+
+        drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
+        return;
+    }
+
+    auto* pointsMaterial = material.as<PointsMaterial>();
+    if (!pointsMaterial || !pointsMaterial->visible) return;
     trackGeometry(*geometry);
 
     auto* posAttr = getFloatAttribute(*geometry, "position");
@@ -661,7 +813,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreatePointsVertexFunction(useVertexColors, useMorphTargets);
     pipelineKey.fragmentFunction = shaderManager->getOrCreatePointsFragmentFunction(useVertexColors);
-    pipelineKey.alphaBlending = pointsMaterial->transparent || pointsMaterial->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *pointsMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
     if (useMorphTargets) pipelineKey.vertexLayoutBitmask |= vertexLayoutMorphTargets;
@@ -756,7 +908,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
         metal::PipelineKey pipelineKey;
         pipelineKey.vertexFunction = (__bridge void*) vertexFunction;
         pipelineKey.fragmentFunction = (__bridge void*) fragmentFunction;
-        pipelineKey.alphaBlending = rawMaterial->transparent || rawMaterial->opacity < 1.f;
+        configurePipelineBlending(pipelineKey, *rawMaterial);
         pipelineKey.vertexLayoutBitmask = rawShaderVertexLayout(*geometry);
         pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
         pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
@@ -842,7 +994,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateRawShaderVertexFunction();
     pipelineKey.fragmentFunction = shaderManager->getOrCreateRawShaderFragmentFunction();
-    pipelineKey.alphaBlending = rawMaterial->transparent || rawMaterial->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *rawMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutColor4;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
@@ -896,7 +1048,7 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scen
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateSpriteVertexFunction(shaderKey);
     pipelineKey.fragmentFunction = shaderManager->getOrCreateSpriteFragmentFunction(shaderKey);
-    pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
@@ -947,7 +1099,7 @@ void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sk
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateSkyVertexFunction();
     pipelineKey.fragmentFunction = shaderManager->getOrCreateSkyFragmentFunction();
-    pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
@@ -1000,7 +1152,7 @@ void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateWaterVertexFunction();
     pipelineKey.fragmentFunction = shaderManager->getOrCreateWaterFragmentFunction();
-    pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
@@ -1079,7 +1231,7 @@ void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, S
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreateReflectorVertexFunction();
     pipelineKey.fragmentFunction = shaderManager->getOrCreateReflectorFragmentFunction();
-    pipelineKey.alphaBlending = material->transparent || material->opacity < 1.f;
+    configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);

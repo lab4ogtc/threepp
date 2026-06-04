@@ -205,6 +205,51 @@ TEST_CASE("Metal P1 cache keys include shader features and vertex layout") {
 
     REQUIRE_FALSE(withUv == withoutUv);
     REQUIRE(metal::PipelineKeyHash{}(withUv) != metal::PipelineKeyHash{}(withoutUv));
+
+    metal::PipelineKey normalBlend = withUv;
+    normalBlend.alphaBlending = true;
+    normalBlend.blending = Blending::Normal;
+
+    metal::PipelineKey additiveBlend = normalBlend;
+    additiveBlend.blending = Blending::Additive;
+
+    REQUIRE_FALSE(normalBlend == additiveBlend);
+    REQUIRE(metal::PipelineKeyHash{}(normalBlend) != metal::PipelineKeyHash{}(additiveBlend));
+
+    metal::PipelineKey opaqueNormal = withUv;
+    opaqueNormal.alphaBlending = false;
+    opaqueNormal.blending = Blending::Normal;
+
+    metal::PipelineKey opaqueAdditive = opaqueNormal;
+    opaqueAdditive.blending = Blending::Additive;
+    opaqueAdditive.blendDst = BlendFactor::One;
+
+    REQUIRE(opaqueNormal == opaqueAdditive);
+    REQUIRE(metal::PipelineKeyHash{}(opaqueNormal) == metal::PipelineKeyHash{}(opaqueAdditive));
+
+    metal::PipelineKey customBlend = normalBlend;
+    customBlend.blending = Blending::Custom;
+    customBlend.blendEquation = BlendEquation::Subtract;
+    customBlend.blendSrc = BlendFactor::One;
+    customBlend.blendDst = BlendFactor::DstColor;
+
+    REQUIRE_FALSE(normalBlend == customBlend);
+    REQUIRE(metal::PipelineKeyHash{}(normalBlend) != metal::PipelineKeyHash{}(customBlend));
+}
+
+TEST_CASE("Metal particle points bind dedicated attributes and uniform slot") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalObjectsRenderer.mm");
+
+    REQUIRE(source.find("if (auto* particleMaterial = material.as<ParticleMaterial>())") != std::string::npos);
+    CHECK(source.find("[encoder setVertexBuffer:posBuf offset:0 atIndex:0]") != std::string::npos);
+    CHECK(source.find("bindParticleAttribute(\"customVisible\", 1, 1)") != std::string::npos);
+    CHECK(source.find("bindParticleAttribute(\"customAngle\", 2, 1)") != std::string::npos);
+    CHECK(source.find("bindParticleAttribute(\"customSize\", 3, 1)") != std::string::npos);
+    CHECK(source.find("bindParticleAttribute(\"customColor\", 4, 3)") != std::string::npos);
+    CHECK(source.find("bindParticleAttribute(\"customOpacity\", 5, 1)") != std::string::npos);
+    CHECK(source.find("[encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:6]") != std::string::npos);
+    CHECK(source.find("[encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:6]") != std::string::npos);
 }
 
 TEST_CASE("Metal P2 shader keys include skinning and lighting variants") {

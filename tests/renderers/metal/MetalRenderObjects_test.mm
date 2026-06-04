@@ -114,6 +114,32 @@ TEST_CASE("Metal point uniforms copy alpha test and point sprite map transform")
     }
 }
 
+TEST_CASE("Metal particle uniforms expose model-view matrix beside MVP") {
+
+    STATIC_REQUIRE(alignof(ParticleUniforms) == 16);
+    STATIC_REQUIRE(sizeof(ParticleUniforms) == 144);
+    STATIC_REQUIRE(offsetof(ParticleUniforms, mvp) == 0);
+    STATIC_REQUIRE(offsetof(ParticleUniforms, modelViewMatrix) == 64);
+    STATIC_REQUIRE(offsetof(ParticleUniforms, toneMappingType) == 128);
+    STATIC_REQUIRE(offsetof(ParticleUniforms, toneMappingExposure) == 132);
+    STATIC_REQUIRE(offsetof(ParticleUniforms, toneMapped) == 136);
+    STATIC_REQUIRE(sizeof(ParticleUniforms) % 16 == 0);
+
+    PerspectiveCamera camera;
+    camera.updateMatrixWorld(true);
+
+    auto points = Points::create(BufferGeometry::create(), PointsMaterial::create());
+    points->updateMatrixWorld(true);
+
+    ParticleUniforms uniforms{};
+    computeParticleUniforms(camera, *points, uniforms);
+
+    CHECK(uniforms.modelViewMatrix[0] == Catch::Approx(1.f));
+    CHECK(uniforms.modelViewMatrix[5] == Catch::Approx(1.f));
+    CHECK(uniforms.modelViewMatrix[10] == Catch::Approx(1.f));
+    CHECK(uniforms.modelViewMatrix[15] == Catch::Approx(1.f));
+}
+
 TEST_CASE("Metal morph targets select GL-compatible active influences") {
 
     auto geometry = BufferGeometry::create();

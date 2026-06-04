@@ -116,6 +116,16 @@ TEST_CASE("Metal special shaders bind uniforms away from vertex attributes") {
     CHECK(contains(metal::basic_fragment, "directBlinnPhong("));
     CHECK(contains(metal::basic_fragment, "params.materialType == 2"));
     CHECK(contains(metal::basic_fragment, "float4 specularColor"));
+    CHECK(contains(metal::particle_system_vertex, "constant ParticleUniforms& uniforms [[buffer(6)]]"));
+    CHECK(contains(metal::particle_system_vertex, "float customVisible [[attribute(1)]]"));
+    CHECK(contains(metal::particle_system_vertex, "float customAngle [[attribute(2)]]"));
+    CHECK(contains(metal::particle_system_vertex, "float customSize [[attribute(3)]]"));
+    CHECK(contains(metal::particle_system_vertex, "float3 customColor [[attribute(4)]]"));
+    CHECK(contains(metal::particle_system_vertex, "float customOpacity [[attribute(5)]]"));
+    CHECK(contains(metal::particle_system_vertex, "customSize * (300.0 / length(mvPosition.xyz))"));
+    CHECK_FALSE(contains(metal::particle_system_vertex, "max(in.customSize"));
+    CHECK(contains(metal::particle_system_fragment, "float2 pointCoord [[point_coord]]"));
+    CHECK_FALSE(contains(metal::particle_system_fragment, "1.0 - pointCoord.y"));
 }
 
 TEST_CASE("Metal shader keys include morph target variant bits") {
@@ -230,6 +240,10 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true));
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(false, true));
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(true, true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateParticleVertexFunction(false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateParticleFragmentFunction(false));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateParticleVertexFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateParticleFragmentFunction(true));
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyVertexFunction());

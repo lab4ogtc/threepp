@@ -14,6 +14,13 @@ namespace threepp::metal {
         void* vertexFunction = nullptr;
         void* fragmentFunction = nullptr;
         bool alphaBlending = false;
+        Blending blending = Blending::Normal;
+        BlendEquation blendEquation = BlendEquation::Add;
+        BlendEquation blendEquationAlpha = BlendEquation::Add;
+        BlendFactor blendSrc = BlendFactor::SrcAlpha;
+        BlendFactor blendDst = BlendFactor::OneMinusSrcAlpha;
+        BlendFactor blendSrcAlpha = BlendFactor::One;
+        BlendFactor blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
         std::uint16_t vertexLayoutBitmask = 0b0001;
         std::uint64_t colorPixelFormat = 80;// MTLPixelFormatBGRA8Unorm
         std::uint64_t rasterSampleCount = 1;

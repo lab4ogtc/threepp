@@ -1410,6 +1410,89 @@ fragment float4 points_fragment(
 }
 )metal";
 
+    constexpr auto particle_system_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ParticleVertexInput {
+    float3 position [[attribute(0)]];
+    float customVisible [[attribute(1)]];
+    float customAngle [[attribute(2)]];
+    float customSize [[attribute(3)]];
+    float3 customColor [[attribute(4)]];
+    float customOpacity [[attribute(5)]];
+};
+
+struct ParticleUniforms {
+    float4x4 mvp;
+    float4x4 modelViewMatrix;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    uint padding;
+};
+
+struct ParticleVertexOutput {
+    float4 position [[position]];
+    float4 color;
+    float angle;
+    float pointSize [[point_size]];
+};
+
+vertex ParticleVertexOutput particle_system_vertex(
+    ParticleVertexInput in [[stage_in]],
+    constant ParticleUniforms& uniforms [[buffer(6)]]
+)
+{
+    ParticleVertexOutput out;
+    out.color = in.customVisible > 0.5 ? float4(in.customColor, in.customOpacity) : float4(0.0);
+    out.angle = in.customAngle;
+    float4 mvPosition = uniforms.modelViewMatrix * float4(in.position, 1.0);
+    out.pointSize = in.customSize * (300.0 / length(mvPosition.xyz));
+    out.position = uniforms.mvp * float4(in.position, 1.0);
+    return out;
+}
+)metal";
+
+    constexpr auto particle_system_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ParticleFragmentInput {
+    float4 position [[position]];
+    float4 color;
+    float angle;
+    float pointSize [[point_size]];
+};
+
+fragment float4 particle_system_fragment(
+    ParticleFragmentInput in [[stage_in]],
+    constant ParticleUniforms& uniforms [[buffer(6)]],
+    float2 pointCoord [[point_coord]]
+#if USE_MAP
+    , texture2d<float> tex [[texture(0)]]
+    , sampler texSampler [[sampler(0)]]
+#endif
+)
+{
+    float4 color = in.color;
+#if USE_MAP
+    float c = cos(in.angle);
+    float s = sin(in.angle);
+    float2 centered = pointCoord - float2(0.5);
+    float2 rotatedUV = float2(
+        c * centered.x + s * centered.y + 0.5,
+        c * centered.y - s * centered.x + 0.5
+    );
+    color *= tex.sample(texSampler, rotatedUV);
+#endif
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+    return color;
+}
+)metal";
+
     constexpr auto raw_shader_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;

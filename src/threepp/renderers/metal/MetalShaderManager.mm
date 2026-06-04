@@ -112,6 +112,16 @@ namespace threepp::metal {
             return source;
         }
 
+        std::string buildParticleShaderSource(bool useMap) {
+            std::string source;
+            source += "#define USE_MAP ";
+            source += useMap ? "1\n" : "0\n";
+            source += tone_mapping_functions;
+            source += particle_system_vertex;
+            source += particle_system_fragment;
+            return source;
+        }
+
         std::string buildSpriteShaderSource(const SpriteShaderKey& key) {
             std::string source;
             source += "#define USE_SIZEATTENUATION ";
@@ -430,6 +440,16 @@ namespace threepp::metal {
     void* MetalShaderManager::getOrCreatePointsFragmentFunction(bool useVertexColors) {
         const auto cacheKey = useVertexColors ? "points_fragment_color" : "points_fragment";
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, false), "points_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreateParticleVertexFunction(bool useMap) {
+        const auto cacheKey = useMap ? "particle_system_vertex_map" : "particle_system_vertex";
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildParticleShaderSource(useMap), "particle_system_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateParticleFragmentFunction(bool useMap) {
+        const auto cacheKey = useMap ? "particle_system_fragment_map" : "particle_system_fragment";
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildParticleShaderSource(useMap), "particle_system_fragment");
     }
 
     void* MetalShaderManager::getOrCreateRawShaderVertexFunction() {

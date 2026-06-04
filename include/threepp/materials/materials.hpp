@@ -10,6 +10,7 @@
 #include "threepp/materials/MeshNormalMaterial.hpp"
 #include "threepp/materials/MeshPhongMaterial.hpp"
 #include "threepp/materials/MeshStandardMaterial.hpp"
+#include "threepp/materials/ParticleMaterial.hpp"
 #include "threepp/materials/PointsMaterial.hpp"
 #include "threepp/materials/ShadowMaterial.hpp"
 #include "threepp/materials/SpriteMaterial.hpp"

@@ -40,6 +40,7 @@ if (APPLE)
     add_example(NAME "water_metal" LINK_IMGUI WEB WEB_EMBED
             "${PROJECT_SOURCE_DIR}/data/textures/waternormals.jpg@data/textures/waternormals.jpg"
     )
+    add_example(NAME "particle_system_metal" LINK_IMGUI)
     add_example(NAME "text_sprite_metal" LINK_IMGUI WEB WEB_EMBED
             "${PROJECT_SOURCE_DIR}/data/fonts@data/fonts"
     )

@@ -23,6 +23,7 @@
 #import "threepp/materials/MeshBasicMaterial.hpp"
 #import "threepp/materials/MeshLambertMaterial.hpp"
 #import "threepp/materials/MeshNormalMaterial.hpp"
+#import "threepp/materials/ParticleMaterial.hpp"
 #import "threepp/materials/MeshPhongMaterial.hpp"
 #import "threepp/materials/MeshStandardMaterial.hpp"
 #import "threepp/materials/PointsMaterial.hpp"
@@ -90,6 +91,7 @@ namespace threepp {
     inline constexpr std::uint16_t vertexLayoutColor4 = 1u << 6u;
     inline constexpr std::uint16_t vertexLayoutMorphTargets = 1u << 7u;
     inline constexpr std::uint16_t vertexLayoutMorphNormals = 1u << 8u;
+    inline constexpr std::uint16_t vertexLayoutParticleSystem = 1u << 9u;
 
     inline int requestedAntialiasingSamples(Window& window) {
         if (auto* glfwWindow = dynamic_cast<GlfwWindow*>(&window)) {
@@ -218,6 +220,15 @@ namespace threepp {
         float morphTargetBaseInfluence;
         float morphTargetInfluences[8];
         float morphPadding[7];
+    };
+
+    struct alignas(16) ParticleUniforms {
+        float mvp[16];
+        float modelViewMatrix[16];
+        std::uint32_t toneMappingType;
+        float toneMappingExposure;
+        std::uint32_t toneMapped;
+        std::uint32_t padding;
     };
 
     struct alignas(16) RawShaderUniforms {
@@ -471,6 +482,16 @@ namespace threepp {
         }
         copyMatrix3Columns(uvTransform, out.uvTransform);
         resetMorphTargetUniforms(out);
+    }
+
+    inline void computeParticleUniforms(const Camera& camera, const Points& points, ParticleUniforms& out) {
+        Matrix4 mvp;
+        computeMVP(camera, points, mvp);
+        copyMatrix(mvp, out.mvp);
+
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *points.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
     }
 
     inline void computeRawShaderUniforms(const Camera& camera, const Mesh& mesh, float time, RawShaderUniforms& out) {
