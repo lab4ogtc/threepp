@@ -360,7 +360,6 @@ void MetalRenderer::Impl::commitPendingFrame() {
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
-    isFirstRenderOfFrame = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
     currentCommandBufferExternallyAccessed = false;
 }
@@ -372,7 +371,7 @@ void MetalRenderer::Impl::ensureFrameStarted() {
     bufferManager->beginFrame();
 
     currentCommandBuffer = [commandQueue commandBuffer];
-    isFirstRenderOfFrame = true;
+    clearedTargetsInFrame.clear();
     auto semaphore = inFlightSemaphore;
     [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
       dispatch_semaphore_signal(semaphore);
@@ -609,6 +608,7 @@ void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
         textureManager->deallocateTexture(target->depthTexture.get());
     }
     renderTargetResources.erase(target);
+    clearedTargetsInFrame.erase(target);
 }
 
 void MetalRenderer::Impl::clearDepthTextureToOne(id<MTLTexture> texture) const {
@@ -817,7 +817,6 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
-    isFirstRenderOfFrame = false;
     return rgb;
 }
 
@@ -1103,7 +1102,6 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
     const auto previousClearDepthFlag = clearDepthFlag;
     const auto previousExplicitFrameInProgress = explicitFrameInProgress;
     const auto previousRenderingPrePass = renderingPrePass;
-    const auto previousIsFirstRenderOfFrame = isFirstRenderOfFrame;
 
     renderingPrePass = true;
 
@@ -1120,7 +1118,6 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
             clearDepthFlag = previousClearDepthFlag;
             explicitFrameInProgress = previousExplicitFrameInProgress;
             renderingPrePass = previousRenderingPrePass;
-            isFirstRenderOfFrame = previousIsFirstRenderOfFrame;
         };
 
         job.initiator->visible = false;
@@ -1226,7 +1223,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     const auto shouldClear = autoClear || clearRequested;
     const auto activeScissorTest = renderTarget ? renderTarget->scissorTest : scissorTest;
-    const auto canUseMetalClear = shouldClear && !activeScissorTest && isFirstRenderOfFrame;
+    const auto isFirstRender = !clearedTargetsInFrame.count(renderTarget);
+    const auto canUseMetalClear = shouldClear && !activeScissorTest && isFirstRender;
 
     MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
     passDesc.colorAttachments[0].texture = colorTexture;
@@ -1546,7 +1544,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     lastScissor = scissor;
     lastRenderTime = std::chrono::steady_clock::now();
-    isFirstRenderOfFrame = false;
+    clearedTargetsInFrame.insert(renderTarget);
 
     if (autoClear) {
         if (!lastFrameWasExternallyAccessed) {

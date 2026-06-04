@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace threepp {
 
@@ -113,7 +114,7 @@ namespace threepp {
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool renderingPrePass = false;
-        bool isFirstRenderOfFrame = false;
+        std::unordered_set<RenderTarget*> clearedTargetsInFrame;
         bool profileRawShader = false;
         bool rawShaderProfileEnvChecked = false;
         std::vector<RenderJob> preRenderJobs;
