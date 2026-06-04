@@ -14,7 +14,7 @@ namespace threepp::metal {
         void* vertexFunction = nullptr;
         void* fragmentFunction = nullptr;
         bool alphaBlending = false;
-        std::uint8_t vertexLayoutBitmask = 0b0001;
+        std::uint16_t vertexLayoutBitmask = 0b0001;
         std::uint64_t colorPixelFormat = 80;// MTLPixelFormatBGRA8Unorm
         std::uint64_t rasterSampleCount = 1;
 
@@ -34,9 +34,9 @@ namespace threepp::metal {
 
         void* getOrCreatePipelineState(const PipelineKey& key);
 
-        void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint8_t vertexLayoutBitmask);
+        void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint16_t vertexLayoutBitmask);
 
-        void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, void* fragmentFunction, std::uint8_t vertexLayoutBitmask);
+        void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, void* fragmentFunction, std::uint16_t vertexLayoutBitmask);
 
         void* getOrCreateDepthStencilState();
 

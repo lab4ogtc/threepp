@@ -3,6 +3,7 @@
 
 #import "MetalBufferManager.hpp"
 #import "MetalDynamicShaderCache.hpp"
+#import "MetalMorphTargets.hpp"
 #import "MetalPipelineCache.hpp"
 #import "MetalRenderList.hpp"
 #import "MetalRenderObjects.hpp"
@@ -47,6 +48,7 @@ namespace threepp {
         std::unique_ptr<metal::MetalShaderManager> shaderManager;
         std::unique_ptr<metal::MetalTextureManager> textureManager;
         std::unique_ptr<metal::MetalDynamicShaderCache> dynamicShaderCache;
+        std::unique_ptr<metal::MetalMorphTargets> morphTargets;
         std::unique_ptr<ShaderCompiler> shaderCompiler;
 
         MetalShadowMap shadowMapState;
@@ -60,6 +62,8 @@ namespace threepp {
         id<MTLSamplerState> shadowSampler = nil;
         id<MTLBuffer> defaultTangentBuffer = nil;
         std::size_t defaultTangentVertexCount = 0;
+        id<MTLBuffer> defaultMorphTargetBuffer = nil;
+        std::size_t defaultMorphTargetVertexCount = 0;
 
         struct ConvertedSkinIndexBuffer {
             unsigned int lastVersion = std::numeric_limits<unsigned int>::max();
@@ -191,6 +195,8 @@ namespace threepp {
 
         id<MTLBuffer> getDefaultTangentBuffer(std::size_t vertexCount);
 
+        id<MTLBuffer> getDefaultMorphTargetBuffer(std::size_t vertexCount);
+
         void setSize(std::pair<int, int> size);
 
         void setClearColor(const Color& color, float alpha);
@@ -251,6 +257,12 @@ namespace threepp {
 
         bool bindSkinning(id<MTLRenderCommandEncoder> encoder, BufferGeometry& geometry, SkinnedMesh* skinnedMesh);
 
+        void bindMorphTargetAttributes(id<MTLRenderCommandEncoder> encoder,
+                                       BufferGeometry& geometry,
+                                       std::size_t vertexCount,
+                                       bool useMorphTargets,
+                                       bool useMorphNormals);
+
         void bindDrawAttributes(id<MTLRenderCommandEncoder> encoder,
                                 BufferGeometry& geometry,
                                 FloatBufferAttribute& position,
@@ -260,7 +272,9 @@ namespace threepp {
                                 bool useNormal,
                                 bool useUv,
                                 bool useVertexColors,
-                                bool useTangent);
+                                bool useTangent,
+                                bool useMorphTargets = false,
+                                bool useMorphNormals = false);
 
         void bindInstancing(id<MTLRenderCommandEncoder> encoder, InstancedMesh& instancedMesh, bool useInstanceColor);
 

@@ -118,6 +118,31 @@ TEST_CASE("Metal special shaders bind uniforms away from vertex attributes") {
     CHECK(contains(metal::basic_fragment, "float4 specularColor"));
 }
 
+TEST_CASE("Metal shader keys include morph target variant bits") {
+
+    metal::ShaderProgramKey baseProgram;
+    metal::ShaderProgramKey morphProgram = baseProgram;
+    morphProgram.useMorphTargets = true;
+    CHECK_FALSE(baseProgram == morphProgram);
+    CHECK(metal::ShaderProgramKeyHash{}(baseProgram) != metal::ShaderProgramKeyHash{}(morphProgram));
+
+    metal::ShaderProgramKey flatProgram = baseProgram;
+    flatProgram.flatShading = true;
+    CHECK_FALSE(baseProgram == flatProgram);
+    CHECK(metal::ShaderProgramKeyHash{}(baseProgram) != metal::ShaderProgramKeyHash{}(flatProgram));
+
+    metal::ShaderProgramKey morphNormalsProgram = morphProgram;
+    morphNormalsProgram.useMorphNormals = true;
+    CHECK_FALSE(morphProgram == morphNormalsProgram);
+    CHECK(metal::ShaderProgramKeyHash{}(morphProgram) != metal::ShaderProgramKeyHash{}(morphNormalsProgram));
+
+    metal::DepthShaderKey baseDepth;
+    metal::DepthShaderKey morphDepth = baseDepth;
+    morphDepth.useMorphTargets = true;
+    CHECK_FALSE(baseDepth == morphDepth);
+    CHECK(metal::DepthShaderKeyHash{}(baseDepth) != metal::DepthShaderKeyHash{}(morphDepth));
+}
+
 TEST_CASE("Metal P2 shader manager compiles every configured variant") {
 
     @autoreleasepool {
@@ -164,6 +189,27 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
             REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(key));
         }
 
+        metal::ShaderProgramKey morphMeshKey;
+        morphMeshKey.useNormal = true;
+        morphMeshKey.useMorphTargets = true;
+        morphMeshKey.useMorphNormals = true;
+        REQUIRE_NOTHROW(shaderManager.getOrCreateVertexFunction(morphMeshKey));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateFragmentFunction(morphMeshKey));
+
+        metal::ShaderProgramKey flatLightingKey;
+        flatLightingKey.useNormal = true;
+        flatLightingKey.flatShading = true;
+        flatLightingKey.useLights = true;
+        REQUIRE_NOTHROW(shaderManager.getOrCreateVertexFunction(flatLightingKey));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateFragmentFunction(flatLightingKey));
+
+        metal::DepthShaderKey morphDepthKey;
+        morphDepthKey.useMorphTargets = true;
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthVertexFunction(morphDepthKey));
+        REQUIRE_NOTHROW(shaderManager.getOrCreateDepthFragmentFunction(morphDepthKey));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthVertexFunction(morphDepthKey));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointDepthFragmentFunction(morphDepthKey));
+
         for (unsigned int mask = 0; mask < 16; ++mask) {
             metal::SpriteShaderKey key;
             key.useSizeAttenuation = (mask & 1u) != 0u;
@@ -182,6 +228,8 @@ TEST_CASE("Metal P2 shader manager compiles every configured variant") {
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(false));
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(true));
         REQUIRE_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(false, true));
+        REQUIRE_NOTHROW(shaderManager.getOrCreatePointsVertexFunction(true, true));
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderVertexFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateRawShaderFragmentFunction());
         REQUIRE_NOTHROW(shaderManager.getOrCreateSkyVertexFunction());

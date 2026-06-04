@@ -204,7 +204,7 @@ namespace {
         return textures;
     }
 
-    std::uint8_t rawShaderVertexLayout(BufferGeometry& geometry) {
+    std::uint16_t rawShaderVertexLayout(BufferGeometry& geometry) {
         auto bitmask = vertexLayoutPosition;
 
         if (auto* normal = getFloatAttribute(geometry, "normal"); normal && normal->itemSize() == 3) {
@@ -301,6 +301,19 @@ id<MTLBuffer> MetalRenderer::Impl::getDefaultTangentBuffer(std::size_t vertexCou
     return defaultTangentBuffer;
 }
 
+id<MTLBuffer> MetalRenderer::Impl::getDefaultMorphTargetBuffer(std::size_t vertexCount) {
+    if (defaultMorphTargetBuffer && defaultMorphTargetVertexCount >= vertexCount) {
+        return defaultMorphTargetBuffer;
+    }
+
+    std::vector<float> values(vertexCount * 3, 0.f);
+    defaultMorphTargetBuffer = [device newBufferWithBytes:values.data()
+                                                   length:values.size() * sizeof(float)
+                                                  options:MTLResourceStorageModeShared];
+    defaultMorphTargetVertexCount = vertexCount;
+    return defaultMorphTargetBuffer;
+}
+
 id<MTLBuffer> MetalRenderer::Impl::getSkinIndexBuffer(BufferAttribute& attribute) {
     if (auto* floatSkinIndex = attribute.typed<float>()) {
         return (__bridge id<MTLBuffer>) bufferManager->getBuffer(
@@ -350,6 +363,41 @@ bool MetalRenderer::Impl::bindSkinning(id<MTLRenderCommandEncoder> encoder, Buff
     return true;
 }
 
+void MetalRenderer::Impl::bindMorphTargetAttributes(id<MTLRenderCommandEncoder> encoder,
+                                                    BufferGeometry& geometry,
+                                                    std::size_t vertexCount,
+                                                    bool useMorphTargets,
+                                                    bool useMorphNormals) {
+    if (!useMorphTargets) return;
+
+    auto bindMorphBuffer = [&](const std::string& name, NSUInteger bufferIndex) {
+        auto* attr = getFloatAttribute(geometry, name);
+        if (attr && attr->itemSize() == 3) {
+            auto* buf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
+                    *attr,
+                    attr->count() * attr->itemSize() * sizeof(float),
+                    attr->array().data());
+            [encoder setVertexBuffer:buf offset:0 atIndex:bufferIndex];
+        } else {
+            [encoder setVertexBuffer:getDefaultMorphTargetBuffer(vertexCount) offset:0 atIndex:bufferIndex];
+        }
+    };
+
+    for (int i = 0; i < 4; ++i) {
+        bindMorphBuffer("morphTarget" + std::to_string(i), static_cast<NSUInteger>(11 + i));
+    }
+
+    if (useMorphNormals) {
+        for (int i = 0; i < 4; ++i) {
+            bindMorphBuffer("morphNormal" + std::to_string(i), static_cast<NSUInteger>(15 + i));
+        }
+    } else {
+        for (int i = 4; i < 8; ++i) {
+            bindMorphBuffer("morphTarget" + std::to_string(i), static_cast<NSUInteger>(11 + i));
+        }
+    }
+}
+
 void MetalRenderer::Impl::bindDrawAttributes(id<MTLRenderCommandEncoder> encoder,
                                              BufferGeometry& geometry,
                                              FloatBufferAttribute& position,
@@ -359,7 +407,9 @@ void MetalRenderer::Impl::bindDrawAttributes(id<MTLRenderCommandEncoder> encoder
                                              bool useNormal,
                                              bool useUv,
                                              bool useVertexColors,
-                                             bool useTangent) {
+                                             bool useTangent,
+                                             bool useMorphTargets,
+                                             bool useMorphNormals) {
     auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
             position,
             position.count() * position.itemSize() * sizeof(float),
@@ -390,18 +440,20 @@ void MetalRenderer::Impl::bindDrawAttributes(id<MTLRenderCommandEncoder> encoder
         [encoder setVertexBuffer:buf offset:0 atIndex:3];
     }
 
-    if (!useTangent) return;
-
-    auto* tangent = getFloatAttribute(geometry, "tangent");
-    if (tangent) {
-        auto* buf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
-                *tangent,
-                tangent->count() * tangent->itemSize() * sizeof(float),
-                tangent->array().data());
-        [encoder setVertexBuffer:buf offset:0 atIndex:8];
-    } else {
-        [encoder setVertexBuffer:getDefaultTangentBuffer(position.count()) offset:0 atIndex:8];
+    if (useTangent) {
+        auto* tangent = getFloatAttribute(geometry, "tangent");
+        if (tangent) {
+            auto* buf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
+                    *tangent,
+                    tangent->count() * tangent->itemSize() * sizeof(float),
+                    tangent->array().data());
+            [encoder setVertexBuffer:buf offset:0 atIndex:8];
+        } else {
+            [encoder setVertexBuffer:getDefaultTangentBuffer(position.count()) offset:0 atIndex:8];
+        }
     }
+
+    bindMorphTargetAttributes(encoder, geometry, static_cast<std::size_t>(position.count()), useMorphTargets, useMorphNormals);
 }
 
 void MetalRenderer::Impl::bindInstancing(id<MTLRenderCommandEncoder> encoder, InstancedMesh& instancedMesh, bool useInstanceColor) {
@@ -601,13 +653,18 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
 
     auto* colorAttr = getFloatAttribute(*geometry, "color");
     const bool useVertexColors = pointsMaterial->vertexColors && colorAttr && colorAttr->itemSize() == 3;
+    const bool useMorphTargets = wantsMorphTargets(*pointsMaterial, *geometry);
+    if (useMorphTargets && morphTargets) {
+        morphTargets->update(&points, geometry.get(), pointsMaterial, false);
+    }
 
     metal::PipelineKey pipelineKey;
-    pipelineKey.vertexFunction = shaderManager->getOrCreatePointsVertexFunction(useVertexColors);
+    pipelineKey.vertexFunction = shaderManager->getOrCreatePointsVertexFunction(useVertexColors, useMorphTargets);
     pipelineKey.fragmentFunction = shaderManager->getOrCreatePointsFragmentFunction(useVertexColors);
     pipelineKey.alphaBlending = pointsMaterial->transparent || pointsMaterial->opacity < 1.f;
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
+    if (useMorphTargets) pipelineKey.vertexLayoutBitmask |= vertexLayoutMorphTargets;
     pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
@@ -622,15 +679,22 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     [encoder setTriangleFillMode:MTLTriangleFillModeFill];
     applyDepthBias(encoder, *pointsMaterial);
 
-    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false);
+    bindDrawAttributes(encoder, *geometry, *posAttr, nullptr, nullptr, colorAttr, false, false, useVertexColors, false, useMorphTargets, false);
 
     PointUniforms uniforms{};
     const bool useSizeAttenuation = pointsMaterial->sizeAttenuation && dynamic_cast<PerspectiveCamera*>(&camera) != nullptr;
     computePointUniforms(camera, points, *pointsMaterial, pointScale(), useSizeAttenuation, pixelRatio, uniforms);
+    if (useMorphTargets && morphTargets) {
+        writeMorphTargetUniforms(*morphTargets, uniforms);
+    }
     fillToneMappingUniforms(renderer, *pointsMaterial, uniforms);
     fillFogUniforms(scene, *pointsMaterial, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+    bindTextureOrPlaceholder(encoder, pointsMaterial->map, whiteTexture, 0);
+    bindTextureOrPlaceholder(encoder, pointsMaterial->alphaMap, whiteTexture, 1);
+    [encoder setFragmentSamplerState:samplerForTexture(pointsMaterial->alphaMap.get()) atIndex:1];
 
     drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
 }

@@ -96,6 +96,23 @@ struct VertexInput {
 #if USE_NORMAL && USE_MAP
     float4 tangent [[attribute(6)]];
 #endif
+#if USE_MORPHTARGETS
+    float3 morphTarget0 [[attribute(7)]];
+    float3 morphTarget1 [[attribute(8)]];
+    float3 morphTarget2 [[attribute(9)]];
+    float3 morphTarget3 [[attribute(10)]];
+#if USE_NORMAL && USE_MORPHNORMALS
+    float3 morphNormal0 [[attribute(11)]];
+    float3 morphNormal1 [[attribute(12)]];
+    float3 morphNormal2 [[attribute(13)]];
+    float3 morphNormal3 [[attribute(14)]];
+#else
+    float3 morphTarget4 [[attribute(11)]];
+    float3 morphTarget5 [[attribute(12)]];
+    float3 morphTarget6 [[attribute(13)]];
+    float3 morphTarget7 [[attribute(14)]];
+#endif
+#endif
 };
 
 struct TransformUniforms {
@@ -105,6 +122,9 @@ struct TransformUniforms {
     float4x4 normalMatrix;
     float4x4 bindMatrix;
     float4x4 bindMatrixInverse;
+    float morphTargetBaseInfluence;
+    float morphTargetInfluences[8];
+    float transformPadding[7];
 };
 
 struct VertexOutput {
@@ -148,6 +168,28 @@ vertex VertexOutput basic_vertex(
     float4 localPosition = float4(in.position, 1.0);
 #if USE_NORMAL
     float3 localNormal = in.normal;
+#endif
+
+#if USE_MORPHTARGETS
+    localPosition.xyz = localPosition.xyz * transforms.morphTargetBaseInfluence
+        + in.morphTarget0 * transforms.morphTargetInfluences[0]
+        + in.morphTarget1 * transforms.morphTargetInfluences[1]
+        + in.morphTarget2 * transforms.morphTargetInfluences[2]
+        + in.morphTarget3 * transforms.morphTargetInfluences[3];
+#if !USE_MORPHNORMALS
+    localPosition.xyz += in.morphTarget4 * transforms.morphTargetInfluences[4]
+        + in.morphTarget5 * transforms.morphTargetInfluences[5]
+        + in.morphTarget6 * transforms.morphTargetInfluences[6]
+        + in.morphTarget7 * transforms.morphTargetInfluences[7];
+#endif
+#endif
+
+#if USE_NORMAL && USE_MORPHNORMALS
+    localNormal = localNormal * transforms.morphTargetBaseInfluence
+        + in.morphNormal0 * transforms.morphTargetInfluences[0]
+        + in.morphNormal1 * transforms.morphTargetInfluences[1]
+        + in.morphNormal2 * transforms.morphTargetInfluences[2]
+        + in.morphNormal3 * transforms.morphTargetInfluences[3];
 #endif
 
 #if USE_SKINNING
@@ -399,6 +441,12 @@ bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
     }
 
     return false;
+}
+
+float3 flatShadedNormal(float3 worldPosition) {
+    float3 positionDx = dfdx(worldPosition);
+    float3 positionDy = dfdy(worldPosition);
+    return normalize(cross(positionDy, positionDx));
 }
 
 float3 perturbNormalFromMap(float3 n, float3 tangent, float3 bitangent, float2 uv, texture2d<float> normalMap, sampler mapSampler) {
@@ -654,7 +702,11 @@ fragment float4 basic_fragment(
 #endif
 
 #if USE_NORMAL
+#if USE_FLAT_SHADING
+    float3 n = flatShadedNormal(in.worldPosition);
+#else
     float3 n = normalize(in.normal);
+#endif
     float normalFaceDirection = 1.0;
 #if USE_DOUBLE_SIDED
     normalFaceDirection *= frontFacing ? 1.0 : -1.0;
@@ -862,6 +914,16 @@ struct DepthVertexInput {
     float4 skinIndex [[attribute(4)]];
     float4 skinWeight [[attribute(5)]];
 #endif
+#if USE_MORPHTARGETS
+    float3 morphTarget0 [[attribute(7)]];
+    float3 morphTarget1 [[attribute(8)]];
+    float3 morphTarget2 [[attribute(9)]];
+    float3 morphTarget3 [[attribute(10)]];
+    float3 morphTarget4 [[attribute(11)]];
+    float3 morphTarget5 [[attribute(12)]];
+    float3 morphTarget6 [[attribute(13)]];
+    float3 morphTarget7 [[attribute(14)]];
+#endif
 };
 
 struct DepthTransformUniforms {
@@ -869,6 +931,9 @@ struct DepthTransformUniforms {
     float4x4 modelViewMatrix;
     float4x4 bindMatrix;
     float4x4 bindMatrixInverse;
+    float morphTargetBaseInfluence;
+    float morphTargetInfluences[8];
+    float depthPadding[7];
 };
 
 #if USE_CLIPPING
@@ -895,6 +960,17 @@ vertex float4 depth_vertex(
 )
 {
     float4 localPosition = float4(in.position, 1.0);
+#if USE_MORPHTARGETS
+    localPosition.xyz = localPosition.xyz * transforms.morphTargetBaseInfluence
+        + in.morphTarget0 * transforms.morphTargetInfluences[0]
+        + in.morphTarget1 * transforms.morphTargetInfluences[1]
+        + in.morphTarget2 * transforms.morphTargetInfluences[2]
+        + in.morphTarget3 * transforms.morphTargetInfluences[3]
+        + in.morphTarget4 * transforms.morphTargetInfluences[4]
+        + in.morphTarget5 * transforms.morphTargetInfluences[5]
+        + in.morphTarget6 * transforms.morphTargetInfluences[6]
+        + in.morphTarget7 * transforms.morphTargetInfluences[7];
+#endif
 #if USE_SKINNING
     float4x4 skinMatrix =
         boneMatrices[uint(in.skinIndex.x)] * in.skinWeight.x +
@@ -989,6 +1065,16 @@ struct PointDepthVertexInput {
     float4 skinIndex [[attribute(4)]];
     float4 skinWeight [[attribute(5)]];
 #endif
+#if USE_MORPHTARGETS
+    float3 morphTarget0 [[attribute(7)]];
+    float3 morphTarget1 [[attribute(8)]];
+    float3 morphTarget2 [[attribute(9)]];
+    float3 morphTarget3 [[attribute(10)]];
+    float3 morphTarget4 [[attribute(11)]];
+    float3 morphTarget5 [[attribute(12)]];
+    float3 morphTarget6 [[attribute(13)]];
+    float3 morphTarget7 [[attribute(14)]];
+#endif
 };
 
 struct PointDepthTransformUniforms {
@@ -999,6 +1085,9 @@ struct PointDepthTransformUniforms {
     float4x4 bindMatrixInverse;
     float4 lightPosition;
     float4 params;
+    float morphTargetBaseInfluence;
+    float morphTargetInfluences[8];
+    float morphPadding[7];
 };
 
 struct PointDepthVertexOutput {
@@ -1023,6 +1112,17 @@ vertex PointDepthVertexOutput point_depth_vertex(
 {
     PointDepthVertexOutput out;
     float4 localPosition = float4(in.position, 1.0);
+#if USE_MORPHTARGETS
+    localPosition.xyz = localPosition.xyz * transforms.morphTargetBaseInfluence
+        + in.morphTarget0 * transforms.morphTargetInfluences[0]
+        + in.morphTarget1 * transforms.morphTargetInfluences[1]
+        + in.morphTarget2 * transforms.morphTargetInfluences[2]
+        + in.morphTarget3 * transforms.morphTargetInfluences[3]
+        + in.morphTarget4 * transforms.morphTargetInfluences[4]
+        + in.morphTarget5 * transforms.morphTargetInfluences[5]
+        + in.morphTarget6 * transforms.morphTargetInfluences[6]
+        + in.morphTarget7 * transforms.morphTargetInfluences[7];
+#endif
 #if USE_SKINNING
     float4x4 skinMatrix =
         boneMatrices[uint(in.skinIndex.x)] * in.skinWeight.x +
@@ -1189,6 +1289,16 @@ struct PointVertexInput {
 #if USE_VERTEX_COLORS
     float3 color [[attribute(3)]];
 #endif
+#if USE_MORPHTARGETS
+    float3 morphTarget0 [[attribute(7)]];
+    float3 morphTarget1 [[attribute(8)]];
+    float3 morphTarget2 [[attribute(9)]];
+    float3 morphTarget3 [[attribute(10)]];
+    float3 morphTarget4 [[attribute(11)]];
+    float3 morphTarget5 [[attribute(12)]];
+    float3 morphTarget6 [[attribute(13)]];
+    float3 morphTarget7 [[attribute(14)]];
+#endif
 };
 
 struct PointUniforms {
@@ -1197,12 +1307,21 @@ struct PointUniforms {
     float pointSize;
     float scale;
     uint sizeAttenuation;
+    uint useMap;
+    uint useAlphaMap;
     uint toneMappingType;
     float toneMappingExposure;
     uint toneMapped;
-    float2 padding;
+    float alphaTest;
+    float padding0;
+    float padding1;
+    float padding2;
+    float3x3 uvTransform;
     float4 fogColor;
     float4 fogParams;
+    float morphTargetBaseInfluence;
+    float morphTargetInfluences[8];
+    float morphPadding[7];
 };
 
 struct PointVertexOutput {
@@ -1218,7 +1337,19 @@ vertex PointVertexOutput points_vertex(
 )
 {
     PointVertexOutput out;
-    float4 projected = uniforms.mvp * float4(in.position, 1.0);
+    float3 localPosition = in.position;
+#if USE_MORPHTARGETS
+    localPosition = localPosition * uniforms.morphTargetBaseInfluence
+        + in.morphTarget0 * uniforms.morphTargetInfluences[0]
+        + in.morphTarget1 * uniforms.morphTargetInfluences[1]
+        + in.morphTarget2 * uniforms.morphTargetInfluences[2]
+        + in.morphTarget3 * uniforms.morphTargetInfluences[3]
+        + in.morphTarget4 * uniforms.morphTargetInfluences[4]
+        + in.morphTarget5 * uniforms.morphTargetInfluences[5]
+        + in.morphTarget6 * uniforms.morphTargetInfluences[6]
+        + in.morphTarget7 * uniforms.morphTargetInfluences[7];
+#endif
+    float4 projected = uniforms.mvp * float4(localPosition, 1.0);
     out.position = projected;
     // 透视投影下 projected.w 等于视图空间 -Z；正交投影下 projected.w 恒为 1.0，
     // 因此正交相机的 points 雾化深度会退化为常量。
@@ -1252,10 +1383,25 @@ struct PointFragmentInput {
 
 fragment float4 points_fragment(
     PointFragmentInput in [[stage_in]],
-    constant PointUniforms& uniforms [[buffer(4)]]
+    constant PointUniforms& uniforms [[buffer(4)]],
+    float2 pointCoord [[point_coord]],
+    texture2d<float> map [[texture(0)]],
+    sampler mapSampler [[sampler(0)]],
+    texture2d<float> alphaMap [[texture(1)]],
+    sampler alphaMapSampler [[sampler(1)]]
 )
 {
     float4 color = in.color;
+    float2 pointUv = (uniforms.uvTransform * float3(pointCoord.x, 1.0 - pointCoord.y, 1.0)).xy;
+    if (uniforms.useMap != 0) {
+        color *= map.sample(mapSampler, pointUv);
+    }
+    if (uniforms.useAlphaMap != 0) {
+        color.a *= alphaMap.sample(alphaMapSampler, pointUv).g;
+    }
+    if (color.a < uniforms.alphaTest) {
+        discard_fragment();
+    }
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }

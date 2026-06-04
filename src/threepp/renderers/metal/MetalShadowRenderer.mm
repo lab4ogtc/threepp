@@ -53,17 +53,33 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                     if (useInstancing && useSkinning) {
                         std::cerr << "MetalRenderer: skipping unsupported instanced skinned shadow caster " << object.id << "\n";
                     } else {
-                        std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
+                        Material* morphMaterial = nullptr;
+                        forEachMaterialGroup(*materials, *geometry, [&](Material& material, std::optional<GeometryGroup>) {
+                            if (!morphMaterial && material.visible && wantsMorphTargets(material, *geometry)) {
+                                morphMaterial = &material;
+                            }
+                        });
+                        const bool useMorphTargets = morphMaterial != nullptr;
+                        if (useMorphTargets && morphTargets) {
+                            morphTargets->update(&object, geometry, morphMaterial, false);
+                        }
+
+                        std::uint16_t vertexLayoutBitmask = vertexLayoutPosition;
                         if (useSkinning) vertexLayoutBitmask |= vertexLayoutSkinning;
+                        if (useMorphTargets) vertexLayoutBitmask |= vertexLayoutMorphTargets;
 
                         auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
                                 *posAttr,
                                 posAttr->count() * posAttr->itemSize() * sizeof(float),
                                 posAttr->array().data());
                         [encoder setVertexBuffer:posBuf offset:0 atIndex:0];
+                        bindMorphTargetAttributes(encoder, *geometry, static_cast<std::size_t>(posAttr->count()), useMorphTargets, false);
 
-                        DepthTransformUniforms depthTransforms;
+                        DepthTransformUniforms depthTransforms{};
                         computeDepthTransformUniforms(shadowCamera, object, depthTransforms);
+                        if (useMorphTargets && morphTargets) {
+                            writeMorphTargetUniforms(*morphTargets, depthTransforms);
+                        }
                         [encoder setVertexBytes:&depthTransforms length:sizeof(depthTransforms) atIndex:4];
 
                         NSUInteger instanceCount = 1;
@@ -80,7 +96,7 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                             clippingOptions.includeLocal = material.clipShadows;
                             const auto shadingParams = extractShadingParams(renderer, scene, material, shadowCamera, false, clippingOptions);
                             const bool useClipping = shadingParams.numClippingPlanes > 0u;
-                            const metal::DepthShaderKey shaderKey{useSkinning, useInstancing, useClipping};
+                            const metal::DepthShaderKey shaderKey{useSkinning, useInstancing, useClipping, useMorphTargets};
                             auto* vertexFunction = shaderManager->getOrCreateDepthVertexFunction(shaderKey);
                             auto* fragmentFunction = shaderManager->getOrCreateDepthFragmentFunction(shaderKey);
                             id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);
@@ -134,17 +150,33 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                     if (useInstancing && useSkinning) {
                         std::cerr << "MetalRenderer: skipping unsupported instanced skinned point shadow caster " << object.id << "\n";
                     } else {
-                        std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
+                        Material* morphMaterial = nullptr;
+                        forEachMaterialGroup(*materials, *geometry, [&](Material& material, std::optional<GeometryGroup>) {
+                            if (!morphMaterial && material.visible && wantsMorphTargets(material, *geometry)) {
+                                morphMaterial = &material;
+                            }
+                        });
+                        const bool useMorphTargets = morphMaterial != nullptr;
+                        if (useMorphTargets && morphTargets) {
+                            morphTargets->update(&object, geometry, morphMaterial, false);
+                        }
+
+                        std::uint16_t vertexLayoutBitmask = vertexLayoutPosition;
                         if (useSkinning) vertexLayoutBitmask |= vertexLayoutSkinning;
+                        if (useMorphTargets) vertexLayoutBitmask |= vertexLayoutMorphTargets;
 
                         auto* posBuf = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
                                 *posAttr,
                                 posAttr->count() * posAttr->itemSize() * sizeof(float),
                                 posAttr->array().data());
                         [encoder setVertexBuffer:posBuf offset:0 atIndex:0];
+                        bindMorphTargetAttributes(encoder, *geometry, static_cast<std::size_t>(posAttr->count()), useMorphTargets, false);
 
-                        PointDepthTransformUniforms depthTransforms;
+                        PointDepthTransformUniforms depthTransforms{};
                         computePointDepthTransformUniforms(shadowCamera, object, lightPosition, nearPlane, farPlane, depthTransforms);
+                        if (useMorphTargets && morphTargets) {
+                            writeMorphTargetUniforms(*morphTargets, depthTransforms);
+                        }
                         [encoder setVertexBytes:&depthTransforms length:sizeof(depthTransforms) atIndex:4];
                         [encoder setFragmentBytes:&depthTransforms length:sizeof(depthTransforms) atIndex:4];
 
@@ -162,7 +194,7 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                             clippingOptions.includeLocal = material.clipShadows;
                             const auto shadingParams = extractShadingParams(renderer, scene, material, shadowCamera, false, clippingOptions);
                             const bool useClipping = shadingParams.numClippingPlanes > 0u;
-                            const metal::DepthShaderKey shaderKey{useSkinning, useInstancing, useClipping};
+                            const metal::DepthShaderKey shaderKey{useSkinning, useInstancing, useClipping, useMorphTargets};
                             auto* vertexFunction = shaderManager->getOrCreatePointDepthVertexFunction(shaderKey);
                             auto* fragmentFunction = shaderManager->getOrCreatePointDepthFragmentFunction(shaderKey);
                             id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreateDepthOnlyPipelineState(vertexFunction, fragmentFunction, vertexLayoutBitmask);

@@ -3,8 +3,10 @@
 #include "threepp/materials/MeshBasicMaterial.hpp"
 #include "threepp/materials/PointsMaterial.hpp"
 #include "threepp/materials/SpriteMaterial.hpp"
+#include "threepp/objects/Mesh.hpp"
 #include "threepp/objects/Points.hpp"
 #include "threepp/objects/Sprite.hpp"
+#include "threepp/renderers/metal/MetalMorphTargets.hpp"
 #include "threepp/renderers/metal/MetalRenderObjects.hpp"
 #include "threepp/renderers/metal/MetalShaders.hpp"
 #include "threepp/scenes/Fog.hpp"
@@ -15,7 +17,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstddef>
+#include <memory>
 #include <string_view>
+#include <vector>
 
 using namespace threepp;
 
@@ -83,6 +87,76 @@ TEST_CASE("Metal point uniforms scale point size by renderer pixel ratio") {
     REQUIRE(uniforms.sizeAttenuation == 1u);
 }
 
+TEST_CASE("Metal point uniforms copy alpha test and point sprite map transform") {
+
+    PerspectiveCamera camera;
+    auto material = PointsMaterial::create();
+    material->alphaTest = 0.5f;
+    material->map = Texture::create();
+    material->map->offset.set(0.25f, 0.5f);
+    material->map->repeat.set(2.f, 3.f);
+    material->map->center.set(0.5f, 0.25f);
+    material->map->rotation = 0.5f;
+    auto points = Points::create(BufferGeometry::create(), material);
+
+    PointUniforms uniforms{};
+    computePointUniforms(camera, *points, *material, 100.f, false, 1.f, uniforms);
+
+    const auto& expected = material->map->matrix.elements;
+    REQUIRE(uniforms.useMap == 1u);
+    REQUIRE(uniforms.useAlphaMap == 0u);
+    REQUIRE(uniforms.alphaTest == Catch::Approx(0.5f));
+    for (std::size_t column = 0; column < 3; ++column) {
+        REQUIRE(uniforms.uvTransform[column * 4 + 0] == Catch::Approx(expected[column * 3 + 0]));
+        REQUIRE(uniforms.uvTransform[column * 4 + 1] == Catch::Approx(expected[column * 3 + 1]));
+        REQUIRE(uniforms.uvTransform[column * 4 + 2] == Catch::Approx(expected[column * 3 + 2]));
+        REQUIRE(uniforms.uvTransform[column * 4 + 3] == Catch::Approx(0.f));
+    }
+}
+
+TEST_CASE("Metal morph targets select GL-compatible active influences") {
+
+    auto geometry = BufferGeometry::create();
+    auto positionMorphs = geometry->getOrCreateMorphAttribute("position");
+    auto normalMorphs = geometry->getOrCreateMorphAttribute("normal");
+    for (int i = 0; i < 10; ++i) {
+        positionMorphs->emplace_back(FloatBufferAttribute::create({static_cast<float>(i), 0.f, 0.f}, 3));
+        normalMorphs->emplace_back(FloatBufferAttribute::create({0.f, static_cast<float>(i), 0.f}, 3));
+    }
+
+    auto material = MeshBasicMaterial::create();
+    material->morphTargets = true;
+    material->morphNormals = true;
+    auto mesh = Mesh::create(geometry, material);
+    mesh->morphTargetInfluences() = {0.1f, 0.9f, 0.3f, 0.8f, 0.2f, 0.7f, 0.4f, 0.6f, 0.5f, 0.05f};
+
+    metal::MetalMorphTargets morphTargets;
+    morphTargets.update(mesh.get(), geometry.get(), material.get());
+
+    CHECK(geometry->getAttribute("morphTarget0") == positionMorphs->at(1).get());
+    CHECK(geometry->getAttribute("morphTarget1") == positionMorphs->at(3).get());
+    CHECK_FALSE(geometry->hasAttribute("morphTarget4"));
+    CHECK(geometry->getAttribute("morphNormal0") == normalMorphs->at(1).get());
+    CHECK(geometry->getAttribute("morphNormal3") == normalMorphs->at(7).get());
+    CHECK_FALSE(geometry->hasAttribute("morphNormal4"));
+
+    CHECK(morphTargets.morphTargetBaseInfluence() == Catch::Approx(-2.f));
+    const auto& influences = morphTargets.morphTargetInfluences();
+    REQUIRE(influences.size() == 8);
+    CHECK(influences[0] == Catch::Approx(0.9f));
+    CHECK(influences[1] == Catch::Approx(0.8f));
+    CHECK(influences[3] == Catch::Approx(0.6f));
+    CHECK(influences[4] == Catch::Approx(0.f));
+
+    morphTargets.update(mesh.get(), geometry.get(), material.get(), false);
+    CHECK(geometry->getAttribute("morphTarget7") == positionMorphs->at(8).get());
+    CHECK(morphTargets.morphTargetBaseInfluence() == Catch::Approx(-3.4f));
+    CHECK(morphTargets.morphTargetInfluences()[7] == Catch::Approx(0.5f));
+
+    morphTargets.removeGeometry(geometry->id);
+    CHECK_FALSE(morphTargets.influencesList.contains(geometry->id));
+}
+
 TEST_CASE("Metal shading params expose 16-byte aligned texture flag fields") {
 
     STATIC_REQUIRE(alignof(ShadingParams) == 16);
@@ -112,14 +186,17 @@ TEST_CASE("Metal shading params expose 16-byte aligned texture flag fields") {
 TEST_CASE("Metal depth transform uniforms expose model-view matrix for clipping") {
 
     STATIC_REQUIRE(alignof(DepthTransformUniforms) == 16);
-    STATIC_REQUIRE(sizeof(DepthTransformUniforms) == 256);
+    STATIC_REQUIRE(sizeof(DepthTransformUniforms) == 320);
     STATIC_REQUIRE(offsetof(DepthTransformUniforms, shadowMatrix) == 0);
     STATIC_REQUIRE(offsetof(DepthTransformUniforms, modelViewMatrix) == 64);
     STATIC_REQUIRE(offsetof(DepthTransformUniforms, bindMatrix) == 128);
     STATIC_REQUIRE(offsetof(DepthTransformUniforms, bindMatrixInverse) == 192);
+    STATIC_REQUIRE(offsetof(DepthTransformUniforms, morphTargetBaseInfluence) == 256);
+    STATIC_REQUIRE(offsetof(DepthTransformUniforms, morphTargetInfluences) == 260);
+    STATIC_REQUIRE(sizeof(DepthTransformUniforms) % 16 == 0);
 
     STATIC_REQUIRE(alignof(PointDepthTransformUniforms) == 16);
-    STATIC_REQUIRE(sizeof(PointDepthTransformUniforms) == 352);
+    STATIC_REQUIRE(sizeof(PointDepthTransformUniforms) == 416);
     STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, shadowMatrix) == 0);
     STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, modelMatrix) == 64);
     STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, modelViewMatrix) == 128);
@@ -127,6 +204,9 @@ TEST_CASE("Metal depth transform uniforms expose model-view matrix for clipping"
     STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, bindMatrixInverse) == 256);
     STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, lightPosition) == 320);
     STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, params) == 336);
+    STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, morphTargetBaseInfluence) == 352);
+    STATIC_REQUIRE(offsetof(PointDepthTransformUniforms, morphTargetInfluences) == 356);
+    STATIC_REQUIRE(sizeof(PointDepthTransformUniforms) % 16 == 0);
 }
 
 TEST_CASE("Metal shading params project global and local clipping planes into camera space") {
@@ -210,14 +290,20 @@ TEST_CASE("Metal shadow shading params follow GL clipping scope") {
     REQUIRE(params.clippingPlanes[0][3] == Catch::Approx(-0.25f));
 }
 
-TEST_CASE("Metal point uniforms expose 16-byte aligned fog fields") {
+TEST_CASE("Metal point uniforms expose 16-byte aligned sprite and fog fields") {
 
     STATIC_REQUIRE(alignof(PointUniforms) == 16);
-    STATIC_REQUIRE(sizeof(PointUniforms) == 144);
-    STATIC_REQUIRE(offsetof(PointUniforms, fogColor) == 112);
-    STATIC_REQUIRE(offsetof(PointUniforms, fogParams) == 128);
+    STATIC_REQUIRE(sizeof(PointUniforms) == 272);
+    STATIC_REQUIRE(offsetof(PointUniforms, alphaTest) == 112);
+    STATIC_REQUIRE(offsetof(PointUniforms, uvTransform) == 128);
+    STATIC_REQUIRE(offsetof(PointUniforms, fogColor) == 176);
+    STATIC_REQUIRE(offsetof(PointUniforms, fogParams) == 192);
+    STATIC_REQUIRE(offsetof(PointUniforms, morphTargetBaseInfluence) == 208);
+    STATIC_REQUIRE(offsetof(PointUniforms, morphTargetInfluences) == 212);
+    STATIC_REQUIRE(offsetof(PointUniforms, uvTransform) % 16 == 0);
     STATIC_REQUIRE(offsetof(PointUniforms, fogColor) % 16 == 0);
     STATIC_REQUIRE(offsetof(PointUniforms, fogParams) % 16 == 0);
+    STATIC_REQUIRE(sizeof(PointUniforms) % 16 == 0);
 
     Scene scene;
     scene.fog = Fog(Color(0x336699), 5.f, 50.f);
@@ -233,6 +319,15 @@ TEST_CASE("Metal point uniforms expose 16-byte aligned fog fields") {
     REQUIRE(uniforms.fogParams[0] == Catch::Approx(5.f));
     REQUIRE(uniforms.fogParams[1] == Catch::Approx(50.f));
     REQUIRE(uniforms.fogParams[3] == Catch::Approx(1.f));
+}
+
+TEST_CASE("Metal transform uniforms expose morph fields at 16-byte aligned size") {
+
+    STATIC_REQUIRE(alignof(TransformUniforms) == 16);
+    STATIC_REQUIRE(sizeof(TransformUniforms) == 448);
+    STATIC_REQUIRE(offsetof(TransformUniforms, morphTargetBaseInfluence) == 384);
+    STATIC_REQUIRE(offsetof(TransformUniforms, morphTargetInfluences) == 388);
+    STATIC_REQUIRE(sizeof(TransformUniforms) % 16 == 0);
 }
 
 TEST_CASE("Metal sprite uniforms expose 16-byte aligned uv and fog fields") {
@@ -307,6 +402,33 @@ TEST_CASE("Metal points shaders carry fog depth and apply fog") {
     REQUIRE(contains(fragmentSource, "applyFog(color.rgb, in.fogDepth"));
 }
 
+TEST_CASE("Metal points shaders sample point sprite maps and alpha test") {
+
+    const std::string_view vertexSource{metal::points_vertex};
+    const std::string_view fragmentSource{metal::points_fragment};
+
+    REQUIRE(contains(vertexSource, "float alphaTest;"));
+    REQUIRE(contains(vertexSource, "float3x3 uvTransform;"));
+    REQUIRE(contains(fragmentSource, "pointCoord [[point_coord]]"));
+    REQUIRE(contains(fragmentSource, "pointCoord.x, 1.0 - pointCoord.y"));
+    REQUIRE(contains(fragmentSource, "map.sample(mapSampler, pointUv)"));
+    REQUIRE(contains(fragmentSource, "alphaMap.sample(alphaMapSampler, pointUv).g"));
+    REQUIRE(contains(fragmentSource, "if (color.a < uniforms.alphaTest)"));
+    REQUIRE(contains(fragmentSource, "discard_fragment()"));
+}
+
+TEST_CASE("Metal mesh shader computes flat shaded normals per fragment") {
+
+    const std::string_view fragmentSource{metal::basic_fragment};
+
+    REQUIRE(contains(fragmentSource, "USE_FLAT_SHADING"));
+    REQUIRE(contains(fragmentSource, "float3 flatShadedNormal(float3 worldPosition)"));
+    REQUIRE(contains(fragmentSource, "dfdx(worldPosition)"));
+    REQUIRE(contains(fragmentSource, "dfdy(worldPosition)"));
+    REQUIRE(contains(fragmentSource, "normalize(cross(positionDy, positionDx))"));
+    REQUIRE(contains(fragmentSource, "flatShadedNormal(in.worldPosition)"));
+}
+
 TEST_CASE("Metal mesh and shadow shaders expose clipping discard paths") {
 
     const std::string_view vertexSource{metal::basic_vertex};
@@ -335,4 +457,28 @@ TEST_CASE("Metal mesh and shadow shaders expose clipping discard paths") {
     REQUIRE(contains(pointDepthVertexSource, "out.viewPosition = -(transforms.modelViewMatrix * localPosition).xyz;"));
     REQUIRE(contains(pointDepthFragmentSource, "constant ShadingParams& params [[buffer(0)]]"));
     REQUIRE(contains(pointDepthFragmentSource, "applyClipping(in.viewPosition, params)"));
+}
+
+TEST_CASE("Metal shaders expose morph target attributes and uniforms") {
+
+    const std::string_view vertexSource{metal::basic_vertex};
+    const std::string_view pointsVertexSource{metal::points_vertex};
+    const std::string_view depthVertexSource{metal::depth_vertex};
+    const std::string_view pointDepthVertexSource{metal::point_depth_vertex};
+
+    REQUIRE(contains(vertexSource, "#if USE_MORPHTARGETS"));
+    REQUIRE(contains(vertexSource, "float3 morphTarget0 [[attribute(7)]];"));
+    REQUIRE(contains(vertexSource, "float3 morphNormal0 [[attribute(11)]];"));
+    REQUIRE(contains(vertexSource, "float morphTargetBaseInfluence;"));
+    REQUIRE(contains(vertexSource, "morphTarget4 * transforms.morphTargetInfluences[4]"));
+    REQUIRE(contains(vertexSource, "morphNormal3 * transforms.morphTargetInfluences[3]"));
+
+    REQUIRE(contains(pointsVertexSource, "float3 morphTarget0 [[attribute(7)]];"));
+    REQUIRE(contains(pointsVertexSource, "morphTarget7 * uniforms.morphTargetInfluences[7]"));
+
+    REQUIRE(contains(depthVertexSource, "float3 morphTarget0 [[attribute(7)]];"));
+    REQUIRE(contains(depthVertexSource, "morphTarget7 * transforms.morphTargetInfluences[7]"));
+
+    REQUIRE(contains(pointDepthVertexSource, "float3 morphTarget0 [[attribute(7)]];"));
+    REQUIRE(contains(pointDepthVertexSource, "morphTarget7 * transforms.morphTargetInfluences[7]"));
 }

@@ -23,6 +23,9 @@ namespace threepp::metal {
             if (key.doubleSided && key.flipSided) {
                 throw std::runtime_error("Metal shader variant cannot enable double-sided and flip-sided normals together");
             }
+            if (key.useMorphNormals && !key.useMorphTargets) {
+                throw std::runtime_error("Metal shader variant cannot enable morph normals without morph targets");
+            }
         }
 
         void validateDepthShaderKey(const DepthShaderKey& key) {
@@ -41,6 +44,8 @@ namespace threepp::metal {
             source += key.useVertexColors ? "1\n" : "0\n";
             source += "#define USE_NORMAL ";
             source += key.useNormal ? "1\n" : "0\n";
+            source += "#define USE_FLAT_SHADING ";
+            source += key.flatShading ? "1\n" : "0\n";
             source += "#define USE_SKINNING ";
             source += key.useSkinning ? "1\n" : "0\n";
             source += "#define USE_LIGHTS ";
@@ -55,6 +60,10 @@ namespace threepp::metal {
             source += key.flipSided ? "1\n" : "0\n";
             source += "#define USE_CLIPPING ";
             source += key.useClipping ? "1\n" : "0\n";
+            source += "#define USE_MORPHTARGETS ";
+            source += key.useMorphTargets ? "1\n" : "0\n";
+            source += "#define USE_MORPHNORMALS ";
+            source += key.useMorphNormals ? "1\n" : "0\n";
             source += fog_functions;
             source += basic_vertex;
             source += basic_fragment;
@@ -71,6 +80,8 @@ namespace threepp::metal {
             source += key.useInstancing ? "1\n" : "0\n";
             source += "#define USE_CLIPPING ";
             source += key.useClipping ? "1\n" : "0\n";
+            source += "#define USE_MORPHTARGETS ";
+            source += key.useMorphTargets ? "1\n" : "0\n";
             source += depth_vertex;
             if (key.useClipping) {
                 source += depth_fragment;
@@ -88,10 +99,12 @@ namespace threepp::metal {
             return source;
         }
 
-        std::string buildPointsShaderSource(bool useVertexColors) {
+        std::string buildPointsShaderSource(bool useVertexColors, bool useMorphTargets) {
             std::string source;
             source += "#define USE_VERTEX_COLORS ";
             source += useVertexColors ? "1\n" : "0\n";
+            source += "#define USE_MORPHTARGETS ";
+            source += useMorphTargets ? "1\n" : "0\n";
             source += tone_mapping_functions;
             source += fog_functions;
             source += points_vertex;
@@ -243,6 +256,8 @@ namespace threepp::metal {
             sourceText += key.useInstancing ? "1\n" : "0\n";
             sourceText += "#define USE_CLIPPING ";
             sourceText += key.useClipping ? "1\n" : "0\n";
+            sourceText += "#define USE_MORPHTARGETS ";
+            sourceText += key.useMorphTargets ? "1\n" : "0\n";
             sourceText += point_depth_vertex;
             sourceText += point_depth_fragment;
 
@@ -404,14 +419,17 @@ namespace threepp::metal {
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildLineShaderSource(useVertexColors), "line_fragment");
     }
 
-    void* MetalShaderManager::getOrCreatePointsVertexFunction(bool useVertexColors) {
-        const auto cacheKey = useVertexColors ? "points_vertex_color" : "points_vertex";
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors), "points_vertex");
+    void* MetalShaderManager::getOrCreatePointsVertexFunction(bool useVertexColors, bool useMorphTargets) {
+        std::string cacheKey = useVertexColors ? "points_vertex_color" : "points_vertex";
+        if (useMorphTargets) {
+            cacheKey += "_morph";
+        }
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, useMorphTargets), "points_vertex");
     }
 
     void* MetalShaderManager::getOrCreatePointsFragmentFunction(bool useVertexColors) {
         const auto cacheKey = useVertexColors ? "points_fragment_color" : "points_fragment";
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors), "points_fragment");
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, false), "points_fragment");
     }
 
     void* MetalShaderManager::getOrCreateRawShaderVertexFunction() {

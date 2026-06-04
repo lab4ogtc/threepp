@@ -248,6 +248,7 @@ set(privateHeaders
         "threepp/renderers/metal/MetalShaders.hpp"
         "threepp/renderers/metal/MetalRenderObjects.hpp"
         "threepp/renderers/metal/MetalRendererImpl.hpp"
+        "threepp/renderers/metal/MetalMorphTargets.hpp"
         "threepp/renderers/metal/MetalRenderList.hpp"
         "threepp/renderers/metal/MetalCameraUtils.hpp"
         "threepp/renderers/metal/MetalRenderStateUtils.hpp"

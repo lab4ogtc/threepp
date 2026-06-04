@@ -2,6 +2,7 @@
 #define THREEPP_METAL_RENDER_OBJECTS_HPP
 
 #import "MetalCameraUtils.hpp"
+#import "MetalMorphTargets.hpp"
 #import "MetalRenderList.hpp"
 
 #import "threepp/cameras/Camera.hpp"
@@ -63,6 +64,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <iterator>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -79,13 +81,15 @@ namespace threepp {
     inline constexpr std::size_t maxShadowMapsPerLightType = 4;
     inline constexpr std::size_t maxClippingPlanes = 8;
 
-    inline constexpr std::uint8_t vertexLayoutPosition = 1u << 0u;
-    inline constexpr std::uint8_t vertexLayoutNormal = 1u << 1u;
-    inline constexpr std::uint8_t vertexLayoutUv = 1u << 2u;
-    inline constexpr std::uint8_t vertexLayoutColor = 1u << 3u;
-    inline constexpr std::uint8_t vertexLayoutTangent = 1u << 4u;
-    inline constexpr std::uint8_t vertexLayoutSkinning = 1u << 5u;
-    inline constexpr std::uint8_t vertexLayoutColor4 = 1u << 6u;
+    inline constexpr std::uint16_t vertexLayoutPosition = 1u << 0u;
+    inline constexpr std::uint16_t vertexLayoutNormal = 1u << 1u;
+    inline constexpr std::uint16_t vertexLayoutUv = 1u << 2u;
+    inline constexpr std::uint16_t vertexLayoutColor = 1u << 3u;
+    inline constexpr std::uint16_t vertexLayoutTangent = 1u << 4u;
+    inline constexpr std::uint16_t vertexLayoutSkinning = 1u << 5u;
+    inline constexpr std::uint16_t vertexLayoutColor4 = 1u << 6u;
+    inline constexpr std::uint16_t vertexLayoutMorphTargets = 1u << 7u;
+    inline constexpr std::uint16_t vertexLayoutMorphNormals = 1u << 8u;
 
     inline int requestedAntialiasingSamples(Window& window) {
         if (auto* glfwWindow = dynamic_cast<GlfwWindow*>(&window)) {
@@ -118,6 +122,9 @@ namespace threepp {
         float normalMatrix[16];
         float bindMatrix[16];
         float bindMatrixInverse[16];
+        float morphTargetBaseInfluence;
+        float morphTargetInfluences[8];
+        float transformPadding[7];
     };
 
     struct alignas(16) DepthTransformUniforms {
@@ -125,6 +132,9 @@ namespace threepp {
         float modelViewMatrix[16];
         float bindMatrix[16];
         float bindMatrixInverse[16];
+        float morphTargetBaseInfluence;
+        float morphTargetInfluences[8];
+        float depthPadding[7];
     };
 
     struct alignas(16) PointDepthTransformUniforms {
@@ -135,6 +145,9 @@ namespace threepp {
         float bindMatrixInverse[16];
         float lightPosition[4];
         float params[4];
+        float morphTargetBaseInfluence;
+        float morphTargetInfluences[8];
+        float morphPadding[7];
     };
 
     struct alignas(16) ShadingParams {
@@ -192,12 +205,19 @@ namespace threepp {
         float pointSize;
         float scale;
         std::uint32_t sizeAttenuation;
+        std::uint32_t useMap;
+        std::uint32_t useAlphaMap;
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding[2];
+        float alphaTest;
+        float padding[3];
+        float uvTransform[12];
         float fogColor[4];
         float fogParams[4];
+        float morphTargetBaseInfluence;
+        float morphTargetInfluences[8];
+        float morphPadding[7];
     };
 
     struct alignas(16) RawShaderUniforms {
@@ -339,6 +359,12 @@ namespace threepp {
         target[15] = 1.f;
     }
 
+    template<class Uniforms>
+    inline void resetMorphTargetUniforms(Uniforms& out) {
+        out.morphTargetBaseInfluence = 1.f;
+        std::fill(std::begin(out.morphTargetInfluences), std::end(out.morphTargetInfluences), 0.f);
+    }
+
     inline void computeMVP(const Camera& camera, const Object3D& object, Matrix4& out, bool includeObjectMatrix = true) {
         out.copy(metal::convertProjectionToMetalClipSpace(camera.projectionMatrix));
         out.multiply(camera.matrixWorldInverse);
@@ -377,6 +403,7 @@ namespace threepp {
             copyIdentityMatrix(out.bindMatrix);
             copyIdentityMatrix(out.bindMatrixInverse);
         }
+        resetMorphTargetUniforms(out);
     }
 
     inline void computeSpriteUniforms(const Camera& camera, const Sprite& sprite, const SpriteMaterial& material, SpriteUniforms& out) {
@@ -430,6 +457,20 @@ namespace threepp {
         out.pointSize = material.size * pixelRatio;
         out.scale = scale;
         out.sizeAttenuation = sizeAttenuation ? 1u : 0u;
+        out.useMap = material.map ? 1u : 0u;
+        out.useAlphaMap = material.alphaMap ? 1u : 0u;
+        out.alphaTest = material.alphaTest;
+
+        Matrix3 uvTransform;
+        const auto uvScaleMap = material.map ? material.map : material.alphaMap;
+        if (uvScaleMap) {
+            if (uvScaleMap->matrixAutoUpdate) {
+                uvScaleMap->updateMatrix();
+            }
+            uvTransform.copy(uvScaleMap->matrix);
+        }
+        copyMatrix3Columns(uvTransform, out.uvTransform);
+        resetMorphTargetUniforms(out);
     }
 
     inline void computeRawShaderUniforms(const Camera& camera, const Mesh& mesh, float time, RawShaderUniforms& out) {
@@ -464,6 +505,7 @@ namespace threepp {
             copyIdentityMatrix(out.bindMatrix);
             copyIdentityMatrix(out.bindMatrixInverse);
         }
+        resetMorphTargetUniforms(out);
     }
 
     inline void computePointDepthTransformUniforms(const Camera& shadowCamera, const Object3D& object, const Vector3& lightPosition, float nearPlane, float farPlane, PointDepthTransformUniforms& out) {
@@ -490,6 +532,7 @@ namespace threepp {
         out.lightPosition[3] = 1.f;
         out.params[0] = nearPlane;
         out.params[1] = farPlane;
+        resetMorphTargetUniforms(out);
     }
 
     inline void collectRenderables(Object3D& object, std::vector<Object3D*>& out) {
@@ -621,6 +664,30 @@ namespace threepp {
                skinWeight &&
                skinWeight->itemSize() == 4 &&
                skinWeight->count() == skinIndex->count();
+    }
+
+    inline bool wantsMorphTargets(Material& material, BufferGeometry& geometry) {
+        auto* morphMaterial = material.as<MaterialWithMorphTargets>();
+        return morphMaterial &&
+               morphMaterial->morphTargets &&
+               geometry.getMorphAttribute("position") != nullptr;
+    }
+
+    inline bool wantsMorphNormals(Material& material, BufferGeometry& geometry, bool useNormal, bool useMorphTargets) {
+        if (!useMorphTargets || !useNormal || geometry.getMorphAttribute("normal") == nullptr) return false;
+
+        auto* morphMaterial = material.as<MaterialWithMorphTargets>();
+        if (!morphMaterial || !morphMaterial->morphNormals) return false;
+
+        auto* flatMaterial = dynamic_cast<MaterialWithFlatShading*>(&material);
+        return !flatMaterial || !flatMaterial->flatShading;
+    }
+
+    template<class Uniforms>
+    inline void writeMorphTargetUniforms(const metal::MetalMorphTargets& morphTargets, Uniforms& uniforms) {
+        uniforms.morphTargetBaseInfluence = morphTargets.morphTargetBaseInfluence();
+        const auto& influences = morphTargets.morphTargetInfluences();
+        std::copy(influences.begin(), influences.end(), std::begin(uniforms.morphTargetInfluences));
     }
 
     inline bool hasTexture(const std::shared_ptr<Texture>& texture) {

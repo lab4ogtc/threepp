@@ -130,6 +130,7 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
     bufferManager = std::make_unique<metal::MetalBufferManager>((__bridge void*) device);
     shaderManager = std::make_unique<metal::MetalShaderManager>((__bridge void*) device);
     textureManager = std::make_unique<metal::MetalTextureManager>((__bridge void*) device, (__bridge void*) commandQueue);
+    morphTargets = std::make_unique<metal::MetalMorphTargets>();
 #ifdef THREEPP_HAS_SLANG
     try {
         shaderCompiler = std::make_unique<SlangShaderCompiler>();
@@ -190,6 +191,9 @@ void MetalRenderer::Impl::deallocateGeometry(BufferGeometry& geometry) {
     }
 
     geometries.erase(&geometry);
+    if (morphTargets) {
+        morphTargets->removeGeometry(geometry.id);
+    }
 }
 
 void MetalRenderer::Impl::trackGeometry(BufferGeometry& geometry) {
@@ -1226,20 +1230,28 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;
             const bool useNormal = normAttr != nullptr;
+            const auto* flatMaterial = dynamic_cast<MaterialWithFlatShading*>(material);
+            const bool useFlatShading = useNormal && flatMaterial && flatMaterial->flatShading;
             const bool useLights = useNormal && (isLightingMaterial(*material) || isShadowMaterial(*material));
             const bool useSkinning = skinnedMesh && skinnedMesh->skeleton && hasSkinningAttributes(*geometry);
             const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
             const bool useInstanceColor = useInstancing && instancedMesh->instanceColor() != nullptr;
             const bool useTangent = useNormal && useUv;
+            const bool useMorphTargets = wantsMorphTargets(*material, *geometry);
+            const bool useMorphNormals = wantsMorphNormals(*material, *geometry, useNormal, useMorphTargets);
             if (useInstancing && useSkinning) {
                 std::cerr << "MetalRenderer: skipping unsupported instanced skinned renderable " << obj->id << "\n";
                 continue;
+            }
+            if (useMorphTargets && morphTargets) {
+                morphTargets->update(obj, geometry, material, useMorphNormals);
             }
 
             metal::ShaderProgramKey shaderKey;
             shaderKey.useMap = useUv;
             shaderKey.useVertexColors = useVertexColors;
             shaderKey.useNormal = useNormal;
+            shaderKey.flatShading = useFlatShading;
             shaderKey.useSkinning = useSkinning;
             shaderKey.useLights = useLights;
             shaderKey.useInstancing = useInstancing;
@@ -1247,13 +1259,17 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             shaderKey.doubleSided = material->side == Side::Double;
             shaderKey.flipSided = material->side == Side::Back;
             shaderKey.useClipping = useClipping;
+            shaderKey.useMorphTargets = useMorphTargets;
+            shaderKey.useMorphNormals = useMorphNormals;
 
-            std::uint8_t vertexLayoutBitmask = vertexLayoutPosition;
+            std::uint16_t vertexLayoutBitmask = vertexLayoutPosition;
             if (useNormal) vertexLayoutBitmask |= vertexLayoutNormal;
             if (useUv) vertexLayoutBitmask |= vertexLayoutUv;
             if (useVertexColors) vertexLayoutBitmask |= vertexLayoutColor;
             if (useSkinning) vertexLayoutBitmask |= vertexLayoutSkinning;
             if (useTangent) vertexLayoutBitmask |= vertexLayoutTangent;
+            if (useMorphTargets) vertexLayoutBitmask |= vertexLayoutMorphTargets;
+            if (useMorphNormals) vertexLayoutBitmask |= vertexLayoutMorphNormals;
 
             metal::PipelineKey pipelineKey;
             pipelineKey.vertexFunction = shaderManager->getOrCreateVertexFunction(shaderKey);
@@ -1277,7 +1293,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
             applyDepthBias(encoder, *material);
 
-            bindDrawAttributes(encoder, *geometry, *posAttr, normAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent);
+            bindDrawAttributes(encoder, *geometry, *posAttr, normAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent, useMorphTargets, useMorphNormals);
             if (useSkinning) {
                 bindSkinning(encoder, *geometry, skinnedMesh);
             }
@@ -1287,8 +1303,11 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 instanceCount = static_cast<NSUInteger>(instancedMesh->count());
             }
 
-            TransformUniforms transformUniforms;
+            TransformUniforms transformUniforms{};
             computeTransformUniforms(camera, *obj, transformUniforms, useInstancing);
+            if (useMorphTargets && morphTargets) {
+                writeMorphTargetUniforms(*morphTargets, transformUniforms);
+            }
             [encoder setVertexBytes:&transformUniforms length:sizeof(transformUniforms) atIndex:4];
 
             [encoder setFragmentBytes:&shadingParams length:sizeof(shadingParams) atIndex:0];
