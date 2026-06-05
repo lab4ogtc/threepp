@@ -8,8 +8,13 @@
 #include "threepp/math/Vector4.hpp"
 #include "threepp/renderers/Renderer.hpp"
 
+#include <array>
+#include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -19,6 +24,26 @@ namespace threepp {
     class Window;
 
     struct MetalShadowMap: public RendererShadowMap {};
+
+    /**
+     * @brief Metal Lidar beam compute 输入样本。
+     *
+     * 该布局与内联 Metal compute shader 保持一致。每个样本描述一个 beam
+     * 应从哪个 cube face 的哪个 RG 深度像素读取，并携带该 beam 在对应 face
+     * camera 中的精确 NDC 坐标。
+     */
+    struct alignas(16) MetalLidarBeamSample {
+        std::uint32_t face = 0;
+        std::uint32_t pixelX = 0;
+        std::uint32_t pixelY = 0;
+        std::uint32_t reserved0 = 0;
+        float u = 0.f;
+        float v = 0.f;
+        float reserved1 = 0.f;
+        float reserved2 = 0.f;
+    };
+
+    static_assert(sizeof(MetalLidarBeamSample) == 32);
 
     class MetalRenderer: public Renderer {
 
@@ -72,6 +97,36 @@ namespace threepp {
          * @throws std::runtime_error 当纹理或读回缓冲创建失败时抛出。
          */
         void copyTexturesToImages(const std::vector<Texture*>& textures) override;
+
+        void readbackTextureAsync(
+                Texture& texture,
+                std::function<void(const ReadbackResult& result)> onComplete,
+                std::function<void(const std::string& error)> onError = nullptr) override;
+
+        void readbackLidarDepthAsPointCloudAsync(
+                Texture& packedDepthTexture,
+                const std::array<float, 16>& matrixWorld,
+                float farPlane,
+                std::function<void(const ReadbackResult& result)> onComplete,
+                std::function<void(const std::string& error)> onError = nullptr);
+
+        /**
+         * @brief 使用 Metal compute 将 model-based Lidar beams 直接反投影为 float4 点云。
+         *
+         * @param packedDepthTextures 六个 cube face 的 RG8 packed depth 纹理。
+         * @param matrixWorldPerFace 六个 face camera 的 world matrix 快照。
+         * @param beams 需要采样的 beam 表；输出顺序与输入顺序一致。
+         * @param farPlane 深度编码对应的 far plane。
+         * @param onComplete GPU 计算完成后的主线程回调，返回 RGBA/Float 数据视图。
+         * @param onError 可选错误回调；未提供时异常继续抛出。
+         */
+        void readbackLidarBeamsAsPointCloudAsync(
+                const std::array<Texture*, 6>& packedDepthTextures,
+                const std::array<std::array<float, 16>, 6>& matrixWorldPerFace,
+                std::span<const MetalLidarBeamSample> beams,
+                float farPlane,
+                std::function<void(const ReadbackResult& result)> onComplete,
+                std::function<void(const std::string& error)> onError = nullptr);
 
         [[nodiscard]] void* device() const;
 

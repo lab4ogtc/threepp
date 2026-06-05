@@ -9,17 +9,76 @@
 #include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/textures/DepthTexture.hpp"
 
+#ifdef __APPLE__
+#include "threepp/renderers/metal/MetalRenderer.hpp"
+#endif
+
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <mutex>
 #include <optional>
 #include <random>
+#include <string>
 
 using namespace threepp;
+
+struct LidarSensor::ScanSlot {
+    std::array<std::vector<unsigned char>, LidarSensor::kNumFaces> facePixels;
+    std::array<std::vector<float>, LidarSensor::kNumFaces> facePointClouds;
+    std::vector<float> beamPointCloud;
+    std::array<std::array<float, 16>, LidarSensor::kNumFaces> faceMatrices{};
+    std::vector<Vector3> cloud;
+    std::size_t generation = 0;
+    unsigned int completedFaces = 0;
+    bool gpuPointCloud = false;
+    bool pending = false;
+};
+
+struct LidarSensor::AsyncState {
+    mutable std::mutex mutex;
+    std::array<ScanSlot, 3> slots;
+    std::vector<Vector3> latestCloud;
+    std::size_t latestReadyGeneration = 0;
+    std::size_t nextSubmitSlot = 0;
+    std::size_t nextGeneration = 0;
+};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 namespace {
+
+    unsigned int readbackChannelCount(Format format) {
+        switch (format) {
+            case Format::Red:
+                return 1u;
+            case Format::RG:
+                return 2u;
+            case Format::RGB:
+                return 3u;
+            case Format::RGBA:
+            case Format::BGRA:
+                return 4u;
+            default:
+                return 0u;
+        }
+    }
+
+    unsigned int readbackBytesPerElement(Type type) {
+        switch (type) {
+            case Type::UnsignedByte:
+                return sizeof(unsigned char);
+            case Type::HalfFloat:
+                return 2u;
+            case Type::Float:
+                return sizeof(float);
+            default:
+                return 0u;
+        }
+    }
 
     // Map a direction vector (sensor-local space) to the cube face that it
     // primarily hits, and compute the NDC coordinates (u, v) in [-1, 1] of
@@ -65,6 +124,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 void LidarSensor::init(float near, float far) {
+    asyncState_ = std::make_shared<AsyncState>();
 
     struct FaceDesc { Vector3 lookAt, up; };
     static const std::array<FaceDesc, kNumFaces> kFaces{{
@@ -99,6 +159,7 @@ void LidarSensor::init(float near, float far) {
     readOpts.generateMipmaps = false;
     readOpts.depthBuffer = false;
     readOpts.stencilBuffer = false;
+    readOpts.zeroCopy = true;
 
     for (int i = 0; i < kNumFaces; ++i) {
         sceneOpts.depthTexture = DepthTexture::create(Type::Float);
@@ -201,21 +262,47 @@ LidarSensor::LidarSensor(const LidarModel& model, unsigned int faceSize, float n
 // Scan
 // ---------------------------------------------------------------------------
 
-void LidarSensor::scan(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud) {
-    cloud.clear();
-    renderFaces(renderer, scene);
+void LidarSensor::scan(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud, bool forceImmediate) {
+    if (forceImmediate) {
+        scanImmediate(renderer, scene, cloud);
+        return;
+    }
 
-    if (beams_.empty())
-        unprojectDense(cloud);
-    else
-        unprojectBeams(cloud);
+    drainCompletedScans();
+    copyLatestReadyCloud(cloud);
+
+    std::size_t slotIndex = 0;
+    std::size_t generation = 0;
+    if (!reserveAsyncSlot(slotIndex, generation)) return;
+
+    try {
+        renderFaces(renderer, scene);
+
+        {
+            std::lock_guard lock(asyncState_->mutex);
+            auto& slot = asyncState_->slots[slotIndex];
+            if (slot.pending && slot.generation == generation) {
+                for (int f = 0; f < kNumFaces; ++f) {
+                    std::copy_n(cameras_[f]->matrixWorld->elements.data(), slot.faceMatrices[f].size(), slot.faceMatrices[f].begin());
+                }
+            }
+        }
+
+        submitAsyncReadback(renderer, slotIndex, generation);
+        renderer.setRenderTarget(nullptr);
+        renderer.endFrame();
+    } catch (...) {
+        renderer.setRenderTarget(nullptr);
+        releaseAsyncSlot(slotIndex, generation);
+        throw;
+    }
+
+    drainCompletedScans();
+    copyLatestReadyCloud(cloud);
 }
 
 void LidarSensor::renderFaces(Renderer& renderer, Scene& scene) {
     if (!parent) updateMatrixWorld();
-
-    std::vector<Texture*> readbackTextures;
-    readbackTextures.reserve(kNumFaces);
 
     for (int f = 0; f < kNumFaces; ++f) {
         renderer.setRenderTarget(sceneTargets_[f].get());
@@ -224,20 +311,380 @@ void LidarSensor::renderFaces(Renderer& renderer, Scene& scene) {
         postMaterial_->uniforms.at("tDepth").setValue(sceneTargets_[f]->depthTexture.get());
         renderer.setRenderTarget(readbackTargets_[f].get());
         renderer.render(postScene_, postCamera_);
+    }
+}
 
-        readbackTextures.push_back(readbackTargets_[f]->texture.get());
+void LidarSensor::scanImmediate(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud) {
+    cloud.clear();
+    renderFaces(renderer, scene);
+
+    std::vector<Texture*> readbackTextures;
+    readbackTextures.reserve(kNumFaces);
+    for (const auto& target : readbackTargets_) {
+        readbackTextures.push_back(target->texture.get());
     }
 
     renderer.copyTexturesToImages(readbackTextures);
     renderer.setRenderTarget(nullptr);
+
+    ScanSlot slot;
+    for (int f = 0; f < kNumFaces; ++f) {
+        const auto& pixels = readbackTargets_[f]->texture->image().data();
+        slot.facePixels[f] = pixels;
+        std::copy_n(cameras_[f]->matrixWorld->elements.data(), slot.faceMatrices[f].size(), slot.faceMatrices[f].begin());
+    }
+
+    if (beams_.empty())
+        unprojectDense(slot, cloud);
+    else
+        unprojectBeams(slot, cloud);
+}
+
+bool LidarSensor::reserveAsyncSlot(std::size_t& slotIndex, std::size_t& generation) {
+    std::lock_guard lock(asyncState_->mutex);
+
+    for (std::size_t offset = 0; offset < asyncState_->slots.size(); ++offset) {
+        const auto candidate = (asyncState_->nextSubmitSlot + offset) % asyncState_->slots.size();
+        auto& slot = asyncState_->slots[candidate];
+        if (slot.pending) continue;
+
+        slot = ScanSlot{};
+        slot.pending = true;
+        slot.generation = ++asyncState_->nextGeneration;
+        slotIndex = candidate;
+        generation = slot.generation;
+        asyncState_->nextSubmitSlot = (candidate + 1u) % asyncState_->slots.size();
+        return true;
+    }
+
+    return false;
+}
+
+void LidarSensor::releaseAsyncSlot(std::size_t slotIndex, std::size_t generation) {
+    std::lock_guard lock(asyncState_->mutex);
+    if (slotIndex >= asyncState_->slots.size()) return;
+
+    auto& slot = asyncState_->slots[slotIndex];
+    if (slot.generation != generation) return;
+
+    slot.pending = false;
+    slot.completedFaces = 0;
+}
+
+void LidarSensor::copyLatestReadyCloud(std::vector<Vector3>& cloud) const {
+    std::lock_guard lock(asyncState_->mutex);
+    if (asyncState_->latestCloud.empty()) {
+        cloud.clear();
+        return;
+    }
+
+    cloud = asyncState_->latestCloud;
+}
+
+void LidarSensor::submitAsyncReadback(Renderer& renderer, std::size_t slotIndex, std::size_t generation) {
+    auto state = asyncState_;
+
+#ifdef __APPLE__
+    auto* metalRenderer = dynamic_cast<MetalRenderer*>(&renderer);
+    const bool useGpuPointCloud = metalRenderer != nullptr;
+#else
+    const bool useGpuPointCloud = false;
+#endif
+
+    std::array<std::array<float, 16>, kNumFaces> faceMatrices{};
+    {
+        std::lock_guard lock(state->mutex);
+        auto& slot = state->slots[slotIndex];
+        if (!slot.pending || slot.generation != generation) return;
+        slot.gpuPointCloud = useGpuPointCloud;
+        faceMatrices = slot.faceMatrices;
+    }
+
+#ifdef __APPLE__
+    if (useGpuPointCloud && !beams_.empty()) {
+        std::array<Texture*, kNumFaces> textures{};
+        for (int face = 0; face < kNumFaces; ++face) {
+            textures[face] = readbackTargets_[face]->texture.get();
+        }
+
+        std::vector<MetalLidarBeamSample> metalBeams;
+        metalBeams.reserve(beams_.size());
+        for (const auto& beam : beams_) {
+            metalBeams.push_back(MetalLidarBeamSample{
+                    static_cast<std::uint32_t>(beam.face),
+                    static_cast<std::uint32_t>(beam.pixelX),
+                    static_cast<std::uint32_t>(beam.pixelY),
+                    0u,
+                    beam.u,
+                    beam.v,
+                    0.f,
+                    0.f});
+        }
+
+        const auto beamCount = metalBeams.size();
+        metalRenderer->readbackLidarBeamsAsPointCloudAsync(
+                textures,
+                faceMatrices,
+                metalBeams,
+                far_,
+                [state, slotIndex, generation, beamCount](const ReadbackResult& result) {
+                    const auto rowBytes = beamCount * 4u * sizeof(float);
+                    if (!result.data || result.width != beamCount || result.height != 1u ||
+                        result.format != Format::RGBA || result.type != Type::Float ||
+                        result.bytesPerRow < rowBytes) {
+                        std::lock_guard lock(state->mutex);
+                        auto& slot = state->slots[slotIndex];
+                        if (slot.generation == generation) {
+                            slot.pending = false;
+                        }
+                        return;
+                    }
+
+                    std::vector<float> compact(beamCount * 4u);
+                    std::memcpy(compact.data(), result.data, rowBytes);
+
+                    std::lock_guard lock(state->mutex);
+                    auto& slot = state->slots[slotIndex];
+                    if (!slot.pending || slot.generation != generation) return;
+
+                    slot.beamPointCloud = std::move(compact);
+                    slot.completedFaces = kNumFaces;
+                },
+                [state, slotIndex, generation](const std::string&) {
+                    std::lock_guard lock(state->mutex);
+                    auto& slot = state->slots[slotIndex];
+                    if (slot.generation != generation) return;
+
+                    slot.pending = false;
+                    slot.completedFaces = 0;
+                });
+        return;
+    }
+#endif
+
+    for (int face = 0; face < kNumFaces; ++face) {
+        auto* texture = readbackTargets_[face]->texture.get();
+
+#ifdef __APPLE__
+        if (useGpuPointCloud) {
+            metalRenderer->readbackLidarDepthAsPointCloudAsync(
+                    *texture,
+                    faceMatrices[face],
+                    far_,
+                    [state, slotIndex, generation, face, faceSize = faceSize_](const ReadbackResult& result) {
+                        const auto rowFloats = static_cast<std::size_t>(faceSize) * 4u;
+                        const auto rowBytes = rowFloats * sizeof(float);
+                        if (!result.data || result.width != faceSize || result.height != faceSize ||
+                            result.format != Format::RGBA || result.type != Type::Float ||
+                            result.bytesPerRow < rowBytes) {
+                            std::lock_guard lock(state->mutex);
+                            auto& slot = state->slots[slotIndex];
+                            if (slot.generation == generation) {
+                                slot.pending = false;
+                            }
+                            return;
+                        }
+
+                        std::vector<float> compact(rowFloats * static_cast<std::size_t>(faceSize));
+                        auto* dstBytes = reinterpret_cast<unsigned char*>(compact.data());
+                        for (unsigned int y = 0; y < faceSize; ++y) {
+                            const auto* src = result.data + static_cast<std::size_t>(y) * static_cast<std::size_t>(result.bytesPerRow);
+                            auto* dst = dstBytes + static_cast<std::size_t>(y) * rowBytes;
+                            std::memcpy(dst, src, rowBytes);
+                        }
+
+                        std::lock_guard lock(state->mutex);
+                        auto& slot = state->slots[slotIndex];
+                        if (!slot.pending || slot.generation != generation) return;
+
+                        slot.facePointClouds[face] = std::move(compact);
+                        ++slot.completedFaces;
+                    },
+                    [state, slotIndex, generation](const std::string&) {
+                        std::lock_guard lock(state->mutex);
+                        auto& slot = state->slots[slotIndex];
+                        if (slot.generation != generation) return;
+
+                        slot.pending = false;
+                        slot.completedFaces = 0;
+                    });
+            continue;
+        }
+#endif
+
+        renderer.readbackTextureAsync(
+                *texture,
+                [state, slotIndex, generation, face, faceSize = faceSize_](const ReadbackResult& result) {
+                    const auto channels = readbackChannelCount(result.format);
+                    const auto bytesPerElement = readbackBytesPerElement(result.type);
+                    const auto bytesPerPixel = channels * bytesPerElement;
+                    const auto rowBytes = static_cast<std::size_t>(faceSize) * static_cast<std::size_t>(bytesPerPixel);
+                    if (!result.data || result.width != faceSize || result.height != faceSize ||
+                        bytesPerPixel == 0u || result.bytesPerRow < rowBytes) {
+                        std::lock_guard lock(state->mutex);
+                        auto& slot = state->slots[slotIndex];
+                        if (slot.generation == generation) {
+                            slot.pending = false;
+                        }
+                        return;
+                    }
+
+                    std::vector<unsigned char> compact(rowBytes * static_cast<std::size_t>(faceSize));
+                    for (unsigned int y = 0; y < faceSize; ++y) {
+                        const auto* src = result.data + static_cast<std::size_t>(y) * static_cast<std::size_t>(result.bytesPerRow);
+                        auto* dst = compact.data() + static_cast<std::size_t>(y) * rowBytes;
+                        std::memcpy(dst, src, rowBytes);
+                    }
+
+                    std::lock_guard lock(state->mutex);
+                    auto& slot = state->slots[slotIndex];
+                    if (!slot.pending || slot.generation != generation) return;
+
+                    slot.facePixels[face] = std::move(compact);
+                    ++slot.completedFaces;
+                },
+                [state, slotIndex, generation](const std::string&) {
+                    std::lock_guard lock(state->mutex);
+                    auto& slot = state->slots[slotIndex];
+                    if (slot.generation != generation) return;
+
+                    slot.pending = false;
+                    slot.completedFaces = 0;
+                });
+    }
+}
+
+void LidarSensor::drainCompletedScans() {
+    std::vector<std::pair<std::size_t, ScanSlot>> completedSlots;
+    {
+        std::lock_guard lock(asyncState_->mutex);
+        for (std::size_t i = 0; i < asyncState_->slots.size(); ++i) {
+            auto& slot = asyncState_->slots[i];
+            if (slot.pending && slot.completedFaces == kNumFaces) {
+                completedSlots.emplace_back(i, slot);
+                slot.pending = false;
+                slot.completedFaces = 0;
+            }
+        }
+    }
+
+    std::sort(completedSlots.begin(), completedSlots.end(), [](const auto& a, const auto& b) {
+        return a.second.generation < b.second.generation;
+    });
+
+    for (auto& [slotIndex, slot] : completedSlots) {
+        slot.cloud.clear();
+        if (slot.gpuPointCloud && beams_.empty())
+            collectDenseGpuPoints(slot, slot.cloud);
+        else if (slot.gpuPointCloud)
+            collectBeamGpuPoints(slot, slot.cloud);
+        else if (beams_.empty())
+            unprojectDense(slot, slot.cloud);
+        else
+            unprojectBeams(slot, slot.cloud);
+
+        std::lock_guard lock(asyncState_->mutex);
+        if (slot.generation >= asyncState_->latestReadyGeneration) {
+            asyncState_->latestCloud = slot.cloud;
+            asyncState_->latestReadyGeneration = slot.generation;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Unprojection
 // ---------------------------------------------------------------------------
 
-void LidarSensor::unprojectDense(std::vector<Vector3>& points) const {
-    static std::mt19937 rng_{std::random_device{}()};
+void LidarSensor::collectDenseGpuPoints(const ScanSlot& slot, std::vector<Vector3>& points) const {
+    std::mt19937 rng{std::random_device{}()};
+
+    const bool addNoise = rangeNoise > 0.f;
+    std::optional<std::normal_distribution<float>> noiseDist;
+    if (addNoise) noiseDist = std::normal_distribution{0.f, rangeNoise};
+
+    const auto expectedFloats = static_cast<std::size_t>(faceSize_) * static_cast<std::size_t>(faceSize_) * 4u;
+
+    for (int face = 0; face < kNumFaces; ++face) {
+        const auto& facePoints = slot.facePointClouds[face];
+        if (facePoints.size() < expectedFloats) continue;
+
+        points.reserve(points.size() + faceSize_ * faceSize_);
+
+        const auto& me = slot.faceMatrices[face];
+        const float originX = me[12];
+        const float originY = me[13];
+        const float originZ = me[14];
+
+        for (std::size_t i = 0; i + 3u < facePoints.size(); i += 4u) {
+            if (facePoints[i + 3u] < 0.5f) continue;
+
+            float x = facePoints[i + 0u];
+            float y = facePoints[i + 1u];
+            float z = facePoints[i + 2u];
+
+            if (addNoise) {
+                const float dx = x - originX;
+                const float dy = y - originY;
+                const float dz = z - originZ;
+                const float depth = std::sqrt(dx * dx + dy * dy + dz * dz);
+                const float noisyDepth = depth + (*noiseDist)(rng);
+                if (depth <= 0.f || noisyDepth <= 0.f || noisyDepth > far_) continue;
+
+                const float scale = noisyDepth / depth;
+                x = originX + dx * scale;
+                y = originY + dy * scale;
+                z = originZ + dz * scale;
+            }
+
+            points.emplace_back(x, y, z);
+        }
+    }
+}
+
+void LidarSensor::collectBeamGpuPoints(const ScanSlot& slot, std::vector<Vector3>& points) const {
+    std::mt19937 rng{std::random_device{}()};
+
+    const auto expectedFloats = beams_.size() * 4u;
+    if (slot.beamPointCloud.size() < expectedFloats) return;
+
+    points.reserve(beams_.size());
+
+    const bool addNoise = rangeNoise > 0.f;
+    std::optional<std::normal_distribution<float>> noiseDist;
+    if (addNoise) noiseDist = std::normal_distribution{0.f, rangeNoise};
+
+    for (std::size_t beamIndex = 0; beamIndex < beams_.size(); ++beamIndex) {
+        const auto pointIndex = beamIndex * 4u;
+        if (slot.beamPointCloud[pointIndex + 3u] < 0.5f) continue;
+
+        float x = slot.beamPointCloud[pointIndex + 0u];
+        float y = slot.beamPointCloud[pointIndex + 1u];
+        float z = slot.beamPointCloud[pointIndex + 2u];
+
+        if (addNoise) {
+            const auto& matrix = slot.faceMatrices[beams_[beamIndex].face];
+            const float originX = matrix[12];
+            const float originY = matrix[13];
+            const float originZ = matrix[14];
+            const float dx = x - originX;
+            const float dy = y - originY;
+            const float dz = z - originZ;
+            const float depth = std::sqrt(dx * dx + dy * dy + dz * dz);
+            const float noisyDepth = depth + (*noiseDist)(rng);
+            if (depth <= 0.f || noisyDepth <= 0.f || noisyDepth > far_) continue;
+
+            const float scale = noisyDepth / depth;
+            x = originX + dx * scale;
+            y = originY + dy * scale;
+            z = originZ + dz * scale;
+        }
+
+        points.emplace_back(x, y, z);
+    }
+}
+
+void LidarSensor::unprojectDense(const ScanSlot& slot, std::vector<Vector3>& points) const {
+    std::mt19937 rng{std::random_device{}()};
 
     const bool addNoise = rangeNoise > 0.f;
     std::optional<std::normal_distribution<float>> noiseDist;
@@ -246,10 +693,10 @@ void LidarSensor::unprojectDense(std::vector<Vector3>& points) const {
     for (int face = 0; face < kNumFaces; ++face) {
         points.reserve(points.size() + faceSize_ * faceSize_);
 
-        const auto& pixels = readbackTargets_[face]->texture->image().data();
+        const auto& pixels = slot.facePixels[face];
         const auto* px = pixels.data();
 
-        const auto& me = cameras_[face]->matrixWorld->elements;
+        const auto& me = slot.faceMatrices[face];
         const float m0 = me[0], m1 = me[1], m2 = me[2];
         const float m4 = me[4], m5 = me[5], m6 = me[6];
         const float m8 = me[8], m9 = me[9], m10 = me[10];
@@ -265,7 +712,7 @@ void LidarSensor::unprojectDense(std::vector<Vector3>& points) const {
 
                 float depth = nd * far_;
                 if (addNoise) {
-                    depth += (*noiseDist)(rng_);
+                    depth += (*noiseDist)(rng);
                     if (depth <= 0.f || depth > far_) continue;
                 }
 
@@ -279,8 +726,8 @@ void LidarSensor::unprojectDense(std::vector<Vector3>& points) const {
     }
 }
 
-void LidarSensor::unprojectBeams(std::vector<Vector3>& points) const {
-    static std::mt19937 rng_{std::random_device{}()};
+void LidarSensor::unprojectBeams(const ScanSlot& slot, std::vector<Vector3>& points) const {
+    std::mt19937 rng{std::random_device{}()};
 
     points.reserve(beams_.size());
 
@@ -288,8 +735,8 @@ void LidarSensor::unprojectBeams(std::vector<Vector3>& points) const {
     std::array<const unsigned char*, kNumFaces> facePixels{};
     std::array<const float*, kNumFaces> faceMat{};
     for (int f = 0; f < kNumFaces; ++f) {
-        facePixels[f] = readbackTargets_[f]->texture->image().data().data();
-        faceMat[f] = cameras_[f]->matrixWorld->elements.data();
+        facePixels[f] = slot.facePixels[f].data();
+        faceMat[f] = slot.faceMatrices[f].data();
     }
 
     const bool addNoise = rangeNoise > 0.f;
@@ -304,7 +751,7 @@ void LidarSensor::unprojectBeams(std::vector<Vector3>& points) const {
 
         float depth = nd * far_;
         if (addNoise) {
-            depth += (*noiseDist)(rng_);
+            depth += (*noiseDist)(rng);
             if (depth <= 0.f || depth > far_) continue;
         }
 

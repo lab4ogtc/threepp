@@ -10,9 +10,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <exception>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 using namespace threepp;
@@ -58,9 +60,160 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
 }
 )metal";
 
+    constexpr const char* lidarUnprojectShaderSource = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct LidarUnprojectUniforms {
+    float matrixWorld[16];
+    float farPlane;
+    uint width;
+    uint height;
+};
+
+struct MetalLidarBeamSample {
+    uint face;
+    uint pixelX;
+    uint pixelY;
+    uint reserved0;
+    float u;
+    float v;
+    float reserved1;
+    float reserved2;
+};
+
+struct LidarUnprojectBeamsUniforms {
+    float matrixWorld[96];
+    float farPlane;
+    uint beamCount;
+    uint2 padding;
+};
+
+kernel void lidarUnprojectDense(texture2d<float, access::read> packedDepth [[texture(0)]],
+                                device float4* points [[buffer(0)]],
+                                constant LidarUnprojectUniforms& uniforms [[buffer(1)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= uniforms.width || gid.y >= uniforms.height) return;
+
+    const uint index = gid.y * uniforms.width + gid.x;
+    const float2 rg = packedDepth.read(gid).rg;
+    const float normalizedDepth = rg.x + rg.y * (1.0 / 255.0);
+    if (normalizedDepth >= 0.9999) {
+        points[index] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    const float depth = normalizedDepth * uniforms.farPlane;
+    const float xd = (float(gid.x) + 0.5) / float(uniforms.width) * 2.0 - 1.0;
+    const float yd = (float(gid.y) + 0.5) / float(uniforms.height) * 2.0 - 1.0;
+    constant float* m = uniforms.matrixWorld;
+
+    points[index] = float4(
+        (m[0] * xd + m[4] * yd - m[8]) * depth + m[12],
+        (m[1] * xd + m[5] * yd - m[9]) * depth + m[13],
+        (m[2] * xd + m[6] * yd - m[10]) * depth + m[14],
+        1.0);
+}
+
+kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0)]],
+                                texture2d<float, access::read> face1 [[texture(1)]],
+                                texture2d<float, access::read> face2 [[texture(2)]],
+                                texture2d<float, access::read> face3 [[texture(3)]],
+                                texture2d<float, access::read> face4 [[texture(4)]],
+                                texture2d<float, access::read> face5 [[texture(5)]],
+                                device const MetalLidarBeamSample* beams [[buffer(0)]],
+                                device float4* points [[buffer(1)]],
+                                constant LidarUnprojectBeamsUniforms& uniforms [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= uniforms.beamCount) return;
+
+    const MetalLidarBeamSample sample = beams[gid];
+    const uint2 pixel = uint2(sample.pixelX, sample.pixelY);
+    float2 rg;
+    switch (sample.face) {
+        case 0:
+            if (pixel.x >= face0.get_width() || pixel.y >= face0.get_height()) {
+                points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            rg = face0.read(pixel).rg;
+            break;
+        case 1:
+            if (pixel.x >= face1.get_width() || pixel.y >= face1.get_height()) {
+                points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            rg = face1.read(pixel).rg;
+            break;
+        case 2:
+            if (pixel.x >= face2.get_width() || pixel.y >= face2.get_height()) {
+                points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            rg = face2.read(pixel).rg;
+            break;
+        case 3:
+            if (pixel.x >= face3.get_width() || pixel.y >= face3.get_height()) {
+                points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            rg = face3.read(pixel).rg;
+            break;
+        case 4:
+            if (pixel.x >= face4.get_width() || pixel.y >= face4.get_height()) {
+                points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            rg = face4.read(pixel).rg;
+            break;
+        case 5:
+            if (pixel.x >= face5.get_width() || pixel.y >= face5.get_height()) {
+                points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+                return;
+            }
+            rg = face5.read(pixel).rg;
+            break;
+        default:
+            points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+            return;
+    }
+
+    const float normalizedDepth = rg.x + rg.y * (1.0 / 255.0);
+    if (normalizedDepth >= 0.9999) {
+        points[gid] = float4(0.0, 0.0, 0.0, 0.0);
+        return;
+    }
+
+    const float depth = normalizedDepth * uniforms.farPlane;
+    constant float* m = uniforms.matrixWorld + sample.face * 16;
+    points[gid] = float4(
+        (m[0] * sample.u + m[4] * sample.v - m[8]) * depth + m[12],
+        (m[1] * sample.u + m[5] * sample.v - m[9]) * depth + m[13],
+        (m[2] * sample.u + m[6] * sample.v - m[10]) * depth + m[14],
+        1.0);
+}
+)metal";
+
     struct alignas(16) ScissorClearUniforms {
         float color[4];
     };
+
+    struct alignas(16) LidarUnprojectUniforms {
+        float matrixWorld[16];
+        float farPlane;
+        std::uint32_t width;
+        std::uint32_t height;
+        std::uint32_t padding;
+    };
+
+    struct alignas(16) LidarUnprojectBeamsUniforms {
+        float matrixWorld[6][16];
+        float farPlane;
+        std::uint32_t beamCount;
+        std::uint32_t padding[2];
+    };
+
+    static_assert(sizeof(LidarUnprojectBeamsUniforms) == 400);
 
     unsigned int textureFormatChannelCount(Format format) {
         switch (format) {
@@ -82,14 +235,20 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
         switch (pixelFormat) {
             case MTLPixelFormatR8Unorm:
                 return 1u;
+            case MTLPixelFormatR16Float:
+                return 2u;
             case MTLPixelFormatRG8Unorm:
                 return 2u;
+            case MTLPixelFormatRG16Float:
+                return 4u;
             case MTLPixelFormatRGBA8Unorm:
             case MTLPixelFormatRGBA8Unorm_sRGB:
             case MTLPixelFormatBGRA8Unorm:
             case MTLPixelFormatBGRA8Unorm_sRGB:
             case MTLPixelFormatR32Float:
                 return 4u;
+            case MTLPixelFormatRGBA16Float:
+                return 8u;
             case MTLPixelFormatRG32Float:
                 return 8u;
             case MTLPixelFormatRGBA32Float:
@@ -108,6 +267,30 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
             default:
                 return false;
         }
+    }
+
+    bool isZeroCopyCompatiblePixelFormat(MTLPixelFormat pixelFormat) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR8Unorm:
+            case MTLPixelFormatRG8Unorm:
+            case MTLPixelFormatRGBA8Unorm:
+            case MTLPixelFormatBGRA8Unorm:
+            case MTLPixelFormatR16Float:
+            case MTLPixelFormatRG16Float:
+            case MTLPixelFormatRGBA16Float:
+            case MTLPixelFormatR32Float:
+            case MTLPixelFormatRG32Float:
+            case MTLPixelFormatRGBA32Float:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    NSUInteger alignTo(NSUInteger value, NSUInteger alignment) {
+        if (alignment <= 1u) return value;
+        const auto remainder = value % alignment;
+        return remainder == 0u ? value : value + alignment - remainder;
     }
 
     bool canUseFastReadbackPath(const Texture& texture, MTLPixelFormat pixelFormat) {
@@ -142,6 +325,50 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
         }
 
         return false;
+    }
+
+    bool canExposeRawReadbackLayout(const Texture& texture, MTLPixelFormat pixelFormat) {
+        switch (texture.type) {
+            case Type::UnsignedByte:
+                switch (texture.format) {
+                    case Format::Red:
+                        return pixelFormat == MTLPixelFormatR8Unorm;
+                    case Format::RG:
+                        return pixelFormat == MTLPixelFormatRG8Unorm;
+                    case Format::RGBA:
+                        return pixelFormat == MTLPixelFormatRGBA8Unorm ||
+                               pixelFormat == MTLPixelFormatRGBA8Unorm_sRGB;
+                    case Format::BGRA:
+                        return pixelFormat == MTLPixelFormatBGRA8Unorm ||
+                               pixelFormat == MTLPixelFormatBGRA8Unorm_sRGB;
+                    default:
+                        return false;
+                }
+            case Type::HalfFloat:
+                switch (texture.format) {
+                    case Format::Red:
+                        return pixelFormat == MTLPixelFormatR16Float;
+                    case Format::RG:
+                        return pixelFormat == MTLPixelFormatRG16Float;
+                    case Format::RGBA:
+                        return pixelFormat == MTLPixelFormatRGBA16Float;
+                    default:
+                        return false;
+                }
+            case Type::Float:
+                switch (texture.format) {
+                    case Format::Red:
+                        return pixelFormat == MTLPixelFormatR32Float;
+                    case Format::RG:
+                        return pixelFormat == MTLPixelFormatRG32Float;
+                    case Format::RGBA:
+                        return pixelFormat == MTLPixelFormatRGBA32Float;
+                    default:
+                        return false;
+                }
+            default:
+                return false;
+        }
     }
 
     unsigned char readByteComponent(const unsigned char* pixel, MTLPixelFormat pixelFormat, unsigned int channel) {
@@ -731,11 +958,12 @@ id<MTLTexture> MetalRenderer::Impl::createDepthTexture(NSUInteger width, NSUInte
     return [device newTextureWithDescriptor:desc];
 }
 
-id<MTLTexture> MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const {
+MetalRenderer::Impl::RenderTargetColorTextureAllocation MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const {
     const auto width = std::max<NSUInteger>(target.width, 1);
     const auto height = std::max<NSUInteger>(target.height, 1);
     const auto mipmapped = target.texture->generateMipmaps ? YES : NO;
     MTLTextureDescriptor* desc = nil;
+    RenderTargetColorTextureAllocation allocation;
 
     if (dynamic_cast<CubeTexture*>(target.texture.get())) {
         if (width != height) {
@@ -758,8 +986,40 @@ id<MTLTexture> MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget&
                                                               mipmapped:mipmapped];
     }
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+
+    const auto canUseZeroCopy = target.zeroCopy &&
+                                desc.textureType == MTLTextureType2D &&
+                                !mipmapped &&
+                                isZeroCopyCompatiblePixelFormat(pixelFormat);
+    if (canUseZeroCopy) {
+        const auto bytesPerPixel = pixelFormatBytesPerPixel(pixelFormat);
+        const auto rawBytesPerRow = width * bytesPerPixel;
+        const auto minimumAlignment = [device minimumLinearTextureAlignmentForPixelFormat:pixelFormat];
+        const auto alignment = std::max<NSUInteger>(minimumAlignment, 256u);
+        const auto alignedBytesPerRow = alignTo(rawBytesPerRow, alignment);
+        const auto bufferLength = alignedBytesPerRow * height;
+
+        desc.storageMode = MTLStorageModeShared;
+        id<MTLBuffer> backingBuffer = [device newBufferWithLength:bufferLength options:MTLResourceStorageModeShared];
+        if (backingBuffer) {
+            id<MTLTexture> texture = [backingBuffer newTextureWithDescriptor:desc
+                                                                      offset:0
+                                                                 bytesPerRow:alignedBytesPerRow];
+            if (texture) {
+                allocation.texture = texture;
+                allocation.backingBuffer = backingBuffer;
+                allocation.alignedBytesPerRow = alignedBytesPerRow;
+                allocation.isZeroCopy = true;
+                return allocation;
+            }
+        }
+
+        std::cerr << "Metal RenderTarget zeroCopy requested but buffer-backed texture allocation failed; falling back to private storage\n";
+    }
+
     desc.storageMode = MTLStorageModePrivate;
-    return [device newTextureWithDescriptor:desc];
+    allocation.texture = [device newTextureWithDescriptor:desc];
+    return allocation;
 }
 
 id<MTLTexture> MetalRenderer::Impl::createRenderTargetDepthTexture(RenderTarget& target) const {
@@ -792,12 +1052,14 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
         it->second.colorPixelFormat == colorPixelFormat &&
         it->second.colorTextureType == colorTextureType &&
         it->second.mipmapped == mipmapped &&
+        it->second.requestedZeroCopy == target.zeroCopy &&
         it->second.colorTexture &&
         it->second.depthTexture) {
         return it->second;
     }
 
-    auto colorTexture = createRenderTargetColorTexture(target, colorPixelFormat);
+    auto colorAllocation = createRenderTargetColorTexture(target, colorPixelFormat);
+    auto colorTexture = colorAllocation.texture;
     auto depthTexture = createRenderTargetDepthTexture(target);
     if (!colorTexture || !depthTexture) {
         throw std::runtime_error("Failed to create Metal RenderTarget resources");
@@ -818,12 +1080,16 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     auto& resources = renderTargetResources[&target];
     resources.colorTexture = colorTexture;
     resources.depthTexture = depthTexture;
+    resources.backingBuffer = colorAllocation.backingBuffer;
     resources.width = width;
     resources.height = height;
     resources.depth = depth;
+    resources.alignedBytesPerRow = colorAllocation.alignedBytesPerRow;
     resources.colorPixelFormat = colorPixelFormat;
     resources.colorTextureType = colorTextureType;
     resources.mipmapped = mipmapped;
+    resources.requestedZeroCopy = target.zeroCopy;
+    resources.isZeroCopy = colorAllocation.isZeroCopy;
     return resources;
 }
 
@@ -856,6 +1122,17 @@ id<MTLBuffer> MetalRenderer::Impl::acquireReadbackBuffer(NSUInteger size) {
 
     readbackBufferPool.push_back({buffer, requestedSize, true});
     return buffer;
+}
+
+void MetalRenderer::Impl::releaseReadbackBuffer(id<MTLBuffer> buffer) {
+    if (!buffer) return;
+
+    for (auto& entry : readbackBufferPool) {
+        if (entry.buffer == buffer) {
+            entry.inUse = false;
+            return;
+        }
+    }
 }
 
 void MetalRenderer::Impl::releaseAllReadbackBuffers() {
@@ -1223,6 +1500,422 @@ void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
                 out[(static_cast<std::size_t>(dstY) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * destinationChannels + c] = value;
             }
         }
+    }
+}
+
+void MetalRenderer::Impl::readbackTextureAsync(Texture& texture,
+                                               std::function<void(const ReadbackResult& result)> onComplete,
+                                               std::function<void(const std::string& error)> onError) {
+    if (!onComplete) return;
+
+    try {
+        id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(texture);
+        if (!sourceTexture) {
+            throw std::runtime_error("MetalRenderer::readbackTextureAsync could not acquire the source texture");
+        }
+        if (!canExposeRawReadbackLayout(texture, sourceTexture.pixelFormat)) {
+            throw std::runtime_error("MetalRenderer::readbackTextureAsync cannot expose this texture's raw Metal layout as the requested Format/Type");
+        }
+
+        const auto width = static_cast<NSUInteger>(sourceTexture.width);
+        const auto height = static_cast<NSUInteger>(sourceTexture.height);
+        const auto sourceBytesPerPixel = pixelFormatBytesPerPixel(sourceTexture.pixelFormat);
+        const auto fallbackBytesPerRow = alignTo(width * sourceBytesPerPixel, 256u);
+        id<MTLBuffer> zeroCopyBuffer = sourceTexture.buffer;
+        const auto isZeroCopy = zeroCopyBuffer != nil;
+        const auto bytesPerRow = isZeroCopy && sourceTexture.bufferBytesPerRow > 0u
+                                         ? sourceTexture.bufferBytesPerRow
+                                         : fallbackBytesPerRow;
+        const auto bufferOffset = isZeroCopy ? sourceTexture.bufferOffset : 0u;
+        const auto byteLength = bytesPerRow * height;
+
+        id<MTLBuffer> readbackBuffer = nil;
+        id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
+        bool temporaryCommandBuffer = false;
+
+        if (!isZeroCopy) {
+            readbackBuffer = [device newBufferWithLength:byteLength options:MTLResourceStorageModeShared];
+            if (!readbackBuffer) {
+                throw std::runtime_error("MetalRenderer::readbackTextureAsync could not allocate a readback buffer");
+            }
+            if (!commandBuffer) {
+                commandBuffer = [commandQueue commandBuffer];
+                temporaryCommandBuffer = true;
+            }
+            if (!commandBuffer) {
+                throw std::runtime_error("MetalRenderer::readbackTextureAsync could not create a command buffer");
+            }
+
+            id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+            [blitEncoder copyFromTexture:sourceTexture
+                             sourceSlice:0
+                             sourceLevel:0
+                            sourceOrigin:MTLOriginMake(0, 0, 0)
+                              sourceSize:MTLSizeMake(width, height, 1)
+                                toBuffer:readbackBuffer
+                       destinationOffset:0
+                  destinationBytesPerRow:bytesPerRow
+                destinationBytesPerImage:byteLength];
+            [blitEncoder endEncoding];
+        } else if (!commandBuffer) {
+            commandBuffer = [commandQueue commandBuffer];
+            temporaryCommandBuffer = true;
+            if (!commandBuffer) {
+                throw std::runtime_error("MetalRenderer::readbackTextureAsync could not create a command buffer");
+            }
+        }
+
+        auto complete = std::move(onComplete);
+        auto error = std::move(onError);
+        const auto format = texture.format;
+        const auto type = texture.type;
+        id<MTLBuffer> resultBuffer = isZeroCopy ? zeroCopyBuffer : readbackBuffer;
+
+        auto invokeOnMain = ^(id<MTLCommandBuffer> completedCommandBuffer) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            if (completedCommandBuffer &&
+                completedCommandBuffer.status == MTLCommandBufferStatusError) {
+                if (error) {
+                    const char* message = completedCommandBuffer.error.localizedDescription.UTF8String;
+                    error(message ? message : "MetalRenderer::readbackTextureAsync command buffer failed");
+                }
+                return;
+            }
+
+            const auto* contents = static_cast<const unsigned char*>([resultBuffer contents]);
+            const ReadbackResult result{
+                    contents ? contents + static_cast<std::size_t>(bufferOffset) : nullptr,
+                    static_cast<unsigned int>(width),
+                    static_cast<unsigned int>(height),
+                    static_cast<unsigned int>(bytesPerRow),
+                    format,
+                    type,
+                    isZeroCopy};
+
+            try {
+                complete(result);
+            } catch (const std::exception& e) {
+                if (error) error(e.what());
+            } catch (...) {
+                if (error) error("MetalRenderer::readbackTextureAsync completion callback failed");
+            }
+          });
+        };
+
+        [commandBuffer addCompletedHandler:invokeOnMain];
+        if (temporaryCommandBuffer) {
+            [commandBuffer commit];
+        }
+    } catch (const std::exception& e) {
+        if (onError) {
+            onError(e.what());
+            return;
+        }
+        throw;
+    } catch (...) {
+        if (onError) {
+            onError("MetalRenderer::readbackTextureAsync failed");
+            return;
+        }
+        throw;
+    }
+}
+
+id<MTLComputePipelineState> MetalRenderer::Impl::getOrCreateUnprojectComputePSO() {
+    if (unprojectComputePSO) return unprojectComputePSO;
+
+    NSError* error = nil;
+    NSString* source = [NSString stringWithUTF8String:lidarUnprojectShaderSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create lidar unproject compute library: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    id<MTLFunction> function = [library newFunctionWithName:@"lidarUnprojectDense"];
+    if (!function) {
+        throw std::runtime_error("Failed to create lidar unproject compute function");
+    }
+
+    unprojectComputePSO = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!unprojectComputePSO) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create lidar unproject compute pipeline: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    return unprojectComputePSO;
+}
+
+id<MTLComputePipelineState> MetalRenderer::Impl::getOrCreateUnprojectBeamsComputePSO() {
+    if (unprojectBeamsComputePSO) return unprojectBeamsComputePSO;
+
+    NSError* error = nil;
+    NSString* source = [NSString stringWithUTF8String:lidarUnprojectShaderSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create lidar beam unproject compute library: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    id<MTLFunction> function = [library newFunctionWithName:@"lidarUnprojectBeams"];
+    if (!function) {
+        throw std::runtime_error("Failed to create lidar beam unproject compute function");
+    }
+
+    unprojectBeamsComputePSO = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!unprojectBeamsComputePSO) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create lidar beam unproject compute pipeline: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    return unprojectBeamsComputePSO;
+}
+
+void MetalRenderer::Impl::readbackLidarDepthAsPointCloudAsync(Texture& packedDepthTexture,
+                                                              const std::array<float, 16>& matrixWorld,
+                                                              float farPlane,
+                                                              std::function<void(const ReadbackResult& result)> onComplete,
+                                                              std::function<void(const std::string& error)> onError) {
+    if (!onComplete) return;
+
+    try {
+        id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(packedDepthTexture);
+        if (!sourceTexture) {
+            throw std::runtime_error("MetalRenderer::readbackLidarDepthAsPointCloudAsync could not acquire the packed depth texture");
+        }
+        if (packedDepthTexture.format != Format::RG || packedDepthTexture.type != Type::UnsignedByte) {
+            throw std::runtime_error("MetalRenderer::readbackLidarDepthAsPointCloudAsync requires an RG8 packed depth texture");
+        }
+
+        auto pso = getOrCreateUnprojectComputePSO();
+        const auto width = static_cast<NSUInteger>(sourceTexture.width);
+        const auto height = static_cast<NSUInteger>(sourceTexture.height);
+        const auto bytesPerRow = width * sizeof(float) * 4u;
+        const auto byteLength = bytesPerRow * height;
+        id<MTLBuffer> outputBuffer = [device newBufferWithLength:byteLength options:MTLResourceStorageModeShared];
+        if (!outputBuffer) {
+            throw std::runtime_error("MetalRenderer::readbackLidarDepthAsPointCloudAsync could not allocate an output buffer");
+        }
+
+        id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
+        bool temporaryCommandBuffer = false;
+        if (!commandBuffer) {
+            commandBuffer = [commandQueue commandBuffer];
+            temporaryCommandBuffer = true;
+        }
+        if (!commandBuffer) {
+            throw std::runtime_error("MetalRenderer::readbackLidarDepthAsPointCloudAsync could not create a command buffer");
+        }
+
+        LidarUnprojectUniforms uniforms{};
+        std::copy(matrixWorld.begin(), matrixWorld.end(), uniforms.matrixWorld);
+        uniforms.farPlane = farPlane;
+        uniforms.width = static_cast<std::uint32_t>(width);
+        uniforms.height = static_cast<std::uint32_t>(height);
+
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pso];
+        [encoder setTexture:sourceTexture atIndex:0];
+        [encoder setBuffer:outputBuffer offset:0 atIndex:0];
+        [encoder setBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+
+        const auto threadWidth = std::max<NSUInteger>(pso.threadExecutionWidth, 1u);
+        const auto maxThreads = std::max<NSUInteger>(pso.maxTotalThreadsPerThreadgroup, threadWidth);
+        const auto threadHeight = std::max<NSUInteger>(maxThreads / threadWidth, 1u);
+        const MTLSize threadsPerGrid = MTLSizeMake(width, height, 1);
+        const MTLSize threadsPerThreadgroup = MTLSizeMake(threadWidth, threadHeight, 1);
+        [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [encoder endEncoding];
+
+        auto complete = std::move(onComplete);
+        auto error = std::move(onError);
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            if (completedCommandBuffer.status == MTLCommandBufferStatusError) {
+                if (error) {
+                    const char* message = completedCommandBuffer.error.localizedDescription.UTF8String;
+                    error(message ? message : "MetalRenderer::readbackLidarDepthAsPointCloudAsync command buffer failed");
+                }
+                return;
+            }
+
+            const ReadbackResult result{
+                    static_cast<const unsigned char*>([outputBuffer contents]),
+                    static_cast<unsigned int>(width),
+                    static_cast<unsigned int>(height),
+                    static_cast<unsigned int>(bytesPerRow),
+                    Format::RGBA,
+                    Type::Float,
+                    true};
+
+            try {
+                complete(result);
+            } catch (const std::exception& e) {
+                if (error) error(e.what());
+            } catch (...) {
+                if (error) error("MetalRenderer::readbackLidarDepthAsPointCloudAsync completion callback failed");
+            }
+          });
+        }];
+
+        if (temporaryCommandBuffer) {
+            [commandBuffer commit];
+        }
+    } catch (const std::exception& e) {
+        if (onError) {
+            onError(e.what());
+            return;
+        }
+        throw;
+    } catch (...) {
+        if (onError) {
+            onError("MetalRenderer::readbackLidarDepthAsPointCloudAsync failed");
+            return;
+        }
+        throw;
+    }
+}
+
+void MetalRenderer::Impl::readbackLidarBeamsAsPointCloudAsync(const std::array<Texture*, 6>& packedDepthTextures,
+                                                              const std::array<std::array<float, 16>, 6>& matrixWorldPerFace,
+                                                              std::span<const MetalLidarBeamSample> beams,
+                                                              float farPlane,
+                                                              std::function<void(const ReadbackResult& result)> onComplete,
+                                                              std::function<void(const std::string& error)> onError) {
+    if (!onComplete) return;
+
+    try {
+        if (beams.size() > static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+            throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync beam count exceeds ReadbackResult width");
+        }
+
+        if (beams.empty()) {
+            const ReadbackResult result{
+                    nullptr,
+                    0u,
+                    1u,
+                    0u,
+                    Format::RGBA,
+                    Type::Float,
+                    true};
+            onComplete(result);
+            return;
+        }
+
+        std::array<id<MTLTexture>, 6> sourceTextures{};
+        for (std::size_t i = 0; i < packedDepthTextures.size(); ++i) {
+            auto* texture = packedDepthTextures[i];
+            if (!texture) {
+                throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync received a null depth texture");
+            }
+            if (texture->format != Format::RG || texture->type != Type::UnsignedByte) {
+                throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync requires RG8 packed depth textures");
+            }
+
+            sourceTextures[i] = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture);
+            if (!sourceTextures[i]) {
+                throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync could not acquire a packed depth texture");
+            }
+        }
+
+        auto pso = getOrCreateUnprojectBeamsComputePSO();
+        const auto beamCount = static_cast<NSUInteger>(beams.size());
+        const auto bytesPerRow = beamCount * sizeof(float) * 4u;
+        const auto byteLength = bytesPerRow;
+
+        id<MTLBuffer> beamBuffer = [device newBufferWithLength:beamCount * sizeof(MetalLidarBeamSample)
+                                                       options:MTLResourceStorageModeShared];
+        if (!beamBuffer) {
+            throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync could not allocate a beam buffer");
+        }
+        std::memcpy([beamBuffer contents], beams.data(), beams.size_bytes());
+
+        id<MTLBuffer> outputBuffer = [device newBufferWithLength:byteLength options:MTLResourceStorageModeShared];
+        if (!outputBuffer) {
+            throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync could not allocate an output buffer");
+        }
+
+        id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
+        bool temporaryCommandBuffer = false;
+        if (!commandBuffer) {
+            commandBuffer = [commandQueue commandBuffer];
+            temporaryCommandBuffer = true;
+        }
+        if (!commandBuffer) {
+            throw std::runtime_error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync could not create a command buffer");
+        }
+
+        LidarUnprojectBeamsUniforms uniforms{};
+        for (std::size_t face = 0; face < matrixWorldPerFace.size(); ++face) {
+            std::copy(matrixWorldPerFace[face].begin(), matrixWorldPerFace[face].end(), uniforms.matrixWorld[face]);
+        }
+        uniforms.farPlane = farPlane;
+        uniforms.beamCount = static_cast<std::uint32_t>(beamCount);
+
+        id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+        [encoder setComputePipelineState:pso];
+        for (NSUInteger face = 0; face < sourceTextures.size(); ++face) {
+            [encoder setTexture:sourceTextures[face] atIndex:face];
+        }
+        [encoder setBuffer:beamBuffer offset:0 atIndex:0];
+        [encoder setBuffer:outputBuffer offset:0 atIndex:1];
+        [encoder setBytes:&uniforms length:sizeof(uniforms) atIndex:2];
+
+        const auto threadWidth = std::max<NSUInteger>(
+                std::min<NSUInteger>(pso.threadExecutionWidth, pso.maxTotalThreadsPerThreadgroup),
+                1u);
+        const MTLSize threadsPerGrid = MTLSizeMake(beamCount, 1, 1);
+        const MTLSize threadsPerThreadgroup = MTLSizeMake(threadWidth, 1, 1);
+        [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+        [encoder endEncoding];
+
+        auto complete = std::move(onComplete);
+        auto error = std::move(onError);
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
+          dispatch_async(dispatch_get_main_queue(), ^{
+            (void) beamBuffer;
+            if (completedCommandBuffer.status == MTLCommandBufferStatusError) {
+                if (error) {
+                    const char* message = completedCommandBuffer.error.localizedDescription.UTF8String;
+                    error(message ? message : "MetalRenderer::readbackLidarBeamsAsPointCloudAsync command buffer failed");
+                }
+                return;
+            }
+
+            const ReadbackResult result{
+                    static_cast<const unsigned char*>([outputBuffer contents]),
+                    static_cast<unsigned int>(beamCount),
+                    1u,
+                    static_cast<unsigned int>(bytesPerRow),
+                    Format::RGBA,
+                    Type::Float,
+                    true};
+
+            try {
+                complete(result);
+            } catch (const std::exception& e) {
+                if (error) error(e.what());
+            } catch (...) {
+                if (error) error("MetalRenderer::readbackLidarBeamsAsPointCloudAsync completion callback failed");
+            }
+          });
+        }];
+
+        if (temporaryCommandBuffer) {
+            [commandBuffer commit];
+        }
+    } catch (const std::exception& e) {
+        if (onError) {
+            onError(e.what());
+            return;
+        }
+        throw;
+    } catch (...) {
+        if (onError) {
+            onError("MetalRenderer::readbackLidarBeamsAsPointCloudAsync failed");
+            return;
+        }
+        throw;
     }
 }
 
@@ -2157,6 +2850,32 @@ void MetalRenderer::copyTextureToImage(Texture& texture) {
 void MetalRenderer::copyTexturesToImages(const std::vector<Texture*>& textures) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->copyTexturesToImages(textures);
+}
+
+void MetalRenderer::readbackTextureAsync(Texture& texture,
+                                         std::function<void(const ReadbackResult& result)> onComplete,
+                                         std::function<void(const std::string& error)> onError) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    pimpl_->readbackTextureAsync(texture, std::move(onComplete), std::move(onError));
+}
+
+void MetalRenderer::readbackLidarDepthAsPointCloudAsync(Texture& packedDepthTexture,
+                                                        const std::array<float, 16>& matrixWorld,
+                                                        float farPlane,
+                                                        std::function<void(const ReadbackResult& result)> onComplete,
+                                                        std::function<void(const std::string& error)> onError) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    pimpl_->readbackLidarDepthAsPointCloudAsync(packedDepthTexture, matrixWorld, farPlane, std::move(onComplete), std::move(onError));
+}
+
+void MetalRenderer::readbackLidarBeamsAsPointCloudAsync(const std::array<Texture*, 6>& packedDepthTextures,
+                                                        const std::array<std::array<float, 16>, 6>& matrixWorldPerFace,
+                                                        std::span<const MetalLidarBeamSample> beams,
+                                                        float farPlane,
+                                                        std::function<void(const ReadbackResult& result)> onComplete,
+                                                        std::function<void(const std::string& error)> onError) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    pimpl_->readbackLidarBeamsAsPointCloudAsync(packedDepthTextures, matrixWorldPerFace, beams, farPlane, std::move(onComplete), std::move(onError));
 }
 
 std::optional<void*> MetalRenderer::getMetalTexture(Texture& texture) const {

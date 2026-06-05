@@ -47,6 +47,7 @@ RenderTarget::RenderTarget(unsigned int width, unsigned int height, const Option
       scissor(0.f, 0.f, static_cast<float>(width), static_cast<float>(height)),
       viewport(0.f, 0.f, static_cast<float>(width), static_cast<float>(height)),
       depthBuffer(options.depthBuffer), stencilBuffer(options.stencilBuffer),
+      zeroCopy(options.zeroCopy),
       texture(Texture::create({Image({}, width, height)})) {
 
     if (options.mapping) texture->mapping = *options.mapping;
@@ -89,6 +90,7 @@ RenderTarget& RenderTarget::copy(const RenderTarget& source) {
 
     this->depthBuffer = source.depthBuffer;
     this->stencilBuffer = source.stencilBuffer;
+    this->zeroCopy = source.zeroCopy;
     this->depthTexture = source.depthTexture;
 
     return *this;

@@ -24,6 +24,12 @@ target_include_directories(MetalP2RuntimeSmoke_test PRIVATE "${PROJECT_SOURCE_DI
 threepp_configure_slang_runtime(MetalP2RuntimeSmoke_test)
 add_test(NAME MetalP2RuntimeSmoke_test COMMAND MetalP2RuntimeSmoke_test)
 
+add_executable(ZeroCopyTexture_test ZeroCopyTexture_test.mm)
+target_link_libraries(ZeroCopyTexture_test PRIVATE threepp Catch2::Catch2WithMain)
+target_include_directories(ZeroCopyTexture_test PRIVATE "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/src/external/glfw/include")
+threepp_configure_slang_runtime(ZeroCopyTexture_test)
+add_test(NAME ZeroCopyTexture_test COMMAND ZeroCopyTexture_test)
+
 if (TARGET assimp::assimp)
     add_executable(MetalSimpleSkinningSmoke_test MetalSimpleSkinningSmoke_test.mm)
     target_link_libraries(MetalSimpleSkinningSmoke_test PRIVATE threepp Catch2::Catch2WithMain assimp::assimp)

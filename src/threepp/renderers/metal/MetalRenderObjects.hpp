@@ -1038,19 +1038,53 @@ namespace threepp {
 
     inline MTLPixelFormat toRenderTargetColorPixelFormat(const Texture& texture) {
         const auto srgb = usesSRGBColorEncoding(texture.encoding);
-        switch (texture.format) {
-            case Format::RGB:
-            case Format::RGBA:
-                return srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
-            case Format::BGRA:
-                return srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
-            case Format::RG:
-                return MTLPixelFormatRG8Unorm;
-            case Format::Red:
-                return MTLPixelFormatR8Unorm;
+        switch (texture.type) {
+            case Type::UnsignedByte:
+                switch (texture.format) {
+                    case Format::RGB:
+                    case Format::RGBA:
+                        return srgb ? MTLPixelFormatRGBA8Unorm_sRGB : MTLPixelFormatRGBA8Unorm;
+                    case Format::BGRA:
+                        return srgb ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+                    case Format::RG:
+                        return MTLPixelFormatRG8Unorm;
+                    case Format::Red:
+                        return MTLPixelFormatR8Unorm;
+                    default:
+                        break;
+                }
+                break;
+            case Type::HalfFloat:
+                switch (texture.format) {
+                    case Format::RGB:
+                    case Format::RGBA:
+                        return MTLPixelFormatRGBA16Float;
+                    case Format::RG:
+                        return MTLPixelFormatRG16Float;
+                    case Format::Red:
+                        return MTLPixelFormatR16Float;
+                    default:
+                        break;
+                }
+                break;
+            case Type::Float:
+                switch (texture.format) {
+                    case Format::RGB:
+                    case Format::RGBA:
+                        return MTLPixelFormatRGBA32Float;
+                    case Format::RG:
+                        return MTLPixelFormatRG32Float;
+                    case Format::Red:
+                        return MTLPixelFormatR32Float;
+                    default:
+                        break;
+                }
+                break;
             default:
-                throw std::runtime_error("Metal RenderTarget currently supports only RGB8, RGBA8, BGRA8, RG8, and R8 color textures");
+                break;
         }
+
+        throw std::runtime_error("Metal RenderTarget supports unsigned byte, half-float, and float Red, RG, RGB, RGBA/BGRA color textures");
     }
 
 

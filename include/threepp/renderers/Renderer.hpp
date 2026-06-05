@@ -2,13 +2,17 @@
 #ifndef THREEPP_RENDERER_HPP
 #define THREEPP_RENDERER_HPP
 
+#include <exception>
+#include <functional>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "threepp/canvas/WindowSize.hpp"
 #include "threepp/constants.hpp"
 #include "threepp/math/Plane.hpp"
+#include "threepp/textures/Texture.hpp"
 
 namespace threepp {
 
@@ -31,6 +35,22 @@ namespace threepp {
         bool autoUpdate = true;
         bool needsUpdate = false;
         ShadowMap type = ShadowMap::PFC;
+    };
+
+    /**
+     * @brief 纹理读回完成时暴露给调用方的只读视图。
+     *
+     * data 指针仅在 readbackTextureAsync() 的 onComplete 回调执行期间有效。
+     * 如需跨帧或跨线程持有数据，调用方必须在回调内完成深拷贝。
+     */
+    struct ReadbackResult {
+        const unsigned char* data = nullptr;
+        unsigned int width = 0;
+        unsigned int height = 0;
+        unsigned int bytesPerRow = 0;
+        Format format = Format::RGBA;
+        Type type = Type::UnsignedByte;
+        bool isZeroCopy = false;
     };
 
     class Renderer {
@@ -81,6 +101,83 @@ namespace threepp {
         virtual void copyTexturesToImages(const std::vector<Texture*>& textures) {
             for (auto* texture : textures) {
                 if (texture) copyTextureToImage(*texture);
+            }
+        }
+
+        /**
+         * @brief 异步读回纹理数据。
+         *
+         * 默认实现使用 copyTextureToImage() 同步降级，并在当前调用线程立即触发回调。
+         * 后端可覆写为真正的非阻塞 GPU 读回，但必须保证 onComplete 在渲染主线程/
+         * 调用线程执行，且 ReadbackResult::data 只在回调期间有效。
+         *
+         * @param texture 需要读回的纹理。
+         * @param onComplete 读回成功回调。
+         * @param onError 可选错误回调；未提供时异常会继续抛出。
+         */
+        virtual void readbackTextureAsync(
+                Texture& texture,
+                std::function<void(const ReadbackResult& result)> onComplete,
+                std::function<void(const std::string& error)> onError = nullptr) {
+
+            auto channelCount = [](Format format) -> unsigned int {
+                switch (format) {
+                    case Format::Red:
+                        return 1u;
+                    case Format::RG:
+                        return 2u;
+                    case Format::RGB:
+                        return 3u;
+                    case Format::RGBA:
+                    case Format::BGRA:
+                        return 4u;
+                    default:
+                        return 4u;
+                }
+            };
+            auto bytesPerElement = [](Type type) -> unsigned int {
+                switch (type) {
+                    case Type::HalfFloat:
+                        return 2u;
+                    case Type::Float:
+                        return sizeof(float);
+                    default:
+                        return sizeof(unsigned char);
+                }
+            };
+
+            try {
+                copyTextureToImage(texture);
+                const auto& image = texture.image();
+                const auto channels = channelCount(texture.format);
+                const unsigned char* data = nullptr;
+                if (texture.type == Type::Float) {
+                    data = reinterpret_cast<const unsigned char*>(image.data<float>().data());
+                } else {
+                    data = image.data<unsigned char>().data();
+                }
+
+                const ReadbackResult result{
+                        data,
+                        image.width,
+                        image.height,
+                        image.width * channels * bytesPerElement(texture.type),
+                        texture.format,
+                        texture.type,
+                        false};
+                if (onComplete) onComplete(result);
+            } catch (const std::exception& e) {
+                if (onError) {
+                    onError(e.what());
+                    return;
+                }
+                throw;
+            } catch (...) {
+                if (onError) {
+                    onError("Renderer::readbackTextureAsync failed");
+                    return;
+                }
+                throw;
             }
         }
 

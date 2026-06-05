@@ -92,6 +92,15 @@ namespace {
     };
 
     template<class T>
+    concept HasAsyncTextureReadback = requires(T& renderer,
+                                               Texture& texture,
+                                               std::function<void(const ReadbackResult&)> onComplete,
+                                               std::function<void(const std::string&)> onError) {
+        { renderer.readbackTextureAsync(texture, onComplete) } -> std::same_as<void>;
+        { renderer.readbackTextureAsync(texture, onComplete, onError) } -> std::same_as<void>;
+    };
+
+    template<class T>
     concept HasMetalShadowMap = requires(T& renderer) {
         renderer.shadowMap().enabled = true;
         renderer.shadowMap().autoUpdate = false;
@@ -146,15 +155,43 @@ TEST_CASE("Renderer backends expose texture readback API") {
     STATIC_REQUIRE(HasBatchTextureReadback<Renderer>);
     STATIC_REQUIRE(HasBatchTextureReadback<GLRenderer>);
     STATIC_REQUIRE(HasBatchTextureReadback<MetalRenderer>);
+    STATIC_REQUIRE(HasAsyncTextureReadback<Renderer>);
+    STATIC_REQUIRE(HasAsyncTextureReadback<GLRenderer>);
+    STATIC_REQUIRE(HasAsyncTextureReadback<MetalRenderer>);
 }
 
-TEST_CASE("LidarSensor batches cube-face texture readbacks") {
+TEST_CASE("RenderTarget options carry zero-copy readback intent") {
 
+    RenderTarget::Options options;
+    options.format = Format::RG;
+    options.zeroCopy = true;
+
+    auto target = RenderTarget::create(8, 4, options);
+    REQUIRE(target != nullptr);
+    REQUIRE(target->zeroCopy);
+    REQUIRE(target->texture->format == Format::RG);
+}
+
+TEST_CASE("LidarSensor submits asynchronous zero-copy cube-face readbacks") {
+
+    const auto header = readProjectFile("include/threepp/helpers/LidarSensor.hpp");
     const auto source = readProjectFile("src/threepp/helpers/LidarSensor.cpp");
     const auto renderFaces = source.find("void LidarSensor::renderFaces");
     REQUIRE(renderFaces != std::string::npos);
-    REQUIRE(source.find("std::vector<Texture*> readbackTextures", renderFaces) != std::string::npos);
-    REQUIRE(source.find("renderer.copyTexturesToImages(readbackTextures)", renderFaces) != std::string::npos);
+    const auto renderFacesEnd = source.find("void LidarSensor::scanImmediate", renderFaces);
+    REQUIRE(renderFacesEnd != std::string::npos);
+    const auto renderFacesBody = source.substr(renderFaces, renderFacesEnd - renderFaces);
+    REQUIRE(header.find("std::shared_ptr<AsyncState> asyncState_") != std::string::npos);
+    REQUIRE(header.find("bool forceImmediate = false") != std::string::npos);
+    REQUIRE(source.find("readOpts.zeroCopy = true") != std::string::npos);
+    REQUIRE(source.find("std::array<ScanSlot, 3> slots") != std::string::npos);
+    REQUIRE(source.find("std::vector<Vector3> latestCloud") != std::string::npos);
+    REQUIRE(countOccurrences(source, "copyLatestReadyCloud(cloud)") >= 2);
+    REQUIRE(source.find("renderer.readbackTextureAsync") != std::string::npos);
+    REQUIRE(source.find("renderer.endFrame()") != std::string::npos);
+    REQUIRE(source.find("copyTexturesToImages") != std::string::npos);
+    REQUIRE(renderFacesBody.find("renderer.copyTexturesToImages(readbackTextures)") == std::string::npos);
+    REQUIRE(source.find("faceMatrices") != std::string::npos);
 }
 
 TEST_CASE("Metal texture readback matches GL row order and batches GPU waits") {
@@ -197,6 +234,88 @@ TEST_CASE("Metal texture readback fast path is format-exact and excludes BGRA") 
     REQUIRE(readPixelsBody.find("texture.format != Format::BGRA") != std::string::npos);
     REQUIRE(readPixelsBody.find("reinterpret_cast<unsigned char*>") != std::string::npos);
     REQUIRE(readPixelsBody.find("std::memcpy(dstBytes") != std::string::npos);
+}
+
+TEST_CASE("Metal zero-copy render targets are buffer-backed and aligned") {
+
+    const auto header = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto resources = header.find("struct MetalRenderTargetResources");
+    REQUIRE(resources != std::string::npos);
+    REQUIRE(header.find("id<MTLBuffer> backingBuffer", resources) != std::string::npos);
+    REQUIRE(header.find("NSUInteger alignedBytesPerRow", resources) != std::string::npos);
+    REQUIRE(header.find("bool isZeroCopy", resources) != std::string::npos);
+
+    const auto createMethod = source.find("MetalRenderer::Impl::createRenderTargetColorTexture");
+    REQUIRE(createMethod != std::string::npos);
+    const auto createMethodEnd = source.find("id<MTLTexture> MetalRenderer::Impl::createRenderTargetDepthTexture", createMethod);
+    REQUIRE(createMethodEnd != std::string::npos);
+    const auto createBody = source.substr(createMethod, createMethodEnd - createMethod);
+    REQUIRE(createBody.find("target.zeroCopy") != std::string::npos);
+    REQUIRE(createBody.find("minimumLinearTextureAlignmentForPixelFormat") != std::string::npos);
+    REQUIRE(createBody.find("newBufferWithLength") != std::string::npos);
+    REQUIRE(createBody.find("newTextureWithDescriptor:desc") != std::string::npos);
+    REQUIRE(createBody.find("offset:0") != std::string::npos);
+    REQUIRE(createBody.find("bytesPerRow:alignedBytesPerRow") != std::string::npos);
+    REQUIRE(createBody.find("MTLStorageModeShared") != std::string::npos);
+}
+
+TEST_CASE("Metal async readback uses zero-copy buffers when available") {
+
+    const auto header = readProjectFile("include/threepp/renderers/metal/MetalRenderer.hpp");
+    const auto implHeader = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+
+    REQUIRE(header.find("void readbackTextureAsync(") != std::string::npos);
+    REQUIRE(implHeader.find("void readbackTextureAsync(") != std::string::npos);
+
+    const auto method = source.find("void MetalRenderer::Impl::readbackTextureAsync");
+    REQUIRE(method != std::string::npos);
+    const auto methodEnd = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels", method);
+    REQUIRE(methodEnd != std::string::npos);
+    const auto body = source.substr(method, methodEnd - method);
+    REQUIRE(body.find("sourceTexture.buffer") != std::string::npos);
+    REQUIRE(body.find("canExposeRawReadbackLayout") != std::string::npos);
+    REQUIRE(body.find("ReadbackResult") != std::string::npos);
+    REQUIRE(body.find("dispatch_get_main_queue") != std::string::npos);
+    REQUIRE(body.find("addCompletedHandler") != std::string::npos);
+    REQUIRE(body.find("auto* scope = this") == std::string::npos);
+    REQUIRE(body.find("newBufferWithLength:byteLength") != std::string::npos);
+    REQUIRE(body.find("releaseReadbackBuffer(readbackBuffer)") == std::string::npos);
+
+    REQUIRE(source.find("void MetalRenderer::readbackTextureAsync") != std::string::npos);
+}
+
+TEST_CASE("Metal renderer exposes GPU lidar unprojection compute path") {
+
+    const auto metalHeader = readProjectFile("include/threepp/renderers/metal/MetalRenderer.hpp");
+    const auto implHeader = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto lidarSource = readProjectFile("src/threepp/helpers/LidarSensor.cpp");
+
+    REQUIRE(metalHeader.find("readbackLidarDepthAsPointCloudAsync") != std::string::npos);
+    REQUIRE(metalHeader.find("MetalLidarBeamSample") != std::string::npos);
+    REQUIRE(metalHeader.find("readbackLidarBeamsAsPointCloudAsync") != std::string::npos);
+    REQUIRE(implHeader.find("id<MTLComputePipelineState> unprojectComputePSO") != std::string::npos);
+    REQUIRE(implHeader.find("id<MTLComputePipelineState> unprojectBeamsComputePSO") != std::string::npos);
+    REQUIRE(implHeader.find("getOrCreateUnprojectComputePSO") != std::string::npos);
+    REQUIRE(implHeader.find("getOrCreateUnprojectBeamsComputePSO") != std::string::npos);
+    REQUIRE(source.find("lidarUnprojectShaderSource") != std::string::npos);
+    REQUIRE(source.find("kernel void lidarUnprojectDense") != std::string::npos);
+    REQUIRE(source.find("kernel void lidarUnprojectBeams") != std::string::npos);
+    REQUIRE(source.find("newComputePipelineStateWithFunction") != std::string::npos);
+    REQUIRE(source.find("dispatchThreads") != std::string::npos);
+    REQUIRE(source.find("Format::RGBA") != std::string::npos);
+    REQUIRE(source.find("Type::Float") != std::string::npos);
+
+    REQUIRE(lidarSource.find("#include \"threepp/renderers/metal/MetalRenderer.hpp\"") != std::string::npos);
+    REQUIRE(lidarSource.find("readbackLidarDepthAsPointCloudAsync") != std::string::npos);
+    REQUIRE(lidarSource.find("readbackLidarBeamsAsPointCloudAsync") != std::string::npos);
+    REQUIRE(lidarSource.find("beamPointCloud") != std::string::npos);
+    REQUIRE(lidarSource.find("facePointClouds") != std::string::npos);
+    REQUIRE(lidarSource.find("collectDenseGpuPoints") != std::string::npos);
+    REQUIRE(lidarSource.find("collectBeamGpuPoints") != std::string::npos);
+    REQUIRE(lidarSource.find("result.bytesPerRow < rowBytes") != std::string::npos);
 }
 
 TEST_CASE("Metal render-target passes stay in the current command buffer") {

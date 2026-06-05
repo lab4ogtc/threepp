@@ -9,6 +9,8 @@
 #include "threepp/scenes/Scene.hpp"
 
 #include <array>
+#include <cstddef>
+#include <memory>
 #include <vector>
 
 namespace threepp {
@@ -56,8 +58,11 @@ namespace threepp {
         /**
          * Performs a scan and returns hit points in world space.
          * The renderer's active render target is restored to nullptr after the scan.
+         * Normal mode is pipelined and returns the latest completed point cloud
+         * while submitting the current scan without blocking. forceImmediate
+         * preserves the old synchronous behavior for tests and single-step tools.
          */
-        void scan(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud);
+        void scan(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud, bool forceImmediate = false);
 
         [[nodiscard]] unsigned int faceSize() const { return faceSize_; }
         [[nodiscard]] float near() const { return near_; }
@@ -90,12 +95,24 @@ namespace threepp {
         };
         std::vector<BeamSample> beams_;
 
+        struct ScanSlot;
+        struct AsyncState;
+        std::shared_ptr<AsyncState> asyncState_;
+
         void init(float near, float far);
         void buildBeamTable(const LidarModel& model);
 
         void renderFaces(Renderer& renderer, Scene& scene);
-        void unprojectDense(std::vector<Vector3>& points) const;
-        void unprojectBeams(std::vector<Vector3>& points) const;
+        void scanImmediate(Renderer& renderer, Scene& scene, std::vector<Vector3>& cloud);
+        void submitAsyncReadback(Renderer& renderer, std::size_t slotIndex, std::size_t generation);
+        [[nodiscard]] bool reserveAsyncSlot(std::size_t& slotIndex, std::size_t& generation);
+        void releaseAsyncSlot(std::size_t slotIndex, std::size_t generation);
+        void copyLatestReadyCloud(std::vector<Vector3>& cloud) const;
+        void drainCompletedScans();
+        void collectDenseGpuPoints(const ScanSlot& slot, std::vector<Vector3>& points) const;
+        void collectBeamGpuPoints(const ScanSlot& slot, std::vector<Vector3>& points) const;
+        void unprojectDense(const ScanSlot& slot, std::vector<Vector3>& points) const;
+        void unprojectBeams(const ScanSlot& slot, std::vector<Vector3>& points) const;
     };
 
 }// namespace threepp

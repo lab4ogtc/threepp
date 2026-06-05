@@ -16,12 +16,14 @@
 #import <QuartzCore/QuartzCore.h>
 #import <dispatch/dispatch.h>
 
+#include <array>
 #include <chrono>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
+#include <span>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -67,6 +69,8 @@ namespace threepp {
         std::size_t defaultTangentVertexCount = 0;
         id<MTLBuffer> defaultMorphTargetBuffer = nil;
         std::size_t defaultMorphTargetVertexCount = 0;
+        id<MTLComputePipelineState> unprojectComputePSO = nil;
+        id<MTLComputePipelineState> unprojectBeamsComputePSO = nil;
 
         struct ReadbackBuffer {
             id<MTLBuffer> buffer = nil;
@@ -87,12 +91,23 @@ namespace threepp {
         struct MetalRenderTargetResources {
             id<MTLTexture> colorTexture = nil;
             id<MTLTexture> depthTexture = nil;
+            id<MTLBuffer> backingBuffer = nil;
             NSUInteger width = 0;
             NSUInteger height = 0;
             NSUInteger depth = 1;
+            NSUInteger alignedBytesPerRow = 0;
             MTLPixelFormat colorPixelFormat = MTLPixelFormatInvalid;
             MTLTextureType colorTextureType = MTLTextureType2D;
             bool mipmapped = false;
+            bool requestedZeroCopy = false;
+            bool isZeroCopy = false;
+        };
+
+        struct RenderTargetColorTextureAllocation {
+            id<MTLTexture> texture = nil;
+            id<MTLBuffer> backingBuffer = nil;
+            NSUInteger alignedBytesPerRow = 0;
+            bool isZeroCopy = false;
         };
 
         struct RenderTargetClearKey {
@@ -220,13 +235,15 @@ namespace threepp {
 
         id<MTLTexture> createDepthTexture(NSUInteger width, NSUInteger height, bool mipmapped = false) const;
 
-        id<MTLTexture> createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const;
+        RenderTargetColorTextureAllocation createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const;
 
         id<MTLTexture> createRenderTargetDepthTexture(RenderTarget& target) const;
 
         MetalRenderTargetResources& getOrCreateRenderTargetResources(RenderTarget& target);
 
         id<MTLBuffer> acquireReadbackBuffer(NSUInteger size);
+
+        void releaseReadbackBuffer(id<MTLBuffer> buffer);
 
         void releaseAllReadbackBuffers();
 
@@ -244,6 +261,10 @@ namespace threepp {
 
         id<MTLBuffer> getDefaultMorphTargetBuffer(std::size_t vertexCount);
 
+        id<MTLComputePipelineState> getOrCreateUnprojectComputePSO();
+
+        id<MTLComputePipelineState> getOrCreateUnprojectBeamsComputePSO();
+
         void setSize(std::pair<int, int> size);
 
         void setClearColor(const Color& color, float alpha);
@@ -255,6 +276,23 @@ namespace threepp {
         void copyTextureToImage(Texture& texture);
 
         void copyTexturesToImages(const std::vector<Texture*>& textures);
+
+        void readbackTextureAsync(Texture& texture,
+                                  std::function<void(const ReadbackResult& result)> onComplete,
+                                  std::function<void(const std::string& error)> onError);
+
+        void readbackLidarDepthAsPointCloudAsync(Texture& packedDepthTexture,
+                                                 const std::array<float, 16>& matrixWorld,
+                                                 float farPlane,
+                                                 std::function<void(const ReadbackResult& result)> onComplete,
+                                                 std::function<void(const std::string& error)> onError);
+
+        void readbackLidarBeamsAsPointCloudAsync(const std::array<Texture*, 6>& packedDepthTextures,
+                                                 const std::array<std::array<float, 16>, 6>& matrixWorldPerFace,
+                                                 std::span<const MetalLidarBeamSample> beams,
+                                                 float farPlane,
+                                                 std::function<void(const ReadbackResult& result)> onComplete,
+                                                 std::function<void(const std::string& error)> onError);
 
         void readPixelsFromTextureReadback(Texture& texture,
                                            id<MTLTexture> sourceTexture,
