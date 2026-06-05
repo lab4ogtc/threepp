@@ -46,6 +46,8 @@ namespace threepp {
 
         void swapBuffers() override;
 
+        [[nodiscard]] bool vsync() const override;
+
         // Canvas-compatible methods
 
         void exitOnKeyEscape(bool value);

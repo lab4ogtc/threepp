@@ -682,7 +682,7 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
     metalLayer.device = device;
     metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     metalLayer.maximumDrawableCount = 3;
-    metalLayer.displaySyncEnabled = YES;
+    metalLayer.displaySyncEnabled = window.vsync() ? YES : NO;
     metalLayer.framebufferOnly = NO;
     metalLayer.frame = contentView.bounds;
     metalLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;

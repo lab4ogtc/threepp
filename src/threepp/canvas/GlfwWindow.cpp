@@ -216,6 +216,7 @@ struct GlfwWindow::Impl {
     bool exitOnKeyEscape_;
     int antialiasing_;
     ClientAPI clientAPI_;
+    bool vsync_;
 
     std::vector<std::function<void(WindowSize)>> resizeListener;
     std::vector<std::function<void(int monitor)>> monitorChangesListener;
@@ -224,7 +225,8 @@ struct GlfwWindow::Impl {
         : scope(scope),
           exitOnKeyEscape_(params.exitOnKeyEscape_),
           antialiasing_(params.antialiasing_),
-          clientAPI_(params.clientAPI_) {
+          clientAPI_(params.clientAPI_),
+          vsync_(params.vsync_) {
 
         retainGlfwWindow();
 
@@ -508,6 +510,11 @@ void GlfwWindow::swapBuffers() {
     if (pimpl_->clientAPI_ == ClientAPI::OpenGL) {
         glfwSwapBuffers(pimpl_->window);
     }
+}
+
+bool GlfwWindow::vsync() const {
+
+    return pimpl_->vsync_;
 }
 
 void GlfwWindow::animate(const std::function<void()>& f) {

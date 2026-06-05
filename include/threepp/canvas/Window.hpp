@@ -24,6 +24,8 @@ namespace threepp {
 
         virtual void swapBuffers() = 0;
 
+        [[nodiscard]] virtual bool vsync() const = 0;
+
         virtual ~Window() = default;
     };
 
