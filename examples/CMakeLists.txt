@@ -8,6 +8,12 @@ add_example(NAME "demo" LINK_IMGUI WEB WEB_EMBED
         "${PROJECT_SOURCE_DIR}/data/fonts@data/fonts"
 )
 
+if (APPLE)
+    add_example(NAME "demo_metal" LINK_IMGUI
+            "${PROJECT_SOURCE_DIR}/data/fonts@data/fonts"
+    )
+endif ()
+
 add_subdirectory(animation)
 add_subdirectory(audio)
 add_subdirectory(controls)

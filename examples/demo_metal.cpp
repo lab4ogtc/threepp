@@ -1,8 +1,8 @@
-
 #include "threepp/canvas/Monitor.hpp"
 #include "threepp/extras/imgui/ImguiContext.hpp"
 #include "threepp/input/IOCapture.hpp"
 #include "threepp/objects/TextSprite.hpp"
+#include "threepp/renderers/metal/MetalRenderer.hpp"
 #include "threepp/threepp.hpp"
 
 using namespace threepp;
@@ -101,8 +101,8 @@ auto createPlane() {
 
 int main() {
 
-    GlfwWindow canvas("threepp demo", {{"aa", 4}});
-    GLRenderer renderer(canvas);
+    GlfwWindow canvas("threepp demo (Metal)", {{"clientAPI", "Metal"}, {"aa", 4}});
+    MetalRenderer renderer(canvas);
     renderer.autoClear = false;
 
     auto scene = Scene::create();
