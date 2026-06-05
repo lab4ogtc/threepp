@@ -1,8 +1,11 @@
 
+// 对齐说明：本示例应与 helpers.cpp（OpenGL 版本）保持渲染逻辑与参数的同步更新。
+
 #include "threepp/helpers/BoxHelper.hpp"
 #include "threepp/helpers/PlaneHelper.hpp"
 #include "threepp/helpers/PolarGridHelper.hpp"
-#include "threepp/threepp.hpp"
+#include "threepp/renderers/Renderer.hpp"
+#include <threepp/threepp.hpp>
 
 #include <cmath>
 
@@ -10,8 +13,8 @@ using namespace threepp;
 
 int main() {
 
-    GlfwWindow canvas("Helpers", {{"aa", 4}});
-    GLRenderer renderer(canvas);
+    GlfwWindow canvas("Helpers (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
+    auto renderer = Renderer::create(canvas, Backend::Metal);
 
     auto scene = Scene::create();
     auto camera = PerspectiveCamera::create(75, canvas.aspect(), 0.1f, 1000);
@@ -52,7 +55,7 @@ int main() {
     canvas.onWindowResize([&](WindowSize size) {
         camera->aspect = size.aspect();
         camera->updateProjectionMatrix();
-        renderer.setSize(size);
+        renderer->setSize(size);
     });
 
     Clock clock;
@@ -67,6 +70,6 @@ int main() {
 
         boxHelper->update();
 
-        renderer.render(*scene, *camera);
+        renderer->render(*scene, *camera);
     });
 }
