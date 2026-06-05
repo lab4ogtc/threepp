@@ -684,7 +684,7 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
     configurePipelineBlending(pipelineKey, *lineMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -768,7 +768,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
         pipelineKey.fragmentFunction = shaderManager->getOrCreateParticleFragmentFunction(useMap);
         configurePipelineBlending(pipelineKey, *particleMaterial);
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutParticleSystem;
-        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+        configurePipelineColorFormats(pipelineKey, colorPixelFormat);
         pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -815,7 +815,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
     if (useMorphTargets) pipelineKey.vertexLayoutBitmask |= vertexLayoutMorphTargets;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -908,7 +908,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
         pipelineKey.fragmentFunction = (__bridge void*) fragmentFunction;
         configurePipelineBlending(pipelineKey, *rawMaterial);
         pipelineKey.vertexLayoutBitmask = rawShaderVertexLayout(geometry);
-        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
         pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
         id<MTLRenderPipelineState> pso = nil;
@@ -942,6 +942,12 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
         auto* tangentAttr = getFloatAttribute(geometry, "tangent");
         const auto useTangent = tangentAttr && tangentAttr->itemSize() == 4;
         bindDrawAttributes(encoder, geometry, *posAttr, normalAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent);
+        auto* instancedMesh = dynamic_cast<InstancedMesh*>(&mesh);
+        const auto resolvedInstanceCount = geometry.instanceCount.value_or(instancedMesh ? instancedMesh->count() : 1);
+        if (resolvedInstanceCount == 0) return;
+        if (instancedMesh) {
+            bindInstancing(encoder, *instancedMesh, instancedMesh->instanceColor() != nullptr);
+        }
 
         SystemUniforms systemUniforms{};
         fillSystemUniforms(camera, mesh, *rawMaterial, systemUniforms);
@@ -982,7 +988,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
             [encoder setFragmentSamplerState:sampler atIndex:i];
         }
 
-        drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
+        drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, static_cast<NSUInteger>(resolvedInstanceCount), group);
         return;
     }
 
@@ -994,7 +1000,7 @@ void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
     pipelineKey.fragmentFunction = shaderManager->getOrCreateRawShaderFragmentFunction();
     configurePipelineBlending(pipelineKey, *rawMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutColor4;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -1042,7 +1048,7 @@ void MetalRenderer::Impl::renderDepthTexture(id<MTLRenderCommandEncoder> encoder
     pipelineKey.fragmentFunction = shaderManager->getOrCreateDepthTextureFragmentFunction();
     configurePipelineBlending(pipelineKey, *depthMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -1123,7 +1129,7 @@ void MetalRenderer::Impl::renderLinearDepthTexture(id<MTLRenderCommandEncoder> e
     pipelineKey.fragmentFunction = shaderManager->getOrCreateDepthTextureLinearReadbackFragmentFunction();
     configurePipelineBlending(pipelineKey, *depthMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -1194,7 +1200,7 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scen
     pipelineKey.fragmentFunction = shaderManager->getOrCreateSpriteFragmentFunction(shaderKey);
     configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutUv;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -1243,7 +1249,7 @@ void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sk
     pipelineKey.fragmentFunction = shaderManager->getOrCreateSkyFragmentFunction();
     configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -1294,7 +1300,7 @@ void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene
     pipelineKey.fragmentFunction = shaderManager->getOrCreateWaterFragmentFunction();
     configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -1371,7 +1377,7 @@ void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, S
     pipelineKey.fragmentFunction = shaderManager->getOrCreateReflectorFragmentFunction();
     configurePipelineBlending(pipelineKey, *material);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);

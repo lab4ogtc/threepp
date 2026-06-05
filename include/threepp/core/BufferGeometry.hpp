@@ -10,6 +10,7 @@
 
 #include "threepp/core/BufferAttribute.hpp"
 
+#include <cstddef>
 #include <optional>
 #include <unordered_map>
 
@@ -32,6 +33,8 @@ namespace threepp {
         std::optional<Sphere> boundingSphere;
 
         DrawRange drawRange{0, std::numeric_limits<int>::max() / 2};
+
+        std::optional<std::size_t> instanceCount;
 
         BufferGeometry();
 

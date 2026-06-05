@@ -3,6 +3,7 @@
 #include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/renderers/shaders/ShaderCompiler.hpp"
 #include "threepp/textures/CubeTexture.hpp"
+#include "threepp/textures/DataArrayTexture.hpp"
 
 #ifdef THREEPP_HAS_SLANG
 #include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
@@ -218,16 +219,20 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
     unsigned int textureFormatChannelCount(Format format) {
         switch (format) {
             case Format::Red:
+            case Format::RedInteger:
                 return 1u;
             case Format::RG:
+            case Format::RGInteger:
                 return 2u;
             case Format::RGB:
+            case Format::RGBInteger:
                 return 3u;
             case Format::RGBA:
+            case Format::RGBAInteger:
             case Format::BGRA:
                 return 4u;
             default:
-                throw std::runtime_error("MetalRenderer::copyTextureToImage supports only Red, RG, RGB, RGBA, and BGRA texture formats");
+                throw std::runtime_error("MetalRenderer::copyTextureToImage supports only Red, RG, RGB, RGBA, BGRA, and integer variants");
         }
     }
 
@@ -246,12 +251,15 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
             case MTLPixelFormatBGRA8Unorm:
             case MTLPixelFormatBGRA8Unorm_sRGB:
             case MTLPixelFormatR32Float:
+            case MTLPixelFormatR32Uint:
                 return 4u;
             case MTLPixelFormatRGBA16Float:
                 return 8u;
             case MTLPixelFormatRG32Float:
+            case MTLPixelFormatRG32Uint:
                 return 8u;
             case MTLPixelFormatRGBA32Float:
+            case MTLPixelFormatRGBA32Uint:
                 return 16u;
             default:
                 throw std::runtime_error("MetalRenderer::copyTextureToImage encountered an unsupported Metal pixel format");
@@ -281,6 +289,17 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
             case MTLPixelFormatR32Float:
             case MTLPixelFormatRG32Float:
             case MTLPixelFormatRGBA32Float:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    bool pixelFormatIsInteger(MTLPixelFormat pixelFormat) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR32Uint:
+            case MTLPixelFormatRG32Uint:
+            case MTLPixelFormatRGBA32Uint:
                 return true;
             default:
                 return false;
@@ -319,6 +338,22 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
                     return pixelFormat == MTLPixelFormatRG32Float;
                 case Format::RGBA:
                     return pixelFormat == MTLPixelFormatRGBA32Float;
+                default:
+                    return false;
+            }
+        }
+
+        if (texture.type == Type::UnsignedInt) {
+            switch (texture.format) {
+                case Format::Red:
+                case Format::RedInteger:
+                    return pixelFormat == MTLPixelFormatR32Uint;
+                case Format::RG:
+                case Format::RGInteger:
+                    return pixelFormat == MTLPixelFormatRG32Uint;
+                case Format::RGBA:
+                case Format::RGBAInteger:
+                    return pixelFormat == MTLPixelFormatRGBA32Uint;
                 default:
                     return false;
             }
@@ -401,6 +436,19 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
                 return channel < 4u ? pixel[channel] : 0.f;
             default:
                 return channel == 3u ? 1.f : 0.f;
+        }
+    }
+
+    std::uint32_t readUintComponent(const std::uint32_t* pixel, MTLPixelFormat pixelFormat, unsigned int channel) {
+        switch (pixelFormat) {
+            case MTLPixelFormatR32Uint:
+                return channel == 0u ? pixel[0] : (channel == 3u ? 1u : 0u);
+            case MTLPixelFormatRG32Uint:
+                return channel < 2u ? pixel[channel] : (channel == 3u ? 1u : 0u);
+            case MTLPixelFormatRGBA32Uint:
+                return channel < 4u ? pixel[channel] : 0u;
+            default:
+                return channel == 3u ? 1u : 0u;
         }
     }
 
@@ -958,36 +1006,53 @@ id<MTLTexture> MetalRenderer::Impl::createDepthTexture(NSUInteger width, NSUInte
     return [device newTextureWithDescriptor:desc];
 }
 
-MetalRenderer::Impl::RenderTargetColorTextureAllocation MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const {
+bool renderTargetUsesArrayTexture(RenderTarget& target) {
+    return target.depth > 1 || dynamic_cast<DataArrayTexture*>(target.texture.get()) != nullptr;
+}
+
+MTLTextureType renderTargetTextureType(RenderTarget& target, Texture& texture) {
+    if (dynamic_cast<CubeTexture*>(&texture)) {
+        return MTLTextureTypeCube;
+    }
+    if (dynamic_cast<DataArrayTexture*>(&texture) || renderTargetUsesArrayTexture(target)) {
+        return MTLTextureType2DArray;
+    }
+    return MTLTextureType2D;
+}
+
+MetalRenderer::Impl::RenderTargetColorTextureAllocation MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget& target, Texture& texture, MTLPixelFormat pixelFormat) const {
     const auto width = std::max<NSUInteger>(target.width, 1);
     const auto height = std::max<NSUInteger>(target.height, 1);
-    const auto mipmapped = target.texture->generateMipmaps ? YES : NO;
+    const auto depth = std::max<NSUInteger>(target.depth, 1);
+    const auto mipmapped = texture.generateMipmaps ? YES : NO;
+    const auto textureType = renderTargetTextureType(target, texture);
     MTLTextureDescriptor* desc = nil;
     RenderTargetColorTextureAllocation allocation;
 
-    if (dynamic_cast<CubeTexture*>(target.texture.get())) {
+    if (textureType == MTLTextureTypeCube) {
         if (width != height) {
             throw std::runtime_error("Metal cube RenderTarget requires square dimensions");
         }
         desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat
                                                                      size:width
                                                                 mipmapped:mipmapped];
-    } else if (target.depth > 1) {
+    } else if (textureType == MTLTextureType2DArray) {
         desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                   width:width
                                                                  height:height
                                                               mipmapped:mipmapped];
         desc.textureType = MTLTextureType2DArray;
-        desc.arrayLength = static_cast<NSUInteger>(target.depth);
+        desc.arrayLength = depth;
     } else {
         desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                   width:width
-                                                                 height:height
-                                                              mipmapped:mipmapped];
+                                                                   height:height
+                                                                mipmapped:mipmapped];
     }
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
 
     const auto canUseZeroCopy = target.zeroCopy &&
+                                &texture == target.texture.get() &&
                                 desc.textureType == MTLTextureType2D &&
                                 !mipmapped &&
                                 isZeroCopyCompatiblePixelFormat(pixelFormat);
@@ -1034,39 +1099,67 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     if (!target.texture) {
         throw std::runtime_error("Metal RenderTarget requires a color texture");
     }
+    if (target.textures.empty()) {
+        target.textures.push_back(target.texture);
+    }
 
     const auto width = static_cast<NSUInteger>(std::max(target.width, 1u));
     const auto height = static_cast<NSUInteger>(std::max(target.height, 1u));
     const auto depth = static_cast<NSUInteger>(std::max(target.depth, 1u));
-    const auto colorPixelFormat = toRenderTargetColorPixelFormat(*target.texture);
-    const auto colorTextureType = dynamic_cast<CubeTexture*>(target.texture.get()) ? MTLTextureTypeCube
-                                                                                  : (target.depth > 1) ? MTLTextureType2DArray
-                                                                                                       : MTLTextureType2D;
+    const auto colorTextureType = renderTargetTextureType(target, *target.texture);
     const auto mipmapped = target.texture->generateMipmaps;
+    std::vector<MTLPixelFormat> colorPixelFormats;
+    colorPixelFormats.reserve(target.textures.size());
+    for (const auto& texture : target.textures) {
+        if (!texture) {
+            throw std::runtime_error("Metal RenderTarget has a null color attachment texture");
+        }
+        const auto attachmentFormat = toRenderTargetColorPixelFormat(*texture);
+        colorPixelFormats.push_back(attachmentFormat);
+        if (texture->generateMipmaps != mipmapped) {
+            throw std::runtime_error("Metal RenderTarget MRT currently requires all color attachments to share mipmap settings");
+        }
+        const auto attachmentTextureType = renderTargetTextureType(target, *texture);
+        if (attachmentTextureType != colorTextureType) {
+            throw std::runtime_error("Metal RenderTarget MRT currently requires all color attachments to share texture type");
+        }
+    }
 
     auto it = renderTargetResources.find(&target);
     if (it != renderTargetResources.end() &&
         it->second.width == width &&
         it->second.height == height &&
         it->second.depth == depth &&
-        it->second.colorPixelFormat == colorPixelFormat &&
+        it->second.colorPixelFormats == colorPixelFormats &&
         it->second.colorTextureType == colorTextureType &&
         it->second.mipmapped == mipmapped &&
         it->second.requestedZeroCopy == target.zeroCopy &&
-        it->second.colorTexture &&
+        it->second.colorTextures.size() == target.textures.size() &&
+        std::all_of(it->second.colorTextures.begin(), it->second.colorTextures.end(), [](id<MTLTexture> texture) { return texture != nil; }) &&
         it->second.depthTexture) {
         return it->second;
     }
 
-    auto colorAllocation = createRenderTargetColorTexture(target, colorPixelFormat);
-    auto colorTexture = colorAllocation.texture;
+    RenderTargetColorTextureAllocation primaryColorAllocation;
+    std::vector<id<MTLTexture>> colorTextures;
+    colorTextures.reserve(target.textures.size());
+    for (std::size_t i = 0; i < target.textures.size(); ++i) {
+        auto allocation = createRenderTargetColorTexture(target, *target.textures[i], colorPixelFormats[i]);
+        if (i == 0) {
+            primaryColorAllocation = allocation;
+        }
+        colorTextures.push_back(allocation.texture);
+    }
     auto depthTexture = createRenderTargetDepthTexture(target);
-    if (!colorTexture || !depthTexture) {
+    if (colorTextures.empty() || std::any_of(colorTextures.begin(), colorTextures.end(), [](id<MTLTexture> texture) { return texture == nil; }) || !depthTexture) {
         throw std::runtime_error("Failed to create Metal RenderTarget resources");
     }
 
-    updateTextureImageMetadata(*target.texture, target.width, target.height, target.depth, dynamic_cast<CubeTexture*>(target.texture.get()) != nullptr);
-    textureManager->registerExternalTexture(*target.texture, (__bridge void*) colorTexture);
+    for (std::size_t i = 0; i < target.textures.size(); ++i) {
+        auto& texture = target.textures[i];
+        updateTextureImageMetadata(*texture, target.width, target.height, target.depth, dynamic_cast<CubeTexture*>(texture.get()) != nullptr);
+        textureManager->registerExternalTexture(*texture, (__bridge void*) colorTextures[i]);
+    }
 
     if (target.depthTexture) {
         updateTextureImageMetadata(*target.depthTexture, target.width, target.height, 1, false);
@@ -1078,18 +1171,18 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     }
 
     auto& resources = renderTargetResources[&target];
-    resources.colorTexture = colorTexture;
+    resources.colorTextures = std::move(colorTextures);
     resources.depthTexture = depthTexture;
-    resources.backingBuffer = colorAllocation.backingBuffer;
+    resources.backingBuffer = primaryColorAllocation.backingBuffer;
     resources.width = width;
     resources.height = height;
     resources.depth = depth;
-    resources.alignedBytesPerRow = colorAllocation.alignedBytesPerRow;
-    resources.colorPixelFormat = colorPixelFormat;
+    resources.alignedBytesPerRow = primaryColorAllocation.alignedBytesPerRow;
+    resources.colorPixelFormats = std::move(colorPixelFormats);
     resources.colorTextureType = colorTextureType;
     resources.mipmapped = mipmapped;
     resources.requestedZeroCopy = target.zeroCopy;
-    resources.isZeroCopy = colorAllocation.isZeroCopy;
+    resources.isZeroCopy = primaryColorAllocation.isZeroCopy;
     return resources;
 }
 
@@ -1144,7 +1237,13 @@ void MetalRenderer::Impl::releaseAllReadbackBuffers() {
 void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
     if (!target) return;
 
-    if (target->texture) {
+    if (!target->textures.empty()) {
+        for (auto& texture : target->textures) {
+            if (texture) {
+                textureManager->deallocateTexture(texture.get());
+            }
+        }
+    } else if (target->texture) {
         textureManager->deallocateTexture(target->texture.get());
     }
     if (target->depthTexture) {
@@ -1239,7 +1338,7 @@ void MetalRenderer::Impl::copyFramebufferToTexture(const Vector2& position, Text
 
     if (renderTarget) {
         auto& resources = getOrCreateRenderTargetResources(*renderTarget);
-        sourceTexture = resources.colorTexture;
+        sourceTexture = resources.colorTextures.empty() ? nil : resources.colorTextures.front();
         if (!currentCommandBuffer) {
             ensureFrameStarted();
             temporaryCommandBuffer = true;
@@ -1328,7 +1427,9 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
         id<MTLTexture> sourceTexture;
         id<MTLBuffer> readbackBuffer;
         NSUInteger sourceBytesPerRow;
+        NSUInteger sourceBytesPerImage;
         NSUInteger sourceBytesPerPixel;
+        NSUInteger sourceDepth;
         NSUInteger byteLength;
     };
 
@@ -1346,13 +1447,19 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
 
             const auto width = static_cast<NSUInteger>(sourceTexture.width);
             const auto height = static_cast<NSUInteger>(sourceTexture.height);
+            const auto sourceDepth = sourceTexture.textureType == MTLTextureType2DArray ||
+                                             sourceTexture.textureType == MTLTextureTypeCube ||
+                                             sourceTexture.textureType == MTLTextureTypeCubeArray
+                                         ? static_cast<NSUInteger>(sourceTexture.arrayLength)
+                                         : (sourceTexture.textureType == MTLTextureType3D ? static_cast<NSUInteger>(sourceTexture.depth) : 1u);
             const auto sourceBytesPerPixel = pixelFormatBytesPerPixel(sourceTexture.pixelFormat);
             const auto sourceBytesPerRow = ((width * sourceBytesPerPixel) + 255u) & ~255u;
-            const auto byteLength = sourceBytesPerRow * height;
+            const auto sourceBytesPerImage = sourceBytesPerRow * height;
+            const auto byteLength = sourceBytesPerImage * std::max<NSUInteger>(sourceDepth, 1u);
 
             id<MTLBuffer> readbackBuffer = acquireReadbackBuffer(byteLength);
 
-            readbacks.push_back({texture, sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerPixel, byteLength});
+            readbacks.push_back({texture, sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerImage, sourceBytesPerPixel, sourceDepth, byteLength});
         }
     } catch (...) {
         releaseAllReadbackBuffers();
@@ -1375,15 +1482,32 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
     for (const auto& readback : readbacks) {
         const auto width = static_cast<NSUInteger>(readback.sourceTexture.width);
         const auto height = static_cast<NSUInteger>(readback.sourceTexture.height);
-        [blitEncoder copyFromTexture:readback.sourceTexture
-                         sourceSlice:0
-                         sourceLevel:0
-                        sourceOrigin:MTLOriginMake(0, 0, 0)
-                          sourceSize:MTLSizeMake(width, height, 1)
-                            toBuffer:readback.readbackBuffer
-                   destinationOffset:0
-              destinationBytesPerRow:readback.sourceBytesPerRow
-            destinationBytesPerImage:readback.byteLength];
+        if (readback.sourceTexture.textureType == MTLTextureType2DArray ||
+            readback.sourceTexture.textureType == MTLTextureTypeCube ||
+            readback.sourceTexture.textureType == MTLTextureTypeCubeArray) {
+            for (NSUInteger slice = 0; slice < readback.sourceDepth; ++slice) {
+                [blitEncoder copyFromTexture:readback.sourceTexture
+                                 sourceSlice:slice
+                                 sourceLevel:0
+                                sourceOrigin:MTLOriginMake(0, 0, 0)
+                                  sourceSize:MTLSizeMake(width, height, 1)
+                                    toBuffer:readback.readbackBuffer
+                           destinationOffset:readback.sourceBytesPerImage * slice
+                      destinationBytesPerRow:readback.sourceBytesPerRow
+                    destinationBytesPerImage:readback.sourceBytesPerImage];
+            }
+        } else {
+            const auto depth = readback.sourceTexture.textureType == MTLTextureType3D ? readback.sourceDepth : 1u;
+            [blitEncoder copyFromTexture:readback.sourceTexture
+                             sourceSlice:0
+                             sourceLevel:0
+                            sourceOrigin:MTLOriginMake(0, 0, 0)
+                              sourceSize:MTLSizeMake(width, height, depth)
+                                toBuffer:readback.readbackBuffer
+                       destinationOffset:0
+                  destinationBytesPerRow:readback.sourceBytesPerRow
+                destinationBytesPerImage:readback.sourceBytesPerImage];
+        }
     }
     [blitEncoder endEncoding];
 
@@ -1407,6 +1531,8 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
                                       readback.sourceTexture,
                                       readback.readbackBuffer,
                                       readback.sourceBytesPerRow,
+                                      readback.sourceBytesPerImage,
+                                      readback.sourceDepth,
                                       readback.sourceBytesPerPixel);
     }
 }
@@ -1415,40 +1541,84 @@ void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
                                                         id<MTLTexture> sourceTexture,
                                                         id<MTLBuffer> readbackBuffer,
                                                         NSUInteger sourceBytesPerRow,
+                                                        NSUInteger sourceBytesPerImage,
+                                                        NSUInteger sourceDepth,
                                                         NSUInteger sourceBytesPerPixel) {
     const auto width = static_cast<NSUInteger>(sourceTexture.width);
     const auto height = static_cast<NSUInteger>(sourceTexture.height);
+    const auto depth = std::max<NSUInteger>(sourceDepth, 1u);
 
     auto& image = texture.image();
     image.width = static_cast<unsigned int>(width);
     image.height = static_cast<unsigned int>(height);
-    image.depth = 0;
+    image.depth = depth > 1u ? static_cast<unsigned int>(depth) : 0u;
 
     const auto destinationChannels = textureFormatChannelCount(texture.format);
-    const auto pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height);
+    const auto pixelCount = static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * static_cast<std::size_t>(depth);
     const auto sourceIsFloat = pixelFormatIsFloat(sourceTexture.pixelFormat);
+    const auto sourceIsInteger = pixelFormatIsInteger(sourceTexture.pixelFormat);
     const auto* rawBytes = static_cast<const unsigned char*>([readbackBuffer contents]);
 
     if (texture.format != Format::BGRA && canUseFastReadbackPath(texture, sourceTexture.pixelFormat)) {
-        const auto elementSize = texture.type == Type::Float ? sizeof(float) : sizeof(unsigned char);
+        const auto elementSize =
+                texture.type == Type::Float ? sizeof(float) :
+                texture.type == Type::UnsignedInt ? sizeof(std::uint32_t) :
+                sizeof(unsigned char);
         const auto rowBytes = static_cast<NSUInteger>(width * destinationChannels * elementSize);
+        const auto imageBytes = rowBytes * height;
         unsigned char* dstBytes = nullptr;
 
         if (texture.type == Type::Float) {
             image.setData(std::vector<float>(pixelCount * destinationChannels));
             dstBytes = reinterpret_cast<unsigned char*>(image.data<float>().data());
+        } else if (texture.type == Type::UnsignedInt) {
+            image.setData(std::vector<std::uint32_t>(pixelCount * destinationChannels));
+            dstBytes = reinterpret_cast<unsigned char*>(image.data<std::uint32_t>().data());
         } else {
             image.setData(std::vector<unsigned char>(pixelCount * destinationChannels));
             dstBytes = reinterpret_cast<unsigned char*>(image.data<unsigned char>().data());
         }
 
-        if (sourceBytesPerRow == rowBytes) {
-            std::memcpy(dstBytes, rawBytes, static_cast<std::size_t>(rowBytes * height));
+        if (sourceBytesPerRow == rowBytes && sourceBytesPerImage == imageBytes) {
+            std::memcpy(dstBytes, rawBytes, static_cast<std::size_t>(imageBytes * depth));
         } else {
+            for (NSUInteger z = 0; z < depth; ++z) {
+                for (NSUInteger y = 0; y < height; ++y) {
+                    std::memcpy(dstBytes + static_cast<std::size_t>(z * imageBytes + y * rowBytes),
+                                rawBytes + static_cast<std::size_t>(z * sourceBytesPerImage + y * sourceBytesPerRow),
+                                static_cast<std::size_t>(rowBytes));
+                }
+            }
+        }
+        return;
+    }
+
+    if (texture.type == Type::UnsignedInt) {
+        image.setData(std::vector<std::uint32_t>(pixelCount * destinationChannels));
+        auto& out = image.data<std::uint32_t>();
+        for (NSUInteger z = 0; z < depth; ++z) {
             for (NSUInteger y = 0; y < height; ++y) {
-                std::memcpy(dstBytes + static_cast<std::size_t>(y * rowBytes),
-                            rawBytes + static_cast<std::size_t>(y * sourceBytesPerRow),
-                            static_cast<std::size_t>(rowBytes));
+                const auto* srcRow = rawBytes + z * sourceBytesPerImage + y * sourceBytesPerRow;
+                for (NSUInteger x = 0; x < width; ++x) {
+                    const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
+                    const auto dstBase =
+                            ((static_cast<std::size_t>(z) * static_cast<std::size_t>(height) + static_cast<std::size_t>(y)) *
+                                 static_cast<std::size_t>(width) +
+                             static_cast<std::size_t>(x)) *
+                            destinationChannels;
+                    for (unsigned int c = 0; c < destinationChannels; ++c) {
+                        const auto canonical = destinationCanonicalChannel(texture.format, c);
+                        std::uint32_t value = 0u;
+                        if (sourceIsInteger) {
+                            value = readUintComponent(reinterpret_cast<const std::uint32_t*>(srcPixel), sourceTexture.pixelFormat, canonical);
+                        } else if (sourceIsFloat) {
+                            value = static_cast<std::uint32_t>(std::max(0.0f, readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical)));
+                        } else {
+                            value = readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical);
+                        }
+                        out[dstBase + c] = value;
+                    }
+                }
             }
         }
         return;
@@ -1457,20 +1627,26 @@ void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
     if (texture.type == Type::Float) {
         image.setData(std::vector<float>(pixelCount * destinationChannels));
         auto& out = image.data<float>();
-        for (NSUInteger y = 0; y < height; ++y) {
-            const auto* srcRow = rawBytes + y * sourceBytesPerRow;
-            const auto dstY = y;
-            for (NSUInteger x = 0; x < width; ++x) {
-                const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
-                for (unsigned int c = 0; c < destinationChannels; ++c) {
-                    const auto canonical = destinationCanonicalChannel(texture.format, c);
-                    float value = 0.f;
-                    if (sourceIsFloat) {
-                        value = readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical);
-                    } else {
-                        value = static_cast<float>(readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical)) * (1.f / 255.f);
+        for (NSUInteger z = 0; z < depth; ++z) {
+            for (NSUInteger y = 0; y < height; ++y) {
+                const auto* srcRow = rawBytes + z * sourceBytesPerImage + y * sourceBytesPerRow;
+                for (NSUInteger x = 0; x < width; ++x) {
+                    const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
+                    const auto dstBase =
+                            ((static_cast<std::size_t>(z) * static_cast<std::size_t>(height) + static_cast<std::size_t>(y)) *
+                                 static_cast<std::size_t>(width) +
+                             static_cast<std::size_t>(x)) *
+                            destinationChannels;
+                    for (unsigned int c = 0; c < destinationChannels; ++c) {
+                        const auto canonical = destinationCanonicalChannel(texture.format, c);
+                        float value = 0.f;
+                        if (sourceIsFloat) {
+                            value = readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical);
+                        } else {
+                            value = static_cast<float>(readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical)) * (1.f / 255.f);
+                        }
+                        out[dstBase + c] = value;
                     }
-                    out[(static_cast<std::size_t>(dstY) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * destinationChannels + c] = value;
                 }
             }
         }
@@ -1478,26 +1654,32 @@ void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
     }
 
     if (texture.type != Type::UnsignedByte) {
-        throw std::runtime_error("MetalRenderer::copyTextureToImage supports only UnsignedByte and Float texture readback");
+        throw std::runtime_error("MetalRenderer::copyTextureToImage supports only UnsignedByte, UnsignedInt, and Float texture readback");
     }
 
     image.setData(std::vector<unsigned char>(pixelCount * destinationChannels));
     auto& out = image.data<unsigned char>();
-    for (NSUInteger y = 0; y < height; ++y) {
-        const auto* srcRow = rawBytes + y * sourceBytesPerRow;
-        const auto dstY = y;
-        for (NSUInteger x = 0; x < width; ++x) {
-            const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
-            for (unsigned int c = 0; c < destinationChannels; ++c) {
-                const auto canonical = destinationCanonicalChannel(texture.format, c);
-                unsigned char value = 0;
-                if (sourceIsFloat) {
-                    const auto floatValue = readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical);
-                    value = static_cast<unsigned char>(std::clamp(std::lround(floatValue * 255.f), 0l, 255l));
-                } else {
-                    value = readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical);
+    for (NSUInteger z = 0; z < depth; ++z) {
+        for (NSUInteger y = 0; y < height; ++y) {
+            const auto* srcRow = rawBytes + z * sourceBytesPerImage + y * sourceBytesPerRow;
+            for (NSUInteger x = 0; x < width; ++x) {
+                const auto* srcPixel = srcRow + x * sourceBytesPerPixel;
+                const auto dstBase =
+                        ((static_cast<std::size_t>(z) * static_cast<std::size_t>(height) + static_cast<std::size_t>(y)) *
+                             static_cast<std::size_t>(width) +
+                         static_cast<std::size_t>(x)) *
+                        destinationChannels;
+                for (unsigned int c = 0; c < destinationChannels; ++c) {
+                    const auto canonical = destinationCanonicalChannel(texture.format, c);
+                    unsigned char value = 0;
+                    if (sourceIsFloat) {
+                        const auto floatValue = readFloatComponent(reinterpret_cast<const float*>(srcPixel), sourceTexture.pixelFormat, canonical);
+                        value = static_cast<unsigned char>(std::clamp(std::lround(floatValue * 255.f), 0l, 255l));
+                    } else {
+                        value = readByteComponent(srcPixel, sourceTexture.pixelFormat, canonical);
+                    }
+                    out[dstBase + c] = value;
                 }
-                out[(static_cast<std::size_t>(dstY) * static_cast<std::size_t>(width) + static_cast<std::size_t>(x)) * destinationChannels + c] = value;
             }
         }
     }
@@ -2093,6 +2275,20 @@ void MetalRenderer::Impl::applyDepthBias(id<MTLRenderCommandEncoder> encoder, co
     currentDepthBiasUnits = units;
 }
 
+void MetalRenderer::Impl::configurePipelineColorFormats(metal::PipelineKey& key, MTLPixelFormat primaryFormat) const {
+    key.colorPixelFormat = static_cast<std::uint64_t>(primaryFormat);
+    key.colorAttachmentCount = static_cast<std::uint64_t>(activeColorAttachmentCount);
+    key.colorPixelFormats.fill(0);
+
+    const auto count = std::min<std::size_t>(
+            static_cast<std::size_t>(activeColorAttachmentCount),
+            key.colorPixelFormats.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const auto format = i < activeColorPixelFormats.size() ? activeColorPixelFormats[i] : primaryFormat;
+        key.colorPixelFormats[i] = static_cast<std::uint64_t>(format);
+    }
+}
+
 void MetalRenderer::Impl::bindTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, id<MTLTexture> placeholder, NSUInteger index, bool allowPlaceholder) {
     id<MTLTexture> metalTexture = placeholder;
     id<MTLSamplerState> sampler = defaultSampler;
@@ -2168,7 +2364,7 @@ void MetalRenderer::Impl::renderBackgroundCube(id<MTLRenderCommandEncoder> encod
     pipelineKey.fragmentFunction = shaderManager->getOrCreateBackgroundCubeFragmentFunction();
     pipelineKey.alphaBlending = false;
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
-    pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
     pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
     id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -2361,10 +2557,12 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     if (renderTarget) {
         auto& resources = getOrCreateRenderTargetResources(*renderTarget);
         activeRenderTargetResources = &resources;
-        colorTexture = resources.colorTexture;
+        colorTexture = resources.colorTextures.empty() ? nil : resources.colorTextures.front();
         passDepthTexture = resources.depthTexture;
-        colorPixelFormat = resources.colorPixelFormat;
+        colorPixelFormat = resources.colorPixelFormats.empty() ? MTLPixelFormatInvalid : resources.colorPixelFormats.front();
         activeRenderSampleCount = 1;
+        activeColorAttachmentCount = static_cast<NSUInteger>(std::max<std::size_t>(resources.colorTextures.size(), 1));
+        activeColorPixelFormats = resources.colorPixelFormats;
     } else {
         if (!ensureDrawable()) {
             commitPendingFrame();
@@ -2374,6 +2572,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         passDepthTexture = depthTexture;
         colorPixelFormat = colorTexture.pixelFormat;
         activeRenderSampleCount = drawableSampleCount;
+        activeColorAttachmentCount = 1;
+        activeColorPixelFormats = {colorPixelFormat};
         if (activeRenderSampleCount > 1) {
             colorTexture = getOrCreateMultisampleColorTexture(colorPixelFormat);
         }
@@ -2392,26 +2592,34 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     const auto canUseMetalClear = shouldClear && !activeScissorTest && isFirstRender;
 
     MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
-    passDesc.colorAttachments[0].texture = colorTexture;
-    if (renderTarget) {
-        if (static_cast<NSUInteger>(activeMipmapLevel) >= colorTexture.mipmapLevelCount ||
-            (passDepthTexture && static_cast<NSUInteger>(activeMipmapLevel) >= passDepthTexture.mipmapLevelCount)) {
-            throw std::out_of_range("MetalRenderer::render activeMipmapLevel exceeds render target attachment mip levels");
+    if (renderTarget && activeRenderTargetResources) {
+        for (NSUInteger i = 0; i < activeRenderTargetResources->colorTextures.size(); ++i) {
+            auto attachmentTexture = activeRenderTargetResources->colorTextures[i];
+            if (static_cast<NSUInteger>(activeMipmapLevel) >= attachmentTexture.mipmapLevelCount ||
+                (passDepthTexture && static_cast<NSUInteger>(activeMipmapLevel) >= passDepthTexture.mipmapLevelCount)) {
+                throw std::out_of_range("MetalRenderer::render activeMipmapLevel exceeds render target attachment mip levels");
+            }
+            passDesc.colorAttachments[i].texture = attachmentTexture;
+            passDesc.colorAttachments[i].level = static_cast<NSUInteger>(activeMipmapLevel);
+            if (cubeRenderTargetTexture) {
+                passDesc.colorAttachments[i].slice = static_cast<NSUInteger>(activeCubeFace);
+            } else if (isArrayRenderTarget) {
+                passDesc.colorAttachments[i].slice = static_cast<NSUInteger>(activeLayer);
+            }
+            passDesc.colorAttachments[i].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
+            passDesc.colorAttachments[i].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
+            passDesc.colorAttachments[i].storeAction = MTLStoreActionStore;
         }
-        passDesc.colorAttachments[0].level = static_cast<NSUInteger>(activeMipmapLevel);
-        if (cubeRenderTargetTexture) {
-            passDesc.colorAttachments[0].slice = static_cast<NSUInteger>(activeCubeFace);
-        } else if (isArrayRenderTarget) {
-            passDesc.colorAttachments[0].slice = static_cast<NSUInteger>(activeLayer);
-        }
-    }
-    passDesc.colorAttachments[0].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
-    passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
-    if (!renderTarget && activeRenderSampleCount > 1) {
-        passDesc.colorAttachments[0].resolveTexture = currentDrawable.texture;
-        passDesc.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
     } else {
-        passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        passDesc.colorAttachments[0].texture = colorTexture;
+        passDesc.colorAttachments[0].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
+        passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
+        if (activeRenderSampleCount > 1) {
+            passDesc.colorAttachments[0].resolveTexture = currentDrawable.texture;
+            passDesc.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
+        } else {
+            passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        }
     }
 
     passDesc.depthAttachment.texture = passDepthTexture;
@@ -2453,7 +2661,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     configureActiveEncoder();
 
-    if (shouldClear && !canUseMetalClear) {
+    if (shouldClear && !canUseMetalClear && !pixelFormatIsInteger(colorPixelFormat)) {
         const MTLViewport clearViewport{
                 0.0,
                 0.0,
@@ -2649,7 +2857,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             pipelineKey.fragmentFunction = shaderManager->getOrCreateFragmentFunction(shaderKey);
             configurePipelineBlending(pipelineKey, *material);
             pipelineKey.vertexLayoutBitmask = vertexLayoutBitmask;
-            pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(colorPixelFormat);
+            configurePipelineColorFormats(pipelineKey, colorPixelFormat);
             pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
 
             id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
@@ -2719,7 +2927,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     encoderScope.end();
     if (activeRenderTargetResources) {
-        generateRenderTargetMipmapsIfNeeded(*renderTarget, activeRenderTargetResources->colorTexture);
+        for (auto colorAttachmentTexture : activeRenderTargetResources->colorTextures) {
+            generateRenderTargetMipmapsIfNeeded(*renderTarget, colorAttachmentTexture);
+        }
     }
 
     clearRequested = false;

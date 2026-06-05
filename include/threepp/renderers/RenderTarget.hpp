@@ -10,6 +10,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace threepp {
 
@@ -37,6 +38,7 @@ namespace threepp {
 
             TextureType type_{TextureType::Texture2D};
             int depth{1};
+            int count{1};
 
             Options() = default;
         };
@@ -53,6 +55,7 @@ namespace threepp {
         Vector4 viewport;
 
         std::shared_ptr<Texture> texture;
+        std::vector<std::shared_ptr<Texture>> textures;
 
         bool depthBuffer;
         bool stencilBuffer;

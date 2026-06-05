@@ -29,6 +29,8 @@ namespace threepp::metal {
             alphaBlending != other.alphaBlending ||
             vertexLayoutBitmask != other.vertexLayoutBitmask ||
             colorPixelFormat != other.colorPixelFormat ||
+            colorAttachmentCount != other.colorAttachmentCount ||
+            colorPixelFormats != other.colorPixelFormats ||
             rasterSampleCount != other.rasterSampleCount) {
             return false;
         }
@@ -50,20 +52,28 @@ namespace threepp::metal {
         auto h3 = std::hash<bool>{}(key.alphaBlending);
         auto h4 = std::hash<std::uint16_t>{}(key.vertexLayoutBitmask);
         auto h5 = std::hash<std::uint64_t>{}(key.colorPixelFormat);
-        auto h6 = std::hash<std::uint64_t>{}(key.rasterSampleCount);
-        auto hash = h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5);
+        auto h6 = std::hash<std::uint64_t>{}(key.colorAttachmentCount);
+        auto h7 = std::hash<std::uint64_t>{}(key.rasterSampleCount);
+        auto hash = h1 ^ (h2 << 1) ^ (h3 << 2) ^ (h4 << 3) ^ (h5 << 4) ^ (h6 << 5) ^ (h7 << 6);
+        const auto colorAttachmentCount = std::min<std::uint64_t>(key.colorAttachmentCount, key.colorPixelFormats.size());
+        for (std::uint64_t i = 0; i < colorAttachmentCount; ++i) {
+            const auto format = key.colorPixelFormats[static_cast<std::size_t>(i)] != 0
+                ? key.colorPixelFormats[static_cast<std::size_t>(i)]
+                : key.colorPixelFormat;
+            hash ^= std::hash<std::uint64_t>{}(format) << ((i % 8u) + 7u);
+        }
 
         if (!key.alphaBlending) return hash;
 
-        auto h7 = std::hash<int>{}(static_cast<int>(key.blending));
-        auto h8 = std::hash<int>{}(static_cast<int>(key.blendEquation));
-        auto h9 = std::hash<int>{}(static_cast<int>(key.blendEquationAlpha));
-        auto h10 = std::hash<int>{}(static_cast<int>(key.blendSrc));
-        auto h11 = std::hash<int>{}(static_cast<int>(key.blendDst));
-        auto h12 = std::hash<int>{}(static_cast<int>(key.blendSrcAlpha));
-        auto h13 = std::hash<int>{}(static_cast<int>(key.blendDstAlpha));
-        return hash ^ (h7 << 6) ^ (h8 << 7) ^ (h9 << 8) ^ (h10 << 9) ^ (h11 << 10) ^
-               (h12 << 11) ^ (h13 << 12);
+        auto h8 = std::hash<int>{}(static_cast<int>(key.blending));
+        auto h9 = std::hash<int>{}(static_cast<int>(key.blendEquation));
+        auto h10 = std::hash<int>{}(static_cast<int>(key.blendEquationAlpha));
+        auto h11 = std::hash<int>{}(static_cast<int>(key.blendSrc));
+        auto h12 = std::hash<int>{}(static_cast<int>(key.blendDst));
+        auto h13 = std::hash<int>{}(static_cast<int>(key.blendSrcAlpha));
+        auto h14 = std::hash<int>{}(static_cast<int>(key.blendDstAlpha));
+        return hash ^ (h8 << 7) ^ (h9 << 8) ^ (h10 << 9) ^ (h11 << 10) ^ (h12 << 11) ^
+               (h13 << 12) ^ (h14 << 13);
     }
 
     namespace {
@@ -263,20 +273,32 @@ namespace threepp::metal {
             desc.fragmentFunction = (__bridge id<MTLFunction>) key.fragmentFunction;
             desc.vertexDescriptor = createVertexDescriptor(key.vertexLayoutBitmask);
 
-            desc.colorAttachments[0].pixelFormat = static_cast<MTLPixelFormat>(key.colorPixelFormat);
+            const auto colorAttachmentCount = std::min<std::uint64_t>(
+                    std::max<std::uint64_t>(key.colorAttachmentCount, 1),
+                    key.colorPixelFormats.size());
+            for (NSUInteger i = 0; i < static_cast<NSUInteger>(colorAttachmentCount); ++i) {
+                const auto format = key.colorPixelFormats[static_cast<std::size_t>(i)] != 0
+                    ? key.colorPixelFormats[static_cast<std::size_t>(i)]
+                    : key.colorPixelFormat;
+                desc.colorAttachments[i].pixelFormat = static_cast<MTLPixelFormat>(format);
+            }
             desc.depthAttachmentPixelFormat = MTLPixelFormatDepth32Float;
             desc.rasterSampleCount = static_cast<NSUInteger>(std::max<std::uint64_t>(key.rasterSampleCount, 1));
 
             if (key.alphaBlending) {
-                desc.colorAttachments[0].blendingEnabled = YES;
-                desc.colorAttachments[0].rgbBlendOperation = toMetalBlendOperation(key.blendEquation);
-                desc.colorAttachments[0].alphaBlendOperation = toMetalBlendOperation(key.blendEquationAlpha);
-                desc.colorAttachments[0].sourceRGBBlendFactor = toMetalBlendFactor(key.blendSrc);
-                desc.colorAttachments[0].sourceAlphaBlendFactor = toMetalBlendFactor(key.blendSrcAlpha);
-                desc.colorAttachments[0].destinationRGBBlendFactor = toMetalBlendFactor(key.blendDst);
-                desc.colorAttachments[0].destinationAlphaBlendFactor = toMetalBlendFactor(key.blendDstAlpha);
+                for (NSUInteger i = 0; i < static_cast<NSUInteger>(colorAttachmentCount); ++i) {
+                    desc.colorAttachments[i].blendingEnabled = YES;
+                    desc.colorAttachments[i].rgbBlendOperation = toMetalBlendOperation(key.blendEquation);
+                    desc.colorAttachments[i].alphaBlendOperation = toMetalBlendOperation(key.blendEquationAlpha);
+                    desc.colorAttachments[i].sourceRGBBlendFactor = toMetalBlendFactor(key.blendSrc);
+                    desc.colorAttachments[i].sourceAlphaBlendFactor = toMetalBlendFactor(key.blendSrcAlpha);
+                    desc.colorAttachments[i].destinationRGBBlendFactor = toMetalBlendFactor(key.blendDst);
+                    desc.colorAttachments[i].destinationAlphaBlendFactor = toMetalBlendFactor(key.blendDstAlpha);
+                }
             } else {
-                desc.colorAttachments[0].blendingEnabled = NO;
+                for (NSUInteger i = 0; i < static_cast<NSUInteger>(colorAttachmentCount); ++i) {
+                    desc.colorAttachments[i].blendingEnabled = NO;
+                }
             }
 
             NSError* error = nil;

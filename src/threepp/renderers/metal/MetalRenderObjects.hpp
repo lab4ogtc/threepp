@@ -1060,6 +1060,16 @@ namespace threepp {
                         break;
                 }
                 break;
+            case Type::UnsignedInt:
+                switch (texture.format) {
+                    case Format::RGB:
+                    case Format::RGBA:
+                    case Format::RGBAInteger:
+                        return MTLPixelFormatRGBA32Uint;
+                    default:
+                        break;
+                }
+                break;
             case Type::HalfFloat:
                 switch (texture.format) {
                     case Format::RGB:
@@ -1090,7 +1100,7 @@ namespace threepp {
                 break;
         }
 
-        throw std::runtime_error("Metal RenderTarget supports unsigned byte, half-float, and float Red, RG, RGB, RGBA/BGRA color textures");
+        throw std::runtime_error("Metal RenderTarget supports unsigned byte, unsigned int, half-float, and float Red, RG, RGB, RGBA/BGRA color textures");
     }
 
 

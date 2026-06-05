@@ -7,9 +7,26 @@
 #include "threepp/renderers/GLRenderTarget.hpp"
 #endif
 
+#include <algorithm>
+
 using namespace threepp;
 
 namespace {
+
+    std::shared_ptr<Texture> createRenderTargetTexture(unsigned int width, unsigned int height, unsigned int depth, const RenderTarget::Options& options) {
+        auto texture = Texture::create(Image({}, width, height, depth));
+        if (options.mapping) texture->mapping = *options.mapping;
+        if (options.wrapS) texture->wrapS = *options.wrapS;
+        if (options.wrapT) texture->wrapT = *options.wrapT;
+        if (options.magFilter) texture->magFilter = *options.magFilter;
+        if (options.minFilter) texture->minFilter = *options.minFilter;
+        if (options.format) texture->format = *options.format;
+        if (options.type) texture->type = *options.type;
+        if (options.anisotropy) texture->anisotropy = *options.anisotropy;
+        if (options.encoding) texture->encoding = *options.encoding;
+        texture->generateMipmaps = options.generateMipmaps;
+        return texture;
+    }
 
 #ifndef THREEPP_HAS_GL
     class GenericRenderTarget: public RenderTarget {
@@ -27,6 +44,11 @@ namespace {
                 this->texture->image().width = width;
                 this->texture->image().height = height;
                 this->texture->image().depth = depth;
+                for (auto& targetTexture : this->textures) {
+                    targetTexture->image().width = width;
+                    targetTexture->image().height = height;
+                    targetTexture->image().depth = depth;
+                }
 
                 this->dispose();
                 this->disposed = false;
@@ -47,19 +69,14 @@ RenderTarget::RenderTarget(unsigned int width, unsigned int height, const Option
       scissor(0.f, 0.f, static_cast<float>(width), static_cast<float>(height)),
       viewport(0.f, 0.f, static_cast<float>(width), static_cast<float>(height)),
       depthBuffer(options.depthBuffer), stencilBuffer(options.stencilBuffer),
-      zeroCopy(options.zeroCopy),
-      texture(Texture::create({Image({}, width, height)})) {
+      zeroCopy(options.zeroCopy) {
 
-    if (options.mapping) texture->mapping = *options.mapping;
-    if (options.wrapS) texture->wrapS = *options.wrapS;
-    if (options.wrapT) texture->wrapT = *options.wrapT;
-    if (options.magFilter) texture->magFilter = *options.magFilter;
-    if (options.minFilter) texture->minFilter = *options.minFilter;
-    if (options.format) texture->format = *options.format;
-    if (options.type) texture->type = *options.type;
-    if (options.anisotropy) texture->anisotropy = *options.anisotropy;
-    if (options.encoding) texture->encoding = *options.encoding;
-    texture->generateMipmaps = options.generateMipmaps;
+    const auto textureCount = std::max(1, options.count);
+    textures.reserve(static_cast<std::size_t>(textureCount));
+    for (int i = 0; i < textureCount; ++i) {
+        textures.push_back(createRenderTargetTexture(width, height, depth, options));
+    }
+    texture = textures.front();
 
     if (options.depthTexture) depthTexture = options.depthTexture;
 }
@@ -87,6 +104,7 @@ RenderTarget& RenderTarget::copy(const RenderTarget& source) {
     this->viewport.copy(source.viewport);
 
     this->texture = source.texture;
+    this->textures = source.textures;
 
     this->depthBuffer = source.depthBuffer;
     this->stencilBuffer = source.stencilBuffer;

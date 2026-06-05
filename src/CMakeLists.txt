@@ -187,6 +187,7 @@ set(publicHeaders
         "threepp/objects/Water.hpp"
 
         "threepp/textures/CubeTexture.hpp"
+        "threepp/textures/DataArrayTexture.hpp"
         "threepp/textures/DataTexture.hpp"
         "threepp/textures/DataTexture3D.hpp"
         "threepp/textures/DepthTexture.hpp"
@@ -457,6 +458,7 @@ set(sources
         "threepp/objects/Water.cpp"
 
         "threepp/textures/Texture.cpp"
+        "threepp/textures/DataArrayTexture.cpp"
         "threepp/textures/DataTexture3D.cpp"
         "threepp/textures/DepthTexture.cpp"
 

@@ -3,6 +3,7 @@
 #import "threepp/constants.hpp"
 #import "threepp/core/EventDispatcher.hpp"
 #import "threepp/textures/CubeTexture.hpp"
+#import "threepp/textures/DataArrayTexture.hpp"
 #import "threepp/textures/DataTexture3D.hpp"
 #import "threepp/textures/Texture.hpp"
 
@@ -106,12 +107,16 @@ namespace threepp::metal {
         unsigned int sourceChannelCount(Format format) {
             switch (format) {
                 case Format::Red:
+                case Format::RedInteger:
                     return 1u;
                 case Format::RG:
+                case Format::RGInteger:
                     return 2u;
                 case Format::RGB:
+                case Format::RGBInteger:
                     return 3u;
                 case Format::RGBA:
+                case Format::RGBAInteger:
                     return 4u;
                 default:
                     throw std::runtime_error("MetalTextureManager supports only Red, RG, RGB, and RGBA texture formats");
@@ -119,7 +124,7 @@ namespace threepp::metal {
         }
 
         unsigned int uploadChannelCount(Format format) {
-            return format == Format::RGB ? 4u : sourceChannelCount(format);
+            return (format == Format::RGB || format == Format::RGBInteger) ? 4u : sourceChannelCount(format);
         }
 
         bool usesSRGBTextureEncoding(const Texture& texture) {
@@ -152,6 +157,23 @@ namespace threepp::metal {
                             break;
                     }
                     break;
+                case Type::UnsignedInt:
+                    switch (texture.format) {
+                        case Format::Red:
+                        case Format::RedInteger:
+                            return MTLPixelFormatR32Uint;
+                        case Format::RG:
+                        case Format::RGInteger:
+                            return MTLPixelFormatRG32Uint;
+                        case Format::RGB:
+                        case Format::RGBA:
+                        case Format::RGBInteger:
+                        case Format::RGBAInteger:
+                            return MTLPixelFormatRGBA32Uint;
+                        default:
+                            break;
+                    }
+                    break;
                 case Type::Float:
                     switch (texture.format) {
                         case Format::Red:
@@ -169,13 +191,15 @@ namespace threepp::metal {
                     break;
             }
 
-            throw std::runtime_error("MetalTextureManager supports only unsigned byte and float Red, RG, RGB, and RGBA textures");
+            throw std::runtime_error("MetalTextureManager supports only unsigned byte, unsigned int, and float Red, RG, RGB, and RGBA textures");
         }
 
         template<class T>
         T opaqueAlpha() {
             if constexpr (std::is_same_v<T, unsigned char>) {
                 return 255;
+            } else if constexpr (std::is_same_v<T, std::uint32_t>) {
+                return 1u;
             } else {
                 return 1.f;
             }
@@ -235,6 +259,8 @@ namespace threepp::metal {
                 switch (texture.type) {
                     case Type::UnsignedByte:
                         return image.data<unsigned char>().size() >= expectedSize;
+                    case Type::UnsignedInt:
+                        return image.data<std::uint32_t>().size() >= expectedSize;
                     case Type::Float:
                         return image.data<float>().size() >= expectedSize;
                     default:
@@ -245,14 +271,29 @@ namespace threepp::metal {
             }
         }
 
-        void replace2DRegion(id<MTLTexture> mtlTexture, Texture& texture, const Image& image, NSUInteger level, NSUInteger slice = 0) {
+        template<class T>
+        const T* sliceBytes(const UploadableData<T>& upload, NSUInteger sourceSlice) {
+            return upload.bytes + (upload.bytesPerImage / sizeof(T)) * sourceSlice;
+        }
+
+        void replace2DRegion(id<MTLTexture> mtlTexture, Texture& texture, const Image& image, NSUInteger level, NSUInteger slice = 0, NSUInteger sourceSlice = 0) {
             switch (texture.type) {
                 case Type::UnsignedByte: {
                     const auto upload = getUploadableDataImpl<unsigned char>(image, texture);
                     [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
                                   mipmapLevel:level
                                         slice:slice
-                                    withBytes:upload.bytes
+                                    withBytes:sliceBytes(upload, sourceSlice)
+                                  bytesPerRow:upload.bytesPerRow
+                                bytesPerImage:upload.bytesPerImage];
+                    return;
+                }
+                case Type::UnsignedInt: {
+                    const auto upload = getUploadableDataImpl<std::uint32_t>(image, texture);
+                    [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
+                                  mipmapLevel:level
+                                        slice:slice
+                                    withBytes:sliceBytes(upload, sourceSlice)
                                   bytesPerRow:upload.bytesPerRow
                                 bytesPerImage:upload.bytesPerImage];
                     return;
@@ -262,13 +303,13 @@ namespace threepp::metal {
                     [mtlTexture replaceRegion:MTLRegionMake2D(0, 0, image.width, image.height)
                                   mipmapLevel:level
                                         slice:slice
-                                    withBytes:upload.bytes
+                                    withBytes:sliceBytes(upload, sourceSlice)
                                   bytesPerRow:upload.bytesPerRow
                                 bytesPerImage:upload.bytesPerImage];
                     return;
                 }
                 default:
-                    throw std::runtime_error("MetalTextureManager supports only unsigned byte and float texture uploads");
+                    throw std::runtime_error("MetalTextureManager supports only unsigned byte, unsigned int, and float texture uploads");
             }
         }
 
@@ -284,6 +325,16 @@ namespace threepp::metal {
                                 bytesPerImage:upload.bytesPerImage];
                     return;
                 }
+                case Type::UnsignedInt: {
+                    const auto upload = getUploadableDataImpl<std::uint32_t>(image, texture);
+                    [mtlTexture replaceRegion:MTLRegionMake3D(0, 0, 0, image.width, image.height, std::max(1u, image.depth))
+                                  mipmapLevel:level
+                                        slice:0
+                                    withBytes:upload.bytes
+                                  bytesPerRow:upload.bytesPerRow
+                                bytesPerImage:upload.bytesPerImage];
+                    return;
+                }
                 case Type::Float: {
                     const auto upload = getUploadableDataImpl<float>(image, texture);
                     [mtlTexture replaceRegion:MTLRegionMake3D(0, 0, 0, image.width, image.height, std::max(1u, image.depth))
@@ -295,7 +346,7 @@ namespace threepp::metal {
                     return;
                 }
                 default:
-                    throw std::runtime_error("MetalTextureManager supports only unsigned byte and float texture uploads");
+                    throw std::runtime_error("MetalTextureManager supports only unsigned byte, unsigned int, and float texture uploads");
             }
         }
 
@@ -458,6 +509,43 @@ namespace threepp::metal {
 
                 replace3DRegion(mtlTexture, texture, image, 0);
                 upload3DMipmaps(mtlTexture, texture);
+
+                if (mipmapped && texture.generateMipmaps && texture.mipmaps().empty()) {
+                    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+                    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+                    [blitEncoder generateMipmapsForTexture:mtlTexture];
+                    [blitEncoder endEncoding];
+                    [commandBuffer commit];
+                }
+
+                if (!texture.hasEventListener("dispose", onTextureDispose)) {
+                    texture.addEventListener("dispose", onTextureDispose);
+                }
+
+                textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+                return mtlTexture;
+            }
+
+            if (dynamic_cast<DataArrayTexture*>(&texture)) {
+                const auto mipmapped = wantsMipmaps(texture);
+                const auto arrayLength = std::max(1u, image.depth);
+                MTLTextureDescriptor* desc = [[MTLTextureDescriptor alloc] init];
+                desc.textureType = MTLTextureType2DArray;
+                desc.pixelFormat = toColorPixelFormat(texture);
+                desc.width = image.width;
+                desc.height = image.height;
+                desc.arrayLength = arrayLength;
+                desc.mipmapLevelCount = mipmapped ? mipLevelCount(desc.width, desc.height, 1u) : 1u;
+                desc.usage = MTLTextureUsageShaderRead;
+
+                id<MTLTexture> mtlTexture = [device newTextureWithDescriptor:desc];
+                if (!mtlTexture) {
+                    throw std::runtime_error("Failed to create Metal 2D array texture");
+                }
+
+                for (NSUInteger slice = 0; slice < arrayLength; ++slice) {
+                    replace2DRegion(mtlTexture, texture, image, 0, slice, slice);
+                }
 
                 if (mipmapped && texture.generateMipmaps && texture.mipmaps().empty()) {
                     id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];

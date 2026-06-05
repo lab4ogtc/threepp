@@ -89,14 +89,14 @@ namespace threepp {
         std::vector<unsigned int> lineLoopIndices;
 
         struct MetalRenderTargetResources {
-            id<MTLTexture> colorTexture = nil;
+            std::vector<id<MTLTexture>> colorTextures;
+            std::vector<MTLPixelFormat> colorPixelFormats;
             id<MTLTexture> depthTexture = nil;
             id<MTLBuffer> backingBuffer = nil;
             NSUInteger width = 0;
             NSUInteger height = 0;
             NSUInteger depth = 1;
             NSUInteger alignedBytesPerRow = 0;
-            MTLPixelFormat colorPixelFormat = MTLPixelFormatInvalid;
             MTLTextureType colorTextureType = MTLTextureType2D;
             bool mipmapped = false;
             bool requestedZeroCopy = false;
@@ -193,6 +193,8 @@ namespace threepp {
         float pixelRatio = 1;
         NSUInteger drawableSampleCount = 1;
         NSUInteger activeRenderSampleCount = 1;
+        NSUInteger activeColorAttachmentCount = 1;
+        std::vector<MTLPixelFormat> activeColorPixelFormats;
         Vector4 viewport;
         Vector4 scissor;
         bool scissorTest = false;
@@ -235,7 +237,7 @@ namespace threepp {
 
         id<MTLTexture> createDepthTexture(NSUInteger width, NSUInteger height, bool mipmapped = false) const;
 
-        RenderTargetColorTextureAllocation createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const;
+        RenderTargetColorTextureAllocation createRenderTargetColorTexture(RenderTarget& target, Texture& texture, MTLPixelFormat pixelFormat) const;
 
         id<MTLTexture> createRenderTargetDepthTexture(RenderTarget& target) const;
 
@@ -298,6 +300,8 @@ namespace threepp {
                                            id<MTLTexture> sourceTexture,
                                            id<MTLBuffer> readbackBuffer,
                                            NSUInteger sourceBytesPerRow,
+                                           NSUInteger sourceBytesPerImage,
+                                           NSUInteger sourceDepth,
                                            NSUInteger sourceBytesPerPixel);
 
         std::vector<unsigned char> readRGBPixels();
@@ -317,6 +321,7 @@ namespace threepp {
         void resetDepthBiasCache();
 
         void applyDepthBias(id<MTLRenderCommandEncoder> encoder, const Material& material);
+        void configurePipelineColorFormats(metal::PipelineKey& key, MTLPixelFormat primaryFormat) const;
 
         void bindTextureOrPlaceholder(id<MTLRenderCommandEncoder> encoder, const std::shared_ptr<Texture>& texture, id<MTLTexture> placeholder, NSUInteger index, bool allowPlaceholder = false);
 

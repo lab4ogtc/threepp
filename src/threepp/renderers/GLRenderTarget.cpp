@@ -23,6 +23,11 @@ void GLRenderTarget::setSize(unsigned int width, unsigned int height, unsigned i
         this->texture->image().width = width;
         this->texture->image().height = height;
         this->texture->image().depth = depth;
+        for (auto& targetTexture : this->textures) {
+            targetTexture->image().width = width;
+            targetTexture->image().height = height;
+            targetTexture->image().depth = depth;
+        }
 
         this->dispose();
         this->disposed = false;

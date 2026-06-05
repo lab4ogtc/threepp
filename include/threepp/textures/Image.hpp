@@ -2,13 +2,14 @@
 #ifndef THREEPP_IMAGE_HPP
 #define THREEPP_IMAGE_HPP
 
+#include <cstdint>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace threepp {
 
-    typedef std::variant<std::vector<unsigned char>, std::vector<float>> ImageData;
+    typedef std::variant<std::vector<unsigned char>, std::vector<float>, std::vector<std::uint32_t>> ImageData;
 
     class Image {
 

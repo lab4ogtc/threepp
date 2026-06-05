@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <memory>
 
 #include "threepp/constants.hpp"
@@ -23,6 +24,8 @@ namespace threepp::metal {
         BlendFactor blendDstAlpha = BlendFactor::OneMinusSrcAlpha;
         std::uint16_t vertexLayoutBitmask = 0b0001;
         std::uint64_t colorPixelFormat = 80;// MTLPixelFormatBGRA8Unorm
+        std::uint64_t colorAttachmentCount = 1;
+        std::array<std::uint64_t, 8> colorPixelFormats{};
         std::uint64_t rasterSampleCount = 1;
 
         bool operator==(const PipelineKey& other) const;
