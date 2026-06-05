@@ -2,6 +2,17 @@
 
 using namespace threepp;
 
+namespace {
+
+    MTLPrimitiveType shadowPrimitiveTypeForObject(const Object3D& object) {
+        if (dynamic_cast<const LineSegments*>(&object)) return MTLPrimitiveTypeLine;
+        if (dynamic_cast<const Line*>(&object)) return MTLPrimitiveTypeLineStrip;
+        if (dynamic_cast<const Points*>(&object)) return MTLPrimitiveTypePoint;
+        return MTLPrimitiveTypeTriangle;
+    }
+
+}
+
 id<MTLTexture> MetalRenderer::Impl::getOrCreateShadowTexture(Light& light, LightShadow& shadow) {
     const auto width = static_cast<NSUInteger>(std::max(1.f, std::ceil(shadow.mapSize.x)));
     const auto height = static_cast<NSUInteger>(std::max(1.f, std::ceil(shadow.mapSize.y)));
@@ -36,19 +47,20 @@ bool MetalRenderer::Impl::shouldUpdateShadow(LightShadow& shadow) const {
 void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder, Scene& scene, Object3D& object, Camera& shadowCamera, const Frustum& frustum) {
     if (!object.visible) return;
 
-    if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
-        auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
+    if (isShadowMapRenderable(object)) {
+        auto* instancedMesh = dynamic_cast<InstancedMesh*>(&object);
         const bool hasRenderableInstances = !instancedMesh || instancedMesh->count() > 0;
 
         if (hasRenderableInstances && object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
-            auto* geometry = mesh->geometry().get();
+            auto geometryRef = object.geometry();
+            auto* geometry = geometryRef.get();
             auto* materials = object.as<ObjectWithMaterials>();
             if (geometry && materials) {
                 trackGeometry(*geometry);
                 auto* posAttr = getFloatAttribute(*geometry, "position");
                 if (posAttr) {
                     const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
-                    auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(mesh);
+                    auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(&object);
                     const bool useSkinning = bindSkinning(encoder, *geometry, skinnedMesh);
                     if (useInstancing && useSkinning) {
                         std::cerr << "MetalRenderer: skipping unsupported instanced skinned shadow caster " << object.id << "\n";
@@ -117,7 +129,11 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
                             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
-                            drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount, group);
+                            if (dynamic_cast<LineLoop*>(&object)) {
+                                drawLineLoopGeometry(encoder, *geometry, *posAttr, group);
+                            } else {
+                                drawGeometry(encoder, *geometry, *posAttr, shadowPrimitiveTypeForObject(object), instanceCount, group);
+                            }
                         });
                     }
                 }
@@ -133,19 +149,20 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
 void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> encoder, Scene& scene, Object3D& object, Camera& shadowCamera, const Frustum& frustum, const Vector3& lightPosition, float nearPlane, float farPlane) {
     if (!object.visible) return;
 
-    if (auto* mesh = dynamic_cast<Mesh*>(&object)) {
-        auto* instancedMesh = dynamic_cast<InstancedMesh*>(mesh);
+    if (isShadowMapRenderable(object)) {
+        auto* instancedMesh = dynamic_cast<InstancedMesh*>(&object);
         const bool hasRenderableInstances = !instancedMesh || instancedMesh->count() > 0;
 
         if (hasRenderableInstances && object.castShadow && (!object.frustumCulled || frustum.intersectsObject(object))) {
-            auto* geometry = mesh->geometry().get();
+            auto geometryRef = object.geometry();
+            auto* geometry = geometryRef.get();
             auto* materials = object.as<ObjectWithMaterials>();
             if (geometry && materials) {
                 trackGeometry(*geometry);
                 auto* posAttr = getFloatAttribute(*geometry, "position");
                 if (posAttr) {
                     const bool useInstancing = instancedMesh && instancedMesh->count() > 0;
-                    auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(mesh);
+                    auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(&object);
                     const bool useSkinning = bindSkinning(encoder, *geometry, skinnedMesh);
                     if (useInstancing && useSkinning) {
                         std::cerr << "MetalRenderer: skipping unsupported instanced skinned point shadow caster " << object.id << "\n";
@@ -215,7 +232,11 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
                             [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
 
-                            drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount, group);
+                            if (dynamic_cast<LineLoop*>(&object)) {
+                                drawLineLoopGeometry(encoder, *geometry, *posAttr, group);
+                            } else {
+                                drawGeometry(encoder, *geometry, *posAttr, shadowPrimitiveTypeForObject(object), instanceCount, group);
+                            }
                         });
                     }
                 }

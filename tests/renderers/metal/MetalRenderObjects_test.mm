@@ -351,6 +351,19 @@ TEST_CASE("Metal point uniforms expose 16-byte aligned sprite and fog fields") {
     REQUIRE(uniforms.fogParams[3] == Catch::Approx(1.f));
 }
 
+TEST_CASE("Metal shadow pass accepts the same object classes as GL") {
+
+    auto mesh = Mesh::create(BufferGeometry::create(), MeshBasicMaterial::create());
+    auto line = Line::create(BufferGeometry::create(), LineBasicMaterial::create());
+    auto points = Points::create(BufferGeometry::create(), PointsMaterial::create());
+    auto sprite = Sprite::create(SpriteMaterial::create());
+
+    CHECK(isShadowMapRenderable(*mesh));
+    CHECK(isShadowMapRenderable(*line));
+    CHECK(isShadowMapRenderable(*points));
+    CHECK_FALSE(isShadowMapRenderable(*sprite));
+}
+
 TEST_CASE("Metal transform uniforms expose morph fields at 16-byte aligned size") {
 
     STATIC_REQUIRE(alignof(TransformUniforms) == 16);

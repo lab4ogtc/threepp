@@ -5,4 +5,5 @@ add_example(NAME "spline_editor" LINK_IMGUI WEB)
 
 if (APPLE)
     add_example(NAME "catmull_room_curve3_metal")
+    add_example(NAME "cubic_bezier_curve_metal")
 endif ()

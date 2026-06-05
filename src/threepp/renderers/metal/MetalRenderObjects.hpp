@@ -584,6 +584,12 @@ namespace threepp {
         }
     }
 
+    inline bool isShadowMapRenderable(const Object3D& object) {
+        return dynamic_cast<const Mesh*>(&object) ||
+               dynamic_cast<const Line*>(&object) ||
+               dynamic_cast<const Points*>(&object);
+    }
+
     inline Material* materialForRenderOrder(Object3D& object) {
         auto material = object.material();
         return material ? material.get() : nullptr;
