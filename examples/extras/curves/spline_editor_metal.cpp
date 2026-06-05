@@ -1,12 +1,9 @@
-
-#include "../../external/imgui/imgui.h"
-
-
-#include <threepp/controls/OrbitControls.hpp>
-#include <threepp/controls/TransformControls.hpp>
-#include <threepp/extras/curves/CatmullRomCurve3.hpp>
-#include <threepp/extras/imgui/ImguiContext.hpp>
-#include <threepp/threepp.hpp>
+#include "threepp/controls/OrbitControls.hpp"
+#include "threepp/controls/TransformControls.hpp"
+#include "threepp/extras/curves/CatmullRomCurve3.hpp"
+#include "threepp/extras/imgui/ImguiContext.hpp"
+#include "threepp/renderers/Renderer.hpp"
+#include "threepp/threepp.hpp"
 
 #include <map>
 
@@ -14,21 +11,18 @@ using namespace threepp;
 
 int main() {
 
-    // Renderer & canvas
-    GlfwWindow canvas("Spline Editor", {{"aa", 4}});
-    GLRenderer renderer(canvas);
-    renderer.shadowMap().enabled = true;
+    GlfwWindow canvas("Spline Editor (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
+    auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->shadowMap().enabled = true;
+    renderer->autoClear = false;
 
-    // Scene
     auto scene = Scene::create();
     scene->background = Color().setHex(0xf0f0f0);
 
-    // Camera
     auto camera = PerspectiveCamera::create(70, canvas.aspect(), 1, 10000);
     camera->position.set(0, 250, 1000);
     scene->add(camera);
 
-    // Lights
     scene->add(AmbientLight::create(0xf0f0f0, 0.5f));
     auto light = SpotLight::create(0xffffff, 1.5f);
     light->position.set(0, 1500, 200);
@@ -42,7 +36,6 @@ int main() {
     light->shadow->mapSize.y = 1024;
     scene->add(light);
 
-    // Ground
     auto planeGeo = PlaneGeometry::create(2000, 2000);
     planeGeo->rotateX(-math::PI / 2);
     auto planeMat = ShadowMaterial::create();
@@ -52,14 +45,12 @@ int main() {
     plane->receiveShadow = true;
     scene->add(plane);
 
-    // Grid helper
     auto grid = GridHelper::create(2000, 100);
     grid->position.y = -199;
     grid->material()->opacity = 0.25;
     grid->material()->transparent = true;
     scene->add(grid);
 
-    // Spline points
     std::vector<Vector3> positions = {
             {289.768f, 452.515f, 56.1f},
             {-53.563f, 171.497f, -14.495f},
@@ -68,7 +59,6 @@ int main() {
 
     constexpr int ARC_SEGMENTS = 200;
 
-    // Spline meshes
     std::map<std::string, std::shared_ptr<Line>> splines;
 
     auto createSplineLine = [&](const std::string& type, const Color& color) {
@@ -90,10 +80,8 @@ int main() {
     auto centripetalCurve = createSplineLine("centripetal", Color::green);
     auto chordalCurve = createSplineLine("chordal", Color::blue);
 
-    // Helper objects (control points)
     auto boxGeo = BoxGeometry::create(20, 20, 20);
     std::vector<Object3D*> splineHelpers;
-
 
     auto createSplineHelper = [&](const Vector3& pos) {
         auto mat = MeshLambertMaterial::create({{"color", Color().randomize()}});
@@ -110,12 +98,10 @@ int main() {
         createSplineHelper(pos);
     }
 
-    // Orbit controls
     OrbitControls controls(*camera, canvas);
     controls.dampingFactor = 0.2f;
 
     auto updateSplines([&] {
-        // Update spline meshes whenever a control point moves
         auto updateSplineMesh = [&](const CatmullRomCurve3& curve, const std::shared_ptr<Line>& line) {
             auto posAttr = line->geometry()->getAttribute<float>("position");
             for (int i = 0; i < ARC_SEGMENTS; i++) {
@@ -127,7 +113,6 @@ int main() {
             posAttr->needsUpdate();
         };
 
-        // Copy helper positions to curve
         for (int i = 0; i < splineHelpers.size(); i++) {
             positions[i] = splineHelpers[i]->position;
         }
@@ -144,12 +129,10 @@ int main() {
         updateSplines();
     });
 
-
     LambdaEventListener changeListener([&](const Event& event) {
         controls.enabled = !std::any_cast<bool>(event.target);
     });
 
-    // Transform controls
     TransformControls transformControl(*camera, canvas);
     transformControl.addEventListener("change", eventListener);
     transformControl.addEventListener("dragging-changed", changeListener);
@@ -179,8 +162,7 @@ int main() {
 
     canvas.addMouseListener(mouseListener);
 
-
-    ImguiFunctionalContext ui(canvas, [&] {
+    ImguiFunctionalContext ui(canvas, *renderer, [&] {
         ImGui::SetNextWindowPos({0, 0}, 0, {0, 0});
         ImGui::SetNextWindowSize({0, 0}, 0);
         ImGui::Begin("Spline Editor");
@@ -217,7 +199,7 @@ int main() {
     canvas.setIOCapture(&capture);
 
     canvas.onWindowResize([&](WindowSize size) {
-        renderer.setSize(size);
+        renderer->setSize(size);
         camera->aspect = size.aspect();
         camera->updateProjectionMatrix();
     });
@@ -225,7 +207,8 @@ int main() {
     updateSplines();
     canvas.animate([&] {
         controls.update();
-        renderer.render(*scene, *camera);
+        renderer->clear();
+        renderer->render(*scene, *camera);
 
         ui.render();
     });
