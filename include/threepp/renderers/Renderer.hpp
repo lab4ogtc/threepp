@@ -4,6 +4,7 @@
 
 #include <exception>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <utility>
@@ -90,6 +91,19 @@ namespace threepp {
         [[nodiscard]] virtual RenderTarget* getRenderTarget() = 0;
 
         virtual void copyTextureToImage(Texture& texture) = 0;
+
+        /**
+         * 异步同步纹理数据到 CPU Image。
+         *
+         * 默认实现延迟调用同步 copyTextureToImage()，保持后端兼容；支持真正异步 GPU
+         * 读回的后端应覆写该方法，并在返回的 future 完成时保证 Texture::image()
+         * 已经包含读回数据。
+         */
+        virtual std::future<void> copyTextureToImageAsync(Texture& texture) {
+            return std::async(std::launch::deferred, [this, &texture] {
+                copyTextureToImage(texture);
+            });
+        }
 
         /**
          * 批量同步纹理数据到各自的 CPU Image。
@@ -179,6 +193,18 @@ namespace threepp {
                 }
                 throw;
             }
+        }
+
+        /**
+         * 异步批量同步纹理数据到 CPU Image。
+         *
+         * 默认实现延迟调用同步 copyTexturesToImages()。Metal 等后端可覆写为单个
+         * command buffer + completion handler，避免调用线程等待 GPU 完成。
+         */
+        virtual std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures) {
+            return std::async(std::launch::deferred, [this, textures] {
+                copyTexturesToImages(textures);
+            });
         }
 
         virtual void addPreRenderJob(const RenderJob& job) = 0;

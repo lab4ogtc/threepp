@@ -1234,6 +1234,17 @@ void MetalRenderer::Impl::releaseAllReadbackBuffers() {
     }
 }
 
+void MetalRenderer::Impl::releaseReadbackBuffers(const std::vector<TextureReadback>& readbacks) {
+    for (const auto& readback : readbacks) {
+        for (auto& entry : readbackBufferPool) {
+            if (entry.buffer == readback.readbackBuffer) {
+                entry.inUse = false;
+                break;
+            }
+        }
+    }
+}
+
 void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
     if (!target) return;
 
@@ -1422,17 +1433,15 @@ void MetalRenderer::Impl::copyTextureToImage(Texture& texture) {
 }
 
 void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& textures) {
-    struct TextureReadback {
-        Texture* texture;
-        id<MTLTexture> sourceTexture;
-        id<MTLBuffer> readbackBuffer;
-        NSUInteger sourceBytesPerRow;
-        NSUInteger sourceBytesPerImage;
-        NSUInteger sourceBytesPerPixel;
-        NSUInteger sourceDepth;
-        NSUInteger byteLength;
-    };
+    copyTexturesToImagesAsync(textures).get();
+}
 
+std::future<void> MetalRenderer::Impl::copyTextureToImageAsync(Texture& texture) {
+    std::vector<Texture*> textures{&texture};
+    return copyTexturesToImagesAsync(textures);
+}
+
+std::future<void> MetalRenderer::Impl::copyTexturesToImagesAsync(const std::vector<Texture*>& textures) {
     std::vector<TextureReadback> readbacks;
     readbacks.reserve(textures.size());
 
@@ -1462,11 +1471,15 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
             readbacks.push_back({texture, sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerImage, sourceBytesPerPixel, sourceDepth, byteLength});
         }
     } catch (...) {
-        releaseAllReadbackBuffers();
+        releaseReadbackBuffers(readbacks);
         throw;
     }
 
-    if (readbacks.empty()) return;
+    std::promise<void> readyPromise;
+    if (readbacks.empty()) {
+        readyPromise.set_value();
+        return readyPromise.get_future();
+    }
 
     id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
     const bool temporaryCommandBuffer = commandBuffer == nil;
@@ -1474,7 +1487,7 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
         commandBuffer = [commandQueue commandBuffer];
     }
     if (!commandBuffer) {
-        releaseAllReadbackBuffers();
+        releaseReadbackBuffers(readbacks);
         throw std::runtime_error("MetalRenderer::copyTextureToImage could not create a command buffer");
     }
 
@@ -1511,12 +1524,36 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
     }
     [blitEncoder endEncoding];
 
+    auto completionPromise = std::make_shared<std::promise<void>>();
+    auto completionFuture = completionPromise->get_future();
+    auto completionReadbacks = std::make_shared<std::vector<TextureReadback>>(std::move(readbacks));
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
+        try {
+            if (completedCommandBuffer.error) {
+                const char* message = [[completedCommandBuffer.error localizedDescription] UTF8String];
+                throw std::runtime_error(message ? message : "MetalRenderer::copyTextureToImageAsync command buffer failed");
+            }
+            for (const auto& readback : *completionReadbacks) {
+                readPixelsFromTextureReadback(*readback.texture,
+                                              readback.sourceTexture,
+                                              readback.readbackBuffer,
+                                              readback.sourceBytesPerRow,
+                                              readback.sourceBytesPerImage,
+                                              readback.sourceDepth,
+                                              readback.sourceBytesPerPixel);
+            }
+            releaseReadbackBuffers(*completionReadbacks);
+            completionPromise->set_value();
+        } catch (...) {
+            releaseReadbackBuffers(*completionReadbacks);
+            completionPromise->set_exception(std::current_exception());
+        }
+    }];
+
     if (!temporaryCommandBuffer && currentDrawable) {
         [commandBuffer presentDrawable:currentDrawable];
     }
     [commandBuffer commit];
-    [commandBuffer waitUntilCompleted];
-    releaseAllReadbackBuffers();
 
     if (!temporaryCommandBuffer) {
         currentCommandBuffer = nil;
@@ -1526,15 +1563,7 @@ void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& text
         currentCommandBufferExternallyAccessed = false;
     }
 
-    for (const auto& readback : readbacks) {
-        readPixelsFromTextureReadback(*readback.texture,
-                                      readback.sourceTexture,
-                                      readback.readbackBuffer,
-                                      readback.sourceBytesPerRow,
-                                      readback.sourceBytesPerImage,
-                                      readback.sourceDepth,
-                                      readback.sourceBytesPerPixel);
-    }
+    return completionFuture;
 }
 
 void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
@@ -3057,6 +3086,11 @@ void MetalRenderer::copyTextureToImage(Texture& texture) {
     pimpl_->copyTextureToImage(texture);
 }
 
+std::future<void> MetalRenderer::copyTextureToImageAsync(Texture& texture) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    return pimpl_->copyTextureToImageAsync(texture);
+}
+
 void MetalRenderer::copyTexturesToImages(const std::vector<Texture*>& textures) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->copyTexturesToImages(textures);
@@ -3086,6 +3120,11 @@ void MetalRenderer::readbackLidarBeamsAsPointCloudAsync(const std::array<Texture
                                                         std::function<void(const std::string& error)> onError) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->readbackLidarBeamsAsPointCloudAsync(packedDepthTextures, matrixWorldPerFace, beams, farPlane, std::move(onComplete), std::move(onError));
+}
+
+std::future<void> MetalRenderer::copyTexturesToImagesAsync(const std::vector<Texture*>& textures) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    return pimpl_->copyTexturesToImagesAsync(textures);
 }
 
 std::optional<void*> MetalRenderer::getMetalTexture(Texture& texture) const {

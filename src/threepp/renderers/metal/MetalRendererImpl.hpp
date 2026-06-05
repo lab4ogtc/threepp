@@ -19,6 +19,7 @@
 #include <array>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -78,6 +79,17 @@ namespace threepp {
             bool inUse = false;
         };
         std::vector<ReadbackBuffer> readbackBufferPool;
+
+        struct TextureReadback {
+            Texture* texture = nullptr;
+            id<MTLTexture> sourceTexture = nil;
+            id<MTLBuffer> readbackBuffer = nil;
+            NSUInteger sourceBytesPerRow = 0;
+            NSUInteger sourceBytesPerImage = 0;
+            NSUInteger sourceBytesPerPixel = 0;
+            NSUInteger sourceDepth = 0;
+            NSUInteger byteLength = 0;
+        };
 
         struct ConvertedSkinIndexBuffer {
             unsigned int lastVersion = std::numeric_limits<unsigned int>::max();
@@ -249,6 +261,8 @@ namespace threepp {
 
         void releaseAllReadbackBuffers();
 
+        void releaseReadbackBuffers(const std::vector<TextureReadback>& readbacks);
+
         void deallocateRenderTarget(RenderTarget* target);
 
         void clearDepthTextureToOne(id<MTLTexture> texture) const;
@@ -295,6 +309,10 @@ namespace threepp {
                                                  float farPlane,
                                                  std::function<void(const ReadbackResult& result)> onComplete,
                                                  std::function<void(const std::string& error)> onError);
+
+        std::future<void> copyTextureToImageAsync(Texture& texture);
+
+        std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures);
 
         void readPixelsFromTextureReadback(Texture& texture,
                                            id<MTLTexture> sourceTexture,

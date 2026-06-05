@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <span>
@@ -90,6 +91,8 @@ namespace threepp {
 
         void copyTextureToImage(Texture& texture) override;
 
+        std::future<void> copyTextureToImageAsync(Texture& texture) override;
+
         /**
          * 使用单个 Metal blit command encoder 批量读回纹理，并只等待一次 GPU 完成。
          *
@@ -127,6 +130,8 @@ namespace threepp {
                 float farPlane,
                 std::function<void(const ReadbackResult& result)> onComplete,
                 std::function<void(const std::string& error)> onError = nullptr);
+
+        std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures) override;
 
         [[nodiscard]] void* device() const;
 
