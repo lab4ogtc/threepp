@@ -34,6 +34,7 @@
 #include "threepp/objects/Points.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/objects/Sprite.hpp"
+#include "threepp/textures/CubeTexture.hpp"
 
 #include "threepp/utils/ImageUtils.hpp"
 
@@ -48,8 +49,60 @@
 #include "stb_image_write.h"
 #endif
 
+#include <algorithm>
+#include <bit>
+#include <stdexcept>
+
 
 using namespace threepp;
+
+namespace {
+
+    int maxMipmapLevel(unsigned int width, unsigned int height) {
+        const auto size = std::max(width, height);
+        return size == 0 ? 0 : static_cast<int>(std::bit_width(size)) - 1;
+    }
+
+    void validateRenderTargetSelection(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
+        if (activeCubeFace < 0 || activeMipmapLevel < 0 || activeLayer < 0) {
+            throw std::invalid_argument("GLRenderer::setRenderTarget requires non-negative face, mip level, and layer");
+        }
+
+        if (!renderTarget) {
+            if (activeCubeFace != 0 || activeMipmapLevel != 0 || activeLayer != 0) {
+                throw std::invalid_argument("GLRenderer::setRenderTarget(nullptr) requires zero face, mip level, and layer");
+            }
+            return;
+        }
+
+        const auto isCubeRenderTarget = dynamic_cast<CubeTexture*>(renderTarget->texture.get()) != nullptr;
+        if (isCubeRenderTarget) {
+            if (activeCubeFace >= 6) {
+                throw std::out_of_range("GLRenderer::setRenderTarget cube face must be in [0, 5]");
+            }
+            if (activeLayer != 0) {
+                throw std::invalid_argument("GLRenderer::setRenderTarget cube targets require activeLayer == 0");
+            }
+        } else {
+            if (activeCubeFace != 0) {
+                throw std::invalid_argument("GLRenderer::setRenderTarget non-cube targets require activeCubeFace == 0");
+            }
+            if (renderTarget->depth > 1) {
+                if (activeLayer >= static_cast<int>(renderTarget->depth)) {
+                    throw std::out_of_range("GLRenderer::setRenderTarget activeLayer exceeds render target depth");
+                }
+            } else if (activeLayer != 0) {
+                throw std::invalid_argument("GLRenderer::setRenderTarget 2D targets require activeLayer == 0");
+            }
+        }
+
+        const auto maxLevel = renderTarget->texture->generateMipmaps ? maxMipmapLevel(renderTarget->width, renderTarget->height) : 0;
+        if (activeMipmapLevel > maxLevel) {
+            throw std::out_of_range("GLRenderer::setRenderTarget activeMipmapLevel exceeds allocated render target mip levels");
+        }
+    }
+
+}// namespace
 
 
 struct GLRenderer::Impl {
@@ -88,6 +141,7 @@ struct GLRenderer::Impl {
 
     int _currentActiveCubeFace = 0;
     int _currentActiveMipmapLevel = 0;
+    int _currentActiveLayer = 0;
     GLRenderTarget* _currentRenderTarget = nullptr;
     std::optional<unsigned int> _currentMaterialId;
 
@@ -627,6 +681,7 @@ struct GLRenderer::Impl {
         const auto previousRenderTarget = _currentRenderTarget;
         const auto previousActiveCubeFace = _currentActiveCubeFace;
         const auto previousActiveMipmapLevel = _currentActiveMipmapLevel;
+        const auto previousActiveLayer = _currentActiveLayer;
         const auto previousRenderingPrePass = renderingPrePass;
         const auto previousShadowAutoUpdate = shadowMap.autoUpdate;
 
@@ -641,7 +696,7 @@ struct GLRenderer::Impl {
             try {
                 job.initiator->visible = false;
                 shadowMap.autoUpdate = false;
-                setRenderTarget(glRenderTarget, 0, 0);
+                setRenderTarget(glRenderTarget, 0, 0, 0);
                 state.depthBuffer.setMask(true);
 
                 if (!scope.autoClear) scope.clear();
@@ -649,7 +704,7 @@ struct GLRenderer::Impl {
             } catch (...) {
                 job.initiator->visible = previousVisible;
                 shadowMap.autoUpdate = previousShadowAutoUpdate;
-                setRenderTarget(previousRenderTarget, previousActiveCubeFace, previousActiveMipmapLevel);
+                setRenderTarget(previousRenderTarget, previousActiveCubeFace, previousActiveMipmapLevel, previousActiveLayer);
                 renderingPrePass = previousRenderingPrePass;
                 throw;
             }
@@ -658,7 +713,7 @@ struct GLRenderer::Impl {
         }
 
         shadowMap.autoUpdate = previousShadowAutoUpdate;
-        setRenderTarget(previousRenderTarget, previousActiveCubeFace, previousActiveMipmapLevel);
+        setRenderTarget(previousRenderTarget, previousActiveCubeFace, previousActiveMipmapLevel, previousActiveLayer);
         renderingPrePass = previousRenderingPrePass;
     }
 
@@ -1128,11 +1183,17 @@ struct GLRenderer::Impl {
                (isShaderMaterial && lights);
     }
 
-    void setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel) {
+    void setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
+
+        const auto renderTargetChanged = renderTarget != _currentRenderTarget;
+        const auto activeCubeFaceChanged = activeCubeFace != _currentActiveCubeFace;
+        const auto activeMipmapLevelChanged = activeMipmapLevel != _currentActiveMipmapLevel;
+        const auto activeLayerChanged = activeLayer != _currentActiveLayer;
 
         _currentRenderTarget = renderTarget;
         _currentActiveCubeFace = activeCubeFace;
         _currentActiveMipmapLevel = activeMipmapLevel;
+        _currentActiveLayer = activeLayer;
 
         if (renderTarget && !properties.renderTargetProperties.get(renderTarget)->glFramebuffer) {
 
@@ -1157,6 +1218,37 @@ struct GLRenderer::Impl {
         }
 
         const bool framebufferBound = state.bindFramebuffer(GL_FRAMEBUFFER, framebuffer) && framebuffer;
+        const auto framebufferAttachmentChanged = renderTarget && (renderTargetChanged || activeCubeFaceChanged || activeMipmapLevelChanged || activeLayerChanged);
+
+        if (framebufferAttachmentChanged) {
+            auto* texture = renderTarget->texture.get();
+            const auto glTexture = properties.textureProperties.get(texture)->glTexture;
+
+            if (dynamic_cast<CubeTexture*>(texture)) {
+                glFramebufferTexture2D(
+                        GL_FRAMEBUFFER,
+                        GL_COLOR_ATTACHMENT0,
+                        GL_TEXTURE_CUBE_MAP_POSITIVE_X + activeCubeFace,
+                        *glTexture,
+                        activeMipmapLevel);
+            } else if (renderTarget->depth > 1) {
+                textures.setupFrameBufferTextureLayer(
+                        *properties.renderTargetProperties.get(renderTarget)->glFramebuffer,
+                        renderTarget,
+                        *texture,
+                        GL_COLOR_ATTACHMENT0,
+                        GL_TEXTURE_2D_ARRAY,
+                        activeLayer,
+                        activeMipmapLevel);
+            } else {
+                glFramebufferTexture2D(
+                        GL_FRAMEBUFFER,
+                        GL_COLOR_ATTACHMENT0,
+                        GL_TEXTURE_2D,
+                        *glTexture,
+                        activeMipmapLevel);
+            }
+        }
 
         if (framebufferBound && gl::GLCapabilities::instance().drawBuffers) {
 
@@ -1547,12 +1639,13 @@ void GLRenderer::renderBufferDirect(Camera* camera, Scene* scene, BufferGeometry
     pimpl_->renderBufferDirect(camera, scene, geometry, material, object, group);
 }
 
-void GLRenderer::setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel) {
+void GLRenderer::setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
 
-    pimpl_->setRenderTarget(renderTarget, activeCubeFace, activeMipmapLevel);
+    validateRenderTargetSelection(renderTarget, activeCubeFace, activeMipmapLevel, activeLayer);
+    pimpl_->setRenderTarget(renderTarget, activeCubeFace, activeMipmapLevel, activeLayer);
 }
 
-void GLRenderer::setRenderTarget(RenderTarget* renderTarget) {
+void GLRenderer::setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
 
     auto* glRT = dynamic_cast<GLRenderTarget*>(renderTarget);
 
@@ -1560,7 +1653,8 @@ void GLRenderer::setRenderTarget(RenderTarget* renderTarget) {
         throw std::invalid_argument("GLRenderer only accepts GLRenderTarget");
     }
 
-    pimpl_->setRenderTarget(glRT, 0, 0);
+    validateRenderTargetSelection(glRT, activeCubeFace, activeMipmapLevel, activeLayer);
+    pimpl_->setRenderTarget(glRT, activeCubeFace, activeMipmapLevel, activeLayer);
 }
 
 [[nodiscard]] GLRenderTarget* GLRenderer::getRenderTarget() {
@@ -1611,6 +1705,11 @@ int GLRenderer::getActiveCubeFace() const {
 int GLRenderer::getActiveMipmapLevel() const {
 
     return pimpl_->_currentActiveMipmapLevel;
+}
+
+int GLRenderer::getActiveLayer() const {
+
+    return pimpl_->_currentActiveLayer;
 }
 
 std::optional<unsigned int> GLRenderer::getGlTextureId(Texture& texture) const {

@@ -44,13 +44,16 @@ void GLCubeMaps::get(Texture* texture) {
 
                 if (image.height > 0) {
 
-                    const auto& currentRenderTarget = renderer.getRenderTarget();
+                    auto* currentRenderTarget = renderer.getRenderTarget();
+                    const auto currentActiveCubeFace = renderer.getActiveCubeFace();
+                    const auto currentActiveMipmapLevel = renderer.getActiveMipmapLevel();
+                    const auto currentActiveLayer = renderer.getActiveLayer();
 
                     auto renderTarget = std::make_unique<GLCubeRenderTarget>(image.height / 2);
                     renderTarget->fromEquirectangularTexture(renderer, *texture);
                     cubemaps[texture] = std::move(renderTarget);
 
-                    renderer.setRenderTarget(currentRenderTarget);
+                    renderer.setRenderTarget(currentRenderTarget, currentActiveCubeFace, currentActiveMipmapLevel, currentActiveLayer);
 
                     //TODO
 

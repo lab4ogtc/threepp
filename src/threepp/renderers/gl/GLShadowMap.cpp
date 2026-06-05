@@ -255,6 +255,7 @@ struct GLShadowMap::Impl {
         auto currentRenderTarget = _renderer.getRenderTarget();
         auto activeCubeFace = _renderer.getActiveCubeFace();
         auto activeMipmapLevel = _renderer.getActiveMipmapLevel();
+        auto activeLayer = _renderer.getActiveLayer();
 
         auto& _state = _renderer.state();
 
@@ -373,7 +374,7 @@ struct GLShadowMap::Impl {
 
         scope->needsUpdate = false;
 
-        _renderer.setRenderTarget(currentRenderTarget, activeCubeFace, activeMipmapLevel);
+        _renderer.setRenderTarget(currentRenderTarget, activeCubeFace, activeMipmapLevel, activeLayer);
     }
 
 private:

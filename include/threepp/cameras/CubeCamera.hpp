@@ -72,33 +72,36 @@ namespace threepp {
             auto cameraPZ = this->children[4]->as<PerspectiveCamera>();
             auto cameraNZ = this->children[5]->as<PerspectiveCamera>();
 
-            const auto& currentRenderTarget = renderer.getRenderTarget();
+            auto* currentRenderTarget = renderer.getRenderTarget();
+            const auto currentActiveCubeFace = renderer.getActiveCubeFace();
+            const auto currentActiveMipmapLevel = renderer.getActiveMipmapLevel();
+            const auto currentActiveLayer = renderer.getActiveLayer();
 
             const auto generateMipmaps = renderTarget->texture->generateMipmaps;
 
             renderTarget->texture->generateMipmaps = false;
 
-            renderer.setRenderTarget(renderTarget, 0);
+            renderer.setRenderTarget(renderTarget, 0, 0, 0);
             renderer.render(scene, *cameraPX);
 
-            renderer.setRenderTarget(renderTarget, 1);
+            renderer.setRenderTarget(renderTarget, 1, 0, 0);
             renderer.render(scene, *cameraNX);
 
-            renderer.setRenderTarget(renderTarget, 2);
+            renderer.setRenderTarget(renderTarget, 2, 0, 0);
             renderer.render(scene, *cameraPY);
 
-            renderer.setRenderTarget(renderTarget, 3);
+            renderer.setRenderTarget(renderTarget, 3, 0, 0);
             renderer.render(scene, *cameraNY);
 
-            renderer.setRenderTarget(renderTarget, 4);
+            renderer.setRenderTarget(renderTarget, 4, 0, 0);
             renderer.render(scene, *cameraPZ);
 
             renderTarget->texture->generateMipmaps = generateMipmaps;
 
-            renderer.setRenderTarget(renderTarget, 5);
+            renderer.setRenderTarget(renderTarget, 5, 0, 0);
             renderer.render(scene, *cameraNZ);
 
-            renderer.setRenderTarget(currentRenderTarget);
+            renderer.setRenderTarget(currentRenderTarget, currentActiveCubeFace, currentActiveMipmapLevel, currentActiveLayer);
         }
 
         static std::shared_ptr<CubeCamera> create(float near, float far, GLRenderTarget& renderTarget) {

@@ -95,6 +95,12 @@ namespace {
                 case 0x8dd3:// UNSIGNED_INT_SAMPLER_3D
                     return [&](const UniformValue& value, GLTextures* textures) { setValueT3D1(value, textures); };
 
+                case 0x8dc1:// SAMPLER_2D_ARRAY
+                case 0x8dcf:// INT_SAMPLER_2D_ARRAY
+                case 0x8dd7:// UNSIGNED_INT_SAMPLER_2D_ARRAY
+                case 0x8dc4:// SAMPLER_2D_ARRAY_SHADOW
+                    return [&](const UniformValue& value, GLTextures* textures) { setValueT2DArray(value, textures); };
+
                 case 0x8b60:// SAMPLER_CUBE
                 case 0x8dcc:// INT_SAMPLER_CUBE
                 case 0x8dd4:// UNSIGNED_INT_SAMPLER_CUBE
@@ -127,6 +133,13 @@ namespace {
             glUniform1i(addr, unit);
             auto tex = std::get<Texture*>(value);
             textures->setTexture3D(*tex, unit);
+        }
+
+        void setValueT2DArray(const UniformValue& value, GLTextures* textures) const {
+            const auto unit = textures->allocateTextureUnit();
+            glUniform1i(addr, unit);
+            auto tex = std::get<Texture*>(value);
+            textures->setTexture2DArray(*tex, unit);
         }
 
         void setValueT6(const UniformValue& value, GLTextures* textures) const {
@@ -359,6 +372,22 @@ namespace {
                             auto value = data[i];
                             if (!value) continue;
                             textures->setTexture2D(*data[i], units[i]);
+                        }
+                    };
+                case 0x8dc1:// SAMPLER_2D_ARRAY
+                case 0x8dcf:// INT_SAMPLER_2D_ARRAY
+                case 0x8dd7:// UNSIGNED_INT_SAMPLER_2D_ARRAY
+                case 0x8dc4:// SAMPLER_2D_ARRAY_SHADOW
+                    return [&](const UniformValue& value, GLTextures* textures) {
+                        auto& data = std::get<std::vector<Texture*>>(value);
+                        const auto n = data.size();
+                        auto units = allocTexUnits(*textures, n);
+
+                        glUniform1iv(addr, static_cast<int>(n), units.data());
+
+                        for (unsigned i = 0; i != n; ++i) {
+                            if (!data[i]) continue;
+                            textures->setTexture2DArray(*data[i], units[i]);
                         }
                     };
                 default:

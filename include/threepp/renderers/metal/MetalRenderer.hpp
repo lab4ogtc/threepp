@@ -53,7 +53,9 @@ namespace threepp {
 
         void setScissorTest(bool boolean) override;
 
-        void setRenderTarget(RenderTarget* renderTarget) override;
+        using Renderer::setRenderTarget;
+
+        void setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) override;
 
         [[nodiscard]] RenderTarget* getRenderTarget() override;
 

@@ -4,6 +4,7 @@
 #include "threepp/renderers/gl/GLCapabilities.hpp"
 #include "threepp/renderers/gl/GLUtils.hpp"
 
+#include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/DataTexture3D.hpp"
 
 #ifdef __EMSCRIPTEN__
@@ -111,7 +112,13 @@ void gl::GLTextures::setTextureParameters(GLuint textureType, Texture& texture) 
 
     if (textureType == GL_TEXTURE_3D || textureType == GL_TEXTURE_2D_ARRAY) {
 
-        glTexParameteri(textureType, GL_TEXTURE_WRAP_R, wrappingToGL.at(dynamic_cast<DataTexture3D*>(&texture)->wrapR));
+        const auto wrapR = [textureType, &texture] {
+            if (auto* dataTexture3D = dynamic_cast<DataTexture3D*>(&texture)) {
+                return dataTexture3D->wrapR;
+            }
+            return textureType == GL_TEXTURE_2D_ARRAY ? texture.wrapT : TextureWrapping::ClampToEdge;
+        }();
+        glTexParameteri(textureType, GL_TEXTURE_WRAP_R, wrappingToGL.at(wrapR));
     }
 
     glTexParameteri(textureType, GL_TEXTURE_MAG_FILTER, filterToGL[texture.magFilter]);
@@ -425,6 +432,12 @@ void gl::GLTextures::setupFrameBufferTexture(
 
         state->texImage3D(textureTarget, 0, glInternalFormat, renderTarget->width, renderTarget->height, renderTarget->depth, glFormat, glType, nullptr);
 
+    } else if (textureTarget == GL_TEXTURE_CUBE_MAP) {
+
+        for (int i = 0; i < 6; ++i) {
+            state->texImage2D(GL_TEXTURE_CUBE_MAP_POSITIVE_X + i, 0, glInternalFormat, renderTarget->width, renderTarget->height, glFormat, glType, nullptr);
+        }
+
     } else {
 
         state->texImage2D(textureTarget, 0, glInternalFormat, renderTarget->width, renderTarget->height, glFormat, glType, nullptr);
@@ -432,13 +445,30 @@ void gl::GLTextures::setupFrameBufferTexture(
 
     state->bindFramebuffer(GL_FRAMEBUFFER, framebuffer);
 
-    if (textureTarget == GL_TEXTURE_3D || textureTarget == GL_TEXTURE_2D_ARRAY) {
+    if (textureTarget == GL_TEXTURE_3D) {
         glFramebufferTexture(GL_FRAMEBUFFER, attachment, *properties->textureProperties.get(&texture)->glTexture, 0);
+    } else if (textureTarget == GL_TEXTURE_2D_ARRAY) {
+        glFramebufferTextureLayer(GL_FRAMEBUFFER, attachment, *properties->textureProperties.get(&texture)->glTexture, 0, 0);
+    } else if (textureTarget == GL_TEXTURE_CUBE_MAP) {
+        glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, GL_TEXTURE_CUBE_MAP_POSITIVE_X, *properties->textureProperties.get(&texture)->glTexture, 0);
     } else {
         glFramebufferTexture2D(GL_FRAMEBUFFER, attachment, textureTarget, *properties->textureProperties.get(&texture)->glTexture, 0);
     }
 
     state->bindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+void gl::GLTextures::setupFrameBufferTextureLayer(
+        unsigned int framebuffer,
+        GLRenderTarget*,
+        Texture& texture,
+        GLuint attachment,
+        GLuint,
+        int layer,
+        int level) {
+
+    state->bindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, attachment, *properties->textureProperties.get(&texture)->glTexture, level, layer);
 }
 
 void gl::GLTextures::setupRenderBufferStorage(unsigned int renderbuffer, GLRenderTarget* renderTarget) {
@@ -568,7 +598,9 @@ void gl::GLTextures::setupRenderTarget(GLRenderTarget* renderTarget) {
 
     // Setup color buffer
 
-    auto glTextureType = (renderTarget->depth > 1) ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    auto glTextureType = dynamic_cast<CubeTexture*>(texture.get()) ? GL_TEXTURE_CUBE_MAP
+                                                                   : (renderTarget->depth > 1) ? GL_TEXTURE_2D_ARRAY
+                                                                                               : GL_TEXTURE_2D;
 
     state->bindTexture(glTextureType, textureProperties->glTexture);
     setTextureParameters(glTextureType, *texture);
@@ -596,7 +628,9 @@ void gl::GLTextures::updateRenderTargetMipmap(GLRenderTarget* renderTarget) {
 
     if (textureNeedsGenerateMipmaps(*texture)) {
 
-        const auto target = (renderTarget->depth > 1) ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+        const auto target = dynamic_cast<CubeTexture*>(texture.get()) ? GL_TEXTURE_CUBE_MAP
+                                                                      : (renderTarget->depth > 1) ? GL_TEXTURE_2D_ARRAY
+                                                                                                  : GL_TEXTURE_2D;
         const auto glTexture = properties->textureProperties.get(texture.get())->glTexture;
 
         state->bindTexture(target, *glTexture);

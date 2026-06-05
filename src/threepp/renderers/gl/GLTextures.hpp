@@ -50,6 +50,8 @@ namespace threepp::gl {
         // Setup storage for target texture and bind it to correct framebuffer
         void setupFrameBufferTexture(unsigned int framebuffer, GLRenderTarget* renderTarget, Texture& texture, unsigned int attachment, unsigned int textureTarget);
 
+        void setupFrameBufferTextureLayer(unsigned int framebuffer, GLRenderTarget* renderTarget, Texture& texture, unsigned int attachment, unsigned int textureTarget, int layer, int level);
+
         void setupRenderBufferStorage(unsigned int renderbuffer, GLRenderTarget* renderTarget);
 
         void setupDepthTexture(unsigned int framebuffer, GLRenderTarget* renderTarget);

@@ -46,7 +46,9 @@ namespace {
 
         void setScissorTest(bool) override {}
 
-        void setRenderTarget(RenderTarget*) override {}
+        using Renderer::setRenderTarget;
+
+        void setRenderTarget(RenderTarget*, int, int, int) override {}
 
         [[nodiscard]] RenderTarget* getRenderTarget() override {
             return nullptr;

@@ -146,11 +146,15 @@ namespace threepp {
 
         [[nodiscard]] int getActiveMipmapLevel() const;
 
+        [[nodiscard]] int getActiveLayer() const;
+
         [[nodiscard]] GLRenderTarget* getRenderTarget() override;
 
-        void setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace = 0, int activeMipmapLevel = 0);
+        using Renderer::setRenderTarget;
 
-        void setRenderTarget(RenderTarget* renderTarget) override;
+        void setRenderTarget(GLRenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer);
+
+        void setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) override;
 
         void setRenderTarget(std::nullptr_t) { setRenderTarget(static_cast<RenderTarget*>(nullptr)); }
 

@@ -17,6 +17,7 @@
 #import <dispatch/dispatch.h>
 
 #include <chrono>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -88,7 +89,37 @@ namespace threepp {
             id<MTLTexture> depthTexture = nil;
             NSUInteger width = 0;
             NSUInteger height = 0;
+            NSUInteger depth = 1;
             MTLPixelFormat colorPixelFormat = MTLPixelFormatInvalid;
+            MTLTextureType colorTextureType = MTLTextureType2D;
+            bool mipmapped = false;
+        };
+
+        struct RenderTargetClearKey {
+            RenderTarget* target = nullptr;
+            int activeCubeFace = 0;
+            int activeMipmapLevel = 0;
+            int activeLayer = 0;
+
+            bool operator==(const RenderTargetClearKey& other) const {
+                return target == other.target &&
+                       activeCubeFace == other.activeCubeFace &&
+                       activeMipmapLevel == other.activeMipmapLevel &&
+                       activeLayer == other.activeLayer;
+            }
+        };
+
+        struct RenderTargetClearKeyHash {
+            std::size_t operator()(const RenderTargetClearKey& key) const {
+                auto combine = [](std::size_t seed, std::size_t value) {
+                    return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
+                };
+                auto value = std::hash<RenderTarget*>{}(key.target);
+                value = combine(value, std::hash<int>{}(key.activeCubeFace));
+                value = combine(value, std::hash<int>{}(key.activeMipmapLevel));
+                value = combine(value, std::hash<int>{}(key.activeLayer));
+                return value;
+            }
         };
 
         struct OnRenderTargetDispose: EventListener {
@@ -122,7 +153,7 @@ namespace threepp {
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool renderingPrePass = false;
-        std::unordered_set<RenderTarget*> clearedTargetsInFrame;
+        std::unordered_set<RenderTargetClearKey, RenderTargetClearKeyHash> clearedTargetsInFrame;
         bool profileRawShader = false;
         bool rawShaderProfileEnvChecked = false;
         std::vector<RenderJob> preRenderJobs;
@@ -154,6 +185,9 @@ namespace threepp {
         Vector4 lastScissor;
 
         RenderTarget* renderTarget = nullptr;
+        int activeCubeFace = 0;
+        int activeMipmapLevel = 0;
+        int activeLayer = 0;
         explicit Impl(MetalRenderer& r, Window& w);
 
         ~Impl();
@@ -184,7 +218,7 @@ namespace threepp {
 
         id<MTLTexture> createSolidCubeTexture(std::array<unsigned char, 4> rgba) const;
 
-        id<MTLTexture> createDepthTexture(NSUInteger width, NSUInteger height) const;
+        id<MTLTexture> createDepthTexture(NSUInteger width, NSUInteger height, bool mipmapped = false) const;
 
         id<MTLTexture> createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const;
 

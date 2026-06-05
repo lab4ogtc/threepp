@@ -2,6 +2,7 @@
 
 #include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/renderers/shaders/ShaderCompiler.hpp"
+#include "threepp/textures/CubeTexture.hpp"
 
 #ifdef THREEPP_HAS_SLANG
 #include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
@@ -315,6 +316,78 @@ fragment FragmentOut scissorClearFragment(constant ClearUniforms& uniforms [[buf
     void invokeOnAfterRender(Object3D& obj, MetalRenderer& renderer, Scene& scene, Camera& camera, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
         if (obj.onAfterRender) {
             invokeRenderCallback(obj.onAfterRender.value(), renderer, scene, camera, geometry, material, group);
+        }
+    }
+
+    int maxMipmapLevel(unsigned int width, unsigned int height) {
+        auto size = std::max(width, height);
+        int level = 0;
+        while (size > 1) {
+            size /= 2;
+            ++level;
+        }
+        return level;
+    }
+
+    void validateRenderTargetSelection(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
+        if (activeCubeFace < 0 || activeMipmapLevel < 0 || activeLayer < 0) {
+            throw std::invalid_argument("MetalRenderer::setRenderTarget requires non-negative face, mip level, and layer");
+        }
+
+        if (!renderTarget) {
+            if (activeCubeFace != 0 || activeMipmapLevel != 0 || activeLayer != 0) {
+                throw std::invalid_argument("MetalRenderer::setRenderTarget(nullptr) requires zero face, mip level, and layer");
+            }
+            return;
+        }
+
+        const auto isCubeRenderTarget = dynamic_cast<CubeTexture*>(renderTarget->texture.get()) != nullptr;
+        if (isCubeRenderTarget) {
+            if (activeCubeFace >= 6) {
+                throw std::out_of_range("MetalRenderer::setRenderTarget cube face must be in [0, 5]");
+            }
+            if (activeLayer != 0) {
+                throw std::invalid_argument("MetalRenderer::setRenderTarget cube targets require activeLayer == 0");
+            }
+        } else {
+            if (activeCubeFace != 0) {
+                throw std::invalid_argument("MetalRenderer::setRenderTarget non-cube targets require activeCubeFace == 0");
+            }
+            if (renderTarget->depth > 1) {
+                if (activeLayer >= static_cast<int>(renderTarget->depth)) {
+                    throw std::out_of_range("MetalRenderer::setRenderTarget activeLayer exceeds render target depth");
+                }
+            } else if (activeLayer != 0) {
+                throw std::invalid_argument("MetalRenderer::setRenderTarget 2D targets require activeLayer == 0");
+            }
+        }
+
+        const auto maxLevel = renderTarget->texture->generateMipmaps ? maxMipmapLevel(renderTarget->width, renderTarget->height) : 0;
+        if (activeMipmapLevel > maxLevel) {
+            throw std::out_of_range("MetalRenderer::setRenderTarget activeMipmapLevel exceeds allocated render target mip levels");
+        }
+    }
+
+    void updateTextureImageMetadata(Texture& texture, unsigned int width, unsigned int height, unsigned int depth, bool cubeTexture) {
+        auto& images = texture.images();
+        if (cubeTexture) {
+            while (images.size() < 6) {
+                images.emplace_back(Image({}, width, height));
+            }
+            for (auto& image : images) {
+                image.width = width;
+                image.height = height;
+                image.depth = 0;
+            }
+            return;
+        }
+
+        if (images.empty()) {
+            images.emplace_back(Image({}, width, height, depth));
+        } else {
+            images.front().width = width;
+            images.front().height = height;
+            images.front().depth = depth;
         }
     }
 
@@ -648,21 +721,42 @@ id<MTLTexture> MetalRenderer::Impl::createSolidCubeTexture(std::array<unsigned c
     return texture;
 }
 
-id<MTLTexture> MetalRenderer::Impl::createDepthTexture(NSUInteger width, NSUInteger height) const {
+id<MTLTexture> MetalRenderer::Impl::createDepthTexture(NSUInteger width, NSUInteger height, bool mipmapped) const {
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
                                                                                     width:std::max<NSUInteger>(width, 1)
                                                                                    height:std::max<NSUInteger>(height, 1)
-                                                                                mipmapped:NO];
+                                                                                mipmapped:mipmapped ? YES : NO];
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModePrivate;
     return [device newTextureWithDescriptor:desc];
 }
 
 id<MTLTexture> MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget& target, MTLPixelFormat pixelFormat) const {
-    MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
-                                                                                    width:std::max<NSUInteger>(target.width, 1)
-                                                                                   height:std::max<NSUInteger>(target.height, 1)
-                                                                                mipmapped:target.texture->generateMipmaps ? YES : NO];
+    const auto width = std::max<NSUInteger>(target.width, 1);
+    const auto height = std::max<NSUInteger>(target.height, 1);
+    const auto mipmapped = target.texture->generateMipmaps ? YES : NO;
+    MTLTextureDescriptor* desc = nil;
+
+    if (dynamic_cast<CubeTexture*>(target.texture.get())) {
+        if (width != height) {
+            throw std::runtime_error("Metal cube RenderTarget requires square dimensions");
+        }
+        desc = [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:pixelFormat
+                                                                     size:width
+                                                                mipmapped:mipmapped];
+    } else if (target.depth > 1) {
+        desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                  width:width
+                                                                 height:height
+                                                              mipmapped:mipmapped];
+        desc.textureType = MTLTextureType2DArray;
+        desc.arrayLength = static_cast<NSUInteger>(target.depth);
+    } else {
+        desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
+                                                                  width:width
+                                                                 height:height
+                                                              mipmapped:mipmapped];
+    }
     desc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
     desc.storageMode = MTLStorageModePrivate;
     return [device newTextureWithDescriptor:desc];
@@ -673,26 +767,31 @@ id<MTLTexture> MetalRenderer::Impl::createRenderTargetDepthTexture(RenderTarget&
         (target.depthTexture->format != Format::Depth || target.depthTexture->type != Type::Float)) {
         throw std::runtime_error("Metal RenderTarget depthTexture requires Format::Depth and Type::Float");
     }
-    return createDepthTexture(target.width, target.height);
+    return createDepthTexture(target.width, target.height, target.texture && target.texture->generateMipmaps);
 }
 
 MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreateRenderTargetResources(RenderTarget& target) {
     if (!target.texture) {
         throw std::runtime_error("Metal RenderTarget requires a color texture");
     }
-    if (target.depth != 1) {
-        throw std::runtime_error("Metal RenderTarget currently supports only standard 2D targets");
-    }
 
     const auto width = static_cast<NSUInteger>(std::max(target.width, 1u));
     const auto height = static_cast<NSUInteger>(std::max(target.height, 1u));
+    const auto depth = static_cast<NSUInteger>(std::max(target.depth, 1u));
     const auto colorPixelFormat = toRenderTargetColorPixelFormat(*target.texture);
+    const auto colorTextureType = dynamic_cast<CubeTexture*>(target.texture.get()) ? MTLTextureTypeCube
+                                                                                  : (target.depth > 1) ? MTLTextureType2DArray
+                                                                                                       : MTLTextureType2D;
+    const auto mipmapped = target.texture->generateMipmaps;
 
     auto it = renderTargetResources.find(&target);
     if (it != renderTargetResources.end() &&
         it->second.width == width &&
         it->second.height == height &&
+        it->second.depth == depth &&
         it->second.colorPixelFormat == colorPixelFormat &&
+        it->second.colorTextureType == colorTextureType &&
+        it->second.mipmapped == mipmapped &&
         it->second.colorTexture &&
         it->second.depthTexture) {
         return it->second;
@@ -704,15 +803,11 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
         throw std::runtime_error("Failed to create Metal RenderTarget resources");
     }
 
-    target.texture->image().width = target.width;
-    target.texture->image().height = target.height;
-    target.texture->image().depth = target.depth;
+    updateTextureImageMetadata(*target.texture, target.width, target.height, target.depth, dynamic_cast<CubeTexture*>(target.texture.get()) != nullptr);
     textureManager->registerExternalTexture(*target.texture, (__bridge void*) colorTexture);
 
     if (target.depthTexture) {
-        target.depthTexture->image().width = target.width;
-        target.depthTexture->image().height = target.height;
-        target.depthTexture->image().depth = target.depth;
+        updateTextureImageMetadata(*target.depthTexture, target.width, target.height, 1, false);
         textureManager->registerExternalTexture(*target.depthTexture, (__bridge void*) depthTexture);
     }
 
@@ -725,7 +820,10 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     resources.depthTexture = depthTexture;
     resources.width = width;
     resources.height = height;
+    resources.depth = depth;
     resources.colorPixelFormat = colorPixelFormat;
+    resources.colorTextureType = colorTextureType;
+    resources.mipmapped = mipmapped;
     return resources;
 }
 
@@ -776,7 +874,13 @@ void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
         textureManager->deallocateTexture(target->depthTexture.get());
     }
     renderTargetResources.erase(target);
-    clearedTargetsInFrame.erase(target);
+    for (auto it = clearedTargetsInFrame.begin(); it != clearedTargetsInFrame.end();) {
+        if (it->target == target) {
+            it = clearedTargetsInFrame.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void MetalRenderer::Impl::clearDepthTextureToOne(id<MTLTexture> texture) const {
@@ -1449,6 +1553,9 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
     preRenderJobs.clear();
 
     const auto previousRenderTarget = renderTarget;
+    const auto previousActiveCubeFace = activeCubeFace;
+    const auto previousActiveMipmapLevel = activeMipmapLevel;
+    const auto previousActiveLayer = activeLayer;
     const auto previousClearRequested = clearRequested;
     const auto previousClearColorFlag = clearColorFlag;
     const auto previousClearDepthFlag = clearDepthFlag;
@@ -1465,6 +1572,9 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
         const auto restore = [&] {
             job.initiator->visible = previousVisible;
             renderTarget = previousRenderTarget;
+            activeCubeFace = previousActiveCubeFace;
+            activeMipmapLevel = previousActiveMipmapLevel;
+            activeLayer = previousActiveLayer;
             clearRequested = previousClearRequested;
             clearColorFlag = previousClearColorFlag;
             clearDepthFlag = previousClearDepthFlag;
@@ -1474,6 +1584,9 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
 
         job.initiator->visible = false;
         renderTarget = job.renderTarget;
+        activeCubeFace = 0;
+        activeMipmapLevel = 0;
+        activeLayer = 0;
         clearRequested = true;
         clearColorFlag = true;
         clearDepthFlag = true;
@@ -1575,11 +1688,30 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     const auto shouldClear = autoClear || clearRequested;
     const auto activeScissorTest = renderTarget ? renderTarget->scissorTest : scissorTest;
-    const auto isFirstRender = !clearedTargetsInFrame.count(renderTarget);
+    auto* cubeRenderTargetTexture = renderTarget ? dynamic_cast<CubeTexture*>(renderTarget->texture.get()) : nullptr;
+    const auto isArrayRenderTarget = renderTarget && !cubeRenderTargetTexture && renderTarget->depth > 1;
+    const RenderTargetClearKey clearKey{
+            renderTarget,
+            cubeRenderTargetTexture ? activeCubeFace : 0,
+            renderTarget ? activeMipmapLevel : 0,
+            isArrayRenderTarget ? activeLayer : 0};
+    const auto isFirstRender = !clearedTargetsInFrame.count(clearKey);
     const auto canUseMetalClear = shouldClear && !activeScissorTest && isFirstRender;
 
     MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
     passDesc.colorAttachments[0].texture = colorTexture;
+    if (renderTarget) {
+        if (static_cast<NSUInteger>(activeMipmapLevel) >= colorTexture.mipmapLevelCount ||
+            (passDepthTexture && static_cast<NSUInteger>(activeMipmapLevel) >= passDepthTexture.mipmapLevelCount)) {
+            throw std::out_of_range("MetalRenderer::render activeMipmapLevel exceeds render target attachment mip levels");
+        }
+        passDesc.colorAttachments[0].level = static_cast<NSUInteger>(activeMipmapLevel);
+        if (cubeRenderTargetTexture) {
+            passDesc.colorAttachments[0].slice = static_cast<NSUInteger>(activeCubeFace);
+        } else if (isArrayRenderTarget) {
+            passDesc.colorAttachments[0].slice = static_cast<NSUInteger>(activeLayer);
+        }
+    }
     passDesc.colorAttachments[0].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
     passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
     if (!renderTarget && activeRenderSampleCount > 1) {
@@ -1590,6 +1722,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     }
 
     passDesc.depthAttachment.texture = passDepthTexture;
+    if (renderTarget) {
+        passDesc.depthAttachment.level = static_cast<NSUInteger>(activeMipmapLevel);
+    }
     passDesc.depthAttachment.loadAction = canUseMetalClear && clearDepthFlag ? MTLLoadActionClear : MTLLoadActionLoad;
     passDesc.depthAttachment.clearDepth = 1.0;
     passDesc.depthAttachment.storeAction = MTLStoreActionStore;
@@ -1900,7 +2035,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     lastScissor = scissor;
     lastRenderTime = std::chrono::steady_clock::now();
-    clearedTargetsInFrame.insert(renderTarget);
+    clearedTargetsInFrame.insert(clearKey);
 
     if (autoClear && !renderTarget) {
         if (!lastFrameWasExternallyAccessed) {
@@ -1992,9 +2127,13 @@ void MetalRenderer::setScissorTest(bool boolean) {
     pimpl_->scissorTest = boolean;
 }
 
-void MetalRenderer::setRenderTarget(RenderTarget* renderTarget) {
+void MetalRenderer::setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    validateRenderTargetSelection(renderTarget, activeCubeFace, activeMipmapLevel, activeLayer);
     pimpl_->renderTarget = renderTarget;
+    pimpl_->activeCubeFace = activeCubeFace;
+    pimpl_->activeMipmapLevel = activeMipmapLevel;
+    pimpl_->activeLayer = activeLayer;
 }
 
 RenderTarget* MetalRenderer::getRenderTarget() {

@@ -115,16 +115,19 @@ namespace threepp {
 
         void clear(GLRenderer& renderer, bool color, bool depth, bool, bool stencil) {
 
-            const auto& currentRenderTarget = renderer.getRenderTarget();
+            auto* currentRenderTarget = renderer.getRenderTarget();
+            const auto currentActiveCubeFace = renderer.getActiveCubeFace();
+            const auto currentActiveMipmapLevel = renderer.getActiveMipmapLevel();
+            const auto currentActiveLayer = renderer.getActiveLayer();
 
             for (int i = 0; i < 6; i++) {
 
-                renderer.setRenderTarget(this, i);
+                renderer.setRenderTarget(this, i, 0, 0);
 
                 renderer.clear(color, depth, stencil);
             }
 
-            renderer.setRenderTarget(currentRenderTarget);
+            renderer.setRenderTarget(currentRenderTarget, currentActiveCubeFace, currentActiveMipmapLevel, currentActiveLayer);
         }
     };
 

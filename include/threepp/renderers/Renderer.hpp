@@ -61,7 +61,11 @@ namespace threepp {
 
         virtual void setScissorTest(bool enable) = 0;
 
-        virtual void setRenderTarget(RenderTarget* renderTarget) = 0;
+        virtual void setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) = 0;
+
+        void setRenderTarget(RenderTarget* renderTarget) {
+            setRenderTarget(renderTarget, 0, 0, 0);
+        }
 
         [[nodiscard]] virtual RenderTarget* getRenderTarget() = 0;
 
