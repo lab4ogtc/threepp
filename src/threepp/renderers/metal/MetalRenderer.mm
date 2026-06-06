@@ -3309,6 +3309,17 @@ std::future<PixelReadbackBuffer> MetalRenderer::readRenderTargetPixelsAsync(
     return pimpl_->readRenderTargetPixelsAsync(request);
 }
 
+MaterialPrewarmStatus MetalRenderer::prewarmMaterial(RawShaderMaterial& material) {
+    MaterialPrewarmRequest request;
+    request.material = &material;
+    return prewarmMaterial(request);
+}
+
+MaterialPrewarmStatus MetalRenderer::prewarmMaterial(const MaterialPrewarmRequest& request) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    return pimpl_->prewarmMaterial(request);
+}
+
 void MetalRenderer::copyTexturesToImages(const std::vector<Texture*>& textures) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     pimpl_->copyTexturesToImages(textures);

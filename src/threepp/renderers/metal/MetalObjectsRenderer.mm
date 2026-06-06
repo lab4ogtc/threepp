@@ -849,6 +849,87 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
 }
 
+MaterialPrewarmStatus MetalRenderer::Impl::prewarmMaterial(const MaterialPrewarmRequest& request) {
+    auto* rawMaterial = request.material;
+    if (!rawMaterial || !rawMaterial->visible) {
+        return MaterialPrewarmStatus::Ready;
+    }
+    if (rawMaterial->shaderLanguage != ShaderLanguage::SLANG) {
+        return MaterialPrewarmStatus::Ready;
+    }
+    if (!shaderCompiler) {
+        warnSlangCompilerUnavailableOnce();
+        return MaterialPrewarmStatus::Failed;
+    }
+    if (!dynamicShaderCache || !pipelineCache) {
+        return MaterialPrewarmStatus::Failed;
+    }
+
+    CompileResult vertexCompile;
+    CompileResult fragmentCompile;
+    {
+        RawShaderProfileScope profileCompile{"prewarm slang compile", profileRawShader};
+        vertexCompile = dynamicShaderCache->compile(*shaderCompiler, rawMaterial->vertexShader, ShaderStage::Vertex, TargetLanguage::MSL);
+        fragmentCompile = dynamicShaderCache->compile(*shaderCompiler, rawMaterial->fragmentShader, ShaderStage::Fragment, TargetLanguage::MSL);
+    }
+    if (!vertexCompile.success) {
+        std::cerr << "MetalRenderer: Slang vertex shader prewarm failed:\n"
+                  << vertexCompile.diagnostics << "\n";
+        return MaterialPrewarmStatus::Failed;
+    }
+    if (!fragmentCompile.success) {
+        std::cerr << "MetalRenderer: Slang fragment shader prewarm failed:\n"
+                  << fragmentCompile.diagnostics << "\n";
+        return MaterialPrewarmStatus::Failed;
+    }
+
+    id<MTLFunction> vertexFunction = dynamicShaderCache->getFunction(vertexCompile.code, @"vertexMain");
+    id<MTLFunction> fragmentFunction = dynamicShaderCache->getFunction(fragmentCompile.code, @"fragmentMain");
+    if (!vertexFunction || !fragmentFunction) {
+        return MaterialPrewarmStatus::Failed;
+    }
+
+    metal::PipelineKey pipelineKey;
+    pipelineKey.vertexFunction = (__bridge void*) vertexFunction;
+    pipelineKey.fragmentFunction = (__bridge void*) fragmentFunction;
+    configurePipelineBlending(pipelineKey, *rawMaterial);
+    pipelineKey.vertexLayoutBitmask = request.vertexLayoutBitmask != 0u
+        ? request.vertexLayoutBitmask
+        : vertexLayoutPosition;
+
+    if (request.renderTarget) {
+        auto& resources = getOrCreateRenderTargetResources(*request.renderTarget);
+        const auto primaryFormat = resources.colorPixelFormats.empty()
+            ? MTLPixelFormatInvalid
+            : resources.colorPixelFormats.front();
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(primaryFormat);
+        pipelineKey.colorAttachmentCount = static_cast<std::uint64_t>(std::max<std::size_t>(resources.colorPixelFormats.size(), 1u));
+        pipelineKey.colorPixelFormats.fill(0);
+        const auto count = std::min<std::size_t>(resources.colorPixelFormats.size(), pipelineKey.colorPixelFormats.size());
+        for (std::size_t i = 0; i < count; ++i) {
+            pipelineKey.colorPixelFormats[i] = static_cast<std::uint64_t>(resources.colorPixelFormats[i]);
+        }
+        pipelineKey.rasterSampleCount = 1;
+    } else {
+        pipelineKey.colorPixelFormat = static_cast<std::uint64_t>(MTLPixelFormatBGRA8Unorm);
+        pipelineKey.colorAttachmentCount = 1;
+        pipelineKey.colorPixelFormats.fill(0);
+        pipelineKey.colorPixelFormats[0] = static_cast<std::uint64_t>(MTLPixelFormatBGRA8Unorm);
+        pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(std::max<NSUInteger>(drawableSampleCount, 1));
+    }
+
+    const auto status = pipelineCache->prewarmPipelineState(pipelineKey);
+    switch (status) {
+        case metal::PipelinePrewarmStatus::Ready:
+            return MaterialPrewarmStatus::Ready;
+        case metal::PipelinePrewarmStatus::Compiling:
+            return MaterialPrewarmStatus::Compiling;
+        case metal::PipelinePrewarmStatus::Failed:
+            return MaterialPrewarmStatus::Failed;
+    }
+    return MaterialPrewarmStatus::Failed;
+}
+
 void MetalRenderer::Impl::renderRawShader(id<MTLRenderCommandEncoder> encoder,
                                           Mesh& mesh,
                                           BufferGeometry& geometry,

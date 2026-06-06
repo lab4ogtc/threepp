@@ -325,6 +325,8 @@ namespace threepp {
 
         std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(const PixelReadbackRequest& request);
 
+        MaterialPrewarmStatus prewarmMaterial(const MaterialPrewarmRequest& request);
+
         void readPixelsFromTextureReadback(Texture& texture,
                                            id<MTLTexture> sourceTexture,
                                            id<MTLBuffer> readbackBuffer,

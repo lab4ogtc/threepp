@@ -4,7 +4,11 @@
 #import <Metal/Metal.h>
 
 #include <algorithm>
+#include <condition_variable>
+#include <iostream>
+#include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace threepp::metal {
 
@@ -255,19 +259,25 @@ namespace threepp::metal {
     struct MetalPipelineCache::Impl {
         id<MTLDevice> device;
         std::unordered_map<PipelineKey, id<MTLRenderPipelineState>, PipelineKeyHash> pipelineStates;
+        std::unordered_set<PipelineKey, PipelineKeyHash> pendingPipelineStates;
+        std::unordered_set<PipelineKey, PipelineKeyHash> cancelledPipelineStates;
+        std::unordered_set<PipelineKey, PipelineKeyHash> failedPipelineStates;
         std::unordered_map<DepthPipelineKey, id<MTLRenderPipelineState>, DepthPipelineKeyHash> depthOnlyPipelineStates;
         std::unordered_map<DepthStencilKey, id<MTLDepthStencilState>, DepthStencilKeyHash> depthStencilStates;
+        std::mutex mutex;
+        std::condition_variable condition;
 
         explicit Impl(id<MTLDevice> dev)
             : device(dev) {}
 
-        id<MTLRenderPipelineState> getOrCreatePipelineState(const PipelineKey& key) {
+        ~Impl() {
+            std::unique_lock lock(mutex);
+            condition.wait(lock, [this] {
+                return pendingPipelineStates.empty();
+            });
+        }
 
-            auto it = pipelineStates.find(key);
-            if (it != pipelineStates.end()) {
-                return it->second;
-            }
-
+        MTLRenderPipelineDescriptor* createPipelineDescriptor(const PipelineKey& key) const {
             MTLRenderPipelineDescriptor* desc = [[MTLRenderPipelineDescriptor alloc] init];
             desc.vertexFunction = (__bridge id<MTLFunction>) key.vertexFunction;
             desc.fragmentFunction = (__bridge id<MTLFunction>) key.fragmentFunction;
@@ -301,6 +311,19 @@ namespace threepp::metal {
                 }
             }
 
+            return desc;
+        }
+
+        id<MTLRenderPipelineState> getOrCreatePipelineState(const PipelineKey& key) {
+            std::lock_guard lock(mutex);
+
+            auto it = pipelineStates.find(key);
+            if (it != pipelineStates.end()) {
+                return it->second;
+            }
+
+            MTLRenderPipelineDescriptor* desc = createPipelineDescriptor(key);
+
             NSError* error = nil;
             id<MTLRenderPipelineState> pso = [device newRenderPipelineStateWithDescriptor:desc error:&error];
             if (!pso) {
@@ -309,10 +332,51 @@ namespace threepp::metal {
             }
 
             pipelineStates[key] = pso;
+            failedPipelineStates.erase(key);
             return pso;
         }
 
+        PipelinePrewarmStatus prewarmPipelineState(const PipelineKey& key) {
+            {
+                std::lock_guard lock(mutex);
+                if (pipelineStates.find(key) != pipelineStates.end()) {
+                    return PipelinePrewarmStatus::Ready;
+                }
+                if (failedPipelineStates.find(key) != failedPipelineStates.end()) {
+                    return PipelinePrewarmStatus::Failed;
+                }
+                if (pendingPipelineStates.find(key) != pendingPipelineStates.end()) {
+                    return PipelinePrewarmStatus::Compiling;
+                }
+                cancelledPipelineStates.erase(key);
+                pendingPipelineStates.insert(key);
+            }
+
+            MTLRenderPipelineDescriptor* desc = createPipelineDescriptor(key);
+            [device newRenderPipelineStateWithDescriptor:desc
+                                       completionHandler:^(id<MTLRenderPipelineState> pso, NSError* error) {
+                std::lock_guard lock(mutex);
+                const auto wasCancelled = cancelledPipelineStates.erase(key) > 0;
+                pendingPipelineStates.erase(key);
+                if (wasCancelled) {
+                    condition.notify_all();
+                    return;
+                }
+                if (pso) {
+                    pipelineStates[key] = [pso retain];
+                    failedPipelineStates.erase(key);
+                } else {
+                    failedPipelineStates.insert(key);
+                    NSString* message = error ? error.localizedDescription : @"unknown error";
+                    std::cerr << "MetalRenderer: async PSO prewarm failed: " << [message UTF8String] << "\n";
+                }
+                condition.notify_all();
+            }];
+            return PipelinePrewarmStatus::Compiling;
+        }
+
         id<MTLRenderPipelineState> getOrCreateDepthOnlyPipelineState(void* vertexFunction, void* fragmentFunction, std::uint16_t vertexLayoutBitmask) {
+            std::lock_guard lock(mutex);
             const DepthPipelineKey key{vertexFunction, fragmentFunction, vertexLayoutBitmask};
             auto it = depthOnlyPipelineStates.find(key);
             if (it != depthOnlyPipelineStates.end()) {
@@ -338,6 +402,7 @@ namespace threepp::metal {
         }
 
         id<MTLDepthStencilState> getOrCreateDepthStencilState(bool depthTest, bool depthWrite, DepthFunc depthFunc) {
+            std::lock_guard lock(mutex);
             const DepthStencilKey key{depthTest, depthWrite, depthFunc};
             auto it = depthStencilStates.find(key);
             if (it != depthStencilStates.end()) {
@@ -354,6 +419,7 @@ namespace threepp::metal {
         }
 
         void removePipelineStatesReferencing(void* function) {
+            std::lock_guard lock(mutex);
             for (auto it = pipelineStates.begin(); it != pipelineStates.end();) {
                 if (it->first.vertexFunction == function || it->first.fragmentFunction == function) {
                     it = pipelineStates.erase(it);
@@ -369,6 +435,20 @@ namespace threepp::metal {
                     ++it;
                 }
             }
+
+            for (auto it = failedPipelineStates.begin(); it != failedPipelineStates.end();) {
+                if (it->vertexFunction == function || it->fragmentFunction == function) {
+                    it = failedPipelineStates.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            for (const auto& key : pendingPipelineStates) {
+                if (key.vertexFunction == function || key.fragmentFunction == function) {
+                    cancelledPipelineStates.insert(key);
+                }
+            }
+            condition.notify_all();
         }
     };
 
@@ -379,6 +459,10 @@ namespace threepp::metal {
 
     void* MetalPipelineCache::getOrCreatePipelineState(const PipelineKey& key) {
         return (__bridge void*) pimpl_->getOrCreatePipelineState(key);
+    }
+
+    PipelinePrewarmStatus MetalPipelineCache::prewarmPipelineState(const PipelineKey& key) {
+        return pimpl_->prewarmPipelineState(key);
     }
 
     void* MetalPipelineCache::getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint16_t vertexLayoutBitmask) {

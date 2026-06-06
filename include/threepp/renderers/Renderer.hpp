@@ -24,6 +24,7 @@ namespace threepp {
     class Camera;
     class RenderTarget;
     class Texture;
+    class RawShaderMaterial;
     struct RenderJob;
     class Color;
 
@@ -89,6 +90,18 @@ namespace threepp {
         Type type = Type::UnsignedByte;
     };
 
+    enum class MaterialPrewarmStatus {
+        Ready,
+        Compiling,
+        Failed
+    };
+
+    struct MaterialPrewarmRequest {
+        RawShaderMaterial* material = nullptr;
+        RenderTarget* renderTarget = nullptr;
+        std::uint16_t vertexLayoutBitmask = 1u;
+    };
+
     class Renderer {
 
     public:
@@ -147,6 +160,16 @@ namespace threepp {
         virtual std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
                 const PixelReadbackRequest& /*request*/) {
             throw std::runtime_error("Renderer backend does not support async pixel readback");
+        }
+
+        virtual MaterialPrewarmStatus prewarmMaterial(RawShaderMaterial& material) {
+            MaterialPrewarmRequest request;
+            request.material = &material;
+            return prewarmMaterial(request);
+        }
+
+        virtual MaterialPrewarmStatus prewarmMaterial(const MaterialPrewarmRequest& /*request*/) {
+            return MaterialPrewarmStatus::Ready;
         }
 
         /**

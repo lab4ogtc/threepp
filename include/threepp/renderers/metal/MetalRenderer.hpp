@@ -98,6 +98,10 @@ namespace threepp {
         std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
                 const PixelReadbackRequest& request) override;
 
+        MaterialPrewarmStatus prewarmMaterial(RawShaderMaterial& material) override;
+
+        MaterialPrewarmStatus prewarmMaterial(const MaterialPrewarmRequest& request) override;
+
         /**
          * 使用单个 Metal blit command encoder 批量读回纹理，并只等待一次 GPU 完成。
          *

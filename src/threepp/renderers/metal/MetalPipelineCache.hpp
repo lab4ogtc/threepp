@@ -35,6 +35,12 @@ namespace threepp::metal {
         size_t operator()(const PipelineKey& key) const;
     };
 
+    enum class PipelinePrewarmStatus {
+        Ready,
+        Compiling,
+        Failed
+    };
+
     class MetalPipelineCache {
 
     public:
@@ -43,6 +49,8 @@ namespace threepp::metal {
         ~MetalPipelineCache();
 
         void* getOrCreatePipelineState(const PipelineKey& key);
+
+        PipelinePrewarmStatus prewarmPipelineState(const PipelineKey& key);
 
         void* getOrCreateDepthOnlyPipelineState(void* vertexFunction, std::uint16_t vertexLayoutBitmask);
 
