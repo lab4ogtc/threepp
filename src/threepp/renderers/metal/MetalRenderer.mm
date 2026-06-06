@@ -5,6 +5,8 @@
 #include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/DataArrayTexture.hpp"
 
+#include <spark/tracing.hpp>
+
 #ifdef THREEPP_HAS_SLANG
 #include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
 #endif
@@ -830,12 +832,17 @@ void MetalRenderer::Impl::trackGeometry(BufferGeometry& geometry) {
 }
 
 void MetalRenderer::Impl::commitPendingFrame() {
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::commitPendingFrame");
     if (!currentCommandBuffer) return;
 
     if (currentDrawable) {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::presentDrawable");
         [currentCommandBuffer presentDrawable:currentDrawable];
     }
-    [currentCommandBuffer commit];
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::commitCommandBuffer");
+        [currentCommandBuffer commit];
+    }
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
@@ -844,12 +851,22 @@ void MetalRenderer::Impl::commitPendingFrame() {
 }
 
 void MetalRenderer::Impl::ensureFrameStarted() {
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::ensureFrameStarted");
     if (currentCommandBuffer) return;
 
-    dispatch_semaphore_wait(inFlightSemaphore, DISPATCH_TIME_FOREVER);
-    bufferManager->beginFrame();
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::waitInFlightSemaphore");
+        dispatch_semaphore_wait(inFlightSemaphore, DISPATCH_TIME_FOREVER);
+    }
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::beginFrameBuffers");
+        bufferManager->beginFrame();
+    }
 
-    currentCommandBuffer = [commandQueue commandBuffer];
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::createCommandBuffer");
+        currentCommandBuffer = [commandQueue commandBuffer];
+    }
     clearedTargetsInFrame.clear();
     auto semaphore = inFlightSemaphore;
     [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
@@ -858,13 +875,17 @@ void MetalRenderer::Impl::ensureFrameStarted() {
 }
 
 bool MetalRenderer::Impl::ensureDrawable() {
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::ensureDrawable");
     if (currentDrawable) {
         syncDrawableSize(currentDrawable.texture.width, currentDrawable.texture.height);
         return true;
     }
 
     updateMetalLayerPixelFormat();
-    currentDrawable = [metalLayer nextDrawable];
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::nextDrawable");
+        currentDrawable = [metalLayer nextDrawable];
+    }
     if (currentDrawable) {
         syncDrawableSize(currentDrawable.texture.width, currentDrawable.texture.height);
     }
@@ -2525,6 +2546,7 @@ void MetalRenderer::Impl::renderPreRenderJobs(Scene& scene) {
 }
 
 void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::render");
     throwIfRendererCallbackOperation(recursiveRenderCallbackMessage);
     if (currentCommandBuffer) {
         const auto now = std::chrono::steady_clock::now();
@@ -2554,12 +2576,18 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     }
     updateMetalLayerPixelFormat();
 
-    scene.updateMatrixWorld(false);
-    metal::prepareCameraForRender(camera);
-    updateLODs(scene, camera);
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::prepareScene");
+        scene.updateMatrixWorld(false);
+        metal::prepareCameraForRender(camera);
+        updateLODs(scene, camera);
+    }
 
     SceneLightSet sceneLights;
-    collectLights(scene, sceneLights);
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::collectLights");
+        collectLights(scene, sceneLights);
+    }
 
     Color effectiveClearColor = clearColor;
     float effectiveClearAlpha = clearAlpha;
@@ -2567,6 +2595,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         effectiveClearColor.copy(scene.background.color());
     }
     if (!renderingPrePass) {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::preRenderJobs");
         collectPreRenderJobs(scene, camera);
         renderPreRenderJobs(scene);
     }
@@ -2575,8 +2604,14 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         ensureFrameStarted();
     }
 
-    const auto shadowResources = renderShadowPasses(scene, sceneLights);
-    const auto lightUniforms = buildLightUniforms(sceneLights, shadowResources);
+    auto shadowResources = [&] {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderShadowPasses");
+        return renderShadowPasses(scene, sceneLights);
+    }();
+    auto lightUniforms = [&] {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::buildLightUniforms");
+        return buildLightUniforms(sceneLights, shadowResources);
+    }();
 
     id<MTLTexture> colorTexture = nil;
     id<MTLTexture> passDepthTexture = nil;
@@ -2725,10 +2760,19 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     Frustum frustum;
     frustum.setFromProjectionMatrix(projScreenMatrix);
     std::vector<Object3D*> collectedRenderables;
-    collectRenderables(scene, camera, frustum, collectedRenderables);
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::collectRenderables");
+        collectRenderables(scene, camera, frustum, collectedRenderables);
+    }
     metal::MetalRenderList renderList;
-    buildRenderList(collectedRenderables, camera, renderList);
-    bindPassLightResources(encoder, lightUniforms, shadowResources);
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::buildRenderList");
+        buildRenderList(collectedRenderables, camera, renderList);
+    }
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::bindPassLightResources");
+        bindPassLightResources(encoder, lightUniforms, shadowResources);
+    }
 
     auto invokeBeforeRenderCallback = [&](Object3D& obj, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
         if (!obj.onBeforeRender) return;
@@ -2951,8 +2995,14 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         }
     };
 
-    renderItems(renderList.opaque);
-    renderItems(renderList.transparent);
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderOpaque");
+        renderItems(renderList.opaque);
+    }
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderTransparent");
+        renderItems(renderList.transparent);
+    }
 
     encoderScope.end();
     if (activeRenderTargetResources) {
