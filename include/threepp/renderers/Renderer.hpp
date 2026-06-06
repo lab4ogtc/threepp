@@ -2,10 +2,12 @@
 #ifndef THREEPP_RENDERER_HPP
 #define THREEPP_RENDERER_HPP
 
+#include <cstdint>
 #include <exception>
 #include <functional>
 #include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +54,39 @@ namespace threepp {
         Format format = Format::RGBA;
         Type type = Type::UnsignedByte;
         bool isZeroCopy = false;
+    };
+
+    /**
+     * @brief 渲染目标像素异步读回请求。
+     *
+     * 该 API 直接返回自持有 CPU bytes，适合跨线程消费；默认实现 fail fast，
+     * 不允许退化到同步 copyTextureToImage()。
+     */
+    struct PixelReadbackRequest {
+        RenderTarget* renderTarget = nullptr;
+        int x = 0;
+        int y = 0;
+        int width = 0;
+        int height = 0;
+        int depth = 1;
+        int activeCubeFace = 0;
+        int activeLayer = 0;
+        unsigned int textureIndex = 0;
+        Format format = Format::RGBA;
+        Type type = Type::UnsignedByte;
+    };
+
+    /**
+     * @brief 自持有 CPU 像素读回结果。
+     */
+    struct PixelReadbackBuffer {
+        std::vector<std::uint8_t> bytes;
+        unsigned int width = 0;
+        unsigned int height = 0;
+        unsigned int depth = 1;
+        unsigned int bytesPerPixel = 4;
+        Format format = Format::RGBA;
+        Type type = Type::UnsignedByte;
     };
 
     class Renderer {
@@ -103,6 +138,15 @@ namespace threepp {
             return std::async(std::launch::deferred, [this, &texture] {
                 copyTextureToImage(texture);
             });
+        }
+
+        [[nodiscard]] virtual bool supportsAsyncPixelReadback() const noexcept {
+            return false;
+        }
+
+        virtual std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
+                const PixelReadbackRequest& /*request*/) {
+            throw std::runtime_error("Renderer backend does not support async pixel readback");
         }
 
         /**

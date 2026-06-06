@@ -91,6 +91,15 @@ namespace threepp {
             NSUInteger byteLength = 0;
         };
 
+        struct PixelReadback {
+            id<MTLTexture> sourceTexture = nil;
+            id<MTLBuffer> readbackBuffer = nil;
+            NSUInteger sourceBytesPerRow = 0;
+            NSUInteger sourceBytesPerImage = 0;
+            NSUInteger byteLength = 0;
+            PixelReadbackRequest request;
+        };
+
         struct ConvertedSkinIndexBuffer {
             unsigned int lastVersion = std::numeric_limits<unsigned int>::max();
             std::vector<float> values;
@@ -314,6 +323,8 @@ namespace threepp {
 
         std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures);
 
+        std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(const PixelReadbackRequest& request);
+
         void readPixelsFromTextureReadback(Texture& texture,
                                            id<MTLTexture> sourceTexture,
                                            id<MTLBuffer> readbackBuffer,
@@ -321,6 +332,12 @@ namespace threepp {
                                            NSUInteger sourceBytesPerImage,
                                            NSUInteger sourceDepth,
                                            NSUInteger sourceBytesPerPixel);
+
+        void readRgba8PixelsToBuffer(id<MTLBuffer> readbackBuffer,
+                                     NSUInteger sourceBytesPerRow,
+                                     NSUInteger sourceBytesPerImage,
+                                     const PixelReadbackRequest& request,
+                                     std::vector<std::uint8_t>& out) const;
 
         std::vector<unsigned char> readRGBPixels();
 

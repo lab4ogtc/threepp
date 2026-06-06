@@ -93,6 +93,11 @@ namespace threepp {
 
         std::future<void> copyTextureToImageAsync(Texture& texture) override;
 
+        [[nodiscard]] bool supportsAsyncPixelReadback() const noexcept override;
+
+        std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
+                const PixelReadbackRequest& request) override;
+
         /**
          * 使用单个 Metal blit command encoder 批量读回纹理，并只等待一次 GPU 完成。
          *

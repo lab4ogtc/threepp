@@ -1266,6 +1266,32 @@ void MetalRenderer::Impl::releaseReadbackBuffers(const std::vector<TextureReadba
     }
 }
 
+void MetalRenderer::Impl::readRgba8PixelsToBuffer(id<MTLBuffer> readbackBuffer,
+                                                  NSUInteger sourceBytesPerRow,
+                                                  NSUInteger sourceBytesPerImage,
+                                                  const PixelReadbackRequest& request,
+                                                  std::vector<std::uint8_t>& out) const {
+    const auto width = static_cast<NSUInteger>(request.width);
+    const auto height = static_cast<NSUInteger>(request.height);
+    const auto depth = static_cast<NSUInteger>(request.depth);
+    const auto rowBytes = width * 4u;
+    const auto* rawBytes = static_cast<const std::uint8_t*>([readbackBuffer contents]);
+    if (!rawBytes) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not map the readback buffer");
+    }
+
+    const auto compactBytesPerImage = rowBytes * height;
+    out.resize(static_cast<std::size_t>(compactBytesPerImage * depth));
+    for (NSUInteger z = 0; z < depth; ++z) {
+        for (NSUInteger y = 0; y < height; ++y) {
+            std::memcpy(
+                out.data() + static_cast<std::size_t>(z * compactBytesPerImage + y * rowBytes),
+                rawBytes + static_cast<std::size_t>(z * sourceBytesPerImage + y * sourceBytesPerRow),
+                static_cast<std::size_t>(rowBytes));
+        }
+    }
+}
+
 void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
     if (!target) return;
 
@@ -1567,6 +1593,138 @@ std::future<void> MetalRenderer::Impl::copyTexturesToImagesAsync(const std::vect
             completionPromise->set_value();
         } catch (...) {
             releaseReadbackBuffers(*completionReadbacks);
+            completionPromise->set_exception(std::current_exception());
+        }
+    }];
+
+    if (!temporaryCommandBuffer && currentDrawable) {
+        [commandBuffer presentDrawable:currentDrawable];
+    }
+    [commandBuffer commit];
+
+    if (!temporaryCommandBuffer) {
+        currentCommandBuffer = nil;
+        currentDrawable = nil;
+        explicitFrameInProgress = false;
+        lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
+        currentCommandBufferExternallyAccessed = false;
+    }
+
+    return completionFuture;
+}
+
+std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsync(
+        const PixelReadbackRequest& request) {
+    if (!request.renderTarget) {
+        throw std::invalid_argument("MetalRenderer::readRenderTargetPixelsAsync requires a render target");
+    }
+    if (request.width <= 0 || request.height <= 0 || request.depth <= 0) {
+        throw std::invalid_argument("MetalRenderer::readRenderTargetPixelsAsync requires a positive readback size");
+    }
+    if (request.x < 0 || request.y < 0) {
+        throw std::invalid_argument("MetalRenderer::readRenderTargetPixelsAsync requires a non-negative origin");
+    }
+    if (request.format != Format::RGBA || request.type != Type::UnsignedByte) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync supports only RGBA8 pixel readback");
+    }
+
+    auto& resources = getOrCreateRenderTargetResources(*request.renderTarget);
+    if (request.textureIndex >= resources.colorTextures.size()) {
+        throw std::out_of_range("MetalRenderer::readRenderTargetPixelsAsync texture index is outside the render target attachments");
+    }
+    id<MTLTexture> sourceTexture = resources.colorTextures[request.textureIndex];
+    if (!sourceTexture) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not acquire the source texture");
+    }
+    if (sourceTexture.pixelFormat != MTLPixelFormatRGBA8Unorm &&
+        sourceTexture.pixelFormat != MTLPixelFormatRGBA8Unorm_sRGB) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync supports only RGBA8 source textures");
+    }
+
+    const auto width = static_cast<NSUInteger>(request.width);
+    const auto height = static_cast<NSUInteger>(request.height);
+    const auto depth = static_cast<NSUInteger>(request.depth);
+    const auto sourceX = static_cast<NSUInteger>(request.x);
+    const auto sourceY = static_cast<NSUInteger>(request.y);
+    if (sourceX + width > sourceTexture.width || sourceY + height > sourceTexture.height) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync source region is outside the render target");
+    }
+
+    NSUInteger sourceSlice = 0u;
+    if (sourceTexture.textureType == MTLTextureType2DArray ||
+        sourceTexture.textureType == MTLTextureType2DMultisampleArray) {
+        if (request.activeLayer < 0 ||
+            static_cast<NSUInteger>(request.activeLayer) + depth > sourceTexture.arrayLength) {
+            throw std::out_of_range("MetalRenderer::readRenderTargetPixelsAsync active layer is outside the render target texture");
+        }
+        sourceSlice = static_cast<NSUInteger>(request.activeLayer);
+    } else if (sourceTexture.textureType == MTLTextureTypeCube ||
+               sourceTexture.textureType == MTLTextureTypeCubeArray) {
+        if (request.activeCubeFace < 0 ||
+            static_cast<NSUInteger>(request.activeCubeFace) + depth > sourceTexture.arrayLength) {
+            throw std::out_of_range("MetalRenderer::readRenderTargetPixelsAsync active cube face is outside the render target texture");
+        }
+        sourceSlice = static_cast<NSUInteger>(request.activeCubeFace);
+    } else if (depth != 1u) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync depth > 1 requires an array or cube source texture");
+    }
+
+    const auto sourceBytesPerRow = alignTo(width * 4u, 256u);
+    const auto sourceBytesPerImage = sourceBytesPerRow * height;
+    id<MTLBuffer> readbackBuffer = acquireReadbackBuffer(sourceBytesPerImage * depth);
+
+    id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
+    const bool temporaryCommandBuffer = commandBuffer == nil;
+    if (temporaryCommandBuffer) {
+        commandBuffer = [commandQueue commandBuffer];
+    }
+    if (!commandBuffer) {
+        releaseReadbackBuffer(readbackBuffer);
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not create a command buffer");
+    }
+
+    id<MTLBlitCommandEncoder> blitEncoder = [commandBuffer blitCommandEncoder];
+    for (NSUInteger layer = 0; layer < depth; ++layer) {
+        [blitEncoder copyFromTexture:sourceTexture
+                         sourceSlice:sourceSlice + layer
+                         sourceLevel:0
+                        sourceOrigin:MTLOriginMake(sourceX, sourceY, 0)
+                          sourceSize:MTLSizeMake(width, height, 1)
+                            toBuffer:readbackBuffer
+                   destinationOffset:sourceBytesPerImage * layer
+              destinationBytesPerRow:sourceBytesPerRow
+            destinationBytesPerImage:sourceBytesPerImage];
+    }
+    [blitEncoder endEncoding];
+
+    auto completionPromise = std::make_shared<std::promise<PixelReadbackBuffer>>();
+    auto completionFuture = completionPromise->get_future();
+    PixelReadback readback{sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerImage, sourceBytesPerImage * depth, request};
+    auto completionReadback = std::make_shared<PixelReadback>(std::move(readback));
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
+        try {
+            if (completedCommandBuffer.error) {
+                const char* message = [[completedCommandBuffer.error localizedDescription] UTF8String];
+                throw std::runtime_error(message ? message : "MetalRenderer::readRenderTargetPixelsAsync command buffer failed");
+            }
+
+            PixelReadbackBuffer buffer;
+            buffer.width = static_cast<unsigned int>(completionReadback->request.width);
+            buffer.height = static_cast<unsigned int>(completionReadback->request.height);
+            buffer.depth = static_cast<unsigned int>(completionReadback->request.depth);
+            buffer.bytesPerPixel = 4;
+            buffer.format = completionReadback->request.format;
+            buffer.type = completionReadback->request.type;
+            readRgba8PixelsToBuffer(
+                    completionReadback->readbackBuffer,
+                    completionReadback->sourceBytesPerRow,
+                    completionReadback->sourceBytesPerImage,
+                    completionReadback->request,
+                    buffer.bytes);
+            releaseReadbackBuffer(completionReadback->readbackBuffer);
+            completionPromise->set_value(std::move(buffer));
+        } catch (...) {
+            releaseReadbackBuffer(completionReadback->readbackBuffer);
             completionPromise->set_exception(std::current_exception());
         }
     }];
@@ -3139,6 +3297,16 @@ void MetalRenderer::copyTextureToImage(Texture& texture) {
 std::future<void> MetalRenderer::copyTextureToImageAsync(Texture& texture) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     return pimpl_->copyTextureToImageAsync(texture);
+}
+
+bool MetalRenderer::supportsAsyncPixelReadback() const noexcept {
+    return true;
+}
+
+std::future<PixelReadbackBuffer> MetalRenderer::readRenderTargetPixelsAsync(
+        const PixelReadbackRequest& request) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    return pimpl_->readRenderTargetPixelsAsync(request);
 }
 
 void MetalRenderer::copyTexturesToImages(const std::vector<Texture*>& textures) {
