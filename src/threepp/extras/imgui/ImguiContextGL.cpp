@@ -72,11 +72,13 @@ namespace {
 
 ImguiContext::ImguiContext(void* window)
     : impl_(createImguiImpl(window, nullptr)) {
+    ImGui::GetIO().IniFilename = nullptr;
     setFontScale(monitor::contentScale().first);
 }
 
 ImguiContext::ImguiContext(void* window, Renderer& renderer)
     : impl_(createImguiImpl(window, &renderer)) {
+    ImGui::GetIO().IniFilename = nullptr;
     setFontScale(monitor::contentScale().first);
 }
 
