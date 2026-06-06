@@ -204,13 +204,14 @@ TEST_CASE("Metal texture readback matches GL row order and batches GPU waits") {
     REQUIRE(batchMethodEnd != std::string::npos);
 
     const auto batchBody = source.substr(batchMethod, batchMethodEnd - batchMethod);
-    REQUIRE(countOccurrences(batchBody, "waitUntilCompleted") == 1);
+    REQUIRE(countOccurrences(batchBody, "waitUntilCompleted") == 0);
+    REQUIRE(countOccurrences(batchBody, "addCompletedHandler") >= 1);
 
     const auto readPixelsMethodEnd = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels", batchMethodEnd);
     REQUIRE(readPixelsMethodEnd != std::string::npos);
     const auto readPixelsBody = source.substr(batchMethodEnd, readPixelsMethodEnd - batchMethodEnd);
     REQUIRE(readPixelsBody.find("height - 1u - y") == std::string::npos);
-    REQUIRE(readPixelsBody.find("const auto dstY = y;") != std::string::npos);
+    REQUIRE(readPixelsBody.find("+ y * sourceBytesPerRow") != std::string::npos);
 
     REQUIRE(header.find("struct ReadbackBuffer") != std::string::npos);
     REQUIRE(header.find("std::vector<ReadbackBuffer> readbackBufferPool") != std::string::npos);
@@ -218,7 +219,87 @@ TEST_CASE("Metal texture readback matches GL row order and batches GPU waits") {
     REQUIRE(header.find("void releaseAllReadbackBuffers()") != std::string::npos);
     REQUIRE(batchBody.find("acquireReadbackBuffer(byteLength)") != std::string::npos);
     REQUIRE(batchBody.find("[device newBufferWithLength:byteLength") == std::string::npos);
-    REQUIRE(batchBody.find("releaseAllReadbackBuffers();") != std::string::npos);
+    REQUIRE(batchBody.find("releaseReadbackBuffers(*completionReadbacks);") != std::string::npos);
+}
+
+TEST_CASE("Metal screen readback defers reused command buffer submission until frame end") {
+
+    const auto header = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+
+    REQUIRE(header.find("bool screenCommandsEncoded = false") != std::string::npos);
+
+    const auto commitMethod = source.find("void MetalRenderer::Impl::commitPendingFrame()");
+    REQUIRE(commitMethod != std::string::npos);
+    const auto commitMethodEnd = source.find("void MetalRenderer::Impl::ensureFrameStarted()", commitMethod);
+    REQUIRE(commitMethodEnd != std::string::npos);
+    const auto commitBody = source.substr(commitMethod, commitMethodEnd - commitMethod);
+    REQUIRE(commitBody.find("screenCommandsEncoded = false;") != std::string::npos);
+
+    const auto clearMethod = source.find("void MetalRenderer::Impl::clear(bool color, bool depth");
+    REQUIRE(clearMethod != std::string::npos);
+    const auto clearMethodEnd = source.find("void MetalRenderer::Impl::copyFramebufferToTexture", clearMethod);
+    REQUIRE(clearMethodEnd != std::string::npos);
+    const auto clearBody = source.substr(clearMethod, clearMethodEnd - clearMethod);
+    REQUIRE(clearBody.find("if (currentCommandBuffer && color && screenCommandsEncoded)") != std::string::npos);
+
+    const auto renderMethod = source.find("void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear)");
+    REQUIRE(renderMethod != std::string::npos);
+    const auto renderMethodEnd = source.find("MetalRenderer::MetalRenderer(Window& window)", renderMethod);
+    REQUIRE(renderMethodEnd != std::string::npos);
+    const auto renderBody = source.substr(renderMethod, renderMethodEnd - renderMethod);
+    REQUIRE(renderBody.find("elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation && screenCommandsEncoded") != std::string::npos);
+    REQUIRE(renderBody.find("currentCommandBuffer && !explicitFrameInProgress && screenCommandsEncoded") != std::string::npos);
+    REQUIRE(renderBody.find("screenCommandsEncoded = true;") != std::string::npos);
+
+    const auto batchAsyncMethod = source.find("std::future<void> MetalRenderer::Impl::copyTexturesToImagesAsync");
+    REQUIRE(batchAsyncMethod != std::string::npos);
+    const auto batchAsyncMethodEnd = source.find("std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsync", batchAsyncMethod);
+    REQUIRE(batchAsyncMethodEnd != std::string::npos);
+    const auto batchAsyncBody = source.substr(batchAsyncMethod, batchAsyncMethodEnd - batchAsyncMethod);
+    REQUIRE(batchAsyncBody.find("if (temporaryCommandBuffer)") != std::string::npos);
+    REQUIRE(batchAsyncBody.find("[commandBuffer commit];") != std::string::npos);
+    REQUIRE(batchAsyncBody.find("presentDrawable") == std::string::npos);
+    REQUIRE(batchAsyncBody.find("currentCommandBuffer = nil;") == std::string::npos);
+
+    const auto syncBatchMethod = source.find("void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& textures)");
+    REQUIRE(syncBatchMethod != std::string::npos);
+    const auto syncBatchMethodEnd = source.find("std::future<void> MetalRenderer::Impl::copyTextureToImageAsync", syncBatchMethod);
+    REQUIRE(syncBatchMethodEnd != std::string::npos);
+    const auto syncBatchBody = source.substr(syncBatchMethod, syncBatchMethodEnd - syncBatchMethod);
+    REQUIRE(syncBatchBody.find("auto future = copyTexturesToImagesAsync(textures);") != std::string::npos);
+    REQUIRE(syncBatchBody.find("commitPendingFrame();") != std::string::npos);
+    REQUIRE(syncBatchBody.find("future.get();") != std::string::npos);
+
+    const auto hasReadableTexturePos = syncBatchBody.find("const auto hasReadableTexture");
+    const auto earlyReturnPos = syncBatchBody.find("if (!hasReadableTexture) return;");
+    const auto futurePos = syncBatchBody.find("auto future = copyTexturesToImagesAsync(textures);");
+    const auto commitPos = syncBatchBody.find("commitPendingFrame();");
+    REQUIRE(hasReadableTexturePos != std::string::npos);
+    REQUIRE(earlyReturnPos != std::string::npos);
+    REQUIRE(futurePos != std::string::npos);
+    REQUIRE(commitPos != std::string::npos);
+    REQUIRE(hasReadableTexturePos < earlyReturnPos);
+    REQUIRE(earlyReturnPos < futurePos);
+    REQUIRE(earlyReturnPos < commitPos);
+
+    const auto pixelAsyncMethod = batchAsyncMethodEnd;
+    const auto pixelAsyncMethodEnd = source.find("void MetalRenderer::Impl::readPixelsFromTextureReadback", pixelAsyncMethod);
+    REQUIRE(pixelAsyncMethodEnd != std::string::npos);
+    const auto pixelAsyncBody = source.substr(pixelAsyncMethod, pixelAsyncMethodEnd - pixelAsyncMethod);
+    REQUIRE(pixelAsyncBody.find("if (temporaryCommandBuffer)") != std::string::npos);
+    REQUIRE(pixelAsyncBody.find("[commandBuffer commit];") != std::string::npos);
+    REQUIRE(pixelAsyncBody.find("presentDrawable") == std::string::npos);
+    REQUIRE(pixelAsyncBody.find("currentCommandBuffer = nil;") == std::string::npos);
+
+    const auto readRgbMethod = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels()");
+    REQUIRE(readRgbMethod != std::string::npos);
+    const auto readRgbMethodEnd = source.find("void MetalRenderer::Impl::setViewport", readRgbMethod);
+    REQUIRE(readRgbMethodEnd != std::string::npos);
+    const auto readRgbBody = source.substr(readRgbMethod, readRgbMethodEnd - readRgbMethod);
+    REQUIRE(readRgbBody.find("screenCommandsEncoded = false;") != std::string::npos);
+    REQUIRE(readRgbBody.find("lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;") != std::string::npos);
+    REQUIRE(readRgbBody.find("currentCommandBufferExternallyAccessed = false;") != std::string::npos);
 }
 
 TEST_CASE("Metal texture readback fast path is format-exact and excludes BGRA") {

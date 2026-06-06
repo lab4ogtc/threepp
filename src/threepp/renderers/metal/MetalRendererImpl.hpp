@@ -186,6 +186,7 @@ namespace threepp {
         bool clearDepthFlag = true;
         bool clearRequested = false;
         bool explicitFrameInProgress = false;
+        bool screenCommandsEncoded = false;
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool renderingPrePass = false;

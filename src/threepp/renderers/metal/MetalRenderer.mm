@@ -846,6 +846,7 @@ void MetalRenderer::Impl::commitPendingFrame() {
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
+    screenCommandsEncoded = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
     currentCommandBufferExternallyAccessed = false;
 }
@@ -1376,7 +1377,7 @@ void MetalRenderer::Impl::setClearColor(const Color& color, float alpha) {
 }
 
 void MetalRenderer::Impl::clear(bool color, bool depth, bool /*stencil*/) {
-    if (currentCommandBuffer && color) {
+    if (currentCommandBuffer && color && screenCommandsEncoded) {
         commitPendingFrame();
     }
 
@@ -1480,7 +1481,14 @@ void MetalRenderer::Impl::copyTextureToImage(Texture& texture) {
 }
 
 void MetalRenderer::Impl::copyTexturesToImages(const std::vector<Texture*>& textures) {
-    copyTexturesToImagesAsync(textures).get();
+    const auto hasReadableTexture = std::any_of(textures.begin(), textures.end(), [](const auto* texture) {
+        return texture != nullptr;
+    });
+    if (!hasReadableTexture) return;
+
+    auto future = copyTexturesToImagesAsync(textures);
+    commitPendingFrame();
+    future.get();
 }
 
 std::future<void> MetalRenderer::Impl::copyTextureToImageAsync(Texture& texture) {
@@ -1597,17 +1605,8 @@ std::future<void> MetalRenderer::Impl::copyTexturesToImagesAsync(const std::vect
         }
     }];
 
-    if (!temporaryCommandBuffer && currentDrawable) {
-        [commandBuffer presentDrawable:currentDrawable];
-    }
-    [commandBuffer commit];
-
-    if (!temporaryCommandBuffer) {
-        currentCommandBuffer = nil;
-        currentDrawable = nil;
-        explicitFrameInProgress = false;
-        lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
-        currentCommandBufferExternallyAccessed = false;
+    if (temporaryCommandBuffer) {
+        [commandBuffer commit];
     }
 
     return completionFuture;
@@ -1729,17 +1728,8 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
         }
     }];
 
-    if (!temporaryCommandBuffer && currentDrawable) {
-        [commandBuffer presentDrawable:currentDrawable];
-    }
-    [commandBuffer commit];
-
-    if (!temporaryCommandBuffer) {
-        currentCommandBuffer = nil;
-        currentDrawable = nil;
-        explicitFrameInProgress = false;
-        lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
-        currentCommandBufferExternallyAccessed = false;
+    if (temporaryCommandBuffer) {
+        [commandBuffer commit];
     }
 
     return completionFuture;
@@ -2356,6 +2346,9 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     currentCommandBuffer = nil;
     currentDrawable = nil;
     explicitFrameInProgress = false;
+    screenCommandsEncoded = false;
+    lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
+    currentCommandBufferExternallyAccessed = false;
     return rgb;
 }
 
@@ -2712,12 +2705,12 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         if (hasPreviousRender) {
             const auto elapsed = std::chrono::duration<float, std::milli>(now - lastRenderTime).count();
             const auto isOrderedScissorContinuation = scissorTest && (scissor.x > lastScissor.x || scissor.y > lastScissor.y);
-            if (!renderTarget && elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation) {
+            if (!renderTarget && elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation && screenCommandsEncoded) {
                 commitPendingFrame();
             }
         }
 
-        if (currentCommandBuffer && !explicitFrameInProgress) {
+        if (currentCommandBuffer && !explicitFrameInProgress && screenCommandsEncoded) {
             bool isNewFrame = false;
             if (scissorTest) {
                 if (scissor.x < lastScissor.x || scissor.y < lastScissor.y) {
@@ -2791,6 +2784,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             return;
         }
         colorTexture = currentDrawable.texture;
+        screenCommandsEncoded = true;
         passDepthTexture = depthTexture;
         colorPixelFormat = colorTexture.pixelFormat;
         activeRenderSampleCount = drawableSampleCount;
