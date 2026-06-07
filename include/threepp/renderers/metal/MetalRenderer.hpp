@@ -95,6 +95,16 @@ namespace threepp {
 
         [[nodiscard]] bool supportsAsyncPixelReadback() const noexcept override;
 
+        void setUseLowPriorityQueue(bool useLowPriority) override;
+
+        void submitLowPriority() override;
+
+        [[nodiscard]] void* createEvent() override;
+
+        void encodeSignalEvent(void* event, std::uint64_t value) override;
+
+        void encodeWaitEventOnCurrentFrame(void* event, std::uint64_t value) override;
+
         std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
                 const PixelReadbackRequest& request) override;
 

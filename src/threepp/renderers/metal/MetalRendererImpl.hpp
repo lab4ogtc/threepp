@@ -23,6 +23,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <span>
 #include <unordered_map>
@@ -39,6 +40,8 @@ namespace threepp {
         Window& window;
         id<MTLDevice> device = nil;
         id<MTLCommandQueue> commandQueue = nil;
+        id<MTLCommandQueue> lowPriorityCommandQueue = nil;
+        bool useLowPriorityQueue = false;
         CAMetalLayer* metalLayer = nil;
         id<MTLDepthStencilState> depthStencilState = nil;
         id<MTLTexture> depthTexture = nil;
@@ -79,6 +82,7 @@ namespace threepp {
             bool inUse = false;
         };
         std::vector<ReadbackBuffer> readbackBufferPool;
+        std::mutex readbackPoolMutex;
 
         struct TextureReadback {
             Texture* texture = nullptr;
@@ -240,6 +244,14 @@ namespace threepp {
         void commitPendingFrame();
 
         void ensureFrameStarted();
+
+        void submitLowPriority();
+
+        [[nodiscard]] void* createEvent();
+
+        void encodeSignalEvent(void* event, std::uint64_t value);
+
+        void encodeWaitEventOnCurrentFrame(void* event, std::uint64_t value);
 
         bool ensureDrawable();
 

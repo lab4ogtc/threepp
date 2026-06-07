@@ -18,6 +18,8 @@
 
 using namespace threepp;
 
+extern "C" void freeMetalEvent(void* event);
+
 namespace {
 
     template<class Predicate>
@@ -260,6 +262,43 @@ TEST_CASE("Metal lidar beam unprojection compute samples selected cube faces") {
         REQUIRE(points[3] == 1.f);
         REQUIRE(points[7] == 0.f);
 
+        canvas.close();
+    }
+}
+
+TEST_CASE("Metal low-priority queue and MTLEvent sync logic") {
+
+    @autoreleasepool {
+        id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+        if (!device) {
+            SKIP("Metal device is not available on this host");
+        }
+
+        GlfwWindow canvas{GlfwWindow::Parameters()
+                                  .title("Metal low priority event sync")
+                                  .size(16, 16)
+                                  .headless(true)
+                                  .clientAPI(GlfwWindow::ClientAPI::Metal)};
+        MetalRenderer renderer(canvas);
+
+        void* event = renderer.createEvent();
+        REQUIRE(event != nullptr);
+        id<MTLSharedEvent> sharedEvent = (__bridge id<MTLSharedEvent>) event;
+        REQUIRE(sharedEvent.signaledValue == 0);
+
+        renderer.setUseLowPriorityQueue(true);
+        renderer.encodeSignalEvent(event, 10);
+        REQUIRE(sharedEvent.signaledValue == 0);
+        renderer.submitLowPriority();
+        renderer.setUseLowPriorityQueue(false);
+
+        REQUIRE([sharedEvent waitUntilSignaledValue:10 timeoutMS:2000]);
+        REQUIRE(sharedEvent.signaledValue >= 10);
+
+        renderer.encodeWaitEventOnCurrentFrame(event, 10);
+        REQUIRE_NOTHROW(renderer.endFrame());
+
+        freeMetalEvent(event);
         canvas.close();
     }
 }

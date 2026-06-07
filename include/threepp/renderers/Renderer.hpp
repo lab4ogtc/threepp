@@ -157,6 +157,43 @@ namespace threepp {
             return false;
         }
 
+        /**
+         * @brief 切换后续隐式帧命令缓冲区是否使用低优先级队列。
+         *
+         * 默认实现为空操作；仅支持多队列 GPU 后端需要覆写。
+         */
+        virtual void setUseLowPriorityQueue(bool /*useLowPriority*/) {}
+
+        /**
+         * @brief 提交当前低优先级命令缓冲区。
+         *
+         * 默认实现为空操作；调用方可在非 Metal 后端安全调用。
+         */
+        virtual void submitLowPriority() {}
+
+        /**
+         * @brief 创建一个后端事件对象，用于跨队列 GPU 同步。
+         *
+         * @return 支持事件同步时返回后端事件裸指针，否则返回 nullptr。
+         */
+        [[nodiscard]] virtual void* createEvent() { return nullptr; }
+
+        /**
+         * @brief 在当前命令缓冲区编码事件 signal。
+         *
+         * @param event createEvent() 返回的后端事件指针。
+         * @param value 需要写入的单调递增事件值。
+         */
+        virtual void encodeSignalEvent(void* /*event*/, std::uint64_t /*value*/) {}
+
+        /**
+         * @brief 在当前前台帧命令缓冲区编码事件 wait。
+         *
+         * @param event createEvent() 返回的后端事件指针。
+         * @param value 需要等待的事件值。
+         */
+        virtual void encodeWaitEventOnCurrentFrame(void* /*event*/, std::uint64_t /*value*/) {}
+
         virtual std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
                 const PixelReadbackRequest& /*request*/) {
             throw std::runtime_error("Renderer backend does not support async pixel readback");

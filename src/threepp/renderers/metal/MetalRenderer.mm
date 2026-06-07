@@ -18,9 +18,22 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 using namespace threepp;
+
+extern "C" void freeMetalEvent(void* event) {
+    if (!event) {
+        return;
+    }
+#if __has_feature(objc_arc)
+    id<MTLEvent> mtlEvent = (__bridge_transfer id<MTLEvent>) event;
+    (void) mtlEvent;
+#else
+    [(id<MTLEvent>) event release];
+#endif
+}
 
 namespace {
 
@@ -726,6 +739,10 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
     drawableSampleCount = selectSupportedSampleCount(device, requestedAntialiasingSamples(window));
 
     commandQueue = [device newCommandQueue];
+    commandQueue.label = @"threepp.main";
+    // 公开 Metal SDK 未暴露 GPU queue priority；使用独立队列承载后台工作并通过事件同步。
+    lowPriorityCommandQueue = [device newCommandQueue];
+    lowPriorityCommandQueue.label = @"threepp.low-priority";
     inFlightSemaphore = dispatch_semaphore_create(3);
 
     metalLayer = [CAMetalLayer layer];
@@ -779,6 +796,11 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
 
 MetalRenderer::Impl::~Impl() {
     commitPendingFrame();
+    if (lowPriorityCommandQueue) {
+        id<MTLCommandBuffer> lowPrioritySyncBuffer = [lowPriorityCommandQueue commandBuffer];
+        [lowPrioritySyncBuffer commit];
+        [lowPrioritySyncBuffer waitUntilCompleted];
+    }
     // 提交空命令缓冲区并等待，借助 Metal FIFO 保证前序 GPU 工作完成后再释放资源。
     id<MTLCommandBuffer> syncBuffer = [commandQueue commandBuffer];
     [syncBuffer commit];
@@ -855,6 +877,14 @@ void MetalRenderer::Impl::ensureFrameStarted() {
     SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::ensureFrameStarted");
     if (currentCommandBuffer) return;
 
+    if (useLowPriorityQueue) {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::beginLowPriorityFrame");
+        bufferManager->beginFrame();
+        currentCommandBuffer = [lowPriorityCommandQueue commandBuffer];
+        clearedTargetsInFrame.clear();
+        return;
+    }
+
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::waitInFlightSemaphore");
         dispatch_semaphore_wait(inFlightSemaphore, DISPATCH_TIME_FOREVER);
@@ -873,6 +903,52 @@ void MetalRenderer::Impl::ensureFrameStarted() {
     [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
       dispatch_semaphore_signal(semaphore);
     }];
+}
+
+void MetalRenderer::Impl::submitLowPriority() {
+    if (!currentCommandBuffer) {
+        return;
+    }
+    [currentCommandBuffer commit];
+    currentCommandBuffer = nil;
+    currentDrawable = nil;
+    explicitFrameInProgress = false;
+    screenCommandsEncoded = false;
+    lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
+    currentCommandBufferExternallyAccessed = false;
+}
+
+void* MetalRenderer::Impl::createEvent() {
+    id<MTLEvent> event = [device newSharedEvent];
+#if __has_feature(objc_arc)
+    return (__bridge_retained void*) event;
+#else
+    return event;
+#endif
+}
+
+void MetalRenderer::Impl::encodeSignalEvent(void* event, std::uint64_t value) {
+    if (!event) {
+        return;
+    }
+    ensureFrameStarted();
+    if (!currentCommandBuffer) {
+        return;
+    }
+    id<MTLEvent> mtlEvent = (__bridge id<MTLEvent>) event;
+    [currentCommandBuffer encodeSignalEvent:mtlEvent value:value];
+}
+
+void MetalRenderer::Impl::encodeWaitEventOnCurrentFrame(void* event, std::uint64_t value) {
+    if (!event) {
+        return;
+    }
+    ensureFrameStarted();
+    if (!currentCommandBuffer) {
+        return;
+    }
+    id<MTLEvent> mtlEvent = (__bridge id<MTLEvent>) event;
+    [currentCommandBuffer encodeWaitForEvent:mtlEvent value:value];
 }
 
 bool MetalRenderer::Impl::ensureDrawable() {
@@ -1209,6 +1285,7 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
 }
 
 id<MTLBuffer> MetalRenderer::Impl::acquireReadbackBuffer(NSUInteger size) {
+    std::lock_guard<std::mutex> lock(readbackPoolMutex);
     const auto requestedSize = std::max<NSUInteger>(size, 1u);
     constexpr NSUInteger maxIdleOversizeRetainedReadbackBuffer = 16u * 1024u * 1024u;
 
@@ -1240,6 +1317,7 @@ id<MTLBuffer> MetalRenderer::Impl::acquireReadbackBuffer(NSUInteger size) {
 }
 
 void MetalRenderer::Impl::releaseReadbackBuffer(id<MTLBuffer> buffer) {
+    std::lock_guard<std::mutex> lock(readbackPoolMutex);
     if (!buffer) return;
 
     for (auto& entry : readbackBufferPool) {
@@ -1251,12 +1329,14 @@ void MetalRenderer::Impl::releaseReadbackBuffer(id<MTLBuffer> buffer) {
 }
 
 void MetalRenderer::Impl::releaseAllReadbackBuffers() {
+    std::lock_guard<std::mutex> lock(readbackPoolMutex);
     for (auto& entry : readbackBufferPool) {
         entry.inUse = false;
     }
 }
 
 void MetalRenderer::Impl::releaseReadbackBuffers(const std::vector<TextureReadback>& readbacks) {
+    std::lock_guard<std::mutex> lock(readbackPoolMutex);
     for (const auto& readback : readbacks) {
         for (auto& entry : readbackBufferPool) {
             if (entry.buffer == readback.readbackBuffer) {
@@ -3295,6 +3375,26 @@ std::future<void> MetalRenderer::copyTextureToImageAsync(Texture& texture) {
 
 bool MetalRenderer::supportsAsyncPixelReadback() const noexcept {
     return true;
+}
+
+void MetalRenderer::setUseLowPriorityQueue(bool useLowPriority) {
+    pimpl_->useLowPriorityQueue = useLowPriority;
+}
+
+void MetalRenderer::submitLowPriority() {
+    pimpl_->submitLowPriority();
+}
+
+void* MetalRenderer::createEvent() {
+    return pimpl_->createEvent();
+}
+
+void MetalRenderer::encodeSignalEvent(void* event, std::uint64_t value) {
+    pimpl_->encodeSignalEvent(event, value);
+}
+
+void MetalRenderer::encodeWaitEventOnCurrentFrame(void* event, std::uint64_t value) {
+    pimpl_->encodeWaitEventOnCurrentFrame(event, value);
 }
 
 std::future<PixelReadbackBuffer> MetalRenderer::readRenderTargetPixelsAsync(
