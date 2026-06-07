@@ -4,6 +4,7 @@
 #include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/renderers/metal/MetalRenderer.hpp"
+#include "threepp/textures/DataTexture.hpp"
 #include "threepp/threepp.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -11,6 +12,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -32,6 +34,49 @@ namespace {
     }
 
 }// namespace
+
+TEST_CASE("DataTexture accepts moved ImageData without copying storage") {
+
+    std::vector<std::uint32_t> data{1, 2, 3, 4};
+    const auto* originalStorage = data.data();
+    auto texture = DataTexture::create(threepp::ImageData{std::move(data)}, 1, 1);
+    REQUIRE(texture->image().width == 1);
+    REQUIRE(texture->image().height == 1);
+    REQUIRE(texture->image().data<std::uint32_t>().data() == originalStorage);
+    const auto version = texture->version();
+
+    std::vector<std::uint32_t> replacement{5, 6, 7, 8};
+    const auto* replacementStorage = replacement.data();
+    texture->setData(threepp::ImageData{std::move(replacement)});
+    texture->needsUpdate();
+
+    REQUIRE(texture->image().width == 1);
+    REQUIRE(texture->image().height == 1);
+    REQUIRE(texture->image().data<std::uint32_t>().data() == replacementStorage);
+    REQUIRE(texture->image().data<std::uint32_t>()[0] == 5);
+    REQUIRE(texture->version() == version + 1);
+}
+
+TEST_CASE("DataTexture copies lvalue ImageData storage") {
+
+    threepp::ImageData data = std::vector<std::uint32_t>{1, 2, 3, 4};
+    const auto* originalStorage = std::get<std::vector<std::uint32_t>>(data).data();
+    auto texture = DataTexture::create(data, 1, 1);
+    REQUIRE(texture->image().data<std::uint32_t>().data() != originalStorage);
+    std::get<std::vector<std::uint32_t>>(data)[0] = 99;
+    REQUIRE(texture->image().data<std::uint32_t>()[0] == 1);
+    const auto version = texture->version();
+
+    threepp::ImageData replacement = std::vector<std::uint32_t>{5, 6, 7, 8};
+    const auto* replacementStorage = std::get<std::vector<std::uint32_t>>(replacement).data();
+    texture->setData(replacement);
+    texture->needsUpdate();
+
+    REQUIRE(texture->image().data<std::uint32_t>().data() != replacementStorage);
+    std::get<std::vector<std::uint32_t>>(replacement)[0] = 42;
+    REQUIRE(texture->image().data<std::uint32_t>()[0] == 5);
+    REQUIRE(texture->version() == version + 1);
+}
 
 TEST_CASE("Metal zero-copy RenderTarget supports async main-thread readback") {
 

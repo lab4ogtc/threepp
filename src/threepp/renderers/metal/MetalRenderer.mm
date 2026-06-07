@@ -12,6 +12,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -959,10 +960,15 @@ bool MetalRenderer::Impl::ensureDrawable() {
     }
 
     updateMetalLayerPixelFormat();
+    const auto drawableWaitStart = std::chrono::steady_clock::now();
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::nextDrawable");
         currentDrawable = [metalLayer nextDrawable];
     }
+    const auto drawableWaitUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - drawableWaitStart).count();
+    SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.nextDrawableWaitUs",
+                        static_cast<std::int64_t>(drawableWaitUs));
     if (currentDrawable) {
         syncDrawableSize(currentDrawable.texture.width, currentDrawable.texture.height);
     }
