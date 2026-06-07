@@ -3,6 +3,7 @@
 #include "threepp/materials/MeshBasicMaterial.hpp"
 #include "threepp/materials/PointsMaterial.hpp"
 #include "threepp/materials/SpriteMaterial.hpp"
+#include "threepp/objects/LOD.hpp"
 #include "threepp/objects/Mesh.hpp"
 #include "threepp/objects/Points.hpp"
 #include "threepp/objects/Sprite.hpp"
@@ -185,6 +186,34 @@ TEST_CASE("Metal morph targets select GL-compatible active influences") {
 
     morphTargets.removeGeometry(geometry->id);
     CHECK_FALSE(morphTargets.influencesList.contains(geometry->id));
+}
+
+TEST_CASE("Metal LOD updates respect camera layers like OpenGL") {
+
+    Scene scene;
+    PerspectiveCamera camera(60, 1, 0.1f, 20.f);
+    camera.position.z = -5.f;
+    camera.updateMatrixWorld(true);
+
+    auto nearMesh = Mesh::create(BufferGeometry::create(), MeshBasicMaterial::create());
+    auto farMesh = Mesh::create(BufferGeometry::create(), MeshBasicMaterial::create());
+
+    LOD lod;
+    lod.layers.set(1);
+    lod.addLevel(nearMesh, 0.f);
+    lod.addLevel(farMesh, 3.f);
+    scene.add(lod);
+    scene.updateMatrixWorld(true);
+
+    REQUIRE(lod.getCurrentLevel() == 0);
+    updateLODs(scene, camera);
+    REQUIRE(lod.getCurrentLevel() == 0);
+
+    camera.layers.enable(1);
+    updateLODs(scene, camera);
+    REQUIRE(lod.getCurrentLevel() == 1);
+    REQUIRE_FALSE(nearMesh->visible);
+    REQUIRE(farMesh->visible);
 }
 
 TEST_CASE("Metal shading params expose 16-byte aligned texture flag fields") {

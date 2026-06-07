@@ -653,7 +653,7 @@ namespace threepp {
         if (!object.visible) return;
 
         if (auto* lod = dynamic_cast<LOD*>(&object)) {
-            if (lod->autoUpdate) {
+            if (object.layers.test(camera.layers) && lod->autoUpdate) {
                 lod->update(camera);
             }
         }

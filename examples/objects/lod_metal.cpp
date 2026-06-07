@@ -1,8 +1,8 @@
 #include "threepp/objects/LOD.hpp"
+#include "threepp/canvas/Monitor.hpp"
+#include "threepp/objects/TextSprite.hpp"
 #include "threepp/renderers/Renderer.hpp"
 #include "threepp/threepp.hpp"
-
-#include <cmath>
 
 using namespace threepp;
 
@@ -10,9 +10,9 @@ int main() {
 
     GlfwWindow canvas("LOD (Metal)", {{"aa", 4}, {"clientAPI", "Metal"}});
     auto renderer = Renderer::create(canvas, Backend::Metal);
+    renderer->autoClear = false;
 
     Scene scene;
-    scene.background = Color::aliceblue;
     PerspectiveCamera camera(60, canvas.aspect(), 0.1f, 10);
     camera.position.z = -5;
 
@@ -43,10 +43,24 @@ int main() {
         renderer->setSize(size);
     });
 
-    Clock clock;
-    canvas.animate([&]() {
-        camera.position.z = -5 + 3 * std::sin(clock.getElapsedTime() * 0.5f);
+    HUD hud(*renderer);
+    FontLoader fontLoader;
+    const auto font = *fontLoader.load(std::string(DATA_FOLDER) + "/fonts/typeface/gentilis_bold.typeface.json");
 
+    TextSprite handle1(font, 20.f * monitor::contentScale().first);
+    handle1.setColor(Color::gray);
+    hud.add(handle1).setNormalizedPosition({0.f, 0.05f}).setVerticalAlignment(HUD::VerticalAlignment::ABOVE);
+
+    TextSprite handle2(font, 20.f * monitor::contentScale().first);
+    handle2.setColor(Color::gray);
+    hud.add(handle2).setVerticalAlignment(HUD::VerticalAlignment::ABOVE);
+
+    canvas.animate([&]() {
+        handle1.setText("LOD1 level: " + std::to_string(lod1.getCurrentLevel()));
+        handle2.setText("LOD2 level: " + std::to_string(lod2.getCurrentLevel()));
+
+        renderer->clear();
         renderer->render(scene, camera);
+        hud.render();
     });
 }

@@ -906,6 +906,42 @@ TEST_CASE("Metal water example matches GL tone mapping") {
     REQUIRE(metalSource.find("renderer->toneMapping = ToneMapping::ACESFilmic") != std::string::npos);
 }
 
+TEST_CASE("Metal LOD example matches GL HUD and frame flow") {
+
+    const auto glSource = readProjectFile("examples/objects/lod.cpp");
+    const auto metalSource = readProjectFile("examples/objects/lod_metal.cpp");
+
+    REQUIRE(glSource.find("HUD hud(renderer)") != std::string::npos);
+    REQUIRE(glSource.find("renderer.autoClear = false") != std::string::npos);
+    REQUIRE(glSource.find("handle1.setText(\"LOD1 level: \" + std::to_string(lod1.getCurrentLevel()))") != std::string::npos);
+    REQUIRE(glSource.find("handle2.setText(\"LOD2 level: \" + std::to_string(lod2.getCurrentLevel()))") != std::string::npos);
+    REQUIRE(glSource.find("renderer.clear()") != std::string::npos);
+    REQUIRE(glSource.find("hud.render()") != std::string::npos);
+
+    REQUIRE(metalSource.find("HUD hud(*renderer)") != std::string::npos);
+    REQUIRE(metalSource.find("renderer->autoClear = false") != std::string::npos);
+    REQUIRE(metalSource.find("FontLoader fontLoader") != std::string::npos);
+    REQUIRE(metalSource.find("handle1.setText(\"LOD1 level: \" + std::to_string(lod1.getCurrentLevel()))") != std::string::npos);
+    REQUIRE(metalSource.find("handle2.setText(\"LOD2 level: \" + std::to_string(lod2.getCurrentLevel()))") != std::string::npos);
+    REQUIRE(metalSource.find("renderer->clear()") != std::string::npos);
+    REQUIRE(metalSource.find("hud.render()") != std::string::npos);
+    REQUIRE(metalSource.find("camera.position.z = -5 + 3 * std::sin") == std::string::npos);
+}
+
+TEST_CASE("LOD example embeds font data for web builds") {
+
+    const auto source = readProjectFile("examples/objects/CMakeLists.txt");
+    const auto lodStart = source.find("add_example(NAME \"lod\"");
+    REQUIRE(lodStart != std::string::npos);
+    const auto lodEnd = source.find("add_example(NAME \"points\"", lodStart);
+    REQUIRE(lodEnd != std::string::npos);
+    const auto lodBlock = std::string_view{source}.substr(lodStart, lodEnd - lodStart);
+
+    REQUIRE(lodBlock.find("WEB WEB_EMBED") != std::string_view::npos);
+    REQUIRE(lodBlock.find("WEBWEB_EMBED") == std::string_view::npos);
+    REQUIRE(lodBlock.find("${PROJECT_SOURCE_DIR}/data/fonts@data/fonts") != std::string_view::npos);
+}
+
 TEST_CASE("Metal reflector example matches GL antialiasing") {
 
     const auto glSource = readProjectFile("examples/textures/texture2d.cpp");
