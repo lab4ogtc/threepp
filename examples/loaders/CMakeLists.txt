@@ -16,6 +16,7 @@ add_example(NAME "collada_loader")
 if (APPLE)
     add_example(NAME "obj_loader_metal")
     add_example(NAME "gltf_loader_metal")
+    add_example(NAME "assimp_loader_metal" LINK_ASSIMP)
 endif ()
 
 if (THREEPP_WITH_SVG)
