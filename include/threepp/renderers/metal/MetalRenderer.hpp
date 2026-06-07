@@ -99,6 +99,8 @@ namespace threepp {
 
         void submitLowPriority() override;
 
+        [[nodiscard]] BackgroundQueuePriorityCapability backgroundQueuePriorityCapability() const override;
+
         [[nodiscard]] void* createEvent() override;
 
         void encodeSignalEvent(void* event, std::uint64_t value) override;

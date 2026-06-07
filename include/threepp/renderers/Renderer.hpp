@@ -96,6 +96,18 @@ namespace threepp {
         Failed
     };
 
+    enum class BackgroundQueuePriorityMode {
+        Unsupported,
+        QueueOnly
+    };
+
+    struct BackgroundQueuePriorityCapability {
+        BackgroundQueuePriorityMode mode = BackgroundQueuePriorityMode::Unsupported;
+        bool requested = false;
+        bool applied = false;
+        std::string reason;
+    };
+
     struct MaterialPrewarmRequest {
         RawShaderMaterial* material = nullptr;
         RenderTarget* renderTarget = nullptr;
@@ -158,18 +170,33 @@ namespace threepp {
         }
 
         /**
-         * @brief 切换后续隐式帧命令缓冲区是否使用低优先级队列。
+         * @brief 切换后续隐式帧命令缓冲区是否使用后台独立队列。
          *
+         * 历史接口名保留为 low priority；当前实现只切换独立队列，不设置真实 GPU priority。
          * 默认实现为空操作；仅支持多队列 GPU 后端需要覆写。
          */
         virtual void setUseLowPriorityQueue(bool /*useLowPriority*/) {}
 
         /**
-         * @brief 提交当前低优先级命令缓冲区。
+         * @brief 提交当前后台独立队列命令缓冲区。
          *
          * 默认实现为空操作；调用方可在非 Metal 后端安全调用。
          */
         virtual void submitLowPriority() {}
+
+        /**
+         * @brief 返回后台 GPU 队列优先级能力诊断。
+         *
+         * `requested` 表示调用方请求后台优先级，`applied` 表示已通过可验证路径
+         * 应用真实 GPU priority。`QueueOnly` 仅代表独立后台队列，不代表真实优先级。
+         */
+        [[nodiscard]] virtual BackgroundQueuePriorityCapability backgroundQueuePriorityCapability() const {
+            return {
+                    BackgroundQueuePriorityMode::Unsupported,
+                    false,
+                    false,
+                    "background GPU queue priority is unsupported by this renderer"};
+        }
 
         /**
          * @brief 创建一个后端事件对象，用于跨队列 GPU 同步。

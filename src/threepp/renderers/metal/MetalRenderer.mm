@@ -21,6 +21,8 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
+#include <utility>
 
 using namespace threepp;
 
@@ -39,6 +41,46 @@ extern "C" void freeMetalEvent(void* event) {
 namespace {
 
     constexpr float frameBoundaryThresholdMs = 1.5f;
+
+    [[nodiscard, maybe_unused]] int queuePriorityTraceValue(metal::MetalQueuePriorityMode mode) {
+        switch (mode) {
+            case metal::MetalQueuePriorityMode::Unsupported:
+                return 0;
+            case metal::MetalQueuePriorityMode::QueueOnly:
+                return 1;
+        }
+        return 0;
+    }
+
+    [[nodiscard]] const char* queuePriorityLabel(metal::MetalQueuePriorityMode mode) {
+        switch (mode) {
+            case metal::MetalQueuePriorityMode::Unsupported:
+                return "threepp.background.unsupported";
+            case metal::MetalQueuePriorityMode::QueueOnly:
+                return "threepp.background.queue-only";
+        }
+        return "threepp.background.unsupported";
+    }
+
+    [[nodiscard]] BackgroundQueuePriorityMode toRendererPriorityMode(metal::MetalQueuePriorityMode mode) {
+        switch (mode) {
+            case metal::MetalQueuePriorityMode::Unsupported:
+                return BackgroundQueuePriorityMode::Unsupported;
+            case metal::MetalQueuePriorityMode::QueueOnly:
+                return BackgroundQueuePriorityMode::QueueOnly;
+        }
+        return BackgroundQueuePriorityMode::Unsupported;
+    }
+
+    [[nodiscard]] BackgroundQueuePriorityCapability toRendererCapability(
+        const metal::MetalQueuePriorityCapability& capability)
+    {
+        return {
+                toRendererPriorityMode(capability.mode),
+                capability.requested,
+                capability.applied,
+                capability.reason};
+    }
 
     constexpr const char* scissorClearShaderSource = R"metal(
 #include <metal_stdlib>
@@ -741,9 +783,12 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
 
     commandQueue = [device newCommandQueue];
     commandQueue.label = @"threepp.main";
-    // 公开 Metal SDK 未暴露 GPU queue priority；使用独立队列承载后台工作并通过事件同步。
-    lowPriorityCommandQueue = [device newCommandQueue];
-    lowPriorityCommandQueue.label = @"threepp.low-priority";
+    auto backgroundQueue = metal::createBackgroundCommandQueue(device);
+    lowPriorityCommandQueue = backgroundQueue.queue;
+    backgroundQueuePriorityCapability = std::move(backgroundQueue.capability);
+    if (lowPriorityCommandQueue) {
+        lowPriorityCommandQueue.label = [NSString stringWithUTF8String:queuePriorityLabel(backgroundQueuePriorityCapability.mode)];
+    }
     inFlightSemaphore = dispatch_semaphore_create(3);
 
     metalLayer = [CAMetalLayer layer];
@@ -878,8 +923,14 @@ void MetalRenderer::Impl::ensureFrameStarted() {
     SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::ensureFrameStarted");
     if (currentCommandBuffer) return;
 
-    if (useLowPriorityQueue) {
+    if (useLowPriorityQueue && lowPriorityCommandQueue) {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::beginLowPriorityFrame");
+        SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.backgroundQueuePriorityMode",
+                            queuePriorityTraceValue(backgroundQueuePriorityCapability.mode));
+        SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.backgroundQueuePriorityRequested",
+                            backgroundQueuePriorityCapability.requested ? 1 : 0);
+        SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.backgroundQueuePriorityApplied",
+                            backgroundQueuePriorityCapability.applied ? 1 : 0);
         bufferManager->beginFrame();
         currentCommandBuffer = [lowPriorityCommandQueue commandBuffer];
         clearedTargetsInFrame.clear();
@@ -3389,6 +3440,10 @@ void MetalRenderer::setUseLowPriorityQueue(bool useLowPriority) {
 
 void MetalRenderer::submitLowPriority() {
     pimpl_->submitLowPriority();
+}
+
+BackgroundQueuePriorityCapability MetalRenderer::backgroundQueuePriorityCapability() const {
+    return toRendererCapability(pimpl_->backgroundQueuePriorityCapability);
 }
 
 void* MetalRenderer::createEvent() {

@@ -585,6 +585,7 @@ endif ()
 
 if (APPLE)
     list(APPEND sources
+            "threepp/renderers/metal/MetalQueuePriority.mm"
             "threepp/renderers/metal/MetalRenderer.mm"
             "threepp/renderers/metal/MetalShadowRenderer.mm"
             "threepp/renderers/metal/MetalObjectsRenderer.mm"

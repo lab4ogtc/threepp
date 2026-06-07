@@ -5,6 +5,7 @@
 #import "MetalDynamicShaderCache.hpp"
 #import "MetalMorphTargets.hpp"
 #import "MetalPipelineCache.hpp"
+#import "MetalQueuePriority.hpp"
 #import "MetalRenderList.hpp"
 #import "MetalRenderObjects.hpp"
 #import "MetalRenderStateUtils.hpp"
@@ -41,6 +42,7 @@ namespace threepp {
         id<MTLDevice> device = nil;
         id<MTLCommandQueue> commandQueue = nil;
         id<MTLCommandQueue> lowPriorityCommandQueue = nil;
+        metal::MetalQueuePriorityCapability backgroundQueuePriorityCapability;
         bool useLowPriorityQueue = false;
         CAMetalLayer* metalLayer = nil;
         id<MTLDepthStencilState> depthStencilState = nil;
