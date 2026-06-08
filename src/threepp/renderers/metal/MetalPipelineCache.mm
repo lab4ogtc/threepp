@@ -333,6 +333,10 @@ namespace threepp::metal {
 
             pipelineStates[key] = pso;
             failedPipelineStates.erase(key);
+            if (pendingPipelineStates.erase(key) > 0) {
+                cancelledPipelineStates.insert(key);
+                condition.notify_all();
+            }
             return pso;
         }
 
