@@ -133,6 +133,10 @@ namespace {
             case GLFW_KEY_BACKSPACE: return Key::BACKSPACE;
             case GLFW_KEY_INSERT: return Key::INSERT;
             case GLFW_KEY_DELETE: return Key::DEL;
+            case GLFW_KEY_PAGE_UP: return Key::PAGE_UP;
+            case GLFW_KEY_PAGE_DOWN: return Key::PAGE_DOWN;
+            case GLFW_KEY_HOME: return Key::HOME;
+            case GLFW_KEY_END: return Key::END;
 
             case GLFW_KEY_LEFT_SHIFT: return Key::LEFT_SHIFT;
             case GLFW_KEY_LEFT_CONTROL: return Key::LEFT_CONTROL;
