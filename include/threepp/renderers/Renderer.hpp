@@ -98,6 +98,7 @@ namespace threepp {
 
     enum class BackgroundQueuePriorityMode {
         Unsupported,
+        MainQueue,
         QueueOnly
     };
 

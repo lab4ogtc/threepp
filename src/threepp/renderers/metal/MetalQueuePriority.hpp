@@ -9,6 +9,7 @@ namespace threepp::metal {
 
     enum class MetalQueuePriorityMode {
         Unsupported,
+        MainQueue,
         QueueOnly
     };
 

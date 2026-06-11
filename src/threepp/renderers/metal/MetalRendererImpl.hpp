@@ -18,6 +18,7 @@
 #import <dispatch/dispatch.h>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
@@ -51,7 +52,7 @@ namespace threepp {
         MTLPixelFormat multisampleColorPixelFormat = MTLPixelFormatInvalid;
         id<CAMetalDrawable> currentDrawable = nil;
         id<MTLCommandBuffer> currentCommandBuffer = nil;
-        dispatch_semaphore_t inFlightSemaphore = nullptr;
+        std::atomic<std::uint32_t> inFlightCommandBuffers{0};
         MTLPixelFormat depthPixelFormat = MTLPixelFormatDepth32Float;
 
         std::unique_ptr<metal::MetalPipelineCache> pipelineCache;

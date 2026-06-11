@@ -11,21 +11,20 @@ namespace threepp::metal {
                 "Metal device is unavailable"}};
         }
 
-        id<MTLCommandQueue> queue = [device newCommandQueue];
         MetalQueuePriorityCapability capability;
-        capability.mode = queue ? MetalQueuePriorityMode::QueueOnly : MetalQueuePriorityMode::Unsupported;
+        capability.mode = MetalQueuePriorityMode::MainQueue;
         capability.requested = false;
         capability.applied = false;
-        capability.reason = queue
-            ? "using independent background command queue without GPU priority"
-            : "Metal background command queue creation failed";
-        return {queue, capability};
+        capability.reason = "using main command queue for background submissions";
+        return {nil, capability};
     }
 
     const char* metalQueuePriorityModeName(MetalQueuePriorityMode mode) noexcept {
         switch (mode) {
             case MetalQueuePriorityMode::Unsupported:
                 return "unsupported";
+            case MetalQueuePriorityMode::MainQueue:
+                return "main_queue";
             case MetalQueuePriorityMode::QueueOnly:
                 return "queue_only";
         }

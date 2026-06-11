@@ -46,8 +46,10 @@ namespace {
         switch (mode) {
             case metal::MetalQueuePriorityMode::Unsupported:
                 return 0;
-            case metal::MetalQueuePriorityMode::QueueOnly:
+            case metal::MetalQueuePriorityMode::MainQueue:
                 return 1;
+            case metal::MetalQueuePriorityMode::QueueOnly:
+                return 2;
         }
         return 0;
     }
@@ -56,6 +58,8 @@ namespace {
         switch (mode) {
             case metal::MetalQueuePriorityMode::Unsupported:
                 return "threepp.background.unsupported";
+            case metal::MetalQueuePriorityMode::MainQueue:
+                return "threepp.background.main-queue";
             case metal::MetalQueuePriorityMode::QueueOnly:
                 return "threepp.background.queue-only";
         }
@@ -66,6 +70,8 @@ namespace {
         switch (mode) {
             case metal::MetalQueuePriorityMode::Unsupported:
                 return BackgroundQueuePriorityMode::Unsupported;
+            case metal::MetalQueuePriorityMode::MainQueue:
+                return BackgroundQueuePriorityMode::MainQueue;
             case metal::MetalQueuePriorityMode::QueueOnly:
                 return BackgroundQueuePriorityMode::QueueOnly;
         }
@@ -619,6 +625,16 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
         }
     }
 
+    void releaseCurrentDrawable(id<CAMetalDrawable>& drawable) {
+        if (!drawable) {
+            return;
+        }
+#if !__has_feature(objc_arc)
+        [drawable release];
+#endif
+        drawable = nil;
+    }
+
     class RenderCallbackScope {
 
     public:
@@ -789,7 +805,6 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
     if (lowPriorityCommandQueue) {
         lowPriorityCommandQueue.label = [NSString stringWithUTF8String:queuePriorityLabel(backgroundQueuePriorityCapability.mode)];
     }
-    inFlightSemaphore = dispatch_semaphore_create(3);
 
     metalLayer = [CAMetalLayer layer];
     metalLayer.device = device;
@@ -907,12 +922,27 @@ void MetalRenderer::Impl::commitPendingFrame() {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::presentDrawable");
         [currentCommandBuffer presentDrawable:currentDrawable];
     }
+    if (currentDrawable) {
+        auto* inFlightCounter = &inFlightCommandBuffers;
+        const auto inFlight = inFlightCounter->fetch_add(1, std::memory_order_relaxed) + 1;
+        SPARK_TRACE_COUNTER(
+            "threepp.metal",
+            "MetalRenderer.inFlightCommandBuffers",
+            static_cast<std::int64_t>(inFlight));
+        [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
+          const auto remaining = inFlightCounter->fetch_sub(1, std::memory_order_relaxed) - 1;
+          SPARK_TRACE_COUNTER(
+              "threepp.metal",
+              "MetalRenderer.inFlightCommandBuffers",
+              static_cast<std::int64_t>(remaining));
+        }];
+    }
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::commitCommandBuffer");
         [currentCommandBuffer commit];
     }
     currentCommandBuffer = nil;
-    currentDrawable = nil;
+    releaseCurrentDrawable(currentDrawable);
     explicitFrameInProgress = false;
     screenCommandsEncoded = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
@@ -923,7 +953,7 @@ void MetalRenderer::Impl::ensureFrameStarted() {
     SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::ensureFrameStarted");
     if (currentCommandBuffer) return;
 
-    if (useLowPriorityQueue && lowPriorityCommandQueue) {
+    if (useLowPriorityQueue) {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::beginLowPriorityFrame");
         SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.backgroundQueuePriorityMode",
                             queuePriorityTraceValue(backgroundQueuePriorityCapability.mode));
@@ -931,16 +961,20 @@ void MetalRenderer::Impl::ensureFrameStarted() {
                             backgroundQueuePriorityCapability.requested ? 1 : 0);
         SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.backgroundQueuePriorityApplied",
                             backgroundQueuePriorityCapability.applied ? 1 : 0);
-        bufferManager->beginFrame();
-        currentCommandBuffer = [lowPriorityCommandQueue commandBuffer];
+        SPARK_TRACE_COUNTER("threepp.metal", "MetalRenderer.backgroundQueueDedicated",
+                            lowPriorityCommandQueue ? 1 : 0);
+        {
+            SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::beginLowPriorityFrameBuffers");
+            bufferManager->beginFrame();
+        }
+        {
+            SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::createLowPriorityCommandBuffer");
+            currentCommandBuffer = [(lowPriorityCommandQueue ? lowPriorityCommandQueue : commandQueue) commandBuffer];
+        }
         clearedTargetsInFrame.clear();
         return;
     }
 
-    {
-        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::waitInFlightSemaphore");
-        dispatch_semaphore_wait(inFlightSemaphore, DISPATCH_TIME_FOREVER);
-    }
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::beginFrameBuffers");
         bufferManager->beginFrame();
@@ -951,10 +985,6 @@ void MetalRenderer::Impl::ensureFrameStarted() {
         currentCommandBuffer = [commandQueue commandBuffer];
     }
     clearedTargetsInFrame.clear();
-    auto semaphore = inFlightSemaphore;
-    [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
-      dispatch_semaphore_signal(semaphore);
-    }];
 }
 
 void MetalRenderer::Impl::submitLowPriority() {
@@ -963,7 +993,7 @@ void MetalRenderer::Impl::submitLowPriority() {
     }
     [currentCommandBuffer commit];
     currentCommandBuffer = nil;
-    currentDrawable = nil;
+    releaseCurrentDrawable(currentDrawable);
     explicitFrameInProgress = false;
     screenCommandsEncoded = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
@@ -995,12 +1025,22 @@ void MetalRenderer::Impl::encodeWaitEventOnCurrentFrame(void* event, std::uint64
     if (!event) {
         return;
     }
-    ensureFrameStarted();
-    if (!currentCommandBuffer) {
+    id<MTLEvent> mtlEvent = (__bridge id<MTLEvent>) event;
+    if (currentCommandBuffer) {
+        [currentCommandBuffer encodeWaitForEvent:mtlEvent value:value];
         return;
     }
-    id<MTLEvent> mtlEvent = (__bridge id<MTLEvent>) event;
-    [currentCommandBuffer encodeWaitForEvent:mtlEvent value:value];
+
+    id<MTLCommandBuffer> commandBuffer = nil;
+    {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::encodeStandaloneEventWait");
+        commandBuffer = [commandQueue commandBuffer];
+    }
+    if (!commandBuffer) {
+        return;
+    }
+    [commandBuffer encodeWaitForEvent:mtlEvent value:value];
+    [commandBuffer commit];
 }
 
 bool MetalRenderer::Impl::ensureDrawable() {
@@ -1014,7 +1054,13 @@ bool MetalRenderer::Impl::ensureDrawable() {
     const auto drawableWaitStart = std::chrono::steady_clock::now();
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::nextDrawable");
-        currentDrawable = [metalLayer nextDrawable];
+        @autoreleasepool {
+            id<CAMetalDrawable> drawable = [metalLayer nextDrawable];
+#if !__has_feature(objc_arc)
+            [drawable retain];
+#endif
+            currentDrawable = drawable;
+        }
     }
     const auto drawableWaitUs = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - drawableWaitStart).count();
@@ -2481,7 +2527,7 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
     }
 
     currentCommandBuffer = nil;
-    currentDrawable = nil;
+    releaseCurrentDrawable(currentDrawable);
     explicitFrameInProgress = false;
     screenCommandsEncoded = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
