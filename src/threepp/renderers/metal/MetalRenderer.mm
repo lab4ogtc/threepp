@@ -740,6 +740,89 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
         }
     }
 
+    void updateTextureMetadataFromExternalMetalTexture(Texture& texture, id<MTLTexture> metalTexture) {
+        switch (metalTexture.pixelFormat) {
+            case MTLPixelFormatRGBA8Unorm:
+                texture.format = Format::RGBA;
+                texture.type = Type::UnsignedByte;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRGBA8Unorm_sRGB:
+                texture.format = Format::RGBA;
+                texture.type = Type::UnsignedByte;
+                texture.encoding = Encoding::sRGB;
+                break;
+            case MTLPixelFormatBGRA8Unorm:
+                texture.format = Format::BGRA;
+                texture.type = Type::UnsignedByte;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatBGRA8Unorm_sRGB:
+                texture.format = Format::BGRA;
+                texture.type = Type::UnsignedByte;
+                texture.encoding = Encoding::sRGB;
+                break;
+            case MTLPixelFormatRG8Unorm:
+                texture.format = Format::RG;
+                texture.type = Type::UnsignedByte;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatR8Unorm:
+                texture.format = Format::Red;
+                texture.type = Type::UnsignedByte;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRGBA16Float:
+                texture.format = Format::RGBA;
+                texture.type = Type::HalfFloat;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRG16Float:
+                texture.format = Format::RG;
+                texture.type = Type::HalfFloat;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatR16Float:
+                texture.format = Format::Red;
+                texture.type = Type::HalfFloat;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRGBA32Float:
+                texture.format = Format::RGBA;
+                texture.type = Type::Float;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRG32Float:
+                texture.format = Format::RG;
+                texture.type = Type::Float;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatR32Float:
+                texture.format = Format::Red;
+                texture.type = Type::Float;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRGBA32Uint:
+                texture.format = Format::RGBAInteger;
+                texture.type = Type::UnsignedInt;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatRG32Uint:
+                texture.format = Format::RGInteger;
+                texture.type = Type::UnsignedInt;
+                texture.encoding = Encoding::Linear;
+                break;
+            case MTLPixelFormatR32Uint:
+                texture.format = Format::RedInteger;
+                texture.type = Type::UnsignedInt;
+                texture.encoding = Encoding::Linear;
+                break;
+            default:
+                throw std::runtime_error("MetalRenderer::registerExternalRenderTarget received an unsupported color texture format");
+        }
+        texture.generateMipmaps = metalTexture.mipmapLevelCount > 1;
+    }
+
     struct RenderCommandEncoderScope {
         id<MTLRenderCommandEncoder> encoder = nil;
         bool ended = false;
@@ -1296,7 +1379,94 @@ id<MTLTexture> MetalRenderer::Impl::createRenderTargetDepthTexture(RenderTarget&
     return createDepthTexture(target.width, target.height, target.texture && target.texture->generateMipmaps);
 }
 
+void MetalRenderer::Impl::registerExternalRenderTarget(RenderTarget& target, void* colorTexture, void* depthTexture) {
+    id<MTLTexture> mtlColorTexture = (__bridge id<MTLTexture>) colorTexture;
+    id<MTLTexture> mtlDepthTexture = (__bridge id<MTLTexture>) depthTexture;
+    if (!mtlColorTexture) {
+        throw std::runtime_error("MetalRenderer::registerExternalRenderTarget requires a non-null color texture");
+    }
+    if (!target.texture) {
+        throw std::runtime_error("MetalRenderer::registerExternalRenderTarget requires target.texture");
+    }
+    if (target.textures.empty()) {
+        target.textures.push_back(target.texture);
+    }
+    if (target.textures.size() != 1 || target.textures.front() != target.texture) {
+        throw std::runtime_error("MetalRenderer::registerExternalRenderTarget supports exactly one color attachment");
+    }
+    if (mtlColorTexture.textureType != MTLTextureType2D || mtlColorTexture.sampleCount != 1) {
+        throw std::runtime_error("MetalRenderer::registerExternalRenderTarget currently supports only non-multisampled 2D color textures");
+    }
+    if (mtlDepthTexture &&
+        (mtlDepthTexture.textureType != MTLTextureType2D ||
+         mtlDepthTexture.sampleCount != mtlColorTexture.sampleCount ||
+         mtlDepthTexture.width != mtlColorTexture.width ||
+         mtlDepthTexture.height != mtlColorTexture.height)) {
+        throw std::runtime_error("MetalRenderer::registerExternalRenderTarget depth texture must match the color texture shape");
+    }
+
+    const auto width = static_cast<unsigned int>(std::max<NSUInteger>(mtlColorTexture.width, 1u));
+    const auto height = static_cast<unsigned int>(std::max<NSUInteger>(mtlColorTexture.height, 1u));
+    target.isExternal = true;
+    target.width = width;
+    target.height = height;
+    target.depth = 1;
+    target.viewport.set(0, 0, static_cast<float>(width), static_cast<float>(height));
+    target.scissor.set(0, 0, static_cast<float>(width), static_cast<float>(height));
+
+    updateTextureMetadataFromExternalMetalTexture(*target.texture, mtlColorTexture);
+    updateTextureImageMetadata(*target.texture, width, height, 1, false);
+    textureManager->registerExternalTexture(*target.texture, (__bridge void*) mtlColorTexture);
+
+    id<MTLTexture> resolvedDepthTexture = mtlDepthTexture;
+    if (!resolvedDepthTexture && target.depthBuffer) {
+        auto existing = renderTargetResources.find(&target);
+        if (existing != renderTargetResources.end() &&
+            existing->second.isExternal &&
+            existing->second.externalDepthTexture == nullptr &&
+            existing->second.width == mtlColorTexture.width &&
+            existing->second.height == mtlColorTexture.height &&
+            existing->second.depthTexture) {
+            resolvedDepthTexture = existing->second.depthTexture;
+        } else {
+            resolvedDepthTexture = createDepthTexture(mtlColorTexture.width, mtlColorTexture.height, false);
+        }
+    }
+    if (target.depthTexture && resolvedDepthTexture) {
+        updateTextureImageMetadata(*target.depthTexture, width, height, 1, false);
+        textureManager->registerExternalTexture(*target.depthTexture, (__bridge void*) resolvedDepthTexture);
+    }
+
+    if (!target.hasEventListener("dispose", onRenderTargetDispose)) {
+        target.addEventListener("dispose", onRenderTargetDispose);
+    }
+
+    auto& resources = renderTargetResources[&target];
+    resources.colorTextures = {mtlColorTexture};
+    resources.colorPixelFormats = {mtlColorTexture.pixelFormat};
+    resources.depthTexture = resolvedDepthTexture;
+    resources.backingBuffer = nil;
+    resources.width = mtlColorTexture.width;
+    resources.height = mtlColorTexture.height;
+    resources.depth = 1;
+    resources.alignedBytesPerRow = 0;
+    resources.colorTextureType = mtlColorTexture.textureType;
+    resources.mipmapped = mtlColorTexture.mipmapLevelCount > 1;
+    resources.requestedZeroCopy = target.zeroCopy;
+    resources.isZeroCopy = false;
+    resources.isExternal = true;
+    resources.externalColorTexture = (__bridge void*) mtlColorTexture;
+    resources.externalDepthTexture = (__bridge void*) mtlDepthTexture;
+}
+
 MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreateRenderTargetResources(RenderTarget& target) {
+    if (target.isExternal) {
+        auto it = renderTargetResources.find(&target);
+        if (it != renderTargetResources.end() && it->second.isExternal) {
+            return it->second;
+        }
+        throw std::runtime_error("Metal external RenderTarget must be registered before rendering");
+    }
     if (!target.texture) {
         throw std::runtime_error("Metal RenderTarget requires a color texture");
     }
@@ -1478,6 +1648,30 @@ void MetalRenderer::Impl::readRgba8PixelsToBuffer(id<MTLBuffer> readbackBuffer,
 
 void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
     if (!target) return;
+
+    if (target && target->isExternal) {
+        if (!target->textures.empty()) {
+            for (auto& texture : target->textures) {
+                if (texture) {
+                    textureManager->unregisterExternalTexture(texture.get());
+                }
+            }
+        } else if (target->texture) {
+            textureManager->unregisterExternalTexture(target->texture.get());
+        }
+        if (target->depthTexture) {
+            textureManager->unregisterExternalTexture(target->depthTexture.get());
+        }
+        renderTargetResources.erase(target);
+        for (auto it = clearedTargetsInFrame.begin(); it != clearedTargetsInFrame.end();) {
+            if (it->target == target) {
+                it = clearedTargetsInFrame.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        return;
+    }
 
     if (!target->textures.empty()) {
         for (auto& texture : target->textures) {
@@ -3385,6 +3579,15 @@ WindowSize MetalRenderer::size() const {
 
 void* MetalRenderer::device() const {
     return (__bridge void*) pimpl_->device;
+}
+
+void* MetalRenderer::commandQueue() const {
+    return (__bridge void*) pimpl_->commandQueue;
+}
+
+void MetalRenderer::registerExternalRenderTarget(RenderTarget& target, void* colorTexture, void* depthTexture) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    pimpl_->registerExternalRenderTarget(target, colorTexture, depthTexture);
 }
 
 void* MetalRenderer::currentCommandBuffer() const {

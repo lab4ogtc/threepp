@@ -109,6 +109,7 @@ RenderTarget& RenderTarget::copy(const RenderTarget& source) {
     this->depthBuffer = source.depthBuffer;
     this->stencilBuffer = source.stencilBuffer;
     this->zeroCopy = source.zeroCopy;
+    this->isExternal = source.isExternal;
     this->depthTexture = source.depthTexture;
 
     return *this;

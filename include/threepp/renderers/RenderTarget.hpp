@@ -60,6 +60,7 @@ namespace threepp {
         bool depthBuffer;
         bool stencilBuffer;
         bool zeroCopy;
+        bool isExternal = false;
 
         std::shared_ptr<DepthTexture> depthTexture;
 

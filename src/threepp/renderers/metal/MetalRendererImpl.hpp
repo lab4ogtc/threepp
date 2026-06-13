@@ -129,6 +129,9 @@ namespace threepp {
             bool mipmapped = false;
             bool requestedZeroCopy = false;
             bool isZeroCopy = false;
+            bool isExternal = false;
+            void* externalColorTexture = nullptr;
+            void* externalDepthTexture = nullptr;
         };
 
         struct RenderTargetColorTextureAllocation {
@@ -277,6 +280,8 @@ namespace threepp {
         RenderTargetColorTextureAllocation createRenderTargetColorTexture(RenderTarget& target, Texture& texture, MTLPixelFormat pixelFormat) const;
 
         id<MTLTexture> createRenderTargetDepthTexture(RenderTarget& target) const;
+
+        void registerExternalRenderTarget(RenderTarget& target, void* colorTexture, void* depthTexture);
 
         MetalRenderTargetResources& getOrCreateRenderTargetResources(RenderTarget& target);
 

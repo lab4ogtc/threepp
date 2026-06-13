@@ -156,6 +156,24 @@ namespace threepp {
 
         [[nodiscard]] void* device() const;
 
+        [[nodiscard]] void* commandQueue() const;
+
+        /**
+         * @brief 将 RenderTarget 绑定到外部 Metal 颜色纹理。
+         *
+         * 该接口用于 OpenXR 等外部运行时提供的 `id<MTLTexture>`。渲染器只缓存
+         * 传入纹理并可懒创建/复用深度纹理，不接管外部颜色纹理的生命周期。
+         *
+         * @param target 需要接管的 RenderTarget；调用后会标记为外部 RenderTarget。
+         * @param colorTexture 通过 `__bridge void*` 传入的非空 `id<MTLTexture>`。
+         * @param depthTexture 可选的外部 `id<MTLTexture>` 深度附件；为空时按需自管深度纹理。
+         * @throws std::runtime_error 当纹理为空或当前 Metal 后端不支持该纹理形态时抛出。
+         */
+        void registerExternalRenderTarget(
+                RenderTarget& target,
+                void* colorTexture,
+                void* depthTexture = nullptr);
+
         [[nodiscard]] void* currentCommandBuffer() const;
 
         [[nodiscard]] void* currentDrawableTexture() const;

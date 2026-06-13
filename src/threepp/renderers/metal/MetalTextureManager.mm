@@ -631,6 +631,20 @@ namespace threepp::metal {
             textures[&texture] = CachedTexture{mtlTexture, texture.version(), true};
         }
 
+        void unregisterExternalTexture(Texture* texture) {
+            if (!texture) return;
+
+            auto it = textures.find(texture);
+            if (it == textures.end() || !it->second.external) {
+                return;
+            }
+            if (texture->hasEventListener("dispose", onTextureDispose)) {
+                texture->removeEventListener("dispose", onTextureDispose);
+            }
+            placeholderWarnings.erase(texture);
+            textures.erase(it);
+        }
+
         void updateCachedTexture(Texture& texture, id<MTLTexture> mtlTexture) {
             if (!mtlTexture) {
                 throw std::runtime_error("Cannot cache a null Metal texture");
@@ -673,6 +687,10 @@ namespace threepp::metal {
 
     void MetalTextureManager::registerExternalTexture(Texture& texture, void* mtlTexture) {
         pimpl_->registerExternalTexture(texture, (__bridge id<MTLTexture>) mtlTexture);
+    }
+
+    void MetalTextureManager::unregisterExternalTexture(Texture* texture) {
+        pimpl_->unregisterExternalTexture(texture);
     }
 
     void MetalTextureManager::updateCachedTexture(Texture& texture, void* mtlTexture) {
