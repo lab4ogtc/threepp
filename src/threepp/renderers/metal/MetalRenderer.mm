@@ -19,6 +19,7 @@
 #include <exception>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -41,6 +42,40 @@ extern "C" void freeMetalEvent(void* event) {
 namespace {
 
     constexpr float frameBoundaryThresholdMs = 1.5f;
+
+    [[nodiscard]] std::shared_ptr<const void> makeSharedMetalOwner(id object) {
+        if (!object) {
+            return {};
+        }
+#if __has_feature(objc_arc)
+        void* retained = (__bridge_retained void*) object;
+#else
+        void* retained = object;
+#endif
+        return std::shared_ptr<const void>(retained, [](const void* ptr) {
+            if (!ptr) {
+                return;
+            }
+            auto* raw = const_cast<void*>(ptr);
+#if __has_feature(objc_arc)
+            id object = (__bridge_transfer id) raw;
+            (void) object;
+#else
+            [(id) raw release];
+#endif
+        });
+    }
+
+    void releaseOwnedMetalObject(id object) {
+        if (!object) {
+            return;
+        }
+#if !__has_feature(objc_arc)
+        [object release];
+#else
+        (void) object;
+#endif
+    }
 
     [[nodiscard, maybe_unused]] int queuePriorityTraceValue(metal::MetalQueuePriorityMode mode) {
         switch (mode) {
@@ -963,6 +998,8 @@ MetalRenderer::Impl::~Impl() {
         readbackBuffer.inUse = false;
     }
     readbackBufferPool.clear();
+    releaseOwnedMetalObject(lowPriorityCommandQueue);
+    lowPriorityCommandQueue = nil;
 }
 
 void MetalRenderer::Impl::removeAttribute(BufferAttribute* attribute) {
@@ -995,6 +1032,13 @@ void MetalRenderer::Impl::trackGeometry(BufferGeometry& geometry) {
 
     geometry.addEventListener("dispose", onGeometryDispose);
     geometries[&geometry] = true;
+}
+
+id<MTLCommandQueue> MetalRenderer::Impl::activeSubmissionQueue() const {
+    if (useLowPriorityQueue && lowPriorityCommandQueue) {
+        return lowPriorityCommandQueue;
+    }
+    return commandQueue;
 }
 
 void MetalRenderer::Impl::commitPendingFrame() {
@@ -1052,7 +1096,7 @@ void MetalRenderer::Impl::ensureFrameStarted() {
         }
         {
             SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::createLowPriorityCommandBuffer");
-            currentCommandBuffer = [(lowPriorityCommandQueue ? lowPriorityCommandQueue : commandQueue) commandBuffer];
+            currentCommandBuffer = [activeSubmissionQueue() commandBuffer];
         }
         clearedTargetsInFrame.clear();
         return;
@@ -1073,6 +1117,22 @@ void MetalRenderer::Impl::ensureFrameStarted() {
 void MetalRenderer::Impl::submitLowPriority() {
     if (!currentCommandBuffer) {
         return;
+    }
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::submitLowPriority");
+    if (useLowPriorityQueue && !currentDrawable) {
+        auto* inFlightCounter = &backgroundInFlightCommandBuffers;
+        const auto inFlight = inFlightCounter->fetch_add(1, std::memory_order_relaxed) + 1;
+        SPARK_TRACE_COUNTER(
+            "threepp.metal",
+            "MetalRenderer.backgroundInFlightCommandBuffers",
+            static_cast<std::int64_t>(inFlight));
+        [currentCommandBuffer addCompletedHandler:^(__unused id<MTLCommandBuffer> commandBuffer) {
+          const auto remaining = inFlightCounter->fetch_sub(1, std::memory_order_relaxed) - 1;
+          SPARK_TRACE_COUNTER(
+              "threepp.metal",
+              "MetalRenderer.backgroundInFlightCommandBuffers",
+              static_cast<std::int64_t>(remaining));
+        }];
     }
     [currentCommandBuffer commit];
     currentCommandBuffer = nil;
@@ -1117,7 +1177,7 @@ void MetalRenderer::Impl::encodeWaitEventOnCurrentFrame(void* event, std::uint64
     id<MTLCommandBuffer> commandBuffer = nil;
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::encodeStandaloneEventWait");
-        commandBuffer = [commandQueue commandBuffer];
+        commandBuffer = [activeSubmissionQueue() commandBuffer];
     }
     if (!commandBuffer) {
         return;
@@ -1916,7 +1976,7 @@ std::future<void> MetalRenderer::Impl::copyTexturesToImagesAsync(const std::vect
     id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
     const bool temporaryCommandBuffer = commandBuffer == nil;
     if (temporaryCommandBuffer) {
-        commandBuffer = [commandQueue commandBuffer];
+        commandBuffer = [activeSubmissionQueue() commandBuffer];
     }
     if (!commandBuffer) {
         releaseReadbackBuffers(readbacks);
@@ -2046,16 +2106,27 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
     }
 
     const auto sourceBytesPerRow = alignTo(width * 4u, 256u);
+    if (height > 0u && sourceBytesPerRow > std::numeric_limits<NSUInteger>::max() / height) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync readback row layout is too large");
+    }
     const auto sourceBytesPerImage = sourceBytesPerRow * height;
-    id<MTLBuffer> readbackBuffer = acquireReadbackBuffer(sourceBytesPerImage * depth);
+    if (depth > 0u && sourceBytesPerImage > std::numeric_limits<NSUInteger>::max() / depth) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync readback image layout is too large");
+    }
+    const auto byteLength = sourceBytesPerImage * depth;
+    id<MTLBuffer> readbackBuffer = [device newBufferWithLength:std::max<NSUInteger>(byteLength, 1u)
+                                                       options:MTLResourceStorageModeShared];
+    if (!readbackBuffer) {
+        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not allocate a readback buffer");
+    }
 
     id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
     const bool temporaryCommandBuffer = commandBuffer == nil;
     if (temporaryCommandBuffer) {
-        commandBuffer = [commandQueue commandBuffer];
+        commandBuffer = [activeSubmissionQueue() commandBuffer];
     }
     if (!commandBuffer) {
-        releaseReadbackBuffer(readbackBuffer);
+        releaseOwnedMetalObject(readbackBuffer);
         throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not create a command buffer");
     }
 
@@ -2075,7 +2146,7 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
 
     auto completionPromise = std::make_shared<std::promise<PixelReadbackBuffer>>();
     auto completionFuture = completionPromise->get_future();
-    PixelReadback readback{sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerImage, sourceBytesPerImage * depth, request};
+    PixelReadback readback{sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerImage, byteLength, request};
     auto completionReadback = std::make_shared<PixelReadback>(std::move(readback));
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
         try {
@@ -2084,23 +2155,34 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
                 throw std::runtime_error(message ? message : "MetalRenderer::readRenderTargetPixelsAsync command buffer failed");
             }
 
+            const auto* rawBytes = static_cast<const std::uint8_t*>([completionReadback->readbackBuffer contents]);
+            if (!rawBytes) {
+                throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not map the readback buffer");
+            }
+            if (completionReadback->sourceBytesPerRow > std::numeric_limits<unsigned int>::max() ||
+                completionReadback->sourceBytesPerImage > std::numeric_limits<unsigned int>::max()) {
+                throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync readback stride is too large");
+            }
+
+            auto storageOwner = makeSharedMetalOwner(completionReadback->readbackBuffer);
+            completionReadback->readbackBuffer = nil;
+
             PixelReadbackBuffer buffer;
+            buffer.storageOwner = std::move(storageOwner);
+            buffer.data = rawBytes;
+            buffer.byteLength = static_cast<std::size_t>(completionReadback->byteLength);
             buffer.width = static_cast<unsigned int>(completionReadback->request.width);
             buffer.height = static_cast<unsigned int>(completionReadback->request.height);
             buffer.depth = static_cast<unsigned int>(completionReadback->request.depth);
             buffer.bytesPerPixel = 4;
+            buffer.bytesPerRow = static_cast<unsigned int>(completionReadback->sourceBytesPerRow);
+            buffer.bytesPerImage = static_cast<unsigned int>(completionReadback->sourceBytesPerImage);
             buffer.format = completionReadback->request.format;
             buffer.type = completionReadback->request.type;
-            readRgba8PixelsToBuffer(
-                    completionReadback->readbackBuffer,
-                    completionReadback->sourceBytesPerRow,
-                    completionReadback->sourceBytesPerImage,
-                    completionReadback->request,
-                    buffer.bytes);
-            releaseReadbackBuffer(completionReadback->readbackBuffer);
             completionPromise->set_value(std::move(buffer));
         } catch (...) {
-            releaseReadbackBuffer(completionReadback->readbackBuffer);
+            releaseOwnedMetalObject(completionReadback->readbackBuffer);
+            completionReadback->readbackBuffer = nil;
             completionPromise->set_exception(std::current_exception());
         }
     }];
@@ -2296,7 +2378,7 @@ void MetalRenderer::Impl::readbackTextureAsync(Texture& texture,
                 throw std::runtime_error("MetalRenderer::readbackTextureAsync could not allocate a readback buffer");
             }
             if (!commandBuffer) {
-                commandBuffer = [commandQueue commandBuffer];
+                commandBuffer = [activeSubmissionQueue() commandBuffer];
                 temporaryCommandBuffer = true;
             }
             if (!commandBuffer) {
@@ -2315,7 +2397,7 @@ void MetalRenderer::Impl::readbackTextureAsync(Texture& texture,
                 destinationBytesPerImage:byteLength];
             [blitEncoder endEncoding];
         } else if (!commandBuffer) {
-            commandBuffer = [commandQueue commandBuffer];
+            commandBuffer = [activeSubmissionQueue() commandBuffer];
             temporaryCommandBuffer = true;
             if (!commandBuffer) {
                 throw std::runtime_error("MetalRenderer::readbackTextureAsync could not create a command buffer");
@@ -2457,7 +2539,7 @@ void MetalRenderer::Impl::readbackLidarDepthAsPointCloudAsync(Texture& packedDep
         id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
         bool temporaryCommandBuffer = false;
         if (!commandBuffer) {
-            commandBuffer = [commandQueue commandBuffer];
+            commandBuffer = [activeSubmissionQueue() commandBuffer];
             temporaryCommandBuffer = true;
         }
         if (!commandBuffer) {
@@ -2595,7 +2677,7 @@ void MetalRenderer::Impl::readbackLidarBeamsAsPointCloudAsync(const std::array<T
         id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
         bool temporaryCommandBuffer = false;
         if (!commandBuffer) {
-            commandBuffer = [commandQueue commandBuffer];
+            commandBuffer = [activeSubmissionQueue() commandBuffer];
             temporaryCommandBuffer = true;
         }
         if (!commandBuffer) {

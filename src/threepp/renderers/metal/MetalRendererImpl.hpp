@@ -53,6 +53,7 @@ namespace threepp {
         id<CAMetalDrawable> currentDrawable = nil;
         id<MTLCommandBuffer> currentCommandBuffer = nil;
         std::atomic<std::uint32_t> inFlightCommandBuffers{0};
+        std::atomic<std::uint32_t> backgroundInFlightCommandBuffers{0};
         MTLPixelFormat depthPixelFormat = MTLPixelFormatDepth32Float;
 
         std::unique_ptr<metal::MetalPipelineCache> pipelineCache;
@@ -246,6 +247,8 @@ namespace threepp {
         void deallocateGeometry(BufferGeometry& geometry);
 
         void trackGeometry(BufferGeometry& geometry);
+
+        [[nodiscard]] id<MTLCommandQueue> activeSubmissionQueue() const;
 
         void commitPendingFrame();
 

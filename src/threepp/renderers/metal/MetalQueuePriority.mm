@@ -2,6 +2,12 @@
 
 namespace threepp::metal {
 
+    namespace {
+
+        constexpr NSUInteger kBackgroundCommandQueueMaxCommandBuffers = 2;
+
+    }// namespace
+
     MetalBackgroundCommandQueue createBackgroundCommandQueue(id<MTLDevice> device) {
         if (!device) {
             return {nil, {
@@ -11,11 +17,21 @@ namespace threepp::metal {
                 "Metal device is unavailable"}};
         }
 
+        id<MTLCommandQueue> queue = [device newCommandQueueWithMaxCommandBufferCount:kBackgroundCommandQueueMaxCommandBuffers];
+        if (queue) {
+            MetalQueuePriorityCapability capability;
+            capability.mode = MetalQueuePriorityMode::QueueOnly;
+            capability.requested = false;
+            capability.applied = false;
+            capability.reason = "using dedicated background command queue without GPU priority";
+            return {queue, capability};
+        }
+
         MetalQueuePriorityCapability capability;
         capability.mode = MetalQueuePriorityMode::MainQueue;
         capability.requested = false;
         capability.applied = false;
-        capability.reason = "using main command queue for background submissions";
+        capability.reason = "dedicated background command queue unavailable; using main command queue";
         return {nil, capability};
     }
 

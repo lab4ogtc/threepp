@@ -2,6 +2,7 @@
 #ifndef THREEPP_RENDERER_HPP
 #define THREEPP_RENDERER_HPP
 
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <functional>
@@ -78,14 +79,19 @@ namespace threepp {
     };
 
     /**
-     * @brief 自持有 CPU 像素读回结果。
+     * @brief CPU 像素读回结果，可为自持有 bytes，也可为带 owner 的外部只读 view。
      */
     struct PixelReadbackBuffer {
         std::vector<std::uint8_t> bytes;
+        std::shared_ptr<const void> storageOwner;
+        const std::uint8_t* data = nullptr;
+        std::size_t byteLength = 0;
         unsigned int width = 0;
         unsigned int height = 0;
         unsigned int depth = 1;
         unsigned int bytesPerPixel = 4;
+        unsigned int bytesPerRow = 0;
+        unsigned int bytesPerImage = 0;
         Format format = Format::RGBA;
         Type type = Type::UnsignedByte;
     };
