@@ -380,6 +380,26 @@ namespace threepp::metal {
             bool external = false;
         };
 
+        static void releaseOwnedObjectiveCObject(id object) {
+            if (!object) {
+                return;
+            }
+#if !__has_feature(objc_arc)
+            [object release];
+#else
+            (void) object;
+#endif
+        }
+
+        static void releaseCachedTexture(CachedTexture& cached) {
+            if (!cached.external) {
+                releaseOwnedObjectiveCObject(cached.texture);
+            }
+            cached.texture = nil;
+            cached.version = 0;
+            cached.external = false;
+        }
+
         struct OnTextureDispose: EventListener {
             explicit OnTextureDispose(Impl& scope)
                 : scope(scope) {}
@@ -417,6 +437,16 @@ namespace threepp::metal {
 
             std::cerr << "[MetalTextureManager] Warning: using placeholder texture for texture "
                       << texture.id << " (" << reason << ")\n";
+        }
+
+        void cacheTexture(Texture& texture, CachedTexture cached) {
+            auto it = textures.find(&texture);
+            if (it != textures.end()) {
+                releaseCachedTexture(it->second);
+                it->second = cached;
+                return;
+            }
+            textures.emplace(&texture, cached);
         }
 
         id<MTLTexture> getOrCreateTexture(Texture& texture, bool allowPlaceholder) {
@@ -487,7 +517,7 @@ namespace threepp::metal {
                     texture.addEventListener("dispose", onTextureDispose);
                 }
 
-                textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+                cacheTexture(texture, CachedTexture{mtlTexture, texture.version(), false});
                 return mtlTexture;
             }
 
@@ -522,7 +552,7 @@ namespace threepp::metal {
                     texture.addEventListener("dispose", onTextureDispose);
                 }
 
-                textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+                cacheTexture(texture, CachedTexture{mtlTexture, texture.version(), false});
                 return mtlTexture;
             }
 
@@ -559,7 +589,7 @@ namespace threepp::metal {
                     texture.addEventListener("dispose", onTextureDispose);
                 }
 
-                textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+                cacheTexture(texture, CachedTexture{mtlTexture, texture.version(), false});
                 return mtlTexture;
             }
 
@@ -590,7 +620,7 @@ namespace threepp::metal {
                 texture.addEventListener("dispose", onTextureDispose);
             }
 
-            textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+            cacheTexture(texture, CachedTexture{mtlTexture, texture.version(), false});
             return mtlTexture;
         }
 
@@ -628,7 +658,7 @@ namespace threepp::metal {
                 texture.addEventListener("dispose", onTextureDispose);
             }
 
-            textures[&texture] = CachedTexture{mtlTexture, texture.version(), true};
+            cacheTexture(texture, CachedTexture{mtlTexture, texture.version(), true});
         }
 
         void unregisterExternalTexture(Texture* texture) {
@@ -642,6 +672,7 @@ namespace threepp::metal {
                 texture->removeEventListener("dispose", onTextureDispose);
             }
             placeholderWarnings.erase(texture);
+            releaseCachedTexture(it->second);
             textures.erase(it);
         }
 
@@ -654,7 +685,7 @@ namespace threepp::metal {
                 texture.addEventListener("dispose", onTextureDispose);
             }
 
-            textures[&texture] = CachedTexture{mtlTexture, texture.version(), false};
+            cacheTexture(texture, CachedTexture{mtlTexture, texture.version(), false});
         }
 
         void deallocateTexture(Texture* texture) {
@@ -662,12 +693,23 @@ namespace threepp::metal {
                 texture->removeEventListener("dispose", onTextureDispose);
             }
             placeholderWarnings.erase(texture);
-            textures.erase(texture);
+            auto it = textures.find(texture);
+            if (it != textures.end()) {
+                releaseCachedTexture(it->second);
+                textures.erase(it);
+            }
         }
 
         ~Impl() {
             for (auto& [texture, _] : textures) {
                 texture->removeEventListener("dispose", onTextureDispose);
+            }
+            for (auto& [_, cached] : textures) {
+                releaseCachedTexture(cached);
+            }
+            for (auto& [_, sampler] : samplers) {
+                releaseOwnedObjectiveCObject(sampler);
+                sampler = nil;
             }
         }
     };

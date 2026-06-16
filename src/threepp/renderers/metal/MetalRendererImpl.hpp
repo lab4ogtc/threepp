@@ -288,6 +288,8 @@ namespace threepp {
 
         MetalRenderTargetResources& getOrCreateRenderTargetResources(RenderTarget& target);
 
+        void releaseRenderTargetResources(MetalRenderTargetResources& resources);
+
         id<MTLBuffer> acquireReadbackBuffer(NSUInteger size);
 
         void releaseReadbackBuffer(id<MTLBuffer> buffer);

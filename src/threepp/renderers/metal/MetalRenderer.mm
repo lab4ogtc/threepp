@@ -988,6 +988,10 @@ MetalRenderer::Impl::~Impl() {
     for (auto& [target, _] : renderTargetResources) {
         target->removeEventListener("dispose", onRenderTargetDispose);
     }
+    for (auto& [_, resources] : renderTargetResources) {
+        releaseRenderTargetResources(resources);
+    }
+    renderTargetResources.clear();
     for (auto& [geometry, _] : geometries) {
         geometry->removeEventListener("dispose", onGeometryDispose);
     }
@@ -998,7 +1002,38 @@ MetalRenderer::Impl::~Impl() {
         readbackBuffer.inUse = false;
     }
     readbackBufferPool.clear();
+    for (auto& [_, shadowTexture] : shadowTextures) {
+        releaseOwnedMetalObject(shadowTexture);
+        shadowTexture = nil;
+    }
+    shadowTextures.clear();
+    releaseOwnedMetalObject(depthTexture);
+    releaseOwnedMetalObject(multisampleColorTexture);
+    releaseOwnedMetalObject(whiteTexture);
+    releaseOwnedMetalObject(blackTexture);
+    releaseOwnedMetalObject(normalTexture);
+    releaseOwnedMetalObject(whiteCubeTexture);
+    releaseOwnedMetalObject(whiteDepthTexture);
+    releaseOwnedMetalObject(defaultSampler);
+    releaseOwnedMetalObject(shadowSampler);
+    releaseOwnedMetalObject(defaultTangentBuffer);
+    releaseOwnedMetalObject(defaultMorphTargetBuffer);
+    releaseOwnedMetalObject(unprojectComputePSO);
+    releaseOwnedMetalObject(unprojectBeamsComputePSO);
     releaseOwnedMetalObject(lowPriorityCommandQueue);
+    depthTexture = nil;
+    multisampleColorTexture = nil;
+    whiteTexture = nil;
+    blackTexture = nil;
+    normalTexture = nil;
+    whiteCubeTexture = nil;
+    whiteDepthTexture = nil;
+    defaultSampler = nil;
+    shadowSampler = nil;
+    defaultTangentBuffer = nil;
+    defaultMorphTargetBuffer = nil;
+    unprojectComputePSO = nil;
+    unprojectBeamsComputePSO = nil;
     lowPriorityCommandQueue = nil;
 }
 
@@ -1225,6 +1260,7 @@ void MetalRenderer::Impl::updateMetalLayerPixelFormat() {
 
     metalLayer.pixelFormat = targetPixelFormat;
     multisampleColorPixelFormat = MTLPixelFormatInvalid;
+    releaseOwnedMetalObject(multisampleColorTexture);
     multisampleColorTexture = nil;
 }
 
@@ -1257,6 +1293,7 @@ void MetalRenderer::Impl::syncDrawableSize(NSUInteger width, NSUInteger height) 
     metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
 
     if (framebufferChanged) {
+        releaseOwnedMetalObject(multisampleColorTexture);
         multisampleColorTexture = nil;
         multisampleColorPixelFormat = MTLPixelFormatInvalid;
         createDepthTexture();
@@ -1273,6 +1310,7 @@ void MetalRenderer::Impl::updatePixelRatio(const WindowSize& size) {
 
 void MetalRenderer::Impl::createDepthTexture() {
     if (depthTexture) {
+        releaseOwnedMetalObject(depthTexture);
         depthTexture = nil;
     }
 
@@ -1295,6 +1333,8 @@ id<MTLTexture> MetalRenderer::Impl::getOrCreateMultisampleColorTexture(MTLPixelF
         multisampleColorPixelFormat == pixelFormat) {
         return multisampleColorTexture;
     }
+    releaseOwnedMetalObject(multisampleColorTexture);
+    multisampleColorTexture = nil;
 
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                                     width:std::max(fbWidth, 1)
@@ -1501,6 +1541,9 @@ void MetalRenderer::Impl::registerExternalRenderTarget(RenderTarget& target, voi
         target.addEventListener("dispose", onRenderTargetDispose);
     }
 
+    if (auto existing = renderTargetResources.find(&target); existing != renderTargetResources.end()) {
+        releaseRenderTargetResources(existing->second);
+    }
     auto& resources = renderTargetResources[&target];
     resources.colorTextures = {mtlColorTexture};
     resources.colorPixelFormats = {mtlColorTexture.pixelFormat};
@@ -1586,6 +1629,10 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
         throw std::runtime_error("Failed to create Metal RenderTarget resources");
     }
 
+    if (auto existing = renderTargetResources.find(&target); existing != renderTargetResources.end()) {
+        releaseRenderTargetResources(existing->second);
+    }
+
     for (std::size_t i = 0; i < target.textures.size(); ++i) {
         auto& texture = target.textures[i];
         updateTextureImageMetadata(*texture, target.width, target.height, target.depth, dynamic_cast<CubeTexture*>(texture.get()) != nullptr);
@@ -1615,6 +1662,34 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     resources.requestedZeroCopy = target.zeroCopy;
     resources.isZeroCopy = primaryColorAllocation.isZeroCopy;
     return resources;
+}
+
+void MetalRenderer::Impl::releaseRenderTargetResources(MetalRenderTargetResources& resources) {
+    if (resources.isExternal) {
+        if (resources.depthTexture && resources.externalDepthTexture == nullptr) {
+            releaseOwnedMetalObject(resources.depthTexture);
+        }
+    } else {
+        for (auto& colorTexture : resources.colorTextures) {
+            releaseOwnedMetalObject(colorTexture);
+            colorTexture = nil;
+        }
+        releaseOwnedMetalObject(resources.depthTexture);
+        releaseOwnedMetalObject(resources.backingBuffer);
+    }
+
+    resources.colorTextures.clear();
+    resources.colorPixelFormats.clear();
+    resources.depthTexture = nil;
+    resources.backingBuffer = nil;
+    resources.width = 0;
+    resources.height = 0;
+    resources.depth = 1;
+    resources.alignedBytesPerRow = 0;
+    resources.isZeroCopy = false;
+    resources.isExternal = false;
+    resources.externalColorTexture = nullptr;
+    resources.externalDepthTexture = nullptr;
 }
 
 id<MTLBuffer> MetalRenderer::Impl::acquireReadbackBuffer(NSUInteger size) {
@@ -1722,6 +1797,9 @@ void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
         if (target->depthTexture) {
             textureManager->unregisterExternalTexture(target->depthTexture.get());
         }
+        if (auto it = renderTargetResources.find(target); it != renderTargetResources.end()) {
+            releaseRenderTargetResources(it->second);
+        }
         renderTargetResources.erase(target);
         for (auto it = clearedTargetsInFrame.begin(); it != clearedTargetsInFrame.end();) {
             if (it->target == target) {
@@ -1744,6 +1822,9 @@ void MetalRenderer::Impl::deallocateRenderTarget(RenderTarget* target) {
     }
     if (target->depthTexture) {
         textureManager->deallocateTexture(target->depthTexture.get());
+    }
+    if (auto it = renderTargetResources.find(target); it != renderTargetResources.end()) {
+        releaseRenderTargetResources(it->second);
     }
     renderTargetResources.erase(target);
     for (auto it = clearedTargetsInFrame.begin(); it != clearedTargetsInFrame.end();) {
@@ -1801,6 +1882,7 @@ void MetalRenderer::Impl::setSize(std::pair<int, int> size) {
     updatePixelRatio(WindowSize{size});
     metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
     metalLayer.contentsScale = pixelRatio;
+    releaseOwnedMetalObject(multisampleColorTexture);
     multisampleColorTexture = nil;
     multisampleColorPixelFormat = MTLPixelFormatInvalid;
     createDepthTexture();
