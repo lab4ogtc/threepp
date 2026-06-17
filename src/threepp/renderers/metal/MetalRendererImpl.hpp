@@ -54,6 +54,7 @@ namespace threepp {
         id<MTLCommandBuffer> currentCommandBuffer = nil;
         std::atomic<std::uint32_t> inFlightCommandBuffers{0};
         std::atomic<std::uint32_t> backgroundInFlightCommandBuffers{0};
+        std::vector<void*> pendingPreDrawableEventWaits;
         MTLPixelFormat depthPixelFormat = MTLPixelFormatDepth32Float;
 
         std::unique_ptr<metal::MetalPipelineCache> pipelineCache;
@@ -79,6 +80,7 @@ namespace threepp {
         std::size_t defaultMorphTargetVertexCount = 0;
         id<MTLComputePipelineState> unprojectComputePSO = nil;
         id<MTLComputePipelineState> unprojectBeamsComputePSO = nil;
+        id<MTLComputePipelineState> splatDepthComputePSO = nil;
 
         struct ReadbackBuffer {
             id<MTLBuffer> buffer = nil;
@@ -87,6 +89,7 @@ namespace threepp {
         };
         std::vector<ReadbackBuffer> readbackBufferPool;
         std::mutex readbackPoolMutex;
+        std::shared_ptr<std::atomic_bool> readbackPoolAlive = std::make_shared<std::atomic_bool>(true);
 
         struct TextureReadback {
             Texture* texture = nullptr;
@@ -256,6 +259,8 @@ namespace threepp {
 
         void submitLowPriority();
 
+        void drainPendingPreDrawableEventWaits();
+
         [[nodiscard]] void* createEvent();
 
         void encodeSignalEvent(void* event, std::uint64_t value);
@@ -316,6 +321,8 @@ namespace threepp {
 
         id<MTLComputePipelineState> getOrCreateUnprojectBeamsComputePSO();
 
+        id<MTLComputePipelineState> getOrCreateSplatDepthComputePSO();
+
         void setSize(std::pair<int, int> size);
 
         void setClearColor(const Color& color, float alpha);
@@ -350,6 +357,14 @@ namespace threepp {
         std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures);
 
         std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(const PixelReadbackRequest& request);
+
+        std::shared_ptr<SplatDepthReadbackHandle> submitSplatDepthPass(const SplatDepthPassRequest& request);
+
+        [[nodiscard]] SplatDepthReadbackStatus pollSplatDepthReadback(
+                const std::shared_ptr<SplatDepthReadbackHandle>& handle);
+
+        [[nodiscard]] SplatDepthReadbackBuffer readoutSplatDepthBuffer(
+                const std::shared_ptr<SplatDepthReadbackHandle>& handle);
 
         MaterialPrewarmStatus prewarmMaterial(const MaterialPrewarmRequest& request);
 

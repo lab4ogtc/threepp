@@ -2,6 +2,7 @@
 #ifndef THREEPP_RENDERER_HPP
 #define THREEPP_RENDERER_HPP
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
@@ -96,6 +97,39 @@ namespace threepp {
         Type type = Type::UnsignedByte;
     };
 
+    enum class SplatDepthReadbackStatus {
+        Unsupported,
+        Pending,
+        Ready,
+        Failed
+    };
+
+    struct SplatDepthPassRequest {
+        Texture* generatedTexture = nullptr;
+        Texture* generatedTexture2 = nullptr;
+        std::uint32_t count = 0;
+        std::uint32_t activeSplats = 0;
+        std::array<float, 3> viewOrigin{};
+        std::array<float, 3> viewDirection{0.0f, 0.0f, -1.0f};
+        bool sortRadial = true;
+        bool extSplats = false;
+        bool covSplats = false;
+        std::uint32_t inactiveDepthBits = 0x7f800000u;
+        void* waitEvent = nullptr;
+        std::uint64_t waitEventValue = 0;
+    };
+
+    class SplatDepthReadbackHandle {
+    public:
+        virtual ~SplatDepthReadbackHandle() = default;
+    };
+
+    struct SplatDepthReadbackBuffer {
+        std::shared_ptr<const void> storageOwner;
+        const std::uint32_t* data = nullptr;
+        std::size_t count = 0;
+    };
+
     enum class MaterialPrewarmStatus {
         Ready,
         Compiling,
@@ -176,6 +210,10 @@ namespace threepp {
             return false;
         }
 
+        [[nodiscard]] virtual bool supportsSplatDepthReadback() const noexcept {
+            return false;
+        }
+
         /**
          * @brief 切换后续隐式帧命令缓冲区是否使用后台独立队列。
          *
@@ -231,6 +269,21 @@ namespace threepp {
         virtual std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
                 const PixelReadbackRequest& /*request*/) {
             throw std::runtime_error("Renderer backend does not support async pixel readback");
+        }
+
+        virtual std::shared_ptr<SplatDepthReadbackHandle> submitSplatDepthPass(
+                const SplatDepthPassRequest& /*request*/) {
+            return {};
+        }
+
+        [[nodiscard]] virtual SplatDepthReadbackStatus pollSplatDepthReadback(
+                const std::shared_ptr<SplatDepthReadbackHandle>& /*handle*/) {
+            return SplatDepthReadbackStatus::Unsupported;
+        }
+
+        [[nodiscard]] virtual SplatDepthReadbackBuffer readoutSplatDepthBuffer(
+                const std::shared_ptr<SplatDepthReadbackHandle>& /*handle*/) {
+            return {};
         }
 
         virtual MaterialPrewarmStatus prewarmMaterial(RawShaderMaterial& material) {

@@ -43,20 +43,28 @@ namespace {
 
     constexpr float frameBoundaryThresholdMs = 1.5f;
 
-    [[nodiscard]] std::shared_ptr<const void> makeSharedMetalOwner(id object) {
-        if (!object) {
+    [[nodiscard]] std::shared_ptr<const void> makeSharedPooledMetalReadbackOwner(
+            id<MTLBuffer> buffer,
+            std::function<void(id<MTLBuffer>)> releaseToPool) {
+        if (!buffer) {
             return {};
         }
 #if __has_feature(objc_arc)
-        void* retained = (__bridge_retained void*) object;
+        void* retained = (__bridge_retained void*) buffer;
 #else
-        void* retained = object;
+        [buffer retain];
+        void* retained = buffer;
 #endif
-        return std::shared_ptr<const void>(retained, [](const void* ptr) {
+        return std::shared_ptr<const void>(retained, [releaseToPool = std::move(releaseToPool)](const void* ptr) {
             if (!ptr) {
                 return;
             }
             auto* raw = const_cast<void*>(ptr);
+            id<MTLBuffer> buffer = (__bridge id<MTLBuffer>) raw;
+            try {
+                releaseToPool(buffer);
+            } catch (...) {
+            }
 #if __has_feature(objc_arc)
             id object = (__bridge_transfer id) raw;
             (void) object;
@@ -74,6 +82,30 @@ namespace {
         [object release];
 #else
         (void) object;
+#endif
+    }
+
+    [[nodiscard]] void* retainObjectiveCObject(id object) {
+        if (!object) {
+            return nullptr;
+        }
+#if __has_feature(objc_arc)
+        return (__bridge_retained void*) object;
+#else
+        [object retain];
+        return object;
+#endif
+    }
+
+    void releaseRetainedObjectiveCObject(void* object) {
+        if (!object) {
+            return;
+        }
+#if __has_feature(objc_arc)
+        id retained = (__bridge_transfer id) object;
+        (void) retained;
+#else
+        [(id) object release];
 #endif
     }
 
@@ -122,6 +154,31 @@ namespace {
                 capability.applied,
                 capability.reason};
     }
+
+    class MetalSplatDepthReadbackHandle final : public SplatDepthReadbackHandle {
+    public:
+        id<MTLBuffer> depthBuffer = nil;
+        void* retainedCommandBuffer = nullptr;
+        std::uint32_t count = 0;
+
+        ~MetalSplatDepthReadbackHandle() override {
+            releaseRetainedObjectiveCObject(retainedCommandBuffer);
+            retainedCommandBuffer = nullptr;
+            releaseOwnedMetalObject(depthBuffer);
+            depthBuffer = nil;
+        }
+
+        [[nodiscard]] id<MTLCommandBuffer> commandBuffer() const {
+            return (__bridge id<MTLCommandBuffer>) retainedCommandBuffer;
+        }
+    };
+
+    struct alignas(16) MetalSplatDepthUniforms {
+        float viewOrigin[4]{};
+        float viewDirection[4]{};
+        std::uint32_t flags[4]{};
+        std::uint32_t dimensions[4]{};
+    };
 
     constexpr const char* scissorClearShaderSource = R"metal(
 #include <metal_stdlib>
@@ -291,6 +348,68 @@ kernel void lidarUnprojectBeams(texture2d<float, access::read> face0 [[texture(0
         (m[1] * sample.u + m[5] * sample.v - m[9]) * depth + m[13],
         (m[2] * sample.u + m[6] * sample.v - m[10]) * depth + m[14],
         1.0);
+}
+)metal";
+
+    constexpr const char* splatDepthShaderSource = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct SplatDepthUniforms {
+    float4 viewOrigin;
+    float4 viewDirection;
+    uint4 flags;
+    uint4 dimensions;
+};
+
+float unpackHalf16(uint bits) {
+    return float(as_type<half>(ushort(bits & 0xffffu)));
+}
+
+float3 decodePackedCenter(uint4 packed) {
+    return float3(
+        unpackHalf16(packed.y),
+        unpackHalf16(packed.y >> 16u),
+        unpackHalf16(packed.z));
+}
+
+float3 decodeExtCenter(uint4 packed) {
+    return float3(as_type<float>(packed.x), as_type<float>(packed.y), as_type<float>(packed.z));
+}
+
+kernel void sparkSplatDepth(texture2d_array<uint, access::read> generatedSplats [[texture(0)]],
+                            device uint* depthBits [[buffer(0)]],
+                            constant SplatDepthUniforms& uniforms [[buffer(1)]],
+                            uint index [[thread_position_in_grid]]) {
+    const uint count = uniforms.flags.x;
+    if (index >= count) {
+        return;
+    }
+
+    const uint width = max(uniforms.dimensions.x, 1u);
+    const uint height = max(uniforms.dimensions.y, 1u);
+    const uint layerSize = width * height;
+    const uint layer = index / layerSize;
+    const uint inLayer = index - layer * layerSize;
+    const uint2 coord = uint2(inLayer % width, inLayer / width);
+
+    const uint4 packed = generatedSplats.read(coord, layer);
+    const bool allZero = all(packed == uint4(0u));
+    if (allZero) {
+        depthBits[index] = uniforms.dimensions.z;
+        return;
+    }
+
+    const bool extSplats = uniforms.flags.z != 0u;
+    const bool sortRadial = uniforms.flags.y != 0u;
+    float3 center = extSplats ? decodeExtCenter(packed) - uniforms.viewOrigin.xyz : decodePackedCenter(packed);
+    float metric = INFINITY;
+    if (sortRadial) {
+        metric = length(center);
+    } else {
+        metric = dot(center, uniforms.viewDirection.xyz) + 100.0;
+    }
+    depthBits[index] = as_type<uint>(metric);
 }
 )metal";
 
@@ -968,6 +1087,14 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
 
     depthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState();
     createPlaceholderResources();
+    try {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::prewarmSplatDepthCompute");
+        (void) getOrCreateSplatDepthComputePSO();
+    } catch (const std::exception& e) {
+        std::cerr << "MetalRenderer: splat depth compute prewarm failed: "
+                  << e.what()
+                  << ". Splat depth readback will fall back at submit time.\n";
+    }
 
     setViewport(0, 0, window.size().width(), window.size().height());
     setScissor(0, 0, window.size().width(), window.size().height());
@@ -975,6 +1102,10 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Window& w)
 
 MetalRenderer::Impl::~Impl() {
     commitPendingFrame();
+    drainPendingPreDrawableEventWaits();
+    if (readbackPoolAlive) {
+        readbackPoolAlive->store(false, std::memory_order_release);
+    }
     if (lowPriorityCommandQueue) {
         id<MTLCommandBuffer> lowPrioritySyncBuffer = [lowPriorityCommandQueue commandBuffer];
         [lowPrioritySyncBuffer commit];
@@ -997,6 +1128,7 @@ MetalRenderer::Impl::~Impl() {
     }
     backgroundCubeGeometry.reset();
     for (auto& readbackBuffer : readbackBufferPool) {
+        releaseOwnedMetalObject(readbackBuffer.buffer);
         readbackBuffer.buffer = nil;
         readbackBuffer.size = 0;
         readbackBuffer.inUse = false;
@@ -1020,6 +1152,7 @@ MetalRenderer::Impl::~Impl() {
     releaseOwnedMetalObject(defaultMorphTargetBuffer);
     releaseOwnedMetalObject(unprojectComputePSO);
     releaseOwnedMetalObject(unprojectBeamsComputePSO);
+    releaseOwnedMetalObject(splatDepthComputePSO);
     releaseOwnedMetalObject(lowPriorityCommandQueue);
     depthTexture = nil;
     multisampleColorTexture = nil;
@@ -1034,6 +1167,7 @@ MetalRenderer::Impl::~Impl() {
     defaultMorphTargetBuffer = nil;
     unprojectComputePSO = nil;
     unprojectBeamsComputePSO = nil;
+    splatDepthComputePSO = nil;
     lowPriorityCommandQueue = nil;
 }
 
@@ -1178,6 +1312,27 @@ void MetalRenderer::Impl::submitLowPriority() {
     currentCommandBufferExternallyAccessed = false;
 }
 
+void MetalRenderer::Impl::drainPendingPreDrawableEventWaits() {
+    if (pendingPreDrawableEventWaits.empty()) {
+        return;
+    }
+
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::preDrawableEventWait");
+    SPARK_TRACE_COUNTER(
+        "threepp.metal",
+        "MetalRenderer.pendingPreDrawableEventWaits",
+        static_cast<std::int64_t>(pendingPreDrawableEventWaits.size()));
+    auto waits = std::move(pendingPreDrawableEventWaits);
+    pendingPreDrawableEventWaits.clear();
+    for (auto* rawCommandBuffer : waits) {
+        id<MTLCommandBuffer> commandBuffer = (__bridge id<MTLCommandBuffer>) rawCommandBuffer;
+        if (commandBuffer) {
+            [commandBuffer waitUntilCompleted];
+        }
+        releaseRetainedObjectiveCObject(rawCommandBuffer);
+    }
+}
+
 void* MetalRenderer::Impl::createEvent() {
     id<MTLEvent> event = [device newSharedEvent];
 #if __has_feature(objc_arc)
@@ -1218,6 +1373,9 @@ void MetalRenderer::Impl::encodeWaitEventOnCurrentFrame(void* event, std::uint64
         return;
     }
     [commandBuffer encodeWaitForEvent:mtlEvent value:value];
+    if (auto* retainedCommandBuffer = retainObjectiveCObject(commandBuffer)) {
+        pendingPreDrawableEventWaits.push_back(retainedCommandBuffer);
+    }
     [commandBuffer commit];
 }
 
@@ -1228,6 +1386,7 @@ bool MetalRenderer::Impl::ensureDrawable() {
         return true;
     }
 
+    drainPendingPreDrawableEventWaits();
     updateMetalLayerPixelFormat();
     const auto drawableWaitStart = std::chrono::steady_clock::now();
     {
@@ -1704,6 +1863,7 @@ id<MTLBuffer> MetalRenderer::Impl::acquireReadbackBuffer(NSUInteger size) {
                                entry.size > requestedSize * 2u &&
                                entry.size > maxIdleOversizeRetainedReadbackBuffer;
         if (oversized) {
+            releaseOwnedMetalObject(entry.buffer);
             entry.buffer = [device newBufferWithLength:requestedSize options:MTLResourceStorageModeShared];
             if (!entry.buffer) {
                 throw std::runtime_error("Failed to allocate Metal readback buffer");
@@ -2196,11 +2356,7 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
         throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync readback image layout is too large");
     }
     const auto byteLength = sourceBytesPerImage * depth;
-    id<MTLBuffer> readbackBuffer = [device newBufferWithLength:std::max<NSUInteger>(byteLength, 1u)
-                                                       options:MTLResourceStorageModeShared];
-    if (!readbackBuffer) {
-        throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not allocate a readback buffer");
-    }
+    id<MTLBuffer> readbackBuffer = acquireReadbackBuffer(byteLength);
 
     id<MTLCommandBuffer> commandBuffer = currentCommandBuffer;
     const bool temporaryCommandBuffer = commandBuffer == nil;
@@ -2208,7 +2364,7 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
         commandBuffer = [activeSubmissionQueue() commandBuffer];
     }
     if (!commandBuffer) {
-        releaseOwnedMetalObject(readbackBuffer);
+        releaseReadbackBuffer(readbackBuffer);
         throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync could not create a command buffer");
     }
 
@@ -2230,6 +2386,7 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
     auto completionFuture = completionPromise->get_future();
     PixelReadback readback{sourceTexture, readbackBuffer, sourceBytesPerRow, sourceBytesPerImage, byteLength, request};
     auto completionReadback = std::make_shared<PixelReadback>(std::move(readback));
+    auto poolAlive = readbackPoolAlive;
     [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completedCommandBuffer) {
         try {
             if (completedCommandBuffer.error) {
@@ -2246,7 +2403,13 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
                 throw std::runtime_error("MetalRenderer::readRenderTargetPixelsAsync readback stride is too large");
             }
 
-            auto storageOwner = makeSharedMetalOwner(completionReadback->readbackBuffer);
+            auto storageOwner = makeSharedPooledMetalReadbackOwner(
+                    completionReadback->readbackBuffer,
+                    [this, poolAlive](id<MTLBuffer> buffer) {
+                        if (poolAlive && poolAlive->load(std::memory_order_acquire)) {
+                            releaseReadbackBuffer(buffer);
+                        }
+                    });
             completionReadback->readbackBuffer = nil;
 
             PixelReadbackBuffer buffer;
@@ -2263,7 +2426,7 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
             buffer.type = completionReadback->request.type;
             completionPromise->set_value(std::move(buffer));
         } catch (...) {
-            releaseOwnedMetalObject(completionReadback->readbackBuffer);
+            releaseReadbackBuffer(completionReadback->readbackBuffer);
             completionReadback->readbackBuffer = nil;
             completionPromise->set_exception(std::current_exception());
         }
@@ -2274,6 +2437,140 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
     }
 
     return completionFuture;
+}
+
+std::shared_ptr<SplatDepthReadbackHandle> MetalRenderer::Impl::submitSplatDepthPass(
+        const SplatDepthPassRequest& request) {
+    SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::SubmitDepthPass");
+    if (!request.generatedTexture || request.count == 0u) {
+        return {};
+    }
+    if (request.generatedTexture->format != Format::RGBAInteger ||
+        request.generatedTexture->type != Type::UnsignedInt) {
+        return {};
+    }
+
+    id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*request.generatedTexture);
+    if (!sourceTexture || sourceTexture.pixelFormat != MTLPixelFormatRGBA32Uint) {
+        return {};
+    }
+    if (sourceTexture.textureType != MTLTextureType2DArray) {
+        return {};
+    }
+    const auto width = static_cast<std::uint32_t>(sourceTexture.width);
+    const auto height = static_cast<std::uint32_t>(sourceTexture.height);
+    const auto layers = static_cast<std::uint32_t>(sourceTexture.arrayLength);
+    if (width == 0u || height == 0u || layers == 0u) {
+        return {};
+    }
+    const auto capacity = static_cast<std::uint64_t>(width) *
+                          static_cast<std::uint64_t>(height) *
+                          static_cast<std::uint64_t>(layers);
+    if (request.count > capacity) {
+        return {};
+    }
+
+    auto pso = getOrCreateSplatDepthComputePSO();
+    const auto byteLength = static_cast<NSUInteger>(std::max<std::uint32_t>(request.count, 1u) * sizeof(std::uint32_t));
+    id<MTLBuffer> depthBuffer = [device newBufferWithLength:byteLength options:MTLResourceStorageModeShared];
+    if (!depthBuffer) {
+        return {};
+    }
+
+    id<MTLCommandBuffer> commandBuffer = [activeSubmissionQueue() commandBuffer];
+    if (!commandBuffer) {
+        releaseOwnedMetalObject(depthBuffer);
+        return {};
+    }
+    if (request.waitEvent && request.waitEventValue > 0u) {
+        id<MTLEvent> event = (__bridge id<MTLEvent>) request.waitEvent;
+        [commandBuffer encodeWaitForEvent:event value:request.waitEventValue];
+    }
+
+    id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
+    if (!encoder) {
+        releaseOwnedMetalObject(depthBuffer);
+        return {};
+    }
+
+    MetalSplatDepthUniforms uniforms{};
+    uniforms.viewOrigin[0] = request.viewOrigin[0];
+    uniforms.viewOrigin[1] = request.viewOrigin[1];
+    uniforms.viewOrigin[2] = request.viewOrigin[2];
+    uniforms.viewDirection[0] = request.viewDirection[0];
+    uniforms.viewDirection[1] = request.viewDirection[1];
+    uniforms.viewDirection[2] = request.viewDirection[2];
+    uniforms.flags[0] = request.count;
+    uniforms.flags[1] = request.sortRadial ? 1u : 0u;
+    uniforms.flags[2] = request.extSplats ? 1u : 0u;
+    uniforms.flags[3] = request.covSplats ? 1u : 0u;
+    uniforms.dimensions[0] = width;
+    uniforms.dimensions[1] = height;
+    uniforms.dimensions[2] = request.inactiveDepthBits;
+    uniforms.dimensions[3] = request.activeSplats;
+
+    [encoder setComputePipelineState:pso];
+    [encoder setTexture:sourceTexture atIndex:0];
+    [encoder setBuffer:depthBuffer offset:0 atIndex:0];
+    [encoder setBytes:&uniforms length:sizeof(uniforms) atIndex:1];
+
+    const auto threadWidth = std::max<NSUInteger>(pso.threadExecutionWidth, 1u);
+    const auto maxThreads = std::max<NSUInteger>(pso.maxTotalThreadsPerThreadgroup, threadWidth);
+    const auto threadsPerGroup = std::min<NSUInteger>(maxThreads, std::max<NSUInteger>(threadWidth, 64u));
+    const MTLSize threadsPerGrid = MTLSizeMake(request.count, 1, 1);
+    const MTLSize threadsPerThreadgroup = MTLSizeMake(threadsPerGroup, 1, 1);
+    [encoder dispatchThreads:threadsPerGrid threadsPerThreadgroup:threadsPerThreadgroup];
+    [encoder endEncoding];
+
+    auto handle = std::make_shared<MetalSplatDepthReadbackHandle>();
+    handle->depthBuffer = depthBuffer;
+    handle->retainedCommandBuffer = retainObjectiveCObject(commandBuffer);
+    handle->count = request.count;
+    [commandBuffer commit];
+    return handle;
+}
+
+SplatDepthReadbackStatus MetalRenderer::Impl::pollSplatDepthReadback(
+        const std::shared_ptr<SplatDepthReadbackHandle>& handle) {
+    auto typed = std::dynamic_pointer_cast<MetalSplatDepthReadbackHandle>(handle);
+    if (!typed || !typed->depthBuffer) {
+        return SplatDepthReadbackStatus::Unsupported;
+    }
+    id<MTLCommandBuffer> commandBuffer = typed->commandBuffer();
+    if (!commandBuffer) {
+        return SplatDepthReadbackStatus::Ready;
+    }
+    if (commandBuffer.status == MTLCommandBufferStatusError) {
+        return SplatDepthReadbackStatus::Failed;
+    }
+    if (commandBuffer.status >= MTLCommandBufferStatusCompleted) {
+        if (commandBuffer.error) {
+            return SplatDepthReadbackStatus::Failed;
+        }
+        return SplatDepthReadbackStatus::Ready;
+    }
+    return SplatDepthReadbackStatus::Pending;
+}
+
+SplatDepthReadbackBuffer MetalRenderer::Impl::readoutSplatDepthBuffer(
+        const std::shared_ptr<SplatDepthReadbackHandle>& handle) {
+    auto typed = std::dynamic_pointer_cast<MetalSplatDepthReadbackHandle>(handle);
+    if (!typed || !typed->depthBuffer || typed->count == 0u) {
+        return {};
+    }
+    const auto status = pollSplatDepthReadback(handle);
+    if (status != SplatDepthReadbackStatus::Ready) {
+        return {};
+    }
+    auto* words = static_cast<const std::uint32_t*>([typed->depthBuffer contents]);
+    if (!words) {
+        return {};
+    }
+    return {
+        std::shared_ptr<const void>(handle, static_cast<const void*>(typed.get())),
+        words,
+        typed->count,
+    };
 }
 
 void MetalRenderer::Impl::readPixelsFromTextureReadback(Texture& texture,
@@ -2590,6 +2887,31 @@ id<MTLComputePipelineState> MetalRenderer::Impl::getOrCreateUnprojectBeamsComput
     }
 
     return unprojectBeamsComputePSO;
+}
+
+id<MTLComputePipelineState> MetalRenderer::Impl::getOrCreateSplatDepthComputePSO() {
+    if (splatDepthComputePSO) return splatDepthComputePSO;
+
+    NSError* error = nil;
+    NSString* source = [NSString stringWithUTF8String:splatDepthShaderSource];
+    id<MTLLibrary> library = [device newLibraryWithSource:source options:nil error:&error];
+    if (!library) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create spark splat depth compute library: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    id<MTLFunction> function = [library newFunctionWithName:@"sparkSplatDepth"];
+    if (!function) {
+        throw std::runtime_error("Failed to create spark splat depth compute function");
+    }
+
+    splatDepthComputePSO = [device newComputePipelineStateWithFunction:function error:&error];
+    if (!splatDepthComputePSO) {
+        NSString* msg = [NSString stringWithFormat:@"Failed to create spark splat depth compute pipeline: %@", error.localizedDescription];
+        throw std::runtime_error([msg UTF8String]);
+    }
+
+    return splatDepthComputePSO;
 }
 
 void MetalRenderer::Impl::readbackLidarDepthAsPointCloudAsync(Texture& packedDepthTexture,
@@ -3847,6 +4169,10 @@ bool MetalRenderer::supportsAsyncPixelReadback() const noexcept {
     return true;
 }
 
+bool MetalRenderer::supportsSplatDepthReadback() const noexcept {
+    return true;
+}
+
 void MetalRenderer::setUseLowPriorityQueue(bool useLowPriority) {
     pimpl_->useLowPriorityQueue = useLowPriority;
 }
@@ -3875,6 +4201,22 @@ std::future<PixelReadbackBuffer> MetalRenderer::readRenderTargetPixelsAsync(
         const PixelReadbackRequest& request) {
     throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
     return pimpl_->readRenderTargetPixelsAsync(request);
+}
+
+std::shared_ptr<SplatDepthReadbackHandle> MetalRenderer::submitSplatDepthPass(
+        const SplatDepthPassRequest& request) {
+    throwIfRendererCallbackOperation(rendererCallbackOperationMessage);
+    return pimpl_->submitSplatDepthPass(request);
+}
+
+SplatDepthReadbackStatus MetalRenderer::pollSplatDepthReadback(
+        const std::shared_ptr<SplatDepthReadbackHandle>& handle) {
+    return pimpl_->pollSplatDepthReadback(handle);
+}
+
+SplatDepthReadbackBuffer MetalRenderer::readoutSplatDepthBuffer(
+        const std::shared_ptr<SplatDepthReadbackHandle>& handle) {
+    return pimpl_->readoutSplatDepthBuffer(handle);
 }
 
 MaterialPrewarmStatus MetalRenderer::prewarmMaterial(RawShaderMaterial& material) {

@@ -28,6 +28,7 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -200,16 +201,20 @@ TEST_CASE("Metal texture readback matches GL row order and batches GPU waits") {
     const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
     const auto batchMethod = source.find("void MetalRenderer::Impl::copyTexturesToImages");
     REQUIRE(batchMethod != std::string::npos);
-    const auto batchMethodEnd = source.find("void MetalRenderer::Impl::readPixelsFromTextureReadback", batchMethod);
-    REQUIRE(batchMethodEnd != std::string::npos);
+    const auto depthMethod = source.find("std::shared_ptr<SplatDepthReadbackHandle> MetalRenderer::Impl::submitSplatDepthPass", batchMethod);
+    const auto readPixelsStart = source.find("void MetalRenderer::Impl::readPixelsFromTextureReadback", batchMethod);
+    REQUIRE(readPixelsStart != std::string::npos);
+    const auto batchMethodEnd = depthMethod == std::string::npos
+        ? readPixelsStart
+        : std::min(depthMethod, readPixelsStart);
 
     const auto batchBody = source.substr(batchMethod, batchMethodEnd - batchMethod);
     REQUIRE(countOccurrences(batchBody, "waitUntilCompleted") == 0);
     REQUIRE(countOccurrences(batchBody, "addCompletedHandler") >= 1);
 
-    const auto readPixelsMethodEnd = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels", batchMethodEnd);
+    const auto readPixelsMethodEnd = source.find("std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels", readPixelsStart);
     REQUIRE(readPixelsMethodEnd != std::string::npos);
-    const auto readPixelsBody = source.substr(batchMethodEnd, readPixelsMethodEnd - batchMethodEnd);
+    const auto readPixelsBody = source.substr(readPixelsStart, readPixelsMethodEnd - readPixelsStart);
     REQUIRE(readPixelsBody.find("height - 1u - y") == std::string::npos);
     REQUIRE(readPixelsBody.find("+ y * sourceBytesPerRow") != std::string::npos);
 
@@ -220,6 +225,64 @@ TEST_CASE("Metal texture readback matches GL row order and batches GPU waits") {
     REQUIRE(batchBody.find("acquireReadbackBuffer(byteLength)") != std::string::npos);
     REQUIRE(batchBody.find("[device newBufferWithLength:byteLength") == std::string::npos);
     REQUIRE(batchBody.find("releaseReadbackBuffers(*completionReadbacks);") != std::string::npos);
+}
+
+TEST_CASE("Metal render target pixel readback reuses pooled buffers") {
+
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto method = source.find("std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsync");
+    REQUIRE(method != std::string::npos);
+    const auto depthMethod = source.find("std::shared_ptr<SplatDepthReadbackHandle> MetalRenderer::Impl::submitSplatDepthPass", method);
+    const auto readPixelsStart = source.find("void MetalRenderer::Impl::readPixelsFromTextureReadback", method);
+    REQUIRE(readPixelsStart != std::string::npos);
+    const auto methodEnd = depthMethod == std::string::npos
+        ? readPixelsStart
+        : std::min(depthMethod, readPixelsStart);
+    const auto body = source.substr(method, methodEnd - method);
+
+    REQUIRE(body.find("acquireReadbackBuffer(byteLength)") != std::string::npos);
+    REQUIRE(body.find("[device newBufferWithLength:std::max<NSUInteger>(byteLength, 1u)") == std::string::npos);
+    REQUIRE(body.find("makeSharedPooledMetalReadbackOwner") != std::string::npos);
+    REQUIRE(body.find("releaseReadbackBuffer(readbackBuffer)") != std::string::npos);
+    REQUIRE(body.find("releaseReadbackBuffer(completionReadback->readbackBuffer)") != std::string::npos);
+}
+
+TEST_CASE("Metal event waits drain before drawable acquisition") {
+
+    const auto header = readProjectFile("src/threepp/renderers/metal/MetalRendererImpl.hpp");
+    const auto source = readProjectFile("src/threepp/renderers/metal/MetalRenderer.mm");
+
+    REQUIRE(header.find("std::vector<void*> pendingPreDrawableEventWaits") != std::string::npos);
+    REQUIRE(header.find("void drainPendingPreDrawableEventWaits()") != std::string::npos);
+
+    const auto encodeMethod = source.find("void MetalRenderer::Impl::encodeWaitEventOnCurrentFrame");
+    REQUIRE(encodeMethod != std::string::npos);
+    const auto encodeMethodEnd = source.find("bool MetalRenderer::Impl::ensureDrawable", encodeMethod);
+    REQUIRE(encodeMethodEnd != std::string::npos);
+    const auto encodeBody = source.substr(encodeMethod, encodeMethodEnd - encodeMethod);
+    REQUIRE(encodeBody.find("[activeSubmissionQueue() commandBuffer]") != std::string::npos);
+    REQUIRE(encodeBody.find("pendingPreDrawableEventWaits.push_back") != std::string::npos);
+    REQUIRE(encodeBody.find("waitUntilCompleted") == std::string::npos);
+
+    const auto drainMethod = source.find("void MetalRenderer::Impl::drainPendingPreDrawableEventWaits");
+    REQUIRE(drainMethod != std::string::npos);
+    const auto drainMethodEnd = source.find("void* MetalRenderer::Impl::createEvent", drainMethod);
+    REQUIRE(drainMethodEnd != std::string::npos);
+    const auto drainBody = source.substr(drainMethod, drainMethodEnd - drainMethod);
+    REQUIRE(drainBody.find("MetalRenderer::preDrawableEventWait") != std::string::npos);
+    REQUIRE(drainBody.find("waitUntilCompleted") != std::string::npos);
+    REQUIRE(drainBody.find("releaseRetainedObjectiveCObject") != std::string::npos);
+
+    const auto ensureMethod = source.find("bool MetalRenderer::Impl::ensureDrawable");
+    REQUIRE(ensureMethod != std::string::npos);
+    const auto ensureMethodEnd = source.find("void MetalRenderer::Impl::updateMetalLayerPixelFormat", ensureMethod);
+    REQUIRE(ensureMethodEnd != std::string::npos);
+    const auto ensureBody = source.substr(ensureMethod, ensureMethodEnd - ensureMethod);
+    const auto drainPos = ensureBody.find("drainPendingPreDrawableEventWaits()");
+    const auto drawablePos = ensureBody.find("[metalLayer nextDrawable]");
+    REQUIRE(drainPos != std::string::npos);
+    REQUIRE(drawablePos != std::string::npos);
+    REQUIRE(drainPos < drawablePos);
 }
 
 TEST_CASE("Metal screen readback defers reused command buffer submission until frame end") {

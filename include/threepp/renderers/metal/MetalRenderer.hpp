@@ -95,6 +95,8 @@ namespace threepp {
 
         [[nodiscard]] bool supportsAsyncPixelReadback() const noexcept override;
 
+        [[nodiscard]] bool supportsSplatDepthReadback() const noexcept override;
+
         void setUseLowPriorityQueue(bool useLowPriority) override;
 
         void submitLowPriority() override;
@@ -109,6 +111,15 @@ namespace threepp {
 
         std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
                 const PixelReadbackRequest& request) override;
+
+        std::shared_ptr<SplatDepthReadbackHandle> submitSplatDepthPass(
+                const SplatDepthPassRequest& request) override;
+
+        [[nodiscard]] SplatDepthReadbackStatus pollSplatDepthReadback(
+                const std::shared_ptr<SplatDepthReadbackHandle>& handle) override;
+
+        [[nodiscard]] SplatDepthReadbackBuffer readoutSplatDepthBuffer(
+                const std::shared_ptr<SplatDepthReadbackHandle>& handle) override;
 
         MaterialPrewarmStatus prewarmMaterial(RawShaderMaterial& material) override;
 
