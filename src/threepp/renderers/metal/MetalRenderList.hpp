@@ -1,0 +1,86 @@
+#ifndef THREEPP_METAL_RENDER_LIST_HPP
+#define THREEPP_METAL_RENDER_LIST_HPP
+
+#include "threepp/core/Object3D.hpp"
+#include "threepp/core/misc.hpp"
+#include "threepp/materials/Material.hpp"
+#include "threepp/materials/interfaces.hpp"
+
+#include <algorithm>
+#include <optional>
+#include <vector>
+
+namespace threepp::metal {
+
+    struct MetalRenderItem {
+
+        Object3D* object = nullptr;
+        BufferGeometry* geometry = nullptr;
+        Material* material = nullptr;
+        std::optional<GeometryGroup> group;
+        unsigned int renderOrder = 0;
+        float z = 0;
+    };
+
+    class MetalRenderList {
+
+    public:
+        std::vector<MetalRenderItem> opaque;
+        std::vector<MetalRenderItem> transmissive;
+        std::vector<MetalRenderItem> transparent;
+        std::vector<MetalRenderItem> screenSpaceSprites;
+
+        void clear() {
+            opaque.clear();
+            transmissive.clear();
+            transparent.clear();
+            screenSpaceSprites.clear();
+        }
+
+        void push(Object3D& object, BufferGeometry* geometry, Material& material, float z, std::optional<GeometryGroup> group = std::nullopt) {
+            MetalRenderItem item{&object, geometry, &material, group, object.renderOrder, z};
+            auto* transmissionMaterial = dynamic_cast<MaterialWithTransmission*>(&material);
+            if (transmissionMaterial && transmissionMaterial->transmission > 0.f) {
+                transmissive.insert(transmissive.begin(), item);
+            } else if (material.transparent) {
+                transparent.emplace_back(item);
+            } else {
+                opaque.emplace_back(item);
+            }
+        }
+
+        void push(Object3D& object, Material& material, float z, std::optional<GeometryGroup> group = std::nullopt) {
+            push(object, object.geometry().get(), material, z, group);
+        }
+
+        void sort() {
+            if (opaque.size() > 1) {
+                std::stable_sort(opaque.begin(), opaque.end(), [](const MetalRenderItem& a, const MetalRenderItem& b) {
+                    if (a.renderOrder != b.renderOrder) return a.renderOrder < b.renderOrder;
+                    if (a.material->id != b.material->id) return a.material->id < b.material->id;
+                    if (a.z != b.z) return a.z < b.z;
+                    return a.object->id < b.object->id;
+                });
+            }
+
+            if (transparent.size() > 1) {
+                std::stable_sort(transparent.begin(), transparent.end(), [](const MetalRenderItem& a, const MetalRenderItem& b) {
+                    if (a.renderOrder != b.renderOrder) return a.renderOrder < b.renderOrder;
+                    if (a.z != b.z) return a.z > b.z;
+                    return a.object->id < b.object->id;
+                });
+            }
+
+            if (transmissive.size() > 1) {
+                std::stable_sort(transmissive.begin(), transmissive.end(), [](const MetalRenderItem& a, const MetalRenderItem& b) {
+                    if (a.renderOrder != b.renderOrder) return a.renderOrder < b.renderOrder;
+                    if (a.z != b.z) return a.z > b.z;
+                    return a.object->id < b.object->id;
+                });
+            }
+        }
+    };
+
+}// namespace threepp::metal
+
+#endif

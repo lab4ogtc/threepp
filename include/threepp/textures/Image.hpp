@@ -10,7 +10,7 @@
 
 namespace threepp {
 
-    using ImageData = std::variant<std::vector<unsigned char>, std::vector<float>>;
+    using ImageData = std::variant<std::vector<unsigned char>, std::vector<float>, std::vector<std::uint32_t>>;
 
     class Image {
 
@@ -36,6 +36,12 @@ namespace threepp {
         [[nodiscard]] unsigned int width() const noexcept { return width_; }
         [[nodiscard]] unsigned int height() const noexcept { return height_; }
         [[nodiscard]] unsigned int depth() const noexcept { return depth_; }
+
+        void setSize(unsigned int width, unsigned int height, unsigned int depth = 0) noexcept {
+            width_ = width;
+            height_ = height;
+            depth_ = depth;
+        }
 
         [[nodiscard]] bool isFloat() const noexcept {
             return std::holds_alternative<std::vector<float>>(data_);

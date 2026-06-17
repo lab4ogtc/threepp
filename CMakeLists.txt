@@ -13,6 +13,8 @@ option(THREEPP_WITH_USD "Build with USDLoader (tinyusdz)" OFF)
 option(THREEPP_TREAT_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(THREEPP_WITH_WGPU "Build with WebGPU backend (via wgpu-native)" OFF)
 option(THREEPP_WITH_VULKAN "Build with Vulkan backend (requires Vulkan SDK)" OFF)
+cmake_dependent_option(THREEPP_WITH_METAL "Build with Metal backend" ON "APPLE" OFF)
+cmake_dependent_option(THREEPP_WITH_SLANG "Build Slang shader compiler support" ON "APPLE" OFF)
 cmake_dependent_option(THREEPP_WGPU_GLSL_COMPAT
     "Enable GLSL->SPIR-V translation for ShaderMaterial on the Wgpu backend (requires glslang)"
     ON "THREEPP_WITH_WGPU" OFF)
@@ -34,6 +36,11 @@ cmake_dependent_option(THREEPP_FETCH_ASSIMP "Make assimp available for examples"
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+
+if (APPLE AND THREEPP_WITH_METAL)
+    enable_language(OBJC)
+    enable_language(OBJCXX)
+endif ()
 
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
@@ -57,6 +64,12 @@ else ()
     endif ()
 
 endif ()
+
+if (THREEPP_WITH_SLANG)
+    find_package(slang CONFIG REQUIRED)
+endif ()
+
+include(cmake/ThreeppSlangRuntime.cmake)
 
 
 # ==============================================================================

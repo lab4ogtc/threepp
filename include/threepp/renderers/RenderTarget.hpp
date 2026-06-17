@@ -11,6 +11,7 @@
 #include "threepp/textures/DepthTexture.hpp"
 
 #include <optional>
+#include <vector>
 
 namespace threepp {
 
@@ -32,6 +33,8 @@ namespace threepp {
             bool generateMipmaps{false};
             bool depthBuffer{true};
             bool stencilBuffer{false};
+            bool zeroCopy{false};
+            int count{1};
 
             std::shared_ptr<DepthTexture> depthTexture;
 
@@ -50,9 +53,12 @@ namespace threepp {
         Vector4 viewport;
 
         std::shared_ptr<Texture> texture;
+        std::vector<std::shared_ptr<Texture>> textures;
 
         bool depthBuffer;
         bool stencilBuffer;
+        bool zeroCopy;
+        bool isExternal = false;
 
         std::shared_ptr<DepthTexture> depthTexture;
 

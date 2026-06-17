@@ -37,3 +37,18 @@ std::shared_ptr<Material> ShaderMaterial::createDefault() const {
 
     return std::shared_ptr<ShaderMaterial>(new ShaderMaterial());
 }
+
+void ShaderMaterial::copyInto(Material& material) const {
+
+    Material::copyInto(material);
+
+    auto* m = material.as<ShaderMaterial>();
+    m->vertexShader = vertexShader;
+    m->fragmentShader = fragmentShader;
+    m->uniforms = uniforms;
+    m->shaderLanguage = shaderLanguage;
+    m->uniformLayout = uniformLayout;
+    m->customTextures = customTextures;
+    m->index0AttributeName = index0AttributeName;
+    m->uniformsNeedUpdate = uniformsNeedUpdate;
+}

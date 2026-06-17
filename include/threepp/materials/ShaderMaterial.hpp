@@ -7,8 +7,14 @@
 #include "threepp/materials/Material.hpp"
 
 #include <unordered_map>
+#include <vector>
 
 namespace threepp {
+
+    enum class ShaderLanguage {
+        GLSL,
+        SLANG
+    };
 
     class ShaderMaterial: public virtual Material,
                           public MaterialWithClipping,
@@ -22,6 +28,8 @@ namespace threepp {
         std::string vertexShader;
         std::string fragmentShader;
         UniformMap uniforms;
+        ShaderLanguage shaderLanguage = ShaderLanguage::GLSL;
+        std::vector<std::string> uniformLayout;
 
         /// Type-erased map for GPU-resident textures (e.g. WgpuTexture* for Wgpu).
         /// Keys are shader binding names. Values are backend-specific texture pointers.
@@ -38,6 +46,8 @@ namespace threepp {
         ShaderMaterial();
 
         std::shared_ptr<Material> createDefault() const override;
+
+        void copyInto(Material& material) const override;
     };
 
 }// namespace threepp

@@ -22,13 +22,15 @@ namespace threepp {
         // Selected via createRenderer; the canvas itself is initialised as
         // OpenGL by the wrapping CrossRenderer.
         Cross,
-        Vulkan
+        Vulkan,
+        Metal
     };
 
     class WgpuRenderer;
     class GLRenderer;
     class CrossRenderer;
     class VulkanRenderer;
+    class MetalRenderer;
 
     class Canvas: public PeripheralsEventSource {
 
@@ -90,6 +92,7 @@ namespace threepp {
         friend class WgpuRenderer;
         friend class GLRenderer;
         friend class VulkanRenderer;
+        friend class MetalRenderer;
 
         struct Impl;
         std::unique_ptr<Impl> pimpl_;

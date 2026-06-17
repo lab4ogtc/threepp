@@ -139,6 +139,7 @@ set(publicHeaders
         "threepp/materials/MeshPhysicalMaterial.hpp"
         "threepp/materials/MeshStandardMaterial.hpp"
         "threepp/materials/MeshToonMaterial.hpp"
+        "threepp/materials/ParticleMaterial.hpp"
         "threepp/materials/PointsMaterial.hpp"
         "threepp/materials/RawShaderMaterial.hpp"
         "threepp/materials/ShaderMaterial.hpp"
@@ -174,6 +175,7 @@ set(publicHeaders
 
         "threepp/objects/Bone.hpp"
         "threepp/objects/Group.hpp"
+        "threepp/objects/HUD.hpp"
         "threepp/objects/InstancedMesh.hpp"
         "threepp/objects/Line.hpp"
         "threepp/objects/LineLoop.hpp"
@@ -195,6 +197,7 @@ set(publicHeaders
         "threepp/objects/DisplacedMesh.hpp"
 
         "threepp/textures/CubeTexture.hpp"
+        "threepp/textures/DataArrayTexture.hpp"
         "threepp/textures/DataTexture.hpp"
         "threepp/textures/DataTexture3D.hpp"
         "threepp/textures/DepthTexture.hpp"
@@ -229,16 +232,24 @@ set(publicHeaders
         "threepp/renderers/CrossRenderer.hpp"
         "threepp/renderers/RenderTarget.hpp"
         "threepp/renderers/GLRenderTarget.hpp"
+        "threepp/renderers/metal/MetalRenderer.hpp"
 
         "threepp/renderers/gl/GLInfo.hpp"
         "threepp/renderers/gl/GLShadowMap.hpp"
         "threepp/renderers/gl/GLState.hpp"
 
         "threepp/renderers/shaders/ShaderChunk.hpp"
+        "threepp/renderers/shaders/ShaderCompiler.hpp"
         "threepp/renderers/shaders/ShaderLib.hpp"
         "threepp/renderers/shaders/UniformsLib.hpp"
 
 )
+
+if (THREEPP_WITH_SLANG)
+    list(APPEND publicHeaders
+            "threepp/renderers/shaders/SlangShaderCompiler.hpp"
+    )
+endif ()
 
 set(publicHeadersFull)
 foreach (header IN LISTS publicHeaders)
@@ -259,6 +270,20 @@ set(privateHeaders
         "threepp/renderers/common/RenderStates.hpp"
         "threepp/renderers/common/RendererCapabilities.hpp"
         "threepp/renderers/common/ShadowConfig.hpp"
+
+        "threepp/renderers/metal/MetalShaders.hpp"
+        "threepp/renderers/metal/MetalRenderObjects.hpp"
+        "threepp/renderers/metal/MetalRendererImpl.hpp"
+        "threepp/renderers/metal/MetalMorphTargets.hpp"
+        "threepp/renderers/metal/MetalRenderList.hpp"
+        "threepp/renderers/metal/MetalCameraUtils.hpp"
+        "threepp/renderers/metal/MetalRenderStateUtils.hpp"
+        "threepp/renderers/metal/MetalDynamicShaderCache.hpp"
+        "threepp/renderers/metal/MetalPipelineCache.hpp"
+        "threepp/renderers/metal/MetalQueuePriority.hpp"
+        "threepp/renderers/metal/MetalBufferManager.hpp"
+        "threepp/renderers/metal/MetalShaderManager.hpp"
+        "threepp/renderers/metal/MetalTextureManager.hpp"
 
         "threepp/renderers/gl/Buffer.hpp"
         "threepp/renderers/gl/GLAttributes.hpp"
@@ -403,6 +428,7 @@ set(sources
         "threepp/materials/MeshPhongMaterial.cpp"
         "threepp/materials/MeshPhysicalMaterial.cpp"
         "threepp/materials/MeshStandardMaterial.cpp"
+        "threepp/materials/ParticleMaterial.cpp"
         "threepp/materials/PointsMaterial.cpp"
         "threepp/materials/RawShaderMaterial.cpp"
         "threepp/materials/ShaderMaterial.cpp"
@@ -451,6 +477,7 @@ set(sources
         "threepp/scenes/FogExp2.cpp"
 
         "threepp/objects/Group.cpp"
+        "threepp/objects/HUD.cpp"
         "threepp/objects/Line.cpp"
         "threepp/objects/LineLoop.cpp"
         "threepp/objects/LineSegments.cpp"
@@ -470,6 +497,7 @@ set(sources
         "threepp/objects/DisplacedMesh.cpp"
 
         "threepp/textures/Texture.cpp"
+        "threepp/textures/DataArrayTexture.cpp"
         "threepp/textures/DataTexture3D.cpp"
         "threepp/textures/DepthTexture.cpp"
 
@@ -541,6 +569,12 @@ if (THREEPP_WITH_AUDIO)
 
     list(APPEND sources
             "threepp/audio/Audio.cpp"
+    )
+endif ()
+
+if (THREEPP_WITH_SLANG)
+    list(APPEND sources
+            "threepp/renderers/shaders/SlangShaderCompiler.cpp"
     )
 endif ()
 
@@ -686,6 +720,20 @@ if (THREEPP_WITH_WGPU)
     endif ()
 endif ()
 
+if (THREEPP_WITH_METAL)
+    list(APPEND sources
+            "threepp/renderers/metal/MetalRenderer.mm"
+            "threepp/renderers/metal/MetalShadowRenderer.mm"
+            "threepp/renderers/metal/MetalObjectsRenderer.mm"
+            "threepp/renderers/metal/MetalDynamicShaderCache.mm"
+            "threepp/renderers/metal/MetalPipelineCache.mm"
+            "threepp/renderers/metal/MetalQueuePriority.mm"
+            "threepp/renderers/metal/MetalBufferManager.mm"
+            "threepp/renderers/metal/MetalShaderManager.mm"
+            "threepp/renderers/metal/MetalTextureManager.mm"
+    )
+endif ()
+
 if (NOT DEFINED EMSCRIPTEN)
     list(APPEND privateHeaders
             "threepp/utils/LoadGlad.hpp"
@@ -709,6 +757,12 @@ target_compile_features(threepp PUBLIC "cxx_std_20")
 
 if (UNIX)
     target_link_libraries(threepp PRIVATE pthread dl)
+endif ()
+
+if (THREEPP_WITH_SLANG)
+    target_compile_definitions(threepp PUBLIC THREEPP_HAS_SLANG=1)
+    target_link_libraries(threepp PRIVATE slang::slang)
+    threepp_configure_slang_runtime(threepp)
 endif ()
 
 target_include_directories(threepp
@@ -757,11 +811,18 @@ if (NOT DEFINED EMSCRIPTEN)
     if (THREEPP_USE_EXTERNAL_GLFW OR BUILD_SHARED_LIBS)
         target_link_libraries(threepp PRIVATE glfw)
     else ()
-        target_include_directories(threepp PRIVATE BEFORE SYSTEM "external/glfw/include")
+        target_include_directories(threepp SYSTEM BEFORE PRIVATE "external/glfw/include")
         if (APPLE)
             target_link_libraries(threepp PRIVATE "-framework IOKit")
             target_link_libraries(threepp PRIVATE "-framework Cocoa")
             target_link_libraries(threepp PRIVATE "-framework OpenGL")
+            if (THREEPP_WITH_METAL)
+                target_compile_definitions(threepp PUBLIC THREEPP_WITH_METAL=1)
+                target_link_libraries(threepp PRIVATE "-framework Metal")
+                target_link_libraries(threepp PRIVATE "-framework MetalKit")
+                target_link_libraries(threepp PRIVATE "-framework QuartzCore")
+                target_link_libraries(threepp PRIVATE "-framework AppKit")
+            endif ()
         endif ()
     endif ()
 

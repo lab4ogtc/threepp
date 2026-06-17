@@ -1,0 +1,41 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 20,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "dev-base",
+      "hidden": true,
+      "inherits": [
+        "vcpkg",
+        "debug"
+      ],
+      "cacheVariables": {
+        "X_VCPKG_APPLOCAL_DEPS_INSTALL": "ON",
+        "SPARK_ENABLE_PERFETTO": "ON",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/build/installed/${presetName}/"
+      }
+    },
+    {
+      "name": "dev-macos",
+      "inherits": [
+        "dev-base",
+        "macos-clang"
+      ],
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "dev-macos",
+      "configurePreset": "dev-macos"
+    }
+  ]
+}

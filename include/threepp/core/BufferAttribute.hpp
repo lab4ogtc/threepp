@@ -23,6 +23,8 @@ namespace threepp {
     class BufferAttribute {
 
     public:
+        const unsigned int id = attributeId++;
+
         UpdateRange updateRange{0, -1};
 
         unsigned int version = 0;
@@ -83,6 +85,7 @@ namespace threepp {
 
         inline static Vector3 _vector{};
         inline static Vector2 _vector2{};
+        inline static unsigned int attributeId{0};
     };
 
     template<class T>

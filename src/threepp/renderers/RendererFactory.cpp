@@ -13,6 +13,10 @@
 #include "threepp/renderers/VulkanRenderer.hpp"
 #endif
 
+#ifdef THREEPP_WITH_METAL
+#include "threepp/renderers/metal/MetalRenderer.hpp"
+#endif
+
 #include <iostream>
 #include <stdexcept>
 
@@ -30,6 +34,9 @@ namespace threepp {
 #ifdef THREEPP_WITH_VULKAN
             std::cout << "\n  [4] Vulkan Path-tracer";
 #endif
+#ifdef THREEPP_WITH_METAL
+            std::cout << "\n  [5] Metal";
+#endif
             std::cout << "\n> ";
             std::string line;
             if (std::getline(std::cin, line)) {
@@ -43,6 +50,9 @@ namespace threepp {
 #endif
 #ifdef THREEPP_WITH_VULKAN
                 if (line == "4") chosen = GraphicsAPI::Vulkan;
+#endif
+#ifdef THREEPP_WITH_METAL
+                if (line == "5") chosen = GraphicsAPI::Metal;
 #endif
             }
         }
@@ -71,6 +81,15 @@ namespace threepp {
             return std::make_unique<VulkanRenderer>(canvas);
 #else
             throw std::runtime_error("Vulkan renderer not available (build with -DTHREEPP_WITH_VULKAN=ON)");
+#endif
+        }
+
+        if (chosen == GraphicsAPI::Metal) {
+#ifdef THREEPP_WITH_METAL
+            std::cout << "Using Metal renderer\n";
+            return std::make_unique<MetalRenderer>(canvas);
+#else
+            throw std::runtime_error("Metal renderer not available (build with -DTHREEPP_WITH_METAL=ON)");
 #endif
         }
 

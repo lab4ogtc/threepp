@@ -29,17 +29,22 @@
 
 #include "threepp/loaders/AsyncGroup.hpp"
 #include "threepp/objects/Group.hpp"
+#include "threepp/objects/HUD.hpp"
 #include "threepp/objects/InstancedMesh.hpp"
 #include "threepp/objects/Mesh.hpp"
 #include "threepp/objects/Points.hpp"
 #include "threepp/objects/Sprite.hpp"
 #include "threepp/objects/Text.hpp"
+#include "threepp/textures/DataArrayTexture.hpp"
 
 #include "threepp/cameras/OrthographicCamera.hpp"
 #include "threepp/cameras/PerspectiveCamera.hpp"
 
 #include "threepp/renderers/GLRenderer.hpp"
 #include "threepp/renderers/RendererFactory.hpp"
+#if __has_include("threepp/renderers/metal/MetalRenderer.hpp")
+#include "threepp/renderers/metal/MetalRenderer.hpp"
+#endif
 
 #include "threepp/loaders/loaders.hpp"
 

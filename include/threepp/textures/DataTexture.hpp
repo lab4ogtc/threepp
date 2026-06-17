@@ -10,9 +10,9 @@ namespace threepp {
 
     public:
 
-        void setData(const ImageData& data) {
+        void setData(ImageData data) {
 
-            image().setData(data);
+            image().setData(std::move(data));
         }
 
         template<class T = unsigned char>
@@ -24,15 +24,15 @@ namespace threepp {
         }
 
         static std::shared_ptr<DataTexture> create(
-                const ImageData& data,
+                ImageData data,
                 unsigned int width, unsigned int height) {
 
-            return std::shared_ptr<DataTexture>(new DataTexture(data, width, height));
+            return std::shared_ptr<DataTexture>(new DataTexture(std::move(data), width, height));
         }
 
     private:
         explicit DataTexture(ImageData data, unsigned int width, unsigned int height)
-            : Texture({Image(std::move(data), width, height)}) {
+            : Texture(makeImages(std::move(data), width, height)) {
             this->magFilter = Filter::Nearest;
             this->minFilter = Filter::Nearest;
 
@@ -42,6 +42,13 @@ namespace threepp {
             // this->colorSpace = ColorSpace::sRGB;
 
             this->needsUpdate();
+        }
+
+        static std::vector<Image> makeImages(ImageData data, unsigned int width, unsigned int height) {
+
+            std::vector<Image> images;
+            images.emplace_back(std::move(data), width, height);
+            return images;
         }
     };
 

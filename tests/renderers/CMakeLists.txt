@@ -1,6 +1,10 @@
 
 add_subdirectory(gl)
 
+if (THREEPP_WITH_METAL)
+    add_subdirectory(metal)
+endif ()
+
 if (THREEPP_WITH_WGPU AND THREEPP_WITH_GLFW)
     # Helper function to create a cross-renderer test target with Wgpu/WebGPU support.
     function(add_cross_renderer_test name source)

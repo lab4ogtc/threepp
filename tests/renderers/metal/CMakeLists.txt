@@ -1,0 +1,1 @@
+add_test_executable(MetalRenderList_test)
