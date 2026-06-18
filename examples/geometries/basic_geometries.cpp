@@ -60,7 +60,7 @@ int main() {
 
     bool paramsChanged = false;
 
-    ImguiFunctionalContext ui(canvas, [&] {
+    ImguiFunctionalContext ui(canvas, *renderer, [&] {
         ImGui::SetNextWindowPos({0, 0}, ImGuiCond_Always);
         ImGui::SetNextWindowSize({340*ui.dpiScale(), 0}, ImGuiCond_Always);
         ImGui::Begin("Geometry");
