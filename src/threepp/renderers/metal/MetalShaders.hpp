@@ -47,11 +47,33 @@ float3 ACESFilmicToneMapping(float3 color, float exposure) {
     return clamp(color, 0.0, 1.0);
 }
 
+float3 NeutralToneMapping(float3 color, float exposure) {
+    const float StartCompression = 0.8 - 0.04;
+    const float Desaturation = 0.15;
+
+    color *= exposure;
+
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < StartCompression) return color;
+
+    float d = 1.0 - StartCompression;
+    float newPeak = 1.0 - d * d / (peak + d - StartCompression);
+    color *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (Desaturation * (peak - newPeak) + 1.0);
+    return mix(color, float3(newPeak), g);
+}
+
 float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
     if (toneMappingType == 1) return LinearToneMapping(color, exposure);
     if (toneMappingType == 2) return ReinhardToneMapping(color, exposure);
     if (toneMappingType == 3) return OptimizedCineonToneMapping(color, exposure);
     if (toneMappingType == 4) return ACESFilmicToneMapping(color, exposure);
+    if (toneMappingType == 6) return NeutralToneMapping(color, exposure);
     return color;
 }
 )metal";
@@ -265,6 +287,7 @@ struct ShadingParams {
     float4 baseColor;
     float4 emissiveColor;
     float4 pbrParams;
+    float4 envMapParams;
     uint4 textureFlags0;
     uint4 textureFlags1;
     float4 cameraPosition;
@@ -280,7 +303,7 @@ struct ShadingParams {
     uint numClippingPlanes;
     uint numUnionClippingPlanes;
     uint clipIntersection;
-    uint pad;
+    uint useLegacyLights;
 };
 
 struct DirectionalLightUniform {
@@ -330,27 +353,34 @@ float saturateFloat(float value) {
 }
 
 float3 fresnelSchlick(float cosTheta, float3 f0) {
-    return f0 + (1.0 - f0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+    float fresnel = exp2((-5.55473 * cosTheta - 6.98316) * cosTheta);
+    return (1.0 - f0) * fresnel + f0;
 }
 
-float distributionGGX(float3 n, float3 h, float roughness) {
-    float a = roughness * roughness;
-    float a2 = a * a;
-    float nDotH = max(dot(n, h), 0.0);
-    float nDotH2 = nDotH * nDotH;
-    float denom = (nDotH2 * (a2 - 1.0) + 1.0);
+float distributionGGX(float alpha, float dotNH) {
+    float a2 = alpha * alpha;
+    float denom = dotNH * dotNH * (a2 - 1.0) + 1.0;
     return a2 / max(PI * denom * denom, 0.0001);
 }
 
-float geometrySchlickGGX(float nDotV, float roughness) {
-    float r = roughness + 1.0;
-    float k = (r * r) / 8.0;
-    return nDotV / max(nDotV * (1.0 - k) + k, 0.0001);
+float geometrySmithCorrelatedGGX(float alpha, float dotNL, float dotNV) {
+    float a2 = alpha * alpha;
+    float gv = dotNL * sqrt(a2 + (1.0 - a2) * dotNV * dotNV);
+    float gl = dotNV * sqrt(a2 + (1.0 - a2) * dotNL * dotNL);
+    return 0.5 / max(gv + gl, 0.0001);
 }
 
-float geometrySmith(float3 n, float3 v, float3 l, float roughness) {
-    return geometrySchlickGGX(max(dot(n, v), 0.0), roughness) *
-           geometrySchlickGGX(max(dot(n, l), 0.0), roughness);
+float3 brdfSpecularGGX(float3 l, float3 v, float3 n, float3 specularColor, float roughness) {
+    float alpha = roughness * roughness;
+    float3 h = normalize(l + v);
+    float dotNL = max(dot(n, l), 0.0);
+    float dotNV = max(dot(n, v), 0.0);
+    float dotNH = max(dot(n, h), 0.0);
+    float dotLH = max(dot(l, h), 0.0);
+    float3 f = fresnelSchlick(dotLH, specularColor);
+    float g = geometrySmithCorrelatedGGX(alpha, dotNL, dotNV);
+    float d = distributionGGX(alpha, dotNH);
+    return f * (g * d);
 }
 
 float3 evaluateSH(float3 n, constant float4* sh) {
@@ -406,11 +436,33 @@ float3 ACESFilmicToneMapping(float3 color, float exposure) {
     return clamp(color, 0.0, 1.0);
 }
 
+float3 NeutralToneMapping(float3 color, float exposure) {
+    const float StartCompression = 0.8 - 0.04;
+    const float Desaturation = 0.15;
+
+    color *= exposure;
+
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < StartCompression) return color;
+
+    float d = 1.0 - StartCompression;
+    float newPeak = 1.0 - d * d / (peak + d - StartCompression);
+    color *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (Desaturation * (peak - newPeak) + 1.0);
+    return mix(color, float3(newPeak), g);
+}
+
 float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
     if (toneMappingType == 1) return LinearToneMapping(color, exposure);
     if (toneMappingType == 2) return ReinhardToneMapping(color, exposure);
     if (toneMappingType == 3) return OptimizedCineonToneMapping(color, exposure);
     if (toneMappingType == 4) return ACESFilmicToneMapping(color, exposure);
+    if (toneMappingType == 6) return NeutralToneMapping(color, exposure);
     return color;
 }
 
@@ -589,18 +641,17 @@ float getPointShadow(uint shadowIndex,
     return samplePointShadowTexture(pointShadowMap3, shadowSampler, lightToPosition, shadowMapSize, bias, radius, nearPlane, farPlane);
 }
 
-float3 directBRDF(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness) {
-    radiance *= PI;
-    float3 h = normalize(v + l);
+float3 directBRDF(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness, bool useLegacyLights) {
+    if (useLegacyLights) {
+        radiance *= PI;
+    }
     float nDotL = max(dot(n, l), 0.0);
-    float nDotV = max(dot(n, v), 0.0);
-    float3 f0 = mix(float3(0.04), albedo, metalness);
-    float d = distributionGGX(n, h, roughness);
-    float g = geometrySmith(n, v, l, roughness);
-    float3 f = fresnelSchlick(max(dot(h, v), 0.0), f0);
-    float3 specular = (d * g * f) / max(4.0 * nDotV * nDotL, 0.0001);
-    float3 diffuse = (1.0 - f) * (1.0 - metalness) * albedo / PI;
-    return (diffuse + specular) * radiance * nDotL;
+    float3 irradiance = radiance * nDotL;
+    float3 diffuseColor = albedo * (1.0 - metalness);
+    float3 specularColor = mix(float3(0.04), albedo, metalness);
+    float3 diffuse = diffuseColor / PI;
+    float3 specular = brdfSpecularGGX(l, v, n, specularColor, roughness);
+    return irradiance * (diffuse + specular);
 }
 
 float3 directLambert(float3 radiance, float3 n, float3 l, float3 albedo) {
@@ -622,6 +673,40 @@ float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 al
     float3 fresnel = blinnPhongFresnel(specularColor, dotLH);
     float specularStrength = 0.25 * (shininess * 0.5 + 1.0) * pow(dotNH, shininess) * specularMapStrength;
     return diffuse + irradiance * fresnel * specularStrength;
+}
+
+float2 equirectUv(float3 direction) {
+    float3 dir = normalize(direction);
+    float u = atan2(dir.z, dir.x) * 0.15915494309189535 + 0.5;
+    float v = asin(clamp(dir.y, -1.0, 1.0)) * 0.3183098861837907 + 0.5;
+    return float2(u, v);
+}
+
+float3 sRGBToLinear(float3 value) {
+    float3 high = pow(value * 0.9478672986 + float3(0.0521327014), float3(2.4));
+    float3 low = value * 0.0773993808;
+    return select(high, low, value <= float3(0.04045));
+}
+
+float3 sampleEquirectPmremStrip(texture2d<float> envMap, sampler envSampler, float2 eqUv, float lod) {
+    constexpr float EQ_STRIP_H = 256.0;
+    constexpr float EQ_N_LODS = 7.0;
+    constexpr float EQ_ATLAS_H = EQ_STRIP_H * EQ_N_LODS;
+    float vTexel = clamp(eqUv.y * EQ_STRIP_H, 0.5, EQ_STRIP_H - 0.5);
+    float atlasV = (lod * EQ_STRIP_H + vTexel) / EQ_ATLAS_H;
+    return envMap.sample(envSampler, float2(eqUv.x, atlasV)).rgb;
+}
+
+float3 sampleEquirectPmrem(texture2d<float> envMap, sampler envSampler, float3 direction, float roughness) {
+    constexpr float EQ_N_LODS = 7.0;
+    float lod = clamp(roughness, 0.0, 1.0) * (EQ_N_LODS - 1.0);
+    float l0 = floor(lod);
+    float l1 = min(l0 + 1.0, EQ_N_LODS - 1.0);
+    float f = lod - l0;
+    float2 eqUv = equirectUv(direction);
+    float3 c0 = sampleEquirectPmremStrip(envMap, envSampler, eqUv, l0);
+    float3 c1 = sampleEquirectPmremStrip(envMap, envSampler, eqUv, l1);
+    return mix(c0, c1, f);
 }
 
 fragment float4 basic_fragment(
@@ -646,6 +731,7 @@ fragment float4 basic_fragment(
 #endif
 #if USE_LIGHTS
     , texturecube<float> envMap [[texture(6)]]
+    , texture2d<float> envMapEquirect [[texture(20)]]
     , depth2d<float> directionalShadowMap0 [[texture(7)]]
     , depth2d<float> directionalShadowMap1 [[texture(8)]]
     , depth2d<float> directionalShadowMap2 [[texture(9)]]
@@ -659,6 +745,7 @@ fragment float4 basic_fragment(
     , depth2d<float> pointShadowMap2 [[texture(17)]]
     , depth2d<float> pointShadowMap3 [[texture(18)]]
     , sampler shadowSampler [[sampler(1)]]
+    , sampler envMapSampler [[sampler(2)]]
 #endif
 #if USE_NORMAL && USE_DOUBLE_SIDED
     , bool frontFacing [[front_facing]]
@@ -683,7 +770,7 @@ fragment float4 basic_fragment(
 
     float3 albedo = baseColor.rgb;
     float alpha = baseColor.a;
-    float roughness = clamp(params.pbrParams.x, 0.04, 1.0);
+    float roughnessFactor = params.pbrParams.x;
     float metalness = clamp(params.pbrParams.y, 0.0, 1.0);
     float aoIntensity = params.pbrParams.z;
     float envMapIntensity = params.pbrParams.w;
@@ -691,7 +778,7 @@ fragment float4 basic_fragment(
 
 #if USE_MAP
     if (params.textureFlags0.z != 0) {
-        roughness *= roughnessMap.sample(mapSampler, in.uv).g;
+        roughnessFactor *= roughnessMap.sample(mapSampler, in.uv).g;
     }
     if (params.textureFlags0.w != 0) {
         metalness *= metalnessMap.sample(mapSampler, in.uv).b;
@@ -718,12 +805,20 @@ fragment float4 basic_fragment(
 #else
     float3 n = float3(0.0, 0.0, 1.0);
 #endif
+    float3 geometryNormal = n;
 
 #if USE_MAP && USE_NORMAL
     if (params.textureFlags0.y != 0) {
         n = perturbNormalFromMap(n, in.tangent * normalFaceDirection, in.bitangent * normalFaceDirection, in.uv, normalMap, mapSampler);
     }
 #endif
+
+    float roughness = clamp(roughnessFactor, 0.04, 1.0);
+    if (params.materialType == 0) {
+        float3 dxy = max(abs(dfdx(geometryNormal)), abs(dfdy(geometryNormal)));
+        float geometryRoughness = max(max(dxy.x, dxy.y), dxy.z);
+        roughness = min(max(roughnessFactor, 0.0525) + geometryRoughness, 1.0);
+    }
 
     if (params.materialType == 1) {
         float3 color = n * 0.5 + 0.5;
@@ -744,7 +839,11 @@ fragment float4 basic_fragment(
 
     float shadowMask = 1.0;
     float3 v = normalize(params.cameraPosition.xyz - in.worldPosition);
+    float pbrDiffuseIrradianceScale = params.useLegacyLights != 0 ? 1.0 : (1.0 / PI);
     float3 color = lights.ambientColor.rgb * albedo;
+    if (params.materialType == 0) {
+        color *= (1.0 - metalness) * pbrDiffuseIrradianceScale;
+    }
 
     for (uint i = 0; i < min(lights.counts.x, uint(MAX_DIRECTIONAL_LIGHTS)); ++i) {
         DirectionalLightUniform light = lights.directionalLights[i];
@@ -771,7 +870,7 @@ fragment float4 basic_fragment(
         } else if (params.materialType == 3) {
             color += directLambert(light.color.rgb, n, l, albedo) * shadow;
         } else {
-            color += directBRDF(light.color.rgb, n, v, l, albedo, roughness, metalness) * shadow;
+            color += directBRDF(light.color.rgb, n, v, l, albedo, roughness, metalness, params.useLegacyLights != 0) * shadow;
         }
     }
 
@@ -810,7 +909,7 @@ fragment float4 basic_fragment(
         } else if (params.materialType == 3) {
             color += directLambert(radiance, n, l, albedo) * shadow;
         } else {
-            color += directBRDF(radiance, n, v, l, albedo, roughness, metalness) * shadow;
+            color += directBRDF(radiance, n, v, l, albedo, roughness, metalness, params.useLegacyLights != 0) * shadow;
         }
     }
 
@@ -850,17 +949,23 @@ fragment float4 basic_fragment(
         } else if (params.materialType == 3) {
             color += directLambert(radiance, n, l, albedo) * shadow;
         } else {
-            color += directBRDF(radiance, n, v, l, albedo, roughness, metalness) * shadow;
+            color += directBRDF(radiance, n, v, l, albedo, roughness, metalness, params.useLegacyLights != 0) * shadow;
         }
     }
 
     for (uint i = 0; i < min(lights.counts.w, uint(MAX_HEMI_LIGHTS)); ++i) {
         HemisphereLightUniform light = lights.hemiLights[i];
         float hemiMix = dot(n, normalize(light.direction.xyz)) * 0.5 + 0.5;
-        color += mix(light.groundColor.rgb, light.skyColor.rgb, hemiMix) * albedo * (1.0 - metalness);
+        float3 hemiColor = mix(light.groundColor.rgb, light.skyColor.rgb, hemiMix) * albedo;
+        color += params.materialType == 0
+            ? hemiColor * (1.0 - metalness) * pbrDiffuseIrradianceScale
+            : hemiColor;
     }
 
-    color += max(evaluateSH(n, lights.shCoefficients), float3(0.0)) * albedo * (1.0 - metalness);
+    float3 shColor = max(evaluateSH(n, lights.shCoefficients), float3(0.0)) * albedo;
+    color += params.materialType == 0
+        ? shColor * (1.0 - metalness) * pbrDiffuseIrradianceScale
+        : shColor;
 
 #if USE_MAP
     if (params.textureFlags1.x != 0) {
@@ -870,12 +975,39 @@ fragment float4 basic_fragment(
 #endif
     if (params.textureFlags1.z != 0) {
         float3 reflected = reflect(-v, n);
+        bool sourceIsEquirectEnvMap = params.textureFlags2.y != 0;
+        bool usePmremEnvMap = params.envMapParams.w != 0.0;
+        float cubeMaxMip = clamp(params.envMapParams.y, 0.0, float(envMap.get_num_mip_levels() - 1));
+        float3 cubeReflected = float3(params.envMapParams.x * reflected.x, reflected.y, reflected.z);
         if (params.materialType == 2 || params.materialType == 3) {
-            float3 envColor = envMap.sample(mapSampler, reflected).rgb;
+            float3 envColor = sourceIsEquirectEnvMap
+                ? sampleEquirectPmrem(envMapEquirect, envMapSampler, reflected, 0.0)
+                : envMap.sample(envMapSampler, cubeReflected).rgb;
+            if (!sourceIsEquirectEnvMap && params.envMapParams.z != 0.0) {
+                envColor = sRGBToLinear(envColor);
+            }
             color = mix(color, color * envColor, saturateFloat(envMapIntensity * specularStrength));
         } else {
-            float lod = roughness * 8.0;
-            color += envMap.sample(mapSampler, reflected, level(lod)).rgb * envMapIntensity;
+            float lod = clamp(roughness * cubeMaxMip, 0.0, cubeMaxMip);
+            float3 envColor = usePmremEnvMap
+                ? sampleEquirectPmrem(envMapEquirect, envMapSampler, reflected, roughness)
+                : envMap.sample(envMapSampler, cubeReflected, level(lod)).rgb;
+            float3 envDiff = usePmremEnvMap
+                ? sampleEquirectPmrem(envMapEquirect, envMapSampler, n, 1.0)
+                : float3(0.0);
+            if (!usePmremEnvMap && params.envMapParams.z != 0.0) {
+                envColor = sRGBToLinear(envColor);
+            }
+            float3 f0 = mix(float3(0.04), albedo, metalness);
+            float dotNV = max(dot(n, v), 0.0);
+            float4 dfgC0 = float4(-1.0, -0.0275, -0.572, 0.022);
+            float4 dfgC1 = float4( 1.0,  0.0425,  1.04, -0.04);
+            float4 dfgR = roughness * dfgC0 + dfgC1;
+            float dfgA = min(dfgR.x * dfgR.x, exp2(-9.28 * dotNV)) * dfgR.x + dfgR.y;
+            float2 dfg = float2(-1.04, 1.04) * dfgA + dfgR.zw;
+            float3 indirectSpecular = (f0 * dfg.x + dfg.y) * envColor;
+            float3 indirectDiffuse = envDiff * albedo * (1.0 - metalness);
+            color += (indirectSpecular + indirectDiffuse) * envMapIntensity;
         }
     }
 
@@ -1002,6 +1134,7 @@ struct ShadingParams {
     float4 baseColor;
     float4 emissiveColor;
     float4 pbrParams;
+    float4 envMapParams;
     uint4 textureFlags0;
     uint4 textureFlags1;
     float4 cameraPosition;
@@ -1017,7 +1150,7 @@ struct ShadingParams {
     uint numClippingPlanes;
     uint numUnionClippingPlanes;
     uint clipIntersection;
-    uint pad;
+    uint useLegacyLights;
 };
 
 bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
@@ -1149,6 +1282,7 @@ struct ShadingParams {
     float4 baseColor;
     float4 emissiveColor;
     float4 pbrParams;
+    float4 envMapParams;
     uint4 textureFlags0;
     uint4 textureFlags1;
     float4 cameraPosition;
@@ -1164,7 +1298,7 @@ struct ShadingParams {
     uint numClippingPlanes;
     uint numUnionClippingPlanes;
     uint clipIntersection;
-    uint pad;
+    uint useLegacyLights;
 };
 
 bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
@@ -1925,7 +2059,8 @@ struct BackgroundCubeUniforms {
     uint toneMappingType;
     float toneMappingExposure;
     uint toneMapped;
-    float padding[3];
+    float decodeColor;
+    float padding[2];
 };
 
 struct BackgroundCubeVertexOutput {
@@ -1963,8 +2098,15 @@ struct BackgroundCubeUniforms {
     uint toneMappingType;
     float toneMappingExposure;
     uint toneMapped;
-    float padding[3];
+    float decodeColor;
+    float padding[2];
 };
+
+float3 sRGBToLinear(float3 value) {
+    float3 high = pow(value * 0.9478672986 + float3(0.0521327014), float3(2.4));
+    float3 low = value * 0.0773993808;
+    return select(high, low, value <= float3(0.04045));
+}
 
 fragment float4 background_cube_fragment(
     BackgroundCubeVertexOutput in [[stage_in]],
@@ -1976,6 +2118,55 @@ fragment float4 background_cube_fragment(
     float3 reflectVec = in.worldDirection;
     reflectVec.x *= uniforms.flipEnvMap;
     float4 envColor = envMap.sample(envMapSampler, reflectVec);
+    if (uniforms.decodeColor != 0.0) {
+        envColor.rgb = sRGBToLinear(envColor.rgb);
+    }
+    envColor.a *= uniforms.opacity;
+
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        envColor.rgb = toneMapping(envColor.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+
+    return envColor;
+}
+)metal";
+
+    constexpr auto background_equirect_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct BackgroundCubeVertexOutput {
+    float4 position [[position]];
+    float3 worldDirection;
+};
+
+struct BackgroundCubeUniforms {
+    float4x4 mvp;
+    float4x4 modelMatrix;
+    float opacity;
+    float flipEnvMap;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    float decodeColor;
+    float padding[2];
+};
+
+float2 equirectUv(float3 direction) {
+    float3 dir = normalize(direction);
+    float u = atan2(dir.z, dir.x) * 0.15915494309189535 + 0.5;
+    float v = asin(clamp(dir.y, -1.0, 1.0)) * 0.3183098861837907 + 0.5;
+    return float2(u, v);
+}
+
+fragment float4 background_equirect_fragment(
+    BackgroundCubeVertexOutput in [[stage_in]],
+    constant BackgroundCubeUniforms& uniforms [[buffer(4)]],
+    texture2d<float> envMap [[texture(0)]],
+    sampler envMapSampler [[sampler(0)]]
+)
+{
+    float4 envColor = envMap.sample(envMapSampler, equirectUv(in.worldDirection));
     envColor.a *= uniforms.opacity;
 
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
@@ -2103,11 +2294,33 @@ float3 ACESFilmicToneMapping(float3 color, float exposure) {
     return clamp(color, 0.0, 1.0);
 }
 
+float3 NeutralToneMapping(float3 color, float exposure) {
+    const float StartCompression = 0.8 - 0.04;
+    const float Desaturation = 0.15;
+
+    color *= exposure;
+
+    float x = min(color.r, min(color.g, color.b));
+    float offset = x < 0.08 ? x - 6.25 * x * x : 0.04;
+    color -= offset;
+
+    float peak = max(color.r, max(color.g, color.b));
+    if (peak < StartCompression) return color;
+
+    float d = 1.0 - StartCompression;
+    float newPeak = 1.0 - d * d / (peak + d - StartCompression);
+    color *= newPeak / peak;
+
+    float g = 1.0 - 1.0 / (Desaturation * (peak - newPeak) + 1.0);
+    return mix(color, float3(newPeak), g);
+}
+
 float3 toneMapping(float3 color, uint toneMappingType, float exposure) {
     if (toneMappingType == 1) return LinearToneMapping(color, exposure);
     if (toneMappingType == 2) return ReinhardToneMapping(color, exposure);
     if (toneMappingType == 3) return OptimizedCineonToneMapping(color, exposure);
     if (toneMappingType == 4) return ACESFilmicToneMapping(color, exposure);
+    if (toneMappingType == 6) return NeutralToneMapping(color, exposure);
     return color;
 }
 

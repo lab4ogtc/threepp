@@ -284,6 +284,7 @@ set(privateHeaders
         "threepp/renderers/metal/MetalBufferManager.hpp"
         "threepp/renderers/metal/MetalShaderManager.hpp"
         "threepp/renderers/metal/MetalTextureManager.hpp"
+        "threepp/renderers/metal/MetalPMREM.hpp"
 
         "threepp/renderers/gl/Buffer.hpp"
         "threepp/renderers/gl/GLAttributes.hpp"
@@ -731,6 +732,7 @@ if (THREEPP_WITH_METAL)
             "threepp/renderers/metal/MetalBufferManager.mm"
             "threepp/renderers/metal/MetalShaderManager.mm"
             "threepp/renderers/metal/MetalTextureManager.mm"
+            "threepp/renderers/metal/MetalPMREM.mm"
     )
 endif ()
 

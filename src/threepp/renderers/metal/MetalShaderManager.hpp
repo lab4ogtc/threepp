@@ -155,6 +155,8 @@ namespace threepp::metal {
 
         void* getOrCreateBackgroundCubeFragmentFunction();
 
+        void* getOrCreateBackgroundEquirectFragmentFunction();
+
         void* getOrCreateWaterVertexFunction();
 
         void* getOrCreateWaterFragmentFunction();

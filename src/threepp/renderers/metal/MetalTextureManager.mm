@@ -141,7 +141,8 @@ namespace threepp::metal {
         }
 
         MTLPixelFormat toColorPixelFormat(const Texture& texture) {
-            const auto srgb = usesSRGBTextureEncoding(texture);
+            const auto srgb = usesSRGBTextureEncoding(texture) &&
+                              dynamic_cast<const CubeTexture*>(&texture) == nullptr;
 
             switch (texture.type) {
                 case Type::UnsignedByte:

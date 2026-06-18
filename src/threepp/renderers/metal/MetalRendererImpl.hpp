@@ -5,6 +5,7 @@
 #import "MetalDynamicShaderCache.hpp"
 #import "MetalMorphTargets.hpp"
 #import "MetalPipelineCache.hpp"
+#import "MetalPMREM.hpp"
 #import "MetalQueuePriority.hpp"
 #import "MetalRenderList.hpp"
 #import "MetalRenderObjects.hpp"
@@ -62,6 +63,7 @@ namespace threepp {
         std::unique_ptr<metal::MetalBufferManager> bufferManager;
         std::unique_ptr<metal::MetalShaderManager> shaderManager;
         std::unique_ptr<metal::MetalTextureManager> textureManager;
+        std::unique_ptr<metal::MetalPMREM> pmremGenerator;
         std::unique_ptr<metal::MetalDynamicShaderCache> dynamicShaderCache;
         std::unique_ptr<metal::MetalMorphTargets> morphTargets;
         std::unique_ptr<ShaderCompiler> shaderCompiler;
@@ -74,6 +76,7 @@ namespace threepp {
         id<MTLTexture> whiteCubeTexture = nil;
         id<MTLTexture> whiteDepthTexture = nil;
         id<MTLSamplerState> defaultSampler = nil;
+        id<MTLSamplerState> pmremSampler = nil;
         id<MTLSamplerState> shadowSampler = nil;
         id<MTLBuffer> defaultTangentBuffer = nil;
         std::size_t defaultTangentVertexCount = 0;
@@ -527,6 +530,8 @@ namespace threepp {
         void renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sky, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderBackgroundCube(id<MTLRenderCommandEncoder> encoder, CubeTexture& cubeTexture, Camera& camera, MTLPixelFormat colorPixelFormat);
+
+        void renderBackgroundEquirect(id<MTLRenderCommandEncoder> encoder, Texture& texture, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 

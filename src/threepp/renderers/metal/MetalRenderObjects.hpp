@@ -147,6 +147,7 @@ namespace threepp {
         float baseColor[4];
         float emissiveColor[4];
         float pbrParams[4];
+        float envMapParams[4];
         std::uint32_t textureFlags0[4];
         std::uint32_t textureFlags1[4];
         float cameraPosition[4];
@@ -162,7 +163,7 @@ namespace threepp {
         std::uint32_t numClippingPlanes;
         std::uint32_t numUnionClippingPlanes;
         std::uint32_t clipIntersection;
-        std::uint32_t pad;
+        std::uint32_t useLegacyLights;
     };
 
     struct alignas(16) SpriteUniforms {
@@ -254,7 +255,8 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding[3];
+        float decodeColor;
+        float padding[2];
     };
 
     struct alignas(16) WaterUniforms {
@@ -732,6 +734,123 @@ namespace threepp {
         return hasTexture(texture) && dynamic_cast<CubeTexture*>(texture.get()) != nullptr;
     }
 
+    enum class EnvMapKind: std::uint32_t {
+        None = 0,
+        Cube = 1,
+        Equirectangular = 2
+    };
+
+    struct ResolvedEnvMap {
+        std::shared_ptr<Texture> texture;
+        float intensity{1.f};
+        EnvMapKind kind{EnvMapKind::None};
+        float flipEnvMap{1.f};
+        float maxMipLevel{0.f};
+        float decodeColor{0.f};
+        float usePMREM{0.f};
+    };
+
+    inline bool textureUsesSRGBColorSpace(const Texture& texture) {
+        return texture.colorSpace == ColorSpace::sRGB ||
+               texture.colorSpace == ColorSpace::Gamma;
+    }
+
+    inline bool textureUsesManualCubeDecode(const Texture& texture) {
+        return dynamic_cast<const CubeTexture*>(&texture) != nullptr &&
+               textureUsesSRGBColorSpace(texture);
+    }
+
+    inline bool textureFilterUsesMipmaps(Filter filter) {
+        return filter != Filter::Nearest && filter != Filter::Linear;
+    }
+
+    inline unsigned int maxTextureDimension(const Texture& texture) {
+        if (auto* cubeTexture = dynamic_cast<const CubeTexture*>(&texture)) {
+            const auto& images = cubeTexture->images();
+            if (!images.empty()) {
+                return std::max(images.front().width(), images.front().height());
+            }
+            return 0u;
+        }
+
+        const auto& images = texture.images();
+        if (images.empty()) return 0u;
+
+        return std::max(images.front().width(), images.front().height());
+    }
+
+    inline float estimateMaxMipLevel(const Texture& texture) {
+        if (!texture.mipmaps().empty()) {
+            return static_cast<float>(texture.mipmaps().size());
+        }
+
+        if (!texture.generateMipmaps || !textureFilterUsesMipmaps(texture.minFilter)) {
+            return 0.f;
+        }
+
+        const auto maxDimension = maxTextureDimension(texture);
+        if (maxDimension == 0u) return 0.f;
+
+        return std::floor(std::log2(static_cast<float>(maxDimension)));
+    }
+
+    inline ResolvedEnvMap makeResolvedEnvMap(const std::shared_ptr<Texture>& texture, float intensity, EnvMapKind kind) {
+        if (!texture) return {};
+
+        ResolvedEnvMap result{texture, intensity, kind};
+        if (kind == EnvMapKind::Cube) {
+            if (auto* cubeTexture = dynamic_cast<CubeTexture*>(texture.get())) {
+                // Match the current threepp GL material path: flipEnvMap is a
+                // float shader uniform fed from a bool, so true maps to +1.
+                result.flipEnvMap = cubeTexture->_needsFlipEnvMap ? 1.f : 0.f;
+            }
+            result.maxMipLevel = estimateMaxMipLevel(*texture);
+            result.decodeColor = textureUsesManualCubeDecode(*texture) ? 1.f : 0.f;
+            result.usePMREM = 0.f;
+        } else if (kind == EnvMapKind::Equirectangular) {
+            // MetalPMREM writes the same seven-strip atlas as GLPMREM.
+            result.maxMipLevel = 6.f;
+            result.usePMREM = 1.f;
+        }
+        return result;
+    }
+
+    inline bool isCubeEnvMap(const std::shared_ptr<Texture>& texture) {
+        return hasCubeTexture(texture) &&
+               (texture->mapping == Mapping::CubeReflection ||
+                texture->mapping == Mapping::CubeRefraction);
+    }
+
+    inline bool isEquirectangularEnvMap(const std::shared_ptr<Texture>& texture) {
+        return hasTexture(texture) &&
+               (texture->mapping == Mapping::EquirectangularReflection ||
+                texture->mapping == Mapping::EquirectangularRefraction);
+    }
+
+    inline ResolvedEnvMap resolveEnvMap(const Scene& scene, Material& material) {
+        auto* env = dynamic_cast<MaterialWithEnvMap*>(&material);
+        if (!env) return {};
+
+        if (env->envMap) {
+            if (isCubeEnvMap(env->envMap)) {
+                return makeResolvedEnvMap(env->envMap, env->envMapIntensity, EnvMapKind::Cube);
+            }
+            if (isEquirectangularEnvMap(env->envMap)) {
+                return makeResolvedEnvMap(env->envMap, env->envMapIntensity, EnvMapKind::Equirectangular);
+            }
+            return {};
+        }
+
+        if (isCubeEnvMap(scene.environment)) {
+            return makeResolvedEnvMap(scene.environment, 1.f, EnvMapKind::Cube);
+        }
+        if (isEquirectangularEnvMap(scene.environment)) {
+            return makeResolvedEnvMap(scene.environment, 1.f, EnvMapKind::Equirectangular);
+        }
+
+        return {};
+    }
+
     inline float clamp01(float value) {
         return std::clamp(value, 0.f, 1.f);
     }
@@ -967,10 +1086,14 @@ namespace threepp {
             params.emissiveColor[3] = emissive->emissiveIntensity;
             params.textureFlags1[1] = hasTexture(emissive->emissiveMap) ? 1u : 0u;
         }
-        if (auto* env = dynamic_cast<MaterialWithEnvMap*>(&material)) {
-            params.textureFlags1[2] = hasCubeTexture(env->envMap) ? 1u : 0u;
-            params.pbrParams[3] = env->envMapIntensity;
-        }
+        const auto envMap = resolveEnvMap(scene, material);
+        params.textureFlags1[2] = envMap.texture ? 1u : 0u;
+        params.textureFlags2[1] = envMap.kind == EnvMapKind::Equirectangular ? 1u : 0u;
+        params.pbrParams[3] = envMap.intensity;
+        params.envMapParams[0] = envMap.flipEnvMap;
+        params.envMapParams[1] = envMap.maxMipLevel;
+        params.envMapParams[2] = envMap.decodeColor;
+        params.envMapParams[3] = envMap.usePMREM;
         params.textureFlags1[3] = receiveShadow ? 1u : 0u;
 
         Vector3 cameraPosition;
@@ -980,6 +1103,7 @@ namespace threepp {
         params.cameraPosition[2] = cameraPosition.z;
         params.cameraPosition[3] = 1.f;
         fillToneMappingUniforms(renderer, material, params);
+        params.useLegacyLights = renderer.useLegacyLights ? 1u : 0u;
         fillFogUniforms(scene, material, params);
         std::uint32_t numClippingPlanes = 0;
         if (clippingOptions.includeGlobal) {

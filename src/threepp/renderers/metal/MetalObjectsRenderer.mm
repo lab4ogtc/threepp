@@ -1265,10 +1265,10 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scen
             -0.5f, 0.5f, 0.f,
             0.5f, 0.5f, 0.f};
     static constexpr float uvs[] = {
-            -0.5f, -0.5f,
-            0.5f, -0.5f,
-            -0.5f, 0.5f,
-            0.5f, 0.5f};
+            0.f, 0.f,
+            1.f, 0.f,
+            0.f, 1.f,
+            1.f, 1.f};
 
     metal::SpriteShaderKey shaderKey;
     shaderKey.useSizeAttenuation = material->sizeAttenuation;

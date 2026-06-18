@@ -55,6 +55,11 @@ namespace {
 
     constexpr float frameBoundaryThresholdMs = 1.5f;
 
+    bool isEquirectangularMapping(Mapping mapping) {
+        return mapping == Mapping::EquirectangularReflection ||
+               mapping == Mapping::EquirectangularRefraction;
+    }
+
     [[nodiscard]] std::shared_ptr<const void> makeSharedPooledMetalReadbackOwner(
             id<MTLBuffer> buffer,
             std::function<void(id<MTLBuffer>)> releaseToPool) {
@@ -1074,6 +1079,7 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Canvas& w)
     bufferManager = std::make_unique<metal::MetalBufferManager>((__bridge void*) device);
     shaderManager = std::make_unique<metal::MetalShaderManager>((__bridge void*) device);
     textureManager = std::make_unique<metal::MetalTextureManager>((__bridge void*) device, (__bridge void*) commandQueue);
+    pmremGenerator = std::make_unique<metal::MetalPMREM>((__bridge void*) device, (__bridge void*) commandQueue);
     morphTargets = std::make_unique<metal::MetalMorphTargets>();
 #ifdef THREEPP_HAS_SLANG
     try {
@@ -1154,6 +1160,7 @@ MetalRenderer::Impl::~Impl() {
     releaseOwnedMetalObject(whiteCubeTexture);
     releaseOwnedMetalObject(whiteDepthTexture);
     releaseOwnedMetalObject(defaultSampler);
+    releaseOwnedMetalObject(pmremSampler);
     releaseOwnedMetalObject(shadowSampler);
     releaseOwnedMetalObject(defaultTangentBuffer);
     releaseOwnedMetalObject(defaultMorphTargetBuffer);
@@ -1169,6 +1176,7 @@ MetalRenderer::Impl::~Impl() {
     whiteCubeTexture = nil;
     whiteDepthTexture = nil;
     defaultSampler = nil;
+    pmremSampler = nil;
     shadowSampler = nil;
     defaultTangentBuffer = nil;
     defaultMorphTargetBuffer = nil;
@@ -2052,6 +2060,19 @@ void MetalRenderer::Impl::createPlaceholderResources() {
     defaultSamplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
     defaultSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
     defaultSampler = [device newSamplerStateWithDescriptor:defaultSamplerDesc];
+    releaseOwnedMetalObject(defaultSamplerDesc);
+
+    MTLSamplerDescriptor* pmremSamplerDesc = [[MTLSamplerDescriptor alloc] init];
+    pmremSamplerDesc.sAddressMode = MTLSamplerAddressModeRepeat;
+    pmremSamplerDesc.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    pmremSamplerDesc.rAddressMode = MTLSamplerAddressModeClampToEdge;
+    pmremSamplerDesc.magFilter = MTLSamplerMinMagFilterLinear;
+    pmremSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
+    pmremSamplerDesc.mipFilter = MTLSamplerMipFilterNotMipmapped;
+    pmremSamplerDesc.lodMinClamp = 0.f;
+    pmremSamplerDesc.lodMaxClamp = 32.f;
+    pmremSampler = [device newSamplerStateWithDescriptor:pmremSamplerDesc];
+    releaseOwnedMetalObject(pmremSamplerDesc);
 
     MTLSamplerDescriptor* shadowSamplerDesc = [[MTLSamplerDescriptor alloc] init];
     shadowSamplerDesc.sAddressMode = MTLSamplerAddressModeClampToEdge;
@@ -2060,6 +2081,7 @@ void MetalRenderer::Impl::createPlaceholderResources() {
     shadowSamplerDesc.minFilter = MTLSamplerMinMagFilterLinear;
     shadowSamplerDesc.compareFunction = MTLCompareFunctionLessEqual;
     shadowSampler = [device newSamplerStateWithDescriptor:shadowSamplerDesc];
+    releaseOwnedMetalObject(shadowSamplerDesc);
 }
 
 void MetalRenderer::Impl::setSize(std::pair<int, int> size) {
@@ -3492,6 +3514,7 @@ void MetalRenderer::Impl::renderBackgroundCube(id<MTLRenderCommandEncoder> encod
     uniforms.toneMappingType = static_cast<std::uint32_t>(renderer.toneMapping);
     uniforms.toneMappingExposure = renderer.toneMappingExposure;
     uniforms.toneMapped = 1u;
+    uniforms.decodeColor = textureUsesManualCubeDecode(cubeTexture) ? 1.f : 0.f;
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -3499,6 +3522,70 @@ void MetalRenderer::Impl::renderBackgroundCube(id<MTLRenderCommandEncoder> encod
     id<MTLTexture> metalTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(cubeTexture);
     [encoder setFragmentTexture:metalTexture atIndex:0];
     [encoder setFragmentSamplerState:samplerForTexture(&cubeTexture) atIndex:0];
+
+    drawGeometry(encoder, *backgroundCubeGeometry, *posAttr, MTLPrimitiveTypeTriangle);
+}
+
+void MetalRenderer::Impl::renderBackgroundEquirect(id<MTLRenderCommandEncoder> encoder, Texture& texture, Camera& camera, MTLPixelFormat colorPixelFormat) {
+    if (!backgroundCubeGeometry) {
+        backgroundCubeGeometry = BoxGeometry::create(1, 1, 1);
+        backgroundCubeGeometry->deleteAttribute("normal");
+        backgroundCubeGeometry->deleteAttribute("uv");
+    }
+
+    trackGeometry(*backgroundCubeGeometry);
+
+    auto* posAttr = getFloatAttribute(*backgroundCubeGeometry, "position");
+    if (!posAttr) return;
+
+    metal::PipelineKey pipelineKey;
+    pipelineKey.vertexFunction = shaderManager->getOrCreateBackgroundCubeVertexFunction();
+    pipelineKey.fragmentFunction = shaderManager->getOrCreateBackgroundEquirectFragmentFunction();
+    pipelineKey.alphaBlending = false;
+    pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
+    pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+    id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+    [encoder setRenderPipelineState:pso];
+
+    id<MTLDepthStencilState> backgroundDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+            false,
+            false,
+            DepthFunc::Always);
+    [encoder setDepthStencilState:backgroundDepthStencilState];
+
+    const auto faceCullingState = metal::computeFaceCullingState(Side::Back, false, false);
+    [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
+    [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+
+    bindDrawAttributes(encoder, *backgroundCubeGeometry, *posAttr, nullptr, nullptr, nullptr, false, false, false, false);
+
+    Matrix4 modelMatrix;
+    modelMatrix.copyPosition(*camera.matrixWorld);
+
+    Matrix4 mvp;
+    mvp.copy(metal::convertProjectionToMetalClipSpace(camera.projectionMatrix));
+    mvp.multiply(camera.matrixWorldInverse);
+    mvp.multiply(modelMatrix);
+
+    BackgroundCubeUniforms uniforms{};
+    copyMatrix(mvp, uniforms.mvp);
+    copyMatrix(modelMatrix, uniforms.modelMatrix);
+    uniforms.opacity = 1.f;
+    uniforms.flipEnvMap = 1.f;
+    uniforms.toneMappingType = static_cast<std::uint32_t>(renderer.toneMapping);
+    uniforms.toneMappingExposure = renderer.toneMappingExposure;
+    uniforms.toneMapped = 1u;
+    uniforms.decodeColor = 0.f;
+
+    [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+    [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+
+    id<MTLTexture> metalTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(texture);
+    [encoder setFragmentTexture:metalTexture atIndex:0];
+    [encoder setFragmentSamplerState:samplerForTexture(&texture) atIndex:0];
 
     drawGeometry(encoder, *backgroundCubeGeometry, *posAttr, MTLPrimitiveTypeTriangle);
 }
@@ -3616,6 +3703,39 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     if (hadBeforeRenderCallbacks) {
         rebuildRenderList();
     }
+
+    auto prewarmPMREMs = [&] {
+        std::vector<Texture*> warmed;
+        auto prewarmTexture = [&](Texture* texture) {
+            if (!texture) return;
+            if (std::find(warmed.begin(), warmed.end(), texture) != warmed.end()) return;
+
+            id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*texture);
+            if (sourceTexture) {
+                (void) pmremGenerator->getOrCreate(*texture, (__bridge void*) sourceTexture);
+                warmed.push_back(texture);
+            }
+        };
+
+        auto prewarmItems = [&](const std::vector<metal::MetalRenderItem>& items) {
+            Material* overrideMaterial = scene.overrideMaterial ? scene.overrideMaterial.get() : nullptr;
+            for (const auto& item : items) {
+                auto* material = overrideMaterial ? overrideMaterial : item.material;
+                if (!material) continue;
+
+                const auto envMap = resolveEnvMap(scene, *material);
+                if (envMap.kind == EnvMapKind::Equirectangular) {
+                    prewarmTexture(envMap.texture.get());
+                }
+            }
+        };
+
+        prewarmItems(renderList.opaque);
+        prewarmItems(renderList.transmissive);
+        prewarmItems(renderList.transparent);
+        prewarmItems(renderList.screenSpaceSprites);
+    };
+    prewarmPMREMs();
 
     id<MTLTexture> colorTexture = nil;
     id<MTLTexture> passDepthTexture = nil;
@@ -3755,10 +3875,20 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         }
     }
 
-    if (!scene.background.empty() && scene.background.isTexture()) {
-        if (auto cubeTexture = std::dynamic_pointer_cast<CubeTexture>(scene.background.texture())) {
+    auto renderBackgroundTexture = [&](const std::shared_ptr<Texture>& texture) {
+        if (!texture) return;
+
+        if (auto cubeTexture = std::dynamic_pointer_cast<CubeTexture>(texture)) {
             renderBackgroundCube(encoder, *cubeTexture, camera, colorPixelFormat);
+        } else if (isEquirectangularMapping(texture->mapping)) {
+            renderBackgroundEquirect(encoder, *texture, camera, colorPixelFormat);
         }
+    };
+
+    if (!scene.background.empty() && scene.background.isTexture()) {
+        renderBackgroundTexture(scene.background.texture());
+    } else if (scene.background.empty() && scene.environment) {
+        renderBackgroundTexture(scene.environment);
     }
 
     {
@@ -3950,7 +4080,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
             [encoder setFragmentBytes:&shadingParams length:sizeof(shadingParams) atIndex:0];
 
-            auto* envMaterial = dynamic_cast<MaterialWithEnvMap*>(material);
+            const auto envMap = resolveEnvMap(scene, *material);
             if (useUv) {
                 auto* mapMaterial = dynamic_cast<MaterialWithMap*>(material);
                 auto* normalMaterial = dynamic_cast<MaterialWithNormalMap*>(material);
@@ -3968,7 +4098,18 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 bindTextureOrPlaceholder(encoder, specularMaterial ? specularMaterial->specularMap : nullptr, whiteTexture, 19);
             }
             if (useLights) {
-                bindCubeTextureOrPlaceholder(encoder, envMaterial ? envMaterial->envMap : nullptr, 6);
+                bindCubeTextureOrPlaceholder(encoder, envMap.kind == EnvMapKind::Cube ? envMap.texture : nullptr, 6);
+                id<MTLTexture> equirectTexture = whiteTexture;
+                id<MTLSamplerState> envSampler = samplerForTexture(envMap.texture.get());
+                if (envMap.kind == EnvMapKind::Equirectangular && envMap.texture) {
+                    id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*envMap.texture);
+                    if (sourceTexture) {
+                        equirectTexture = (__bridge id<MTLTexture>) pmremGenerator->getOrCreate(*envMap.texture, (__bridge void*) sourceTexture);
+                    }
+                    envSampler = pmremSampler ? pmremSampler : defaultSampler;
+                }
+                [encoder setFragmentTexture:equirectTexture atIndex:20];
+                [encoder setFragmentSamplerState:envSampler atIndex:2];
             }
             if (!useUv && useLights) {
                 [encoder setFragmentSamplerState:defaultSampler atIndex:0];
