@@ -233,7 +233,7 @@ namespace threepp {
          *
          * 返回的字节流跟随当前 drawable 的像素格式；该格式在获取 drawable 前由
          * outputColorSpace 同步。Linear 输出返回线性附件中的字节，sRGB/Gamma 输出返回
-         * Metal 硬件 sRGB 写入后的字节，适合直接写出为常见图片文件。
+         * Metal sRGB drawable 或 shader fallback 编码后的 sRGB 字节，适合直接写出为常见图片文件。
          *
          * @return 当前物理 framebuffer 尺寸对应的 RGB 像素，按从上到下的行顺序排列。
          * @throws std::runtime_error 当前没有待提交帧或读回资源创建失败时抛出。

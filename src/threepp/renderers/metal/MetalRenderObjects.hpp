@@ -118,6 +118,8 @@ namespace threepp {
         float morphTargetBaseInfluence;
         float morphTargetInfluences[8];
         float transformPadding[7];
+        float viewMatrix[16];
+        float projectionMatrix[16];
     };
 
     struct alignas(16) DepthTransformUniforms {
@@ -164,6 +166,10 @@ namespace threepp {
         std::uint32_t numUnionClippingPlanes;
         std::uint32_t clipIntersection;
         std::uint32_t useLegacyLights;
+        float transmissionParams[4];
+        float attenuationColor[4];
+        std::uint32_t outputEncodeSRGB;
+        std::uint32_t outputPadding[3];
     };
 
     struct alignas(16) SpriteUniforms {
@@ -181,7 +187,8 @@ namespace threepp {
         float uvTransform[12];
         float fogColor[4];
         float fogParams[4];
-        float padding[4];
+        std::uint32_t outputEncodeSRGB;
+        float padding[3];
     };
 
     struct alignas(16) LineUniforms {
@@ -190,7 +197,7 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding;
+        std::uint32_t outputEncodeSRGB;
     };
 
     struct alignas(16) PointUniforms {
@@ -205,7 +212,8 @@ namespace threepp {
         float toneMappingExposure;
         std::uint32_t toneMapped;
         float alphaTest;
-        float padding[3];
+        std::uint32_t outputEncodeSRGB;
+        float padding[2];
         float uvTransform[12];
         float fogColor[4];
         float fogParams[4];
@@ -220,7 +228,7 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        std::uint32_t padding;
+        std::uint32_t outputEncodeSRGB;
     };
 
     struct alignas(16) RawShaderUniforms {
@@ -244,7 +252,7 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding;
+        std::uint32_t outputEncodeSRGB;
     };
 
     struct alignas(16) BackgroundCubeUniforms {
@@ -256,7 +264,8 @@ namespace threepp {
         float toneMappingExposure;
         std::uint32_t toneMapped;
         float decodeColor;
-        float padding[2];
+        std::uint32_t outputEncodeSRGB;
+        float padding;
     };
 
     struct alignas(16) WaterUniforms {
@@ -272,7 +281,7 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding;
+        std::uint32_t outputEncodeSRGB;
         float fogColor[4];
         float fogParams[4];
     };
@@ -285,7 +294,7 @@ namespace threepp {
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
-        float padding;
+        std::uint32_t outputEncodeSRGB;
     };
 
     struct alignas(16) DirectionalLightUniform {
@@ -413,6 +422,9 @@ namespace threepp {
             copyIdentityMatrix(out.bindMatrix);
             copyIdentityMatrix(out.bindMatrixInverse);
         }
+        copyMatrix(camera.matrixWorldInverse, out.viewMatrix);
+        const auto projection = metal::convertProjectionToMetalClipSpace(camera.projectionMatrix);
+        copyMatrix(projection, out.projectionMatrix);
         resetMorphTargetUniforms(out);
     }
 
@@ -954,10 +966,11 @@ namespace threepp {
     }
 
     template<class Uniforms>
-    inline void fillToneMappingUniforms(const Renderer& renderer, const Material& material, Uniforms& uniforms) {
+    inline void fillToneMappingUniforms(const Renderer& renderer, const Material& material, Uniforms& uniforms, bool outputEncodeSRGB = false) {
         uniforms.toneMappingType = static_cast<std::uint32_t>(material.toneMapped ? renderer.toneMapping : ToneMapping::None);
         uniforms.toneMappingExposure = renderer.toneMappingExposure;
         uniforms.toneMapped = material.toneMapped ? 1u : 0u;
+        uniforms.outputEncodeSRGB = outputEncodeSRGB ? 1u : 0u;
     }
 
     template<class Uniforms>
@@ -1021,7 +1034,7 @@ namespace threepp {
                (options.includeLocal && renderer.localClippingEnabled && !material.clippingPlanes.empty());
     }
 
-    inline ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow, const ClippingExtractionOptions& clippingOptions = {}) {
+    inline ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow, const ClippingExtractionOptions& clippingOptions = {}, bool outputEncodeSRGB = false) {
         ShadingParams params{};
         params.baseColor[0] = 1.f;
         params.baseColor[1] = 1.f;
@@ -1035,6 +1048,12 @@ namespace threepp {
         params.specularColor[1] = 0.04f;
         params.specularColor[2] = 0.04f;
         params.specularColor[3] = 30.f;
+        params.transmissionParams[1] = 1.5f;
+        params.transmissionParams[3] = 0.f;
+        params.attenuationColor[0] = 1.f;
+        params.attenuationColor[1] = 1.f;
+        params.attenuationColor[2] = 1.f;
+        params.attenuationColor[3] = 1.f;
 
         if (auto* colorMaterial = dynamic_cast<MaterialWithColor*>(&material)) {
             params.baseColor[0] = colorMaterial->color.r;
@@ -1075,6 +1094,22 @@ namespace threepp {
         if (auto* specular = dynamic_cast<MaterialWithSpecularMap*>(&material)) {
             params.textureFlags2[0] = hasTexture(specular->specularMap) ? 1u : 0u;
         }
+        if (auto* transmission = dynamic_cast<MaterialWithTransmission*>(&material)) {
+            params.transmissionParams[0] = clamp01(transmission->transmission);
+            params.transmissionParams[1] = std::max(transmission->ior, 1.f);
+            params.textureFlags2[2] = hasTexture(transmission->transmissionMap) ? 1u : 0u;
+        }
+        if (auto* thickness = dynamic_cast<MaterialWithThickness*>(&material)) {
+            params.transmissionParams[2] = std::max(thickness->thickness, 0.f);
+            params.textureFlags2[3] = hasTexture(thickness->thicknessMap) ? 1u : 0u;
+        }
+        if (auto* attenuation = dynamic_cast<MaterialWithAttenuation*>(&material)) {
+            params.transmissionParams[3] = std::max(attenuation->attenuationDistance, 0.f);
+            params.attenuationColor[0] = attenuation->attenuationColor.r;
+            params.attenuationColor[1] = attenuation->attenuationColor.g;
+            params.attenuationColor[2] = attenuation->attenuationColor.b;
+            params.attenuationColor[3] = 1.f;
+        }
         if (auto* ao = dynamic_cast<MaterialWithAoMap*>(&material)) {
             params.textureFlags1[0] = hasTexture(ao->aoMap) ? 1u : 0u;
             params.pbrParams[2] = ao->aoMapIntensity;
@@ -1102,7 +1137,7 @@ namespace threepp {
         params.cameraPosition[1] = cameraPosition.y;
         params.cameraPosition[2] = cameraPosition.z;
         params.cameraPosition[3] = 1.f;
-        fillToneMappingUniforms(renderer, material, params);
+        fillToneMappingUniforms(renderer, material, params, outputEncodeSRGB);
         params.useLegacyLights = renderer.useLegacyLights ? 1u : 0u;
         fillFogUniforms(scene, material, params);
         std::uint32_t numClippingPlanes = 0;
@@ -1136,7 +1171,7 @@ namespace threepp {
     }
 
     inline bool needsUv(const ShadingParams& params) {
-        return params.textureFlags0[0] != 0u || params.textureFlags0[1] != 0u || params.textureFlags0[2] != 0u || params.textureFlags0[3] != 0u || params.textureFlags1[0] != 0u || params.textureFlags1[1] != 0u || params.textureFlags2[0] != 0u;
+        return params.textureFlags0[0] != 0u || params.textureFlags0[1] != 0u || params.textureFlags0[2] != 0u || params.textureFlags0[3] != 0u || params.textureFlags1[0] != 0u || params.textureFlags1[1] != 0u || params.textureFlags2[0] != 0u || params.textureFlags2[2] != 0u || params.textureFlags2[3] != 0u;
     }
 
     inline NSUInteger clampToSize(float value, NSUInteger maxValue) {
@@ -1152,6 +1187,20 @@ namespace threepp {
             default:
                 return false;
         }
+    }
+
+    inline bool metalPixelFormatUsesSRGBEncoding(MTLPixelFormat pixelFormat) {
+        switch (pixelFormat) {
+            case MTLPixelFormatRGBA8Unorm_sRGB:
+            case MTLPixelFormatBGRA8Unorm_sRGB:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    inline bool needsShaderOutputSRGBEncoding(ColorSpace outputColorSpace, MTLPixelFormat colorPixelFormat) {
+        return usesSRGBColorEncoding(outputColorSpace) && !metalPixelFormatUsesSRGBEncoding(colorPixelFormat);
     }
 
     inline MTLPixelFormat toRenderTargetColorPixelFormat(const Texture& texture) {

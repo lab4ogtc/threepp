@@ -48,6 +48,7 @@ namespace threepp {
         metal::MetalQueuePriorityCapability backgroundQueuePriorityCapability;
         bool useLowPriorityQueue = false;
         CAMetalLayer* metalLayer = nil;
+        std::optional<ColorSpace> metalLayerColorSpace;
         id<MTLDepthStencilState> depthStencilState = nil;
         id<MTLTexture> depthTexture = nil;
         id<MTLTexture> multisampleColorTexture = nil;
@@ -94,6 +95,17 @@ namespace threepp {
         std::vector<ReadbackBuffer> readbackBufferPool;
         std::mutex readbackPoolMutex;
         std::shared_ptr<std::atomic_bool> readbackPoolAlive = std::make_shared<std::atomic_bool>(true);
+
+        struct BackgroundCubeCacheEntry {
+            std::unique_ptr<RenderTarget> renderTarget;
+            unsigned int sourceVersion = 0;
+            unsigned int sourceWidth = 0;
+            unsigned int sourceHeight = 0;
+            Format sourceFormat = Format::RGBA;
+            Type sourceType = Type::UnsignedByte;
+            ColorSpace sourceColorSpace = ColorSpace::NoColorSpace;
+        };
+        std::unordered_map<Texture*, BackgroundCubeCacheEntry> backgroundCubeCache;
 
         struct TextureReadback {
             Texture* texture = nullptr;
@@ -197,6 +209,7 @@ namespace threepp {
         OnRenderTargetDispose onRenderTargetDispose;
         OnGeometryDispose onGeometryDispose;
         std::unordered_map<RenderTarget*, MetalRenderTargetResources> renderTargetResources;
+        std::unique_ptr<RenderTarget> transmissionRenderTarget;
 
         Color clearColor{0, 0, 0};
         float clearAlpha = 1;
@@ -208,6 +221,7 @@ namespace threepp {
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool insideRender_ = false;
+        ColorSpace activeOutputColorSpace = ColorSpace::sRGB;
         std::function<void(void* commandBuffer, void* commandEncoder)> overlayCallback;
         std::unordered_set<RenderTargetClearKey, RenderTargetClearKeyHash> clearedTargetsInFrame;
         bool profileRawShader = false;
@@ -532,6 +546,10 @@ namespace threepp {
         void renderBackgroundCube(id<MTLRenderCommandEncoder> encoder, CubeTexture& cubeTexture, Camera& camera, MTLPixelFormat colorPixelFormat);
 
         void renderBackgroundEquirect(id<MTLRenderCommandEncoder> encoder, Texture& texture, Camera& camera, MTLPixelFormat colorPixelFormat);
+
+        CubeTexture* resolveBackgroundCubeTexture(Texture& texture);
+
+        void renderEquirectBackgroundToCube(Texture& texture, RenderTarget& target);
 
         void renderWater(id<MTLRenderCommandEncoder> encoder, Scene& scene, Water& water, BufferGeometry& geometry, Material& material, Camera& camera, MTLPixelFormat colorPixelFormat);
 

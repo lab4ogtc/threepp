@@ -64,6 +64,8 @@ namespace threepp::metal {
             source += key.useMorphTargets ? "1\n" : "0\n";
             source += "#define USE_MORPHNORMALS ";
             source += key.useMorphNormals ? "1\n" : "0\n";
+            source += "#define USE_TRANSMISSION ";
+            source += key.useTransmission ? "1\n" : "0\n";
             source += fog_functions;
             source += basic_vertex;
             source += basic_fragment;
@@ -499,6 +501,14 @@ namespace threepp::metal {
         source += tone_mapping_functions;
         source += background_equirect_fragment;
         return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("background_equirect_fragment", source, "background_equirect_fragment");
+    }
+
+    void* MetalShaderManager::getOrCreateEquirectToCubeVertexFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("equirect_to_cube_vertex", equirect_to_cube_vertex, "equirect_to_cube_vertex");
+    }
+
+    void* MetalShaderManager::getOrCreateEquirectToCubeFragmentFunction() {
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction("equirect_to_cube_fragment", equirect_to_cube_fragment, "equirect_to_cube_fragment");
     }
 
     void* MetalShaderManager::getOrCreateWaterVertexFunction() {

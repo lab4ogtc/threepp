@@ -20,6 +20,7 @@ namespace threepp::metal {
         bool useClipping = false;
         bool useMorphTargets = false;
         bool useMorphNormals = false;
+        bool useTransmission = false;
 
         bool operator==(const ShaderProgramKey& other) const {
             return useMap == other.useMap &&
@@ -34,7 +35,8 @@ namespace threepp::metal {
                    flipSided == other.flipSided &&
                    useClipping == other.useClipping &&
                    useMorphTargets == other.useMorphTargets &&
-                   useMorphNormals == other.useMorphNormals;
+                   useMorphNormals == other.useMorphNormals &&
+                   useTransmission == other.useTransmission;
         }
     };
 
@@ -52,7 +54,8 @@ namespace threepp::metal {
                    ((key.flipSided ? 1u : 0u) << 9u) |
                    ((key.useClipping ? 1u : 0u) << 10u) |
                    ((key.useMorphTargets ? 1u : 0u) << 11u) |
-                   ((key.useMorphNormals ? 1u : 0u) << 12u);
+                   ((key.useMorphNormals ? 1u : 0u) << 12u) |
+                   ((key.useTransmission ? 1u : 0u) << 13u);
         }
     };
 
@@ -156,6 +159,10 @@ namespace threepp::metal {
         void* getOrCreateBackgroundCubeFragmentFunction();
 
         void* getOrCreateBackgroundEquirectFragmentFunction();
+
+        void* getOrCreateEquirectToCubeVertexFunction();
+
+        void* getOrCreateEquirectToCubeFragmentFunction();
 
         void* getOrCreateWaterVertexFunction();
 

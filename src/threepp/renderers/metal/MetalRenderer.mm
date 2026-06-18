@@ -847,6 +847,34 @@ kernel void sparkSplatDepth(texture2d_array<uint, access::read> generatedSplats 
         return level;
     }
 
+    void updateMetalLayerColorSpace(CAMetalLayer* layer, ColorSpace colorSpace) {
+        if (!layer) return;
+
+        if (usesSRGBColorEncoding(colorSpace)) {
+            CGColorSpaceRef srgbColorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            layer.colorspace = srgbColorSpace;
+            if (srgbColorSpace) {
+                CGColorSpaceRelease(srgbColorSpace);
+            }
+        } else {
+            layer.colorspace = nil;
+        }
+    }
+
+    MTLPixelFormat screenColorPixelFormatForOutputColorSpace(ColorSpace colorSpace) {
+        return usesSRGBColorEncoding(colorSpace) ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+    }
+
+    Color encodedClearColorForTarget(const Color& color, ColorSpace outputColorSpace, MTLPixelFormat colorPixelFormat) {
+        Color result;
+        if (needsShaderOutputSRGBEncoding(outputColorSpace, colorPixelFormat)) {
+            result.copyLinearToSRGB(color);
+        } else {
+            result.copy(color);
+        }
+        return result;
+    }
+
     void validateRenderTargetSelection(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
         if (activeCubeFace < 0 || activeMipmapLevel < 0 || activeLayer < 0) {
             throw std::invalid_argument("MetalRenderer::setRenderTarget requires non-negative face, mip level, and layer");
@@ -1057,7 +1085,7 @@ MetalRenderer::Impl::Impl(MetalRenderer& r, Canvas& w)
 
     metalLayer = [CAMetalLayer layer];
     metalLayer.device = device;
-    metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    metalLayer.pixelFormat = screenColorPixelFormatForOutputColorSpace(renderer.outputColorSpace);
     metalLayer.maximumDrawableCount = 3;
     metalLayer.displaySyncEnabled = window.vsync() ? YES : NO;
     metalLayer.framebufferOnly = NO;
@@ -1448,9 +1476,13 @@ bool MetalRenderer::Impl::ensureDrawable() {
 void MetalRenderer::Impl::updateMetalLayerPixelFormat() {
     if (renderTarget) return;
 
-    const auto targetPixelFormat = usesSRGBColorEncoding(renderer.outputColorSpace)
-                                           ? MTLPixelFormatBGRA8Unorm_sRGB
-                                           : MTLPixelFormatBGRA8Unorm;
+    if (!metalLayerColorSpace || *metalLayerColorSpace != renderer.outputColorSpace) {
+        updateMetalLayerColorSpace(metalLayer, renderer.outputColorSpace);
+        metalLayerColorSpace = renderer.outputColorSpace;
+    }
+
+    // Metal 默认使用 sRGB drawable：fragment 输出线性值，硬件负责 sRGB encode 与线性空间混合。
+    const auto targetPixelFormat = screenColorPixelFormatForOutputColorSpace(renderer.outputColorSpace);
     if (metalLayer.pixelFormat == targetPixelFormat) return;
 
     metalLayer.pixelFormat = targetPixelFormat;
@@ -3218,7 +3250,7 @@ std::vector<unsigned char> MetalRenderer::Impl::readRGBPixels() {
         throw std::runtime_error("MetalRenderer::readRGBPixels requires an uncommitted frame; set autoClear=false, clear, render, then read");
     }
 
-    // 读回保持 BGRA->RGB 拷贝；Linear/sRGB 的字节含义由当前 drawable 像素格式决定。
+    // 读回保持 BGRA->RGB 拷贝；sRGB/Gamma 输出可能由 sRGB drawable 硬件编码，也可能由 shader fallback 编码。
     id<MTLTexture> sourceTexture = currentDrawable.texture;
     const auto width = static_cast<NSUInteger>(sourceTexture.width);
     const auto height = static_cast<NSUInteger>(sourceTexture.height);
@@ -3515,6 +3547,7 @@ void MetalRenderer::Impl::renderBackgroundCube(id<MTLRenderCommandEncoder> encod
     uniforms.toneMappingExposure = renderer.toneMappingExposure;
     uniforms.toneMapped = 1u;
     uniforms.decodeColor = textureUsesManualCubeDecode(cubeTexture) ? 1.f : 0.f;
+    uniforms.outputEncodeSRGB = needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat) ? 1u : 0u;
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -3579,6 +3612,7 @@ void MetalRenderer::Impl::renderBackgroundEquirect(id<MTLRenderCommandEncoder> e
     uniforms.toneMappingExposure = renderer.toneMappingExposure;
     uniforms.toneMapped = 1u;
     uniforms.decodeColor = 0.f;
+    uniforms.outputEncodeSRGB = needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat) ? 1u : 0u;
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -3588,6 +3622,155 @@ void MetalRenderer::Impl::renderBackgroundEquirect(id<MTLRenderCommandEncoder> e
     [encoder setFragmentSamplerState:samplerForTexture(&texture) atIndex:0];
 
     drawGeometry(encoder, *backgroundCubeGeometry, *posAttr, MTLPrimitiveTypeTriangle);
+}
+
+CubeTexture* MetalRenderer::Impl::resolveBackgroundCubeTexture(Texture& texture) {
+    if (!isEquirectangularMapping(texture.mapping)) return nullptr;
+
+    const auto& images = texture.images();
+    if (images.empty() || images.front().height() == 0) return nullptr;
+
+    const auto sourceWidth = images.front().width();
+    const auto sourceHeight = images.front().height();
+    const auto sourceVersion = texture.version();
+
+    auto& entry = backgroundCubeCache[&texture];
+    const bool cacheValid =
+            entry.renderTarget &&
+            entry.sourceVersion == sourceVersion &&
+            entry.sourceWidth == sourceWidth &&
+            entry.sourceHeight == sourceHeight &&
+            entry.sourceFormat == texture.format &&
+            entry.sourceType == texture.type &&
+            entry.sourceColorSpace == texture.colorSpace;
+
+    if (!cacheValid) {
+        const auto size = std::max(1u, sourceHeight / 2u);
+
+        RenderTarget::Options options;
+        options.generateMipmaps = texture.generateMipmaps;
+        options.minFilter = texture.minFilter;
+        options.magFilter = texture.magFilter;
+        options.format = Format::RGBA;
+        options.type = texture.type;
+        options.encoding = texture.colorSpace;
+
+        auto renderTarget = RenderTarget::create(size, size, options);
+        auto cubeTexture = CubeTexture::create();
+        cubeTexture->name = texture.name.empty() ? "BackgroundCube" : texture.name + ".BackgroundCube";
+        cubeTexture->mapping = texture.mapping == Mapping::EquirectangularRefraction
+                                       ? Mapping::CubeRefraction
+                                       : Mapping::CubeReflection;
+        cubeTexture->format = Format::RGBA;
+        cubeTexture->type = texture.type;
+        cubeTexture->colorSpace = texture.colorSpace;
+        cubeTexture->generateMipmaps = texture.generateMipmaps;
+        cubeTexture->minFilter = texture.minFilter;
+        cubeTexture->magFilter = texture.magFilter;
+
+        renderTarget->texture = cubeTexture;
+        renderTarget->textures.clear();
+        renderTarget->textures.push_back(cubeTexture);
+
+        entry.renderTarget = std::move(renderTarget);
+        entry.sourceVersion = sourceVersion;
+        entry.sourceWidth = sourceWidth;
+        entry.sourceHeight = sourceHeight;
+        entry.sourceFormat = texture.format;
+        entry.sourceType = texture.type;
+        entry.sourceColorSpace = texture.colorSpace;
+
+        renderEquirectBackgroundToCube(texture, *entry.renderTarget);
+    }
+
+    return dynamic_cast<CubeTexture*>(entry.renderTarget->texture.get());
+}
+
+void MetalRenderer::Impl::renderEquirectBackgroundToCube(Texture& texture, RenderTarget& target) {
+    if (!currentCommandBuffer) {
+        ensureFrameStarted();
+    }
+
+    auto& resources = getOrCreateRenderTargetResources(target);
+    if (resources.colorTextures.empty() || !resources.colorTextures.front()) return;
+
+    const auto savedActiveRenderSampleCount = activeRenderSampleCount;
+    const auto savedActiveColorAttachmentCount = activeColorAttachmentCount;
+    const auto savedActiveColorPixelFormats = activeColorPixelFormats;
+
+    activeRenderSampleCount = 1;
+    activeColorAttachmentCount = 1;
+    activeColorPixelFormats = resources.colorPixelFormats;
+    const auto targetColorPixelFormat = resources.colorPixelFormats.empty() ? MTLPixelFormatRGBA8Unorm : resources.colorPixelFormats.front();
+
+    metal::PipelineKey pipelineKey;
+    pipelineKey.vertexFunction = shaderManager->getOrCreateEquirectToCubeVertexFunction();
+    pipelineKey.fragmentFunction = shaderManager->getOrCreateEquirectToCubeFragmentFunction();
+    pipelineKey.alphaBlending = false;
+    pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
+    configurePipelineColorFormats(pipelineKey, targetColorPixelFormat);
+    pipelineKey.rasterSampleCount = 1;
+
+    id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+    id<MTLDepthStencilState> conversionDepthState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+            false,
+            false,
+            DepthFunc::Always);
+
+    struct alignas(16) EquirectToCubeUniforms {
+        std::uint32_t face = 0;
+        float padding[3]{};
+    };
+
+    const std::array<float, 9> fullscreenTriangle{
+            -1.f, -1.f, 0.f,
+            3.f, -1.f, 0.f,
+            -1.f, 3.f, 0.f};
+
+    id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(texture);
+    id<MTLSamplerState> sourceSampler = samplerForTexture(&texture);
+
+    for (NSUInteger face = 0; face < 6; ++face) {
+        MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
+        passDesc.colorAttachments[0].texture = resources.colorTextures.front();
+        passDesc.colorAttachments[0].slice = face;
+        passDesc.colorAttachments[0].loadAction = MTLLoadActionClear;
+        passDesc.colorAttachments[0].clearColor = MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+        passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+        passDesc.depthAttachment.texture = resources.depthTexture;
+        passDesc.depthAttachment.loadAction = MTLLoadActionClear;
+        passDesc.depthAttachment.clearDepth = 1.0;
+        passDesc.depthAttachment.storeAction = MTLStoreActionStore;
+
+        RenderCommandEncoderScope encoderScope{[currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc]};
+        auto encoder = encoderScope.encoder;
+        resetDepthBiasCache();
+        const MTLViewport viewport{
+                0.0,
+                0.0,
+                static_cast<double>(resources.width),
+                static_cast<double>(resources.height),
+                0.0,
+                1.0};
+        [encoder setViewport:viewport];
+        [encoder setRenderPipelineState:pso];
+        [encoder setDepthStencilState:conversionDepthState];
+        [encoder setCullMode:MTLCullModeNone];
+        [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+        EquirectToCubeUniforms uniforms{};
+        uniforms.face = static_cast<std::uint32_t>(face);
+        [encoder setVertexBytes:fullscreenTriangle.data() length:sizeof(float) * fullscreenTriangle.size() atIndex:0];
+        [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
+        [encoder setFragmentTexture:sourceTexture atIndex:0];
+        [encoder setFragmentSamplerState:sourceSampler atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    }
+
+    generateRenderTargetMipmapsIfNeeded(target, resources.colorTextures.front());
+
+    activeRenderSampleCount = savedActiveRenderSampleCount;
+    activeColorAttachmentCount = savedActiveColorAttachmentCount;
+    activeColorPixelFormats = savedActiveColorPixelFormats;
 }
 
 void MetalRenderer::Impl::generateRenderTargetMipmapsIfNeeded(RenderTarget& target, id<MTLTexture> colorTexture) {
@@ -3601,6 +3784,7 @@ void MetalRenderer::Impl::generateRenderTargetMipmapsIfNeeded(RenderTarget& targ
 void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::render");
     if (insideRender_) return;
+    activeOutputColorSpace = renderer.outputColorSpace;
 
     if (currentCommandBuffer) {
         const auto now = std::chrono::steady_clock::now();
@@ -3737,6 +3921,13 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     };
     prewarmPMREMs();
 
+    if (!scene.background.empty() && scene.background.isTexture()) {
+        auto backgroundTexture = scene.background.texture();
+        if (backgroundTexture && isEquirectangularMapping(backgroundTexture->mapping)) {
+            (void) resolveBackgroundCubeTexture(*backgroundTexture);
+        }
+    }
+
     id<MTLTexture> colorTexture = nil;
     id<MTLTexture> passDepthTexture = nil;
     MTLPixelFormat colorPixelFormat = MTLPixelFormatBGRA8Unorm;
@@ -3795,14 +3986,17 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             } else if (isArrayRenderTarget) {
                 passDesc.colorAttachments[i].slice = static_cast<NSUInteger>(activeLayer);
             }
+            const auto attachmentFormat = i < activeColorPixelFormats.size() ? activeColorPixelFormats[i] : colorPixelFormat;
+            const auto encodedClearColor = encodedClearColorForTarget(effectiveClearColor, activeOutputColorSpace, attachmentFormat);
             passDesc.colorAttachments[i].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
-            passDesc.colorAttachments[i].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
+            passDesc.colorAttachments[i].clearColor = MTLClearColorMake(encodedClearColor.r, encodedClearColor.g, encodedClearColor.b, effectiveClearAlpha);
             passDesc.colorAttachments[i].storeAction = MTLStoreActionStore;
         }
     } else {
+        const auto encodedClearColor = encodedClearColorForTarget(effectiveClearColor, activeOutputColorSpace, colorPixelFormat);
         passDesc.colorAttachments[0].texture = colorTexture;
         passDesc.colorAttachments[0].loadAction = canUseMetalClear && clearColorFlag ? MTLLoadActionClear : MTLLoadActionLoad;
-        passDesc.colorAttachments[0].clearColor = MTLClearColorMake(effectiveClearColor.r, effectiveClearColor.g, effectiveClearColor.b, effectiveClearAlpha);
+        passDesc.colorAttachments[0].clearColor = MTLClearColorMake(encodedClearColor.r, encodedClearColor.g, encodedClearColor.b, effectiveClearAlpha);
         if (activeRenderSampleCount > 1) {
             passDesc.colorAttachments[0].resolveTexture = currentDrawable.texture;
             passDesc.colorAttachments[0].storeAction = MTLStoreActionStoreAndMultisampleResolve;
@@ -3819,8 +4013,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     passDesc.depthAttachment.clearDepth = 1.0;
     passDesc.depthAttachment.storeAction = MTLStoreActionStore;
 
-    RenderCommandEncoderScope encoderScope{[currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc]};
-    id<MTLRenderCommandEncoder> encoder = encoderScope.encoder;
+    auto encoderScope = std::make_unique<RenderCommandEncoderScope>([currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc]);
+    id<MTLRenderCommandEncoder> encoder = encoderScope->encoder;
     RenderPassScope renderPassScope{insideRender_};
 
     auto configureActiveEncoder = [&] {
@@ -3860,7 +4054,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 0.0,
                 1.0};
         [encoder setViewport:clearViewport];
-        performScissorClear(encoder, effectiveClearColor, effectiveClearAlpha, colorPixelFormat, clearColorFlag, clearDepthFlag);
+        const auto encodedClearColor = encodedClearColorForTarget(effectiveClearColor, activeOutputColorSpace, colorPixelFormat);
+        performScissorClear(encoder, encodedClearColor, effectiveClearAlpha, colorPixelFormat, clearColorFlag, clearDepthFlag);
         if (renderTarget) {
             const MTLViewport targetViewport{
                     renderTarget->viewport.x,
@@ -3881,14 +4076,20 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         if (auto cubeTexture = std::dynamic_pointer_cast<CubeTexture>(texture)) {
             renderBackgroundCube(encoder, *cubeTexture, camera, colorPixelFormat);
         } else if (isEquirectangularMapping(texture->mapping)) {
-            renderBackgroundEquirect(encoder, *texture, camera, colorPixelFormat);
+            auto cacheIt = backgroundCubeCache.find(texture.get());
+            auto* cubeTexture = cacheIt != backgroundCubeCache.end() && cacheIt->second.renderTarget
+                                        ? dynamic_cast<CubeTexture*>(cacheIt->second.renderTarget->texture.get())
+                                        : nullptr;
+            if (cubeTexture) {
+                renderBackgroundCube(encoder, *cubeTexture, camera, colorPixelFormat);
+            } else {
+                renderBackgroundEquirect(encoder, *texture, camera, colorPixelFormat);
+            }
         }
     };
 
     if (!scene.background.empty() && scene.background.isTexture()) {
         renderBackgroundTexture(scene.background.texture());
-    } else if (scene.background.empty() && scene.environment) {
-        renderBackgroundTexture(scene.environment);
     }
 
     {
@@ -3901,6 +4102,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
         invokeOnAfterRender(obj, renderer, scene, camera, geometry, material, group);
     };
+
+    id<MTLTexture> transmissionTexture = nil;
 
     auto renderItems = [&](const std::vector<metal::MetalRenderItem>& items) {
         Material* overrideMaterial = scene.overrideMaterial ? scene.overrideMaterial.get() : nullptr;
@@ -3992,7 +4195,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             }
             auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
 
-            const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow);
+            const auto outputEncodeSRGB = needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat);
+            const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow, {}, outputEncodeSRGB);
             const bool useClipping = shadingParams.numClippingPlanes > 0u;
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;
@@ -4006,6 +4210,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             const bool useTangent = useNormal && useUv;
             const bool useMorphTargets = wantsMorphTargets(*material, *geometry);
             const bool useMorphNormals = wantsMorphNormals(*material, *geometry, useNormal, useMorphTargets);
+            auto* transmissionMaterial = dynamic_cast<MaterialWithTransmission*>(material);
+            const bool useTransmission = transmissionTexture && useNormal && transmissionMaterial && transmissionMaterial->transmission > 0.f;
             if (useInstancing && useSkinning) {
                 std::cerr << "MetalRenderer: skipping unsupported instanced skinned renderable " << obj->id << "\n";
                 invokeAfterRenderCallback(*obj, geometry, material, item.group);
@@ -4029,6 +4235,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             shaderKey.useClipping = useClipping;
             shaderKey.useMorphTargets = useMorphTargets;
             shaderKey.useMorphNormals = useMorphNormals;
+            shaderKey.useTransmission = useTransmission;
 
             std::uint16_t vertexLayoutBitmask = vertexLayoutPosition;
             if (useNormal) vertexLayoutBitmask |= vertexLayoutNormal;
@@ -4077,6 +4284,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 writeMorphTargetUniforms(*morphTargets, transformUniforms);
             }
             [encoder setVertexBytes:&transformUniforms length:sizeof(transformUniforms) atIndex:4];
+            if (useTransmission) {
+                [encoder setFragmentBytes:&transformUniforms length:sizeof(transformUniforms) atIndex:4];
+            }
 
             [encoder setFragmentBytes:&shadingParams length:sizeof(shadingParams) atIndex:0];
 
@@ -4089,6 +4299,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 auto* aoMaterial = dynamic_cast<MaterialWithAoMap*>(material);
                 auto* emissiveMaterial = dynamic_cast<MaterialWithEmissive*>(material);
                 auto* specularMaterial = dynamic_cast<MaterialWithSpecularMap*>(material);
+                auto* thicknessMaterial = dynamic_cast<MaterialWithThickness*>(material);
                 bindTextureOrPlaceholder(encoder, mapMaterial ? mapMaterial->map : nullptr, whiteTexture, 0);
                 bindTextureOrPlaceholder(encoder, normalMaterial ? normalMaterial->normalMap : nullptr, normalTexture, 1);
                 bindTextureOrPlaceholder(encoder, roughnessMaterial ? roughnessMaterial->roughnessMap : nullptr, whiteTexture, 2);
@@ -4096,6 +4307,10 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 bindTextureOrPlaceholder(encoder, aoMaterial ? aoMaterial->aoMap : nullptr, whiteTexture, 4);
                 bindTextureOrPlaceholder(encoder, emissiveMaterial ? emissiveMaterial->emissiveMap : nullptr, whiteTexture, 5);
                 bindTextureOrPlaceholder(encoder, specularMaterial ? specularMaterial->specularMap : nullptr, whiteTexture, 19);
+                if (useTransmission) {
+                    bindTextureOrPlaceholder(encoder, transmissionMaterial ? transmissionMaterial->transmissionMap : nullptr, whiteTexture, 22);
+                    bindTextureOrPlaceholder(encoder, thicknessMaterial ? thicknessMaterial->thicknessMap : nullptr, whiteTexture, 23);
+                }
             }
             if (useLights) {
                 bindCubeTextureOrPlaceholder(encoder, envMap.kind == EnvMapKind::Cube ? envMap.texture : nullptr, 6);
@@ -4114,6 +4329,10 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             if (!useUv && useLights) {
                 [encoder setFragmentSamplerState:defaultSampler atIndex:0];
             }
+            if (useTransmission) {
+                [encoder setFragmentTexture:transmissionTexture atIndex:21];
+                [encoder setFragmentSamplerState:samplerForTexture(transmissionRenderTarget ? transmissionRenderTarget->texture.get() : nullptr) atIndex:3];
+            }
 
             drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount, item.group);
             invokeAfterRenderCallback(*obj, geometry, material, item.group);
@@ -4123,6 +4342,92 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderOpaque");
         renderItems(renderList.opaque);
+    }
+    if (!renderList.transmissive.empty()) {
+        SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::prepareTransmission");
+
+        if (!transmissionRenderTarget) {
+            RenderTarget::Options options;
+            options.generateMipmaps = true;
+            options.minFilter = Filter::LinearMipmapLinear;
+            options.magFilter = Filter::Nearest;
+            options.wrapS = TextureWrapping::ClampToEdge;
+            options.wrapT = TextureWrapping::ClampToEdge;
+            transmissionRenderTarget = RenderTarget::create(1024 * 2, 1024 * 2, options);
+        }
+
+        auto& transmissionResources = getOrCreateRenderTargetResources(*transmissionRenderTarget);
+        if (!transmissionResources.colorTextures.empty() && transmissionResources.colorTextures.front()) {
+            encoderScope->end();
+
+            auto* savedRenderTarget = renderTarget;
+            const auto savedActiveRenderSampleCount = activeRenderSampleCount;
+            const auto savedActiveColorAttachmentCount = activeColorAttachmentCount;
+            const auto savedActiveColorPixelFormats = activeColorPixelFormats;
+            const auto savedColorPixelFormat = colorPixelFormat;
+            const auto savedOutputColorSpace = activeOutputColorSpace;
+
+            renderTarget = transmissionRenderTarget.get();
+            activeRenderSampleCount = 1;
+            activeColorAttachmentCount = static_cast<NSUInteger>(std::max<std::size_t>(transmissionResources.colorTextures.size(), 1));
+            activeColorPixelFormats = transmissionResources.colorPixelFormats;
+            colorPixelFormat = transmissionResources.colorPixelFormats.empty() ? MTLPixelFormatRGBA8Unorm : transmissionResources.colorPixelFormats.front();
+            activeOutputColorSpace = ColorSpace::Linear;
+
+            MTLRenderPassDescriptor* transmissionPassDesc = [MTLRenderPassDescriptor renderPassDescriptor];
+            for (NSUInteger i = 0; i < transmissionResources.colorTextures.size(); ++i) {
+                const auto attachmentFormat = i < transmissionResources.colorPixelFormats.size() ? transmissionResources.colorPixelFormats[i] : colorPixelFormat;
+                const auto encodedClearColor = encodedClearColorForTarget(effectiveClearColor, activeOutputColorSpace, attachmentFormat);
+                transmissionPassDesc.colorAttachments[i].texture = transmissionResources.colorTextures[i];
+                transmissionPassDesc.colorAttachments[i].loadAction = MTLLoadActionClear;
+                transmissionPassDesc.colorAttachments[i].clearColor = MTLClearColorMake(encodedClearColor.r, encodedClearColor.g, encodedClearColor.b, effectiveClearAlpha);
+                transmissionPassDesc.colorAttachments[i].storeAction = MTLStoreActionStore;
+            }
+            transmissionPassDesc.depthAttachment.texture = transmissionResources.depthTexture;
+            transmissionPassDesc.depthAttachment.loadAction = MTLLoadActionClear;
+            transmissionPassDesc.depthAttachment.clearDepth = 1.0;
+            transmissionPassDesc.depthAttachment.storeAction = MTLStoreActionStore;
+
+            {
+                RenderCommandEncoderScope transmissionEncoderScope{[currentCommandBuffer renderCommandEncoderWithDescriptor:transmissionPassDesc]};
+                encoder = transmissionEncoderScope.encoder;
+                resetDepthBiasCache();
+                [encoder setDepthStencilState:depthStencilState];
+                const MTLViewport transmissionViewport{
+                        0.0,
+                        0.0,
+                        static_cast<double>(transmissionResources.width),
+                        static_cast<double>(transmissionResources.height),
+                        0.0,
+                        1.0};
+                [encoder setViewport:transmissionViewport];
+                if (!scene.background.empty() && scene.background.isTexture()) {
+                    renderBackgroundTexture(scene.background.texture());
+                }
+                bindPassLightResources(encoder, lightUniforms, shadowResources);
+                renderItems(renderList.opaque);
+            }
+
+            generateRenderTargetMipmapsIfNeeded(*transmissionRenderTarget, transmissionResources.colorTextures.front());
+            transmissionTexture = transmissionResources.colorTextures.front();
+
+            renderTarget = savedRenderTarget;
+            activeRenderSampleCount = savedActiveRenderSampleCount;
+            activeColorAttachmentCount = savedActiveColorAttachmentCount;
+            activeColorPixelFormats = savedActiveColorPixelFormats;
+            colorPixelFormat = savedColorPixelFormat;
+            activeOutputColorSpace = savedOutputColorSpace;
+
+            for (NSUInteger i = 0; i < static_cast<NSUInteger>(activeColorAttachmentCount); ++i) {
+                passDesc.colorAttachments[i].loadAction = MTLLoadActionLoad;
+            }
+            passDesc.depthAttachment.loadAction = MTLLoadActionLoad;
+
+            encoderScope = std::make_unique<RenderCommandEncoderScope>([currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc]);
+            encoder = encoderScope->encoder;
+            configureActiveEncoder();
+            bindPassLightResources(encoder, lightUniforms, shadowResources);
+        }
     }
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderTransmissive");
@@ -4195,7 +4500,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         }
     }
 
-    encoderScope.end();
+    encoderScope->end();
     if (activeRenderTargetResources) {
         for (auto colorAttachmentTexture : activeRenderTargetResources->colorTextures) {
             generateRenderTargetMipmapsIfNeeded(*renderTarget, colorAttachmentTexture);

@@ -702,7 +702,7 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
 
     LineUniforms uniforms{};
     computeLineUniforms(camera, line, *lineMaterial, uniforms);
-    fillToneMappingUniforms(renderer, *lineMaterial, uniforms);
+    fillToneMappingUniforms(renderer, *lineMaterial, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
@@ -784,7 +784,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
 
         ParticleUniforms uniforms{};
         computeParticleUniforms(camera, points, uniforms);
-        fillToneMappingUniforms(renderer, *particleMaterial, uniforms);
+        fillToneMappingUniforms(renderer, *particleMaterial, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
         [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:6];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:6];
 
@@ -837,7 +837,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     if (useMorphTargets && morphTargets) {
         writeMorphTargetUniforms(*morphTargets, uniforms);
     }
-    fillToneMappingUniforms(renderer, *pointsMaterial, uniforms);
+    fillToneMappingUniforms(renderer, *pointsMaterial, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
     fillFogUniforms(scene, *pointsMaterial, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -1303,7 +1303,7 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scen
 
     SpriteUniforms uniforms{};
     computeSpriteUniforms(camera, sprite, *material, uniforms);
-    fillToneMappingUniforms(renderer, *material, uniforms);
+    fillToneMappingUniforms(renderer, *material, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
     fillFogUniforms(scene, *material, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -1361,7 +1361,7 @@ void MetalRenderer::Impl::renderSky(id<MTLRenderCommandEncoder> encoder, Sky& sk
     uniforms.params[1] = uniformFloat(material->uniforms, "rayleigh", 1.f);
     uniforms.params[2] = uniformFloat(material->uniforms, "mieCoefficient", 0.005f);
     uniforms.params[3] = uniformFloat(material->uniforms, "mieDirectionalG", 0.8f);
-    fillToneMappingUniforms(renderer, *material, uniforms);
+    fillToneMappingUniforms(renderer, *material, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -1428,7 +1428,7 @@ void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene
     uniforms.params[1] = uniformFloat(material->uniforms, "time", 0.f);
     uniforms.params[2] = uniformFloat(material->uniforms, "size", 1.f);
     uniforms.params[3] = uniformFloat(material->uniforms, "distortionScale", 20.f);
-    fillToneMappingUniforms(renderer, *material, uniforms);
+    fillToneMappingUniforms(renderer, *material, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
     fillFogUniforms(scene, *material, uniforms);
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -1494,7 +1494,7 @@ void MetalRenderer::Impl::renderReflector(id<MTLRenderCommandEncoder> encoder, S
     uniforms.color[2] = color.b;
     uniforms.color[3] = 1.f;
 
-    fillToneMappingUniforms(renderer, *material, uniforms);
+    fillToneMappingUniforms(renderer, *material, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
