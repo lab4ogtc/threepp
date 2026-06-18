@@ -1221,6 +1221,8 @@ void MetalRenderer::Impl::commitPendingFrame() {
     SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::commitPendingFrame");
     if (!currentCommandBuffer) return;
 
+    renderOverlayIfNeeded();
+
     if (currentDrawable) {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::presentDrawable");
         [currentCommandBuffer presentDrawable:currentDrawable];
@@ -1250,6 +1252,25 @@ void MetalRenderer::Impl::commitPendingFrame() {
     screenCommandsEncoded = false;
     lastFrameWasExternallyAccessed = currentCommandBufferExternallyAccessed;
     currentCommandBufferExternallyAccessed = false;
+}
+
+void MetalRenderer::Impl::renderOverlayIfNeeded() {
+    if (!overlayCallback || !currentCommandBuffer || !currentDrawable) {
+        return;
+    }
+
+    MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];
+    passDesc.colorAttachments[0].texture = currentDrawable.texture;
+    passDesc.colorAttachments[0].loadAction = MTLLoadActionLoad;
+    passDesc.colorAttachments[0].storeAction = MTLStoreActionStore;
+
+    id<MTLRenderCommandEncoder> encoder = [currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc];
+    if (!encoder) {
+        return;
+    }
+
+    overlayCallback((__bridge void*) currentCommandBuffer, (__bridge void*) encoder);
+    [encoder endEncoding];
 }
 
 void MetalRenderer::Impl::ensureFrameStarted() {
@@ -4050,14 +4071,18 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     if (autoClear && !renderTarget) {
         if (!lastFrameWasExternallyAccessed) {
-            if (!scissorTest) {
+            if (!scissorTest && !window.isInsideAnimateLoop()) {
                 commitPendingFrame();
             }
         }
     }
 }
 MetalRenderer::MetalRenderer(Canvas& canvas)
-    : pimpl_(std::make_unique<Impl>(*this, canvas)) {}
+    : pimpl_(std::make_unique<Impl>(*this, canvas)) {
+    canvas.setFrameEndCallback([this] {
+        if (pimpl_) pimpl_->commitPendingFrame();
+    });
+}
 
 void MetalRenderer::render(Object3D& scene, Camera& camera) {
     auto* sceneObject = scene.as<Scene>();
@@ -4116,6 +4141,10 @@ void* MetalRenderer::currentDrawableTexture() const {
     pimpl_->currentCommandBufferExternallyAccessed = true;
     if (!pimpl_->ensureDrawable()) return nullptr;
     return (__bridge void*) pimpl_->currentDrawable.texture;
+}
+
+void MetalRenderer::setOverlayCallback(std::function<void(void* commandBuffer, void* commandEncoder)> callback) {
+    pimpl_->overlayCallback = std::move(callback);
 }
 
 void MetalRenderer::setClearColor(const Color& color, float alpha) {

@@ -205,6 +205,7 @@ namespace threepp {
         bool currentCommandBufferExternallyAccessed = false;
         bool lastFrameWasExternallyAccessed = false;
         bool insideRender_ = false;
+        std::function<void(void* commandBuffer, void* commandEncoder)> overlayCallback;
         std::unordered_set<RenderTargetClearKey, RenderTargetClearKeyHash> clearedTargetsInFrame;
         bool profileRawShader = false;
         bool rawShaderProfileEnvChecked = false;
@@ -255,6 +256,8 @@ namespace threepp {
         [[nodiscard]] id<MTLCommandQueue> activeSubmissionQueue() const;
 
         void commitPendingFrame();
+
+        void renderOverlayIfNeeded();
 
         void ensureFrameStarted();
 

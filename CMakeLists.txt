@@ -28,6 +28,7 @@ cmake_dependent_option(THREEPP_USE_EXTERNAL_GLFW "Use externally supplied GLFW" 
 
 cmake_dependent_option(THREEPP_BUILD_EXAMPLE_PROJECTS "Build example projects" ON "THREEPP_BUILD_EXAMPLES" OFF)
 cmake_dependent_option(THREEPP_FETCH_ASSIMP "Make assimp available for examples" OFF "THREEPP_BUILD_EXAMPLES" OFF)
+option(THREEPP_FETCH_DATA "Fetch threepp_data assets when the local data submodule is unavailable" OFF)
 
 
 # ==============================================================================
@@ -80,19 +81,45 @@ include(cmake/FetchOptionalDeps.cmake)
 
 add_subdirectory(src)
 
-# Example/test assets live in a separate
-# repo, fetched only when building examples or tests so library consumers stay
-# lean. Point at a local checkout with -DFETCHCONTENT_SOURCE_DIR_THREEPP_DATA=<dir>.
+# Example/test assets live in a separate repo. Prefer the local data/
+# submodule so configuring examples/tests does not hit the network by default.
+# Set -DTHREEPP_DATA_DIR=<dir> for another checkout, or explicitly enable
+# -DTHREEPP_FETCH_DATA=ON to fetch https://github.com/markaren/threepp_data.git.
 if (THREEPP_BUILD_EXAMPLES OR THREEPP_BUILD_TESTS)
-    include(FetchContent)
-    FetchContent_Declare(
-            threepp_data
-            GIT_REPOSITORY https://github.com/markaren/threepp_data.git
-            GIT_TAG main  # pin a release tag for reproducible builds
-            GIT_SHALLOW TRUE
-    )
-    FetchContent_MakeAvailable(threepp_data)
-    set(THREEPP_DATA_DIR "${threepp_data_SOURCE_DIR}" CACHE INTERNAL "threepp-data asset path")
+    set(THREEPP_DATA_DIR "" CACHE PATH "Path to a local threepp_data asset checkout")
+    set(THREEPP_LOCAL_DATA_DIR "${PROJECT_SOURCE_DIR}/data")
+
+    if (EXISTS "${THREEPP_LOCAL_DATA_DIR}/textures")
+        set(THREEPP_DATA_DIR "${THREEPP_LOCAL_DATA_DIR}" CACHE PATH "Path to a local threepp_data asset checkout" FORCE)
+    elseif (THREEPP_DATA_DIR)
+        if (NOT IS_ABSOLUTE "${THREEPP_DATA_DIR}")
+            get_filename_component(THREEPP_DATA_DIR "${THREEPP_DATA_DIR}" ABSOLUTE BASE_DIR "${PROJECT_SOURCE_DIR}")
+            set(THREEPP_DATA_DIR "${THREEPP_DATA_DIR}" CACHE PATH "Path to a local threepp_data asset checkout" FORCE)
+        endif ()
+    elseif (FETCHCONTENT_SOURCE_DIR_THREEPP_DATA)
+        set(THREEPP_DATA_DIR "${FETCHCONTENT_SOURCE_DIR_THREEPP_DATA}" CACHE PATH "Path to a local threepp_data asset checkout" FORCE)
+    elseif (THREEPP_FETCH_DATA)
+        include(FetchContent)
+        FetchContent_Declare(
+                threepp_data
+                GIT_REPOSITORY https://github.com/markaren/threepp_data.git
+                GIT_TAG main
+                GIT_SHALLOW TRUE
+        )
+        FetchContent_MakeAvailable(threepp_data)
+        set(THREEPP_DATA_DIR "${threepp_data_SOURCE_DIR}" CACHE PATH "Path to a local threepp_data asset checkout" FORCE)
+    else ()
+        message(FATAL_ERROR
+                "threepp data assets are required when THREEPP_BUILD_EXAMPLES or THREEPP_BUILD_TESTS is ON. "
+                "Initialize the data submodule with 'git submodule update --init -- data', "
+                "set -DTHREEPP_DATA_DIR=<path>, or opt into online fetching with -DTHREEPP_FETCH_DATA=ON.")
+    endif ()
+
+    if (NOT EXISTS "${THREEPP_DATA_DIR}/textures")
+        message(FATAL_ERROR "THREEPP_DATA_DIR does not contain the expected textures directory: ${THREEPP_DATA_DIR}")
+    endif ()
+
+    message(STATUS "Using threepp data assets from: ${THREEPP_DATA_DIR}")
 endif ()
 
 if (THREEPP_BUILD_EXAMPLES)
@@ -101,13 +128,16 @@ endif ()
 
 if (NOT DEFINED EMSCRIPTEN AND THREEPP_BUILD_TESTS)
 
-    include(FetchContent)
-    FetchContent_Declare(
-            Catch2
-            GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-            GIT_TAG v3.4.0
-    )
-    FetchContent_MakeAvailable(Catch2)
+    find_package(Catch2 CONFIG QUIET)
+    if (NOT Catch2_FOUND)
+        include(FetchContent)
+        FetchContent_Declare(
+                Catch2
+                GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+                GIT_TAG v3.4.0
+        )
+        FetchContent_MakeAvailable(Catch2)
+    endif ()
 
     enable_testing()
     add_subdirectory(tests)

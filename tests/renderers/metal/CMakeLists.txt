@@ -1,1 +1,2 @@
 add_test_executable(MetalRenderList_test)
+add_test_executable(MetalReflectorShader_test)

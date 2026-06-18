@@ -16,12 +16,30 @@
 #include <threepp/renderers/VulkanRenderer.hpp>
 #endif
 
+#ifdef THREEPP_WITH_METAL
+#include <threepp/renderers/metal/MetalRenderer.hpp>
+#endif
+
 #include <functional>
 #include <iostream>
 
 #include <threepp/canvas/Canvas.hpp>
 #include <threepp/canvas/Monitor.hpp>
 #include <threepp/renderers/Renderer.hpp>
+
+#ifdef THREEPP_WITH_METAL
+namespace threepp::detail {
+
+    void imguiMetalInit(MetalRenderer& renderer);
+
+    bool imguiMetalNewFrame(MetalRenderer& renderer);
+
+    void imguiMetalRenderDrawData(ImDrawData* drawData, void* commandBuffer, void* commandEncoder);
+
+    void imguiMetalShutdown();
+
+}// namespace threepp::detail
+#endif
 
 class ImguiContext {
 
@@ -53,8 +71,11 @@ public:
     ImguiContext(const threepp::Canvas& canvas, threepp::Renderer& renderer)
         : ImguiContext(canvas.windowPtr(), false) {
 
+        bool delegatedBackend = false;
+
 #ifdef THREEPP_WITH_VULKAN
         if (canvas.graphicsApi() == threepp::GraphicsAPI::Vulkan) {
+            delegatedBackend = true;
             vulkanRenderer_ = dynamic_cast<threepp::VulkanRenderer*>(&renderer);
             if (vulkanRenderer_) {
                 auto device = static_cast<VkDevice>(vulkanRenderer_->nativeDevice());
@@ -108,9 +129,29 @@ public:
 
                 vulkanInitialized_ = true;
             }
-        } else
+        }
 #endif
-        if (canvas.graphicsApi() != threepp::GraphicsAPI::WebGPU) {
+#ifdef THREEPP_WITH_METAL
+        if (canvas.graphicsApi() == threepp::GraphicsAPI::Metal) {
+            delegatedBackend = true;
+            metalRenderer_ = dynamic_cast<threepp::MetalRenderer*>(&renderer);
+            if (metalRenderer_) {
+                threepp::detail::imguiMetalInit(*metalRenderer_);
+                metalRenderer_->setOverlayCallback([this](void* commandBuffer, void* commandEncoder) {
+                    if (pendingDrawData_) {
+                        auto sz = metalRenderer_->size();
+                        pendingDrawData_->DisplaySize = ImVec2(
+                                static_cast<float>(sz.width()),
+                                static_cast<float>(sz.height()));
+                        threepp::detail::imguiMetalRenderDrawData(pendingDrawData_, commandBuffer, commandEncoder);
+                    }
+                });
+
+                metalInitialized_ = true;
+            }
+        }
+#endif
+        if (!delegatedBackend && canvas.graphicsApi() != threepp::GraphicsAPI::WebGPU) {
             // GL path — reinitialize for OpenGL (undo the InitForOther from delegated ctor)
             ImGui_ImplGlfw_Shutdown();
             ImGui_ImplGlfw_InitForOpenGL(static_cast<GLFWwindow*>(canvas.windowPtr()), true);
@@ -122,7 +163,7 @@ public:
             glInitialized_ = true;
         }
 #ifdef THREEPP_WITH_WGPU
-        else {
+        if (canvas.graphicsApi() == threepp::GraphicsAPI::WebGPU) {
             wgpuRenderer_ = dynamic_cast<threepp::WgpuRenderer*>(&renderer);
             if (wgpuRenderer_) {
                 ImGui_ImplWGPU_InitInfo initInfo{};
@@ -164,7 +205,7 @@ public:
     ImguiContext& operator=(const ImguiContext&) = delete;
 
     void render() {
-        if (!glInitialized_ && !wgpuInitialized_ && !vulkanInitialized_) return;
+        if (!glInitialized_ && !wgpuInitialized_ && !vulkanInitialized_ && !metalInitialized_) return;
 
         if (!dpiAwareIsConfigured_) {
 
@@ -183,6 +224,9 @@ public:
 #ifdef THREEPP_WITH_VULKAN
         if (vulkanInitialized_) ImGui_ImplVulkan_NewFrame();
 #endif
+#ifdef THREEPP_WITH_METAL
+        if (metalInitialized_ && !threepp::detail::imguiMetalNewFrame(*metalRenderer_)) return;
+#endif
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
@@ -200,6 +244,11 @@ public:
 #endif
 #ifdef THREEPP_WITH_VULKAN
         if (vulkanInitialized_) {
+            pendingDrawData_ = ImGui::GetDrawData();
+        }
+#endif
+#ifdef THREEPP_WITH_METAL
+        if (metalInitialized_) {
             pendingDrawData_ = ImGui::GetDrawData();
         }
 #endif
@@ -227,6 +276,12 @@ public:
             }
         }
 #endif
+#ifdef THREEPP_WITH_METAL
+        if (metalInitialized_) {
+            if (metalRenderer_) metalRenderer_->setOverlayCallback(nullptr);
+            threepp::detail::imguiMetalShutdown();
+        }
+#endif
         ImGui_ImplGlfw_Shutdown();
         ImGui::DestroyContext();
     }
@@ -252,6 +307,7 @@ private:
     bool glInitialized_ = false;
     bool wgpuInitialized_ = false;
     bool vulkanInitialized_ = false;
+    bool metalInitialized_ = false;
     bool dpiAwareIsConfigured_ = true;
     float dpiScale_ = 1.f;
     ImDrawData* pendingDrawData_ = nullptr;
@@ -261,6 +317,9 @@ private:
 #ifdef THREEPP_WITH_VULKAN
     threepp::VulkanRenderer* vulkanRenderer_ = nullptr;
     VkDescriptorPool vulkanDescriptorPool_ = VK_NULL_HANDLE;
+#endif
+#ifdef THREEPP_WITH_METAL
+    threepp::MetalRenderer* metalRenderer_ = nullptr;
 #endif
 };
 

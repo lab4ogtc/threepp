@@ -2244,7 +2244,6 @@ fragment float4 reflector_fragment(
 )
 {
     float2 uv = in.vUv.xy / in.vUv.w;
-    uv.y = 1.0 - uv.y;
 
     float4 base = tDiffuse.sample(tDiffuseSampler, uv);
     float3 blended = blendOverlay(base.rgb, uniforms.color.rgb);

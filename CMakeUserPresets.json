@@ -29,6 +29,11 @@
         "type": "equals",
         "lhs": "${hostSystemName}",
         "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "THREEPP_BUILD_EXAMPLES": "ON",
+        "THREEPP_WITH_METAL": "ON",
+        "THREEPP_WITH_SLANG": "ON"
       }
     }
   ],

@@ -12,6 +12,16 @@ target_sources(imgui PRIVATE
 target_link_libraries(imgui PRIVATE glfw)
 target_include_directories(imgui PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/imgui")
 
+if (APPLE AND THREEPP_WITH_METAL)
+    target_sources(imgui PRIVATE
+            "imgui/imgui_impl_metal.mm"
+            "${PROJECT_SOURCE_DIR}/src/threepp/extras/imgui/ImguiContextMetal.mm"
+    )
+    target_include_directories(imgui PRIVATE "${PROJECT_SOURCE_DIR}/include")
+    target_compile_definitions(imgui PRIVATE THREEPP_WITH_METAL=1)
+    target_link_libraries(imgui PRIVATE "-framework Metal" "-framework QuartzCore")
+endif ()
+
 if (THREEPP_WITH_WGPU)
     target_sources(imgui PRIVATE "imgui/imgui_impl_wgpu.cpp")
     target_compile_definitions(imgui PUBLIC THREEPP_WITH_WGPU=1)

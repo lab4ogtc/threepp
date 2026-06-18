@@ -203,6 +203,16 @@ namespace threepp {
         [[nodiscard]] void* currentDrawableTexture() const;
 
         /**
+         * 注册绘制到当前 drawable 的 overlay 回调。
+         *
+         * 回调在帧提交前执行，参数分别为当前 `id<MTLCommandBuffer>` 和
+         * 已打开的 `id<MTLRenderCommandEncoder>`，均以 `__bridge void*` 传递。
+         * 该接口用于 ImGui 等 Metal overlay，保持在 Metal 后端范围内，不影响
+         * Renderer 基类和其他后端。
+         */
+        void setOverlayCallback(std::function<void(void* commandBuffer, void* commandEncoder)> callback);
+
+        /**
          * @brief 获取 threepp 纹理对应的 Metal `id<MTLTexture>` 裸指针。
          *
          * 返回值通过 `__bridge void*` 零开销桥接，调用方可将其还原为 `id<MTLTexture>`。
