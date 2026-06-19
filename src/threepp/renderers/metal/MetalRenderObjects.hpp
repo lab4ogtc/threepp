@@ -6,6 +6,7 @@
 #import "MetalRenderList.hpp"
 
 #import "threepp/cameras/Camera.hpp"
+#import "threepp/cameras/OrthographicCamera.hpp"
 #import "threepp/cameras/PerspectiveCamera.hpp"
 #import "threepp/canvas/Canvas.hpp"
 #import "threepp/core/BufferAttribute.hpp"
@@ -16,6 +17,7 @@
 #import "threepp/lights/LightProbe.hpp"
 #import "threepp/lights/PointLight.hpp"
 #import "threepp/lights/PointLightShadow.hpp"
+#import "threepp/lights/RectAreaLight.hpp"
 #import "threepp/lights/SpotLight.hpp"
 #import "threepp/materials/LineBasicMaterial.hpp"
 #import "threepp/materials/Material.hpp"
@@ -24,6 +26,7 @@
 #import "threepp/materials/MeshNormalMaterial.hpp"
 #import "threepp/materials/ParticleMaterial.hpp"
 #import "threepp/materials/MeshPhongMaterial.hpp"
+#import "threepp/materials/MeshPhysicalMaterial.hpp"
 #import "threepp/materials/MeshStandardMaterial.hpp"
 #import "threepp/materials/PointsMaterial.hpp"
 #import "threepp/materials/RawShaderMaterial.hpp"
@@ -169,7 +172,8 @@ namespace threepp {
         float transmissionParams[4];
         float attenuationColor[4];
         std::uint32_t outputEncodeSRGB;
-        std::uint32_t outputPadding[3];
+        std::uint32_t isOrthographicCamera;
+        std::uint32_t outputPadding[2];
     };
 
     struct alignas(16) SpriteUniforms {
@@ -329,14 +333,27 @@ namespace threepp {
         float groundColor[4];
     };
 
+    struct alignas(16) RectAreaLightUniform {
+        float position[4];
+        float color[4];
+        float halfWidth[4];
+        float halfHeight[4];
+    };
+
     struct alignas(16) LightUniforms {
         float ambientColor[4];
         std::uint32_t counts[4];
+        std::uint32_t rectAreaParams[4];
         DirectionalLightUniform directionalLights[maxDirectionalLights];
         PointLightUniform pointLights[maxPointLights];
         SpotLightUniform spotLights[maxSpotLights];
         HemisphereLightUniform hemiLights[maxHemisphereLights];
         float shCoefficients[9][4];
+    };
+
+    struct SceneLightUniforms {
+        LightUniforms lights;
+        std::vector<RectAreaLightUniform> rectAreaLights;
     };
 
     struct SceneLightSet {
@@ -345,6 +362,7 @@ namespace threepp {
         std::vector<PointLight*> point;
         std::vector<SpotLight*> spot;
         std::vector<HemisphereLight*> hemisphere;
+        std::vector<RectAreaLight*> rectArea;
         std::vector<LightProbe*> probes;
     };
 
@@ -882,6 +900,8 @@ namespace threepp {
             lights.spot.push_back(spot);
         } else if (auto* hemi = dynamic_cast<HemisphereLight*>(&object)) {
             lights.hemisphere.push_back(hemi);
+        } else if (auto* rectArea = dynamic_cast<RectAreaLight*>(&object)) {
+            lights.rectArea.push_back(rectArea);
         } else if (auto* probe = dynamic_cast<LightProbe*>(&object)) {
             lights.probes.push_back(probe);
         }
@@ -1064,6 +1084,13 @@ namespace threepp {
         if (auto* standard = dynamic_cast<MeshStandardMaterial*>(&material)) {
             params.pbrParams[0] = clamp01(standard->roughness);
             params.pbrParams[1] = clamp01(standard->metalness);
+            if (auto* physical = dynamic_cast<MeshPhysicalMaterial*>(standard)) {
+                const float reflectivity = clamp01(physical->reflectivity);
+                const float dielectricF0 = 0.16f * reflectivity * reflectivity;
+                params.specularColor[0] = dielectricF0;
+                params.specularColor[1] = dielectricF0;
+                params.specularColor[2] = dielectricF0;
+            }
         } else if (auto* phong = dynamic_cast<MeshPhongMaterial*>(&material)) {
             params.pbrParams[0] = clamp01(1.f - std::min(phong->shininess, 100.f) / 100.f);
             params.pbrParams[1] = 0.f;
@@ -1139,6 +1166,7 @@ namespace threepp {
         params.cameraPosition[3] = 1.f;
         fillToneMappingUniforms(renderer, material, params, outputEncodeSRGB);
         params.useLegacyLights = renderer.useLegacyLights ? 1u : 0u;
+        params.isOrthographicCamera = camera.is<OrthographicCamera>() ? 1u : 0u;
         fillFogUniforms(scene, material, params);
         std::uint32_t numClippingPlanes = 0;
         if (clippingOptions.includeGlobal) {

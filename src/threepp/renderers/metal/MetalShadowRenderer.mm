@@ -365,8 +365,11 @@ ShadowResources MetalRenderer::Impl::renderShadowPasses(Scene& scene, const Scen
     return resources;
 }
 
-LightUniforms MetalRenderer::Impl::buildLightUniforms(const SceneLightSet& sceneLights, const ShadowResources& shadows) const {
-    LightUniforms uniforms{};
+SceneLightUniforms MetalRenderer::Impl::buildLightUniforms(const SceneLightSet& sceneLights, const ShadowResources& shadows, const Camera& camera) const {
+    SceneLightUniforms sceneUniforms{};
+    auto& uniforms = sceneUniforms.lights;
+    sceneUniforms.rectAreaLights.reserve(sceneLights.rectArea.size());
+
     uniforms.ambientColor[0] = sceneLights.ambient.r;
     uniforms.ambientColor[1] = sceneLights.ambient.g;
     uniforms.ambientColor[2] = sceneLights.ambient.b;
@@ -463,6 +466,31 @@ LightUniforms MetalRenderer::Impl::buildLightUniforms(const SceneLightSet& scene
         uniforms.counts[3]++;
     }
 
+    for (auto* light : sceneLights.rectArea) {
+        sceneUniforms.rectAreaLights.push_back(RectAreaLightUniform{});
+        auto& dst = sceneUniforms.rectAreaLights.back();
+
+        Vector3 position;
+        position.setFromMatrixPosition(*light->matrixWorld);
+        position.applyMatrix4(camera.matrixWorldInverse);
+        copyVector3(position, dst.position, 1.f);
+        copyColorWithIntensity(light->color, light->intensity, dst.color);
+
+        Matrix4 lightToView;
+        Matrix4 rotation;
+        lightToView.multiplyMatrices(camera.matrixWorldInverse, *light->matrixWorld);
+        rotation.extractRotation(lightToView);
+
+        Vector3 halfWidth(light->width * 0.5f, 0.f, 0.f);
+        Vector3 halfHeight(0.f, light->height * 0.5f, 0.f);
+        halfWidth.applyMatrix4(rotation);
+        halfHeight.applyMatrix4(rotation);
+        copyVector3(halfWidth, dst.halfWidth);
+        copyVector3(halfHeight, dst.halfHeight);
+
+        uniforms.rectAreaParams[0]++;
+    }
+
     if (!sceneLights.probes.empty()) {
         const auto& coefficients = sceneLights.probes.front()->sh.getCoefficients();
         for (std::size_t i = 0; i < std::min<std::size_t>(coefficients.size(), 9); ++i) {
@@ -472,5 +500,5 @@ LightUniforms MetalRenderer::Impl::buildLightUniforms(const SceneLightSet& scene
         }
     }
 
-    return uniforms;
+    return sceneUniforms;
 }

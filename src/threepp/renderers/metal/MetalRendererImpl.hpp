@@ -567,7 +567,7 @@ namespace threepp {
 
         ShadowResources renderShadowPasses(Scene& scene, const SceneLightSet& sceneLights);
 
-        LightUniforms buildLightUniforms(const SceneLightSet& sceneLights, const ShadowResources& shadows) const;
+        SceneLightUniforms buildLightUniforms(const SceneLightSet& sceneLights, const ShadowResources& shadows, const Camera& camera) const;
 
         void generateRenderTargetMipmapsIfNeeded(RenderTarget& target, id<MTLTexture> colorTexture);
 

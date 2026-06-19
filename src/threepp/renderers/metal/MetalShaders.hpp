@@ -167,6 +167,9 @@ struct VertexOutput {
 #if USE_CLIPPING
     float3 viewPosition;
 #endif
+#if USE_RECT_AREA_LIGHTS
+    float3 rectAreaViewPosition;
+#endif
 #if USE_NORMAL
     float3 normal;
 #endif
@@ -251,7 +254,10 @@ vertex VertexOutput basic_vertex(
     float4 modelViewPosition = transforms.modelViewMatrix * localPosition;
     out.fogDepth = -modelViewPosition.z;
 #if USE_CLIPPING
-    out.viewPosition = -(transforms.modelViewMatrix * localPosition).xyz;
+    out.viewPosition = -modelViewPosition.xyz;
+#endif
+#if USE_RECT_AREA_LIGHTS
+    out.rectAreaViewPosition = modelViewPosition.xyz;
 #endif
 #if USE_INSTANCING
     out.position = transforms.mvp * worldPosition;
@@ -318,7 +324,8 @@ struct ShadingParams {
     float4 transmissionParams;
     float4 attenuationColor;
     uint outputEncodeSRGB;
-    uint3 outputPadding;
+    uint isOrthographicCamera;
+    uint2 outputPadding;
 };
 
 struct DirectionalLightUniform {
@@ -353,9 +360,17 @@ struct HemisphereLightUniform {
     float4 groundColor;
 };
 
+struct RectAreaLightUniform {
+    float4 position;
+    float4 color;
+    float4 halfWidth;
+    float4 halfHeight;
+};
+
 struct LightUniforms {
     float4 ambientColor;
     uint4 counts;
+    uint4 rectAreaParams;
     DirectionalLightUniform directionalLights[MAX_DIRECTIONAL_LIGHTS];
     PointLightUniform pointLights[MAX_POINT_LIGHTS];
     SpotLightUniform spotLights[MAX_SPOT_LIGHTS];
@@ -670,14 +685,13 @@ struct DirectBRDFResult {
     float3 specular;
 };
 
-DirectBRDFResult directBRDFTerms(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness, bool useLegacyLights) {
+DirectBRDFResult directBRDFTerms(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness, float3 specularColor, bool useLegacyLights) {
     if (useLegacyLights) {
         radiance *= PI;
     }
     float nDotL = max(dot(n, l), 0.0);
     float3 irradiance = radiance * nDotL;
     float3 diffuseColor = albedo * (1.0 - metalness);
-    float3 specularColor = mix(float3(0.04), albedo, metalness);
     float3 diffuse = diffuseColor / PI;
     float3 specular = brdfSpecularGGX(l, v, n, specularColor, roughness);
     DirectBRDFResult result;
@@ -686,10 +700,80 @@ DirectBRDFResult directBRDFTerms(float3 radiance, float3 n, float3 v, float3 l, 
     return result;
 }
 
-float3 directBRDF(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness, bool useLegacyLights) {
-    DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, useLegacyLights);
+float3 directBRDF(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float roughness, float metalness, float3 specularColor, bool useLegacyLights) {
+    DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, specularColor, useLegacyLights);
     return terms.diffuse + terms.specular;
 }
+
+float computeSpecularOcclusion(float dotNV, float ambientOcclusion, float roughness) {
+    return saturateFloat(pow(dotNV + ambientOcclusion, exp2(-16.0 * roughness - 1.0)) - 1.0 + ambientOcclusion);
+}
+
+#if USE_RECT_AREA_LIGHTS
+float2 ltcUv(float3 n, float3 v, float roughness) {
+    constexpr float lutSize = 64.0;
+    constexpr float lutScale = (lutSize - 1.0) / lutSize;
+    constexpr float lutBias = 0.5 / lutSize;
+    float dotNV = saturateFloat(dot(n, v));
+    return float2(roughness, sqrt(1.0 - dotNV)) * lutScale + float2(lutBias);
+}
+
+float ltcClippedSphereFormFactor(float3 f) {
+    float l = length(f);
+    return max((l * l + f.z) / (l + 1.0), 0.0);
+}
+
+float3 ltcEdgeVectorFormFactor(float3 v1, float3 v2) {
+    float x = dot(v1, v2);
+    float y = abs(x);
+    float a = 0.8543985 + (0.4965155 + 0.0145206 * y) * y;
+    float b = 3.4175940 + (4.1616724 + y) * y;
+    float v = a / b;
+    float thetaSinTheta = x > 0.0
+        ? v
+        : 0.5 * rsqrt(max(1.0 - x * x, 1e-7)) - v;
+    return cross(v1, v2) * thetaSinTheta;
+}
+
+float3 ltcTransformOffset(float3 offset, float3 tangentX, float3 tangentY, float3 n, float4 mInv) {
+    float3 local = float3(dot(offset, tangentX), dot(offset, tangentY), dot(offset, n));
+    return float3(
+        mInv.x * local.x + mInv.z * local.z,
+        local.y,
+        mInv.y * local.x + mInv.w * local.z
+    );
+}
+
+float3 ltcEvaluate(float3 n,
+                   float3 v,
+                   float3 p,
+                   float4 mInv,
+                   float3 rect0,
+                   float3 rect1,
+                   float3 rect2,
+                   float3 rect3) {
+    float3 lightNormal = cross(rect1 - rect0, rect3 - rect0);
+    if (dot(lightNormal, p - rect0) < 0.0) {
+        return float3(0.0);
+    }
+
+    float3 tangentX = normalize(v - n * dot(v, n));
+    float3 tangentY = -cross(n, tangentX);
+
+    float3 coord0 = normalize(ltcTransformOffset(rect0 - p, tangentX, tangentY, n, mInv));
+    float3 coord1 = normalize(ltcTransformOffset(rect1 - p, tangentX, tangentY, n, mInv));
+    float3 coord2 = normalize(ltcTransformOffset(rect2 - p, tangentX, tangentY, n, mInv));
+    float3 coord3 = normalize(ltcTransformOffset(rect3 - p, tangentX, tangentY, n, mInv));
+
+    float3 vectorFormFactor = float3(0.0);
+    vectorFormFactor += ltcEdgeVectorFormFactor(coord0, coord1);
+    vectorFormFactor += ltcEdgeVectorFormFactor(coord1, coord2);
+    vectorFormFactor += ltcEdgeVectorFormFactor(coord2, coord3);
+    vectorFormFactor += ltcEdgeVectorFormFactor(coord3, coord0);
+
+    return float3(ltcClippedSphereFormFactor(vectorFormFactor));
+}
+#endif
 
 float3 directLambert(float3 radiance, float3 n, float3 l, float3 albedo) {
     return radiance * max(dot(n, l), 0.0) * albedo;
@@ -833,7 +917,10 @@ fragment float4 basic_fragment(
 #if USE_LIGHTS
     , constant LightUniforms& lights [[buffer(1)]]
 #endif
-#if USE_TRANSMISSION
+#if USE_RECT_AREA_LIGHTS
+    , constant RectAreaLightUniform* rectAreaLights [[buffer(2)]]
+#endif
+#if USE_TRANSMISSION || USE_RECT_AREA_LIGHTS
     , constant TransformUniforms& transforms [[buffer(4)]]
 #endif
 #if USE_MAP
@@ -867,6 +954,11 @@ fragment float4 basic_fragment(
     , depth2d<float> pointShadowMap3 [[texture(18)]]
     , sampler shadowSampler [[sampler(1)]]
     , sampler envMapSampler [[sampler(2)]]
+#if USE_RECT_AREA_LIGHTS
+    , texture2d<float> ltc1 [[texture(24)]]
+    , texture2d<float> ltc2 [[texture(25)]]
+    , sampler ltcSampler [[sampler(4)]]
+#endif
 #endif
 #if USE_TRANSMISSION
     , texture2d<float> transmissionSamplerMap [[texture(21)]]
@@ -981,17 +1073,15 @@ fragment float4 basic_fragment(
 
     float shadowMask = 1.0;
     float3 v = normalize(params.cameraPosition.xyz - in.worldPosition);
+    float3 pbrSpecularColor = mix(params.specularColor.rgb, albedo, metalness);
     float pbrDiffuseIrradianceScale = params.useLegacyLights != 0 ? 1.0 : (1.0 / PI);
-    float3 color = lights.ambientColor.rgb * albedo;
-#if USE_TRANSMISSION
-    float3 totalDiffuse = float3(0.0);
-    float3 totalSpecular = float3(0.0);
-#endif
+    float3 reflectedDirectDiffuse = float3(0.0);
+    float3 reflectedDirectSpecular = float3(0.0);
+    float3 reflectedIndirectDiffuse = float3(0.0);
+    float3 reflectedIndirectSpecular = float3(0.0);
+    float3 color = params.materialType == 0 ? float3(0.0) : lights.ambientColor.rgb * albedo;
     if (params.materialType == 0) {
-        color *= (1.0 - metalness) * pbrDiffuseIrradianceScale;
-#if USE_TRANSMISSION
-        totalDiffuse = color;
-#endif
+        reflectedIndirectDiffuse += lights.ambientColor.rgb * albedo * (1.0 - metalness) * pbrDiffuseIrradianceScale;
     }
 
     for (uint i = 0; i < min(lights.counts.x, uint(MAX_DIRECTIONAL_LIGHTS)); ++i) {
@@ -1019,14 +1109,13 @@ fragment float4 basic_fragment(
         } else if (params.materialType == 3) {
             color += directLambert(light.color.rgb, n, l, albedo) * shadow;
         } else {
-            DirectBRDFResult terms = directBRDFTerms(light.color.rgb, n, v, l, albedo, roughness, metalness, params.useLegacyLights != 0);
-            color += (terms.diffuse + terms.specular) * shadow;
-#if USE_TRANSMISSION
+            DirectBRDFResult terms = directBRDFTerms(light.color.rgb, n, v, l, albedo, roughness, metalness, pbrSpecularColor, params.useLegacyLights != 0);
             if (params.materialType == 0) {
-                totalDiffuse += terms.diffuse * shadow;
-                totalSpecular += terms.specular * shadow;
+                reflectedDirectDiffuse += terms.diffuse * shadow;
+                reflectedDirectSpecular += terms.specular * shadow;
+            } else {
+                color += (terms.diffuse + terms.specular) * shadow;
             }
-#endif
         }
     }
 
@@ -1065,14 +1154,13 @@ fragment float4 basic_fragment(
         } else if (params.materialType == 3) {
             color += directLambert(radiance, n, l, albedo) * shadow;
         } else {
-            DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, params.useLegacyLights != 0);
-            color += (terms.diffuse + terms.specular) * shadow;
-#if USE_TRANSMISSION
+            DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, pbrSpecularColor, params.useLegacyLights != 0);
             if (params.materialType == 0) {
-                totalDiffuse += terms.diffuse * shadow;
-                totalSpecular += terms.specular * shadow;
+                reflectedDirectDiffuse += terms.diffuse * shadow;
+                reflectedDirectSpecular += terms.specular * shadow;
+            } else {
+                color += (terms.diffuse + terms.specular) * shadow;
             }
-#endif
         }
     }
 
@@ -1112,55 +1200,68 @@ fragment float4 basic_fragment(
         } else if (params.materialType == 3) {
             color += directLambert(radiance, n, l, albedo) * shadow;
         } else {
-            DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, params.useLegacyLights != 0);
-            color += (terms.diffuse + terms.specular) * shadow;
-#if USE_TRANSMISSION
+            DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, pbrSpecularColor, params.useLegacyLights != 0);
             if (params.materialType == 0) {
-                totalDiffuse += terms.diffuse * shadow;
-                totalSpecular += terms.specular * shadow;
+                reflectedDirectDiffuse += terms.diffuse * shadow;
+                reflectedDirectSpecular += terms.specular * shadow;
+            } else {
+                color += (terms.diffuse + terms.specular) * shadow;
             }
-#endif
         }
     }
+
+#if USE_RECT_AREA_LIGHTS
+    if (params.materialType == 0) {
+        float3 rectAreaPosition = in.rectAreaViewPosition;
+        float3 rectAreaNormal = normalize((transforms.viewMatrix * float4(n, 0.0)).xyz);
+        float3 rectAreaViewDir = params.isOrthographicCamera != 0
+            ? float3(0.0, 0.0, 1.0)
+            : normalize(-rectAreaPosition);
+        for (uint i = 0; i < min(lights.rectAreaParams.x, uint(RECT_AREA_LIGHT_COUNT)); ++i) {
+            RectAreaLightUniform light = rectAreaLights[i];
+            float3 lightPos = light.position.xyz;
+            float3 halfWidth = light.halfWidth.xyz;
+            float3 halfHeight = light.halfHeight.xyz;
+
+            float3 rect0 = lightPos + halfWidth - halfHeight;
+            float3 rect1 = lightPos - halfWidth - halfHeight;
+            float3 rect2 = lightPos - halfWidth + halfHeight;
+            float3 rect3 = lightPos + halfWidth + halfHeight;
+
+            float2 lutUV = ltcUv(rectAreaNormal, rectAreaViewDir, roughness);
+            float4 t1 = ltc1.sample(ltcSampler, lutUV);
+            float4 t2 = ltc2.sample(ltcSampler, lutUV);
+
+            float3 fresnel = pbrSpecularColor * t2.x + (float3(1.0) - pbrSpecularColor) * t2.y;
+            float3 ltcSpecular = ltcEvaluate(rectAreaNormal, rectAreaViewDir, rectAreaPosition, t1, rect0, rect1, rect2, rect3);
+            float3 ltcDiffuse = ltcEvaluate(rectAreaNormal, rectAreaViewDir, rectAreaPosition, float4(1.0, 0.0, 0.0, 1.0), rect0, rect1, rect2, rect3);
+            float3 directDiffuse = light.color.rgb * albedo * (1.0 - metalness) * ltcDiffuse;
+            float3 directSpecular = light.color.rgb * fresnel * ltcSpecular;
+
+            reflectedDirectDiffuse += directDiffuse;
+            reflectedDirectSpecular += directSpecular;
+        }
+    }
+#endif
 
     for (uint i = 0; i < min(lights.counts.w, uint(MAX_HEMI_LIGHTS)); ++i) {
         HemisphereLightUniform light = lights.hemiLights[i];
         float hemiMix = dot(n, normalize(light.direction.xyz)) * 0.5 + 0.5;
         float3 hemiColor = mix(light.groundColor.rgb, light.skyColor.rgb, hemiMix) * albedo;
-        float3 hemiContribution = params.materialType == 0
-            ? hemiColor * (1.0 - metalness) * pbrDiffuseIrradianceScale
-            : hemiColor;
-        color += hemiContribution;
-#if USE_TRANSMISSION
         if (params.materialType == 0) {
-            totalDiffuse += hemiContribution;
+            reflectedIndirectDiffuse += hemiColor * (1.0 - metalness) * pbrDiffuseIrradianceScale;
+        } else {
+            color += hemiColor;
         }
-#endif
     }
 
     float3 shColor = max(evaluateSH(n, lights.shCoefficients), float3(0.0)) * albedo;
-    float3 shContribution = params.materialType == 0
-        ? shColor * (1.0 - metalness) * pbrDiffuseIrradianceScale
-        : shColor;
-    color += shContribution;
-#if USE_TRANSMISSION
     if (params.materialType == 0) {
-        totalDiffuse += shContribution;
+        reflectedIndirectDiffuse += shColor * (1.0 - metalness) * pbrDiffuseIrradianceScale;
+    } else {
+        color += shColor;
     }
-#endif
 
-#if USE_MAP
-    if (params.textureFlags1.x != 0) {
-        float ao = mix(1.0, aoMap.sample(mapSampler, in.uv).r, aoIntensity);
-        color *= ao;
-#if USE_TRANSMISSION
-        if (params.materialType == 0) {
-            totalDiffuse *= ao;
-            totalSpecular *= ao;
-        }
-#endif
-    }
-#endif
     if (params.textureFlags1.z != 0) {
         float3 reflected = reflect(-v, n);
         bool sourceIsEquirectEnvMap = params.textureFlags2.y != 0;
@@ -1186,7 +1287,7 @@ fragment float4 basic_fragment(
             if (!usePmremEnvMap && params.envMapParams.z != 0.0) {
                 envColor = sRGBToLinear(envColor);
             }
-            float3 f0 = mix(float3(0.04), albedo, metalness);
+            float3 f0 = pbrSpecularColor;
             float dotNV = max(dot(n, v), 0.0);
             float4 dfgC0 = float4(-1.0, -0.0275, -0.572, 0.022);
             float4 dfgC1 = float4( 1.0,  0.0425,  1.04, -0.04);
@@ -1195,18 +1296,38 @@ fragment float4 basic_fragment(
             float2 dfg = float2(-1.04, 1.04) * dfgA + dfgR.zw;
             float3 indirectSpecular = (f0 * dfg.x + dfg.y) * envColor;
             float3 indirectDiffuse = envDiff * albedo * (1.0 - metalness);
-            color += (indirectSpecular + indirectDiffuse) * envMapIntensity;
-#if USE_TRANSMISSION
             if (params.materialType == 0) {
-                totalDiffuse += indirectDiffuse * envMapIntensity;
-                totalSpecular += indirectSpecular * envMapIntensity;
+                reflectedIndirectDiffuse += indirectDiffuse * envMapIntensity;
+                reflectedIndirectSpecular += indirectSpecular * envMapIntensity;
+            } else {
+                color += (indirectSpecular + indirectDiffuse) * envMapIntensity;
             }
-#endif
         }
+    }
+
+#if USE_MAP
+    if (params.textureFlags1.x != 0) {
+        float ao = mix(1.0, aoMap.sample(mapSampler, in.uv).r, aoIntensity);
+        if (params.materialType == 0) {
+            reflectedIndirectDiffuse *= ao;
+            if (params.textureFlags1.z != 0) {
+                float dotNV = saturateFloat(dot(n, v));
+                reflectedIndirectSpecular *= computeSpecularOcclusion(dotNV, ao, roughness);
+            }
+        } else {
+            color *= ao;
+        }
+    }
+#endif
+
+    if (params.materialType == 0) {
+        color = reflectedDirectDiffuse + reflectedIndirectDiffuse + reflectedDirectSpecular + reflectedIndirectSpecular;
     }
 
 #if USE_TRANSMISSION
     if (totalTransmission > 0.0 && params.materialType == 0) {
+        float3 totalDiffuse = reflectedDirectDiffuse + reflectedIndirectDiffuse;
+        float3 totalSpecular = reflectedDirectSpecular + reflectedIndirectSpecular;
         float ior = max(params.transmissionParams.y, 1.0);
         float3 transmissionViewDir = v;
         float3 f0 = float3(pow((ior - 1.0) / (ior + 1.0), 2.0));

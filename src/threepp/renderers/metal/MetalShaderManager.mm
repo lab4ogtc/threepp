@@ -26,6 +26,9 @@ namespace threepp::metal {
             if (key.useMorphNormals && !key.useMorphTargets) {
                 throw std::runtime_error("Metal shader variant cannot enable morph normals without morph targets");
             }
+            if (key.rectAreaLightCount > 0 && !key.useLights) {
+                throw std::runtime_error("Metal shader variant cannot enable RectAreaLights without lights");
+            }
         }
 
         void validateDepthShaderKey(const DepthShaderKey& key) {
@@ -66,6 +69,11 @@ namespace threepp::metal {
             source += key.useMorphNormals ? "1\n" : "0\n";
             source += "#define USE_TRANSMISSION ";
             source += key.useTransmission ? "1\n" : "0\n";
+            source += "#define USE_RECT_AREA_LIGHTS ";
+            source += key.rectAreaLightCount > 0 ? "1\n" : "0\n";
+            source += "#define RECT_AREA_LIGHT_COUNT ";
+            source += std::to_string(key.rectAreaLightCount);
+            source += "\n";
             source += fog_functions;
             source += basic_vertex;
             source += basic_fragment;

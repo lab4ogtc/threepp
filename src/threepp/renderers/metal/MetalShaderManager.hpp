@@ -2,6 +2,8 @@
 #define THREEPP_METAL_SHADER_MANAGER_HPP
 
 #include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
 
 namespace threepp::metal {
@@ -21,6 +23,7 @@ namespace threepp::metal {
         bool useMorphTargets = false;
         bool useMorphNormals = false;
         bool useTransmission = false;
+        std::uint32_t rectAreaLightCount = 0;
 
         bool operator==(const ShaderProgramKey& other) const {
             return useMap == other.useMap &&
@@ -36,26 +39,29 @@ namespace threepp::metal {
                    useClipping == other.useClipping &&
                    useMorphTargets == other.useMorphTargets &&
                    useMorphNormals == other.useMorphNormals &&
-                   useTransmission == other.useTransmission;
+                   useTransmission == other.useTransmission &&
+                   rectAreaLightCount == other.rectAreaLightCount;
         }
     };
 
     struct ShaderProgramKeyHash {
         std::size_t operator()(const ShaderProgramKey& key) const {
-            return (key.useMap ? 1u : 0u) |
-                   ((key.useVertexColors ? 1u : 0u) << 1u) |
-                   ((key.useNormal ? 1u : 0u) << 2u) |
-                   ((key.flatShading ? 1u : 0u) << 3u) |
-                   ((key.useSkinning ? 1u : 0u) << 4u) |
-                   ((key.useLights ? 1u : 0u) << 5u) |
-                   ((key.useInstancing ? 1u : 0u) << 6u) |
-                   ((key.useInstanceColor ? 1u : 0u) << 7u) |
-                   ((key.doubleSided ? 1u : 0u) << 8u) |
-                   ((key.flipSided ? 1u : 0u) << 9u) |
-                   ((key.useClipping ? 1u : 0u) << 10u) |
-                   ((key.useMorphTargets ? 1u : 0u) << 11u) |
-                   ((key.useMorphNormals ? 1u : 0u) << 12u) |
-                   ((key.useTransmission ? 1u : 0u) << 13u);
+            std::size_t value = (key.useMap ? 1u : 0u) |
+                                ((key.useVertexColors ? 1u : 0u) << 1u) |
+                                ((key.useNormal ? 1u : 0u) << 2u) |
+                                ((key.flatShading ? 1u : 0u) << 3u) |
+                                ((key.useSkinning ? 1u : 0u) << 4u) |
+                                ((key.useLights ? 1u : 0u) << 5u) |
+                                ((key.useInstancing ? 1u : 0u) << 6u) |
+                                ((key.useInstanceColor ? 1u : 0u) << 7u) |
+                                ((key.doubleSided ? 1u : 0u) << 8u) |
+                                ((key.flipSided ? 1u : 0u) << 9u) |
+                                ((key.useClipping ? 1u : 0u) << 10u) |
+                                ((key.useMorphTargets ? 1u : 0u) << 11u) |
+                                ((key.useMorphNormals ? 1u : 0u) << 12u) |
+                                ((key.useTransmission ? 1u : 0u) << 13u);
+            value ^= std::hash<std::uint32_t>{}(key.rectAreaLightCount) + 0x9e3779b9u + (value << 6u) + (value >> 2u);
+            return value;
         }
     };
 

@@ -2,6 +2,7 @@
 
 #include "threepp/cameras/OrthographicCamera.hpp"
 #include "threepp/geometries/BoxGeometry.hpp"
+#include "threepp/lights/RectAreaLightUniformsLib.hpp"
 #include "threepp/renderers/shaders/ShaderCompiler.hpp"
 #include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/DataArrayTexture.hpp"
@@ -3840,9 +3841,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderShadowPasses");
         return renderShadowPasses(scene, sceneLights);
     }();
-    auto lightUniforms = [&] {
+    auto passLightUniforms = [&] {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::buildLightUniforms");
-        return buildLightUniforms(sceneLights, shadowResources);
+        return buildLightUniforms(sceneLights, shadowResources, camera);
     }();
 
     Matrix4 projScreenMatrix;
@@ -4094,7 +4095,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
 
     {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::bindPassLightResources");
-        bindPassLightResources(encoder, lightUniforms, shadowResources);
+        bindPassLightResources(encoder, passLightUniforms.lights, shadowResources);
     }
 
     auto invokeAfterRenderCallback = [&](Object3D& obj, BufferGeometry* geometry, Material* material, std::optional<GeometryGroup> group) {
@@ -4212,6 +4213,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             const bool useMorphNormals = wantsMorphNormals(*material, *geometry, useNormal, useMorphTargets);
             auto* transmissionMaterial = dynamic_cast<MaterialWithTransmission*>(material);
             const bool useTransmission = transmissionTexture && useNormal && transmissionMaterial && transmissionMaterial->transmission > 0.f;
+            const bool useRectAreaLights = useLights &&
+                                           passLightUniforms.lights.rectAreaParams[0] > 0u &&
+                                           dynamic_cast<MeshStandardMaterial*>(material) != nullptr;
             if (useInstancing && useSkinning) {
                 std::cerr << "MetalRenderer: skipping unsupported instanced skinned renderable " << obj->id << "\n";
                 invokeAfterRenderCallback(*obj, geometry, material, item.group);
@@ -4236,6 +4240,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             shaderKey.useMorphTargets = useMorphTargets;
             shaderKey.useMorphNormals = useMorphNormals;
             shaderKey.useTransmission = useTransmission;
+            shaderKey.rectAreaLightCount = useRectAreaLights
+                                               ? static_cast<std::uint32_t>(passLightUniforms.rectAreaLights.size())
+                                               : 0u;
 
             std::uint16_t vertexLayoutBitmask = vertexLayoutPosition;
             if (useNormal) vertexLayoutBitmask |= vertexLayoutNormal;
@@ -4284,7 +4291,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 writeMorphTargetUniforms(*morphTargets, transformUniforms);
             }
             [encoder setVertexBytes:&transformUniforms length:sizeof(transformUniforms) atIndex:4];
-            if (useTransmission) {
+            if (useTransmission || useRectAreaLights) {
                 [encoder setFragmentBytes:&transformUniforms length:sizeof(transformUniforms) atIndex:4];
             }
 
@@ -4325,6 +4332,21 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 }
                 [encoder setFragmentTexture:equirectTexture atIndex:20];
                 [encoder setFragmentSamplerState:envSampler atIndex:2];
+
+                if (useRectAreaLights) {
+                    id<MTLBuffer> rectAreaLightBuffer = (__bridge id<MTLBuffer>) bufferManager->getTransientBuffer(
+                            passLightUniforms.rectAreaLights.size() * sizeof(RectAreaLightUniform),
+                            passLightUniforms.rectAreaLights.data());
+                    [encoder setFragmentBuffer:rectAreaLightBuffer offset:0 atIndex:2];
+
+                    auto& ltcLib = RectAreaLightUniformsLib::instance();
+                    ltcLib.init();
+                    const auto ltc1 = ltcLib.ltc_1();
+                    const auto ltc2 = ltcLib.ltc_2();
+                    bindTextureOrPlaceholder(encoder, ltc1, whiteTexture, 24);
+                    bindTextureOrPlaceholder(encoder, ltc2, whiteTexture, 25);
+                    [encoder setFragmentSamplerState:samplerForTexture(ltc1.get()) atIndex:4];
+                }
             }
             if (!useUv && useLights) {
                 [encoder setFragmentSamplerState:defaultSampler atIndex:0];
@@ -4404,7 +4426,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 if (!scene.background.empty() && scene.background.isTexture()) {
                     renderBackgroundTexture(scene.background.texture());
                 }
-                bindPassLightResources(encoder, lightUniforms, shadowResources);
+                bindPassLightResources(encoder, passLightUniforms.lights, shadowResources);
                 renderItems(renderList.opaque);
             }
 
@@ -4426,7 +4448,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             encoderScope = std::make_unique<RenderCommandEncoderScope>([currentCommandBuffer renderCommandEncoderWithDescriptor:passDesc]);
             encoder = encoderScope->encoder;
             configureActiveEncoder();
-            bindPassLightResources(encoder, lightUniforms, shadowResources);
+            bindPassLightResources(encoder, passLightUniforms.lights, shadowResources);
         }
     }
     {
