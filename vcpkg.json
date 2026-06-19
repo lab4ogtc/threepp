@@ -24,6 +24,12 @@
         "assimp"
       ]
     },
+    "wgpu-glsl": {
+      "description": "Enable GLSL compatibility for the WGPU backend",
+      "dependencies": [
+        "glslang"
+      ]
+    },
     "physx": {
       "description": "Enable NVIDIA PhysX physics integration in examples",
       "dependencies": [

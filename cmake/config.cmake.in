@@ -6,5 +6,9 @@ if (NOT DEFINED EMSCRIPTEN AND @THREEPP_USE_EXTERNAL_GLFW@)
     find_dependency(glfw3 CONFIG)
 endif()
 
+if (NOT DEFINED EMSCRIPTEN AND @THREEPP_WITH_WGPU@ AND @THREEPP_WGPU_GLSL_COMPAT@)
+    find_dependency(glslang CONFIG)
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/threepp-targets.cmake)
 check_required_components(threepp)

@@ -854,17 +854,16 @@ if (THREEPP_WITH_WGPU)
         target_link_libraries(threepp PUBLIC ${WGPU_LIBRARY})
 
         if (THREEPP_WGPU_GLSL_COMPAT)
-            message(STATUS "Wgpu GLSL compat: fetching glslang...")
-            include(${PROJECT_SOURCE_DIR}/cmake/FetchGlslang.cmake)
+            message(STATUS "Wgpu GLSL compat: using glslang package")
+            find_package(glslang CONFIG REQUIRED)
 
             target_sources(threepp PRIVATE
                 "threepp/renderers/wgpu/WgpuShaderTranslator.cpp"
             )
-            target_include_directories(threepp PRIVATE "${glslang_SOURCE_DIR}")
             target_link_libraries(threepp PRIVATE
-                glslang
-                SPIRV
-                glslang-default-resource-limits
+                glslang::glslang
+                glslang::SPIRV
+                glslang::glslang-default-resource-limits
             )
             target_compile_definitions(threepp PRIVATE THREEPP_WGPU_GLSL_COMPAT=1)
         endif()

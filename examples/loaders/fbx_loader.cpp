@@ -11,7 +11,7 @@ int main(int argc, char* argv[]) {
     const std::string fbxPath = argc > 1 ? argv[1] : defaultPath;
 
     Canvas canvas("FBX loader example");
-    GLRenderer renderer{canvas};
+    auto renderer = createRenderer(canvas);
 
     auto scene = Scene::create();
     scene->background = Color::aliceblue;
@@ -43,13 +43,13 @@ int main(int argc, char* argv[]) {
     camera->lookAt(bb.getCenter());
 
     canvas.onWindowResize([&](WindowSize newSize) {
-        renderer.setSize(newSize);
+        renderer->setSize(newSize);
         camera->aspect = newSize.aspect();
         camera->updateProjectionMatrix();
     });
 
     canvas.animate([&] {
-        renderer.render(*scene, *camera);
+        renderer->render(*scene, *camera);
     });
 
     return 0;

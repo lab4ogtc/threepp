@@ -324,8 +324,9 @@ struct ShadingParams {
     float4 transmissionParams;
     float4 attenuationColor;
     uint outputEncodeSRGB;
+    uint outputColorSpaceSRGB;
     uint isOrthographicCamera;
-    uint2 outputPadding;
+    uint outputPadding;
 };
 
 struct DirectionalLightUniform {
@@ -505,8 +506,23 @@ float3 linearToOutputColor(float3 value, uint outputEncodeSRGB) {
     return select(high, low, value <= float3(0.0031308));
 }
 
+float3 outputToLinearColor(float3 value, uint outputDecodeSRGB) {
+    if (outputDecodeSRGB == 0) return value;
+
+    value = max(value, float3(0.0));
+    float3 high = pow((value + float3(0.055)) / 1.055, float3(2.4));
+    float3 low = value / 12.92;
+    return select(high, low, value <= float3(0.04045));
+}
+
 float3 applyFog(float3 color, float fogDepth, constant ShadingParams& params) {
     return applyFog(color, fogDepth, params.fogColor, params.fogParams);
+}
+
+float3 applyOutputSpaceFog(float3 linearColor, float fogDepth, constant ShadingParams& params) {
+    float3 outputColor = linearToOutputColor(linearColor, params.outputColorSpaceSRGB);
+    outputColor = applyFog(outputColor, fogDepth, params.fogColor, params.fogParams);
+    return outputToLinearColor(outputColor, params.outputColorSpaceSRGB != 0 && params.outputEncodeSRGB == 0 ? 1 : 0);
 }
 
 bool applyClipping(float3 viewPosition, constant ShadingParams& params) {
@@ -775,8 +791,12 @@ float3 ltcEvaluate(float3 n,
 }
 #endif
 
-float3 directLambert(float3 radiance, float3 n, float3 l, float3 albedo) {
-    return radiance * max(dot(n, l), 0.0) * albedo;
+float3 directLambert(float3 radiance, float3 n, float3 l, float3 albedo, bool useLegacyLights) {
+    float3 irradiance = radiance * max(dot(n, l), 0.0);
+    if (useLegacyLights) {
+        irradiance *= PI;
+    }
+    return irradiance * albedo * (1.0 / PI);
 }
 
 float2 integrateSpecularBRDF(float dotNV, float roughness) {
@@ -865,15 +885,18 @@ float3 blinnPhongFresnel(float3 specularColor, float dotLH) {
     return (1.0 - specularColor) * fresnel + specularColor;
 }
 
-float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float3 specularColor, float shininess, float specularMapStrength) {
+float3 directBlinnPhong(float3 radiance, float3 n, float3 v, float3 l, float3 albedo, float3 specularColor, float shininess, float specularMapStrength, bool useLegacyLights) {
     float nDotL = max(dot(n, l), 0.0);
     float3 irradiance = radiance * nDotL;
-    float3 diffuse = irradiance * albedo;
+    if (useLegacyLights) {
+        irradiance *= PI;
+    }
+    float3 diffuse = irradiance * albedo * (1.0 / PI);
     float3 halfDir = normalize(l + v);
     float dotNH = max(dot(n, halfDir), 0.0);
     float dotLH = max(dot(l, halfDir), 0.0);
     float3 fresnel = blinnPhongFresnel(specularColor, dotLH);
-    float specularStrength = 0.25 * (shininess * 0.5 + 1.0) * pow(dotNH, shininess) * specularMapStrength;
+    float specularStrength = 0.25 * (1.0 / PI) * (shininess * 0.5 + 1.0) * pow(dotNH, shininess) * specularMapStrength;
     return diffuse + irradiance * fresnel * specularStrength;
 }
 
@@ -1058,8 +1081,7 @@ fragment float4 basic_fragment(
         if (params.toneMapped != 0 && params.toneMappingType != 0) {
             color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
         }
-        color = applyFog(color, in.fogDepth, params);
-        color = linearToOutputColor(color, params.outputEncodeSRGB);
+        color = applyOutputSpaceFog(color, in.fogDepth, params);
         return float4(color, alpha);
     }
 
@@ -1074,14 +1096,14 @@ fragment float4 basic_fragment(
     float shadowMask = 1.0;
     float3 v = normalize(params.cameraPosition.xyz - in.worldPosition);
     float3 pbrSpecularColor = mix(params.specularColor.rgb, albedo, metalness);
-    float pbrDiffuseIrradianceScale = params.useLegacyLights != 0 ? 1.0 : (1.0 / PI);
+    float diffuseIrradianceScale = params.useLegacyLights != 0 ? 1.0 : (1.0 / PI);
     float3 reflectedDirectDiffuse = float3(0.0);
     float3 reflectedDirectSpecular = float3(0.0);
     float3 reflectedIndirectDiffuse = float3(0.0);
     float3 reflectedIndirectSpecular = float3(0.0);
-    float3 color = params.materialType == 0 ? float3(0.0) : lights.ambientColor.rgb * albedo;
+    float3 color = params.materialType == 0 ? float3(0.0) : lights.ambientColor.rgb * albedo * diffuseIrradianceScale;
     if (params.materialType == 0) {
-        reflectedIndirectDiffuse += lights.ambientColor.rgb * albedo * (1.0 - metalness) * pbrDiffuseIrradianceScale;
+        reflectedIndirectDiffuse += lights.ambientColor.rgb * albedo * (1.0 - metalness) * diffuseIrradianceScale;
     }
 
     for (uint i = 0; i < min(lights.counts.x, uint(MAX_DIRECTIONAL_LIGHTS)); ++i) {
@@ -1105,9 +1127,9 @@ fragment float4 basic_fragment(
             continue;
         }
         if (params.materialType == 2) {
-            color += directBlinnPhong(light.color.rgb, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength) * shadow;
+            color += directBlinnPhong(light.color.rgb, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength, params.useLegacyLights != 0) * shadow;
         } else if (params.materialType == 3) {
-            color += directLambert(light.color.rgb, n, l, albedo) * shadow;
+            color += directLambert(light.color.rgb, n, l, albedo, params.useLegacyLights != 0) * shadow;
         } else {
             DirectBRDFResult terms = directBRDFTerms(light.color.rgb, n, v, l, albedo, roughness, metalness, pbrSpecularColor, params.useLegacyLights != 0);
             if (params.materialType == 0) {
@@ -1150,9 +1172,9 @@ fragment float4 basic_fragment(
         }
         float3 radiance = light.color.rgb * attenuation;
         if (params.materialType == 2) {
-            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength) * shadow;
+            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength, params.useLegacyLights != 0) * shadow;
         } else if (params.materialType == 3) {
-            color += directLambert(radiance, n, l, albedo) * shadow;
+            color += directLambert(radiance, n, l, albedo, params.useLegacyLights != 0) * shadow;
         } else {
             DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, pbrSpecularColor, params.useLegacyLights != 0);
             if (params.materialType == 0) {
@@ -1196,9 +1218,9 @@ fragment float4 basic_fragment(
         }
         float3 radiance = light.color.rgb * attenuation;
         if (params.materialType == 2) {
-            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength) * shadow;
+            color += directBlinnPhong(radiance, n, v, l, albedo, params.specularColor.rgb, params.specularColor.a, specularStrength, params.useLegacyLights != 0) * shadow;
         } else if (params.materialType == 3) {
-            color += directLambert(radiance, n, l, albedo) * shadow;
+            color += directLambert(radiance, n, l, albedo, params.useLegacyLights != 0) * shadow;
         } else {
             DirectBRDFResult terms = directBRDFTerms(radiance, n, v, l, albedo, roughness, metalness, pbrSpecularColor, params.useLegacyLights != 0);
             if (params.materialType == 0) {
@@ -1249,17 +1271,17 @@ fragment float4 basic_fragment(
         float hemiMix = dot(n, normalize(light.direction.xyz)) * 0.5 + 0.5;
         float3 hemiColor = mix(light.groundColor.rgb, light.skyColor.rgb, hemiMix) * albedo;
         if (params.materialType == 0) {
-            reflectedIndirectDiffuse += hemiColor * (1.0 - metalness) * pbrDiffuseIrradianceScale;
+            reflectedIndirectDiffuse += hemiColor * (1.0 - metalness) * diffuseIrradianceScale;
         } else {
-            color += hemiColor;
+            color += hemiColor * diffuseIrradianceScale;
         }
     }
 
     float3 shColor = max(evaluateSH(n, lights.shCoefficients), float3(0.0)) * albedo;
     if (params.materialType == 0) {
-        reflectedIndirectDiffuse += shColor * (1.0 - metalness) * pbrDiffuseIrradianceScale;
+        reflectedIndirectDiffuse += shColor * (1.0 - metalness) * (1.0 / PI);
     } else {
-        color += shColor;
+        color += shColor * (1.0 / PI);
     }
 
     if (params.textureFlags1.z != 0) {
@@ -1368,8 +1390,7 @@ fragment float4 basic_fragment(
     if (params.toneMapped != 0 && params.toneMappingType != 0) {
         color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
     }
-    color = applyFog(color, in.fogDepth, params);
-    color = linearToOutputColor(color, params.outputEncodeSRGB);
+    color = applyOutputSpaceFog(color, in.fogDepth, params);
     return float4(color, alpha);
 #else
     float3 color = albedo + emissive;
@@ -1380,8 +1401,7 @@ fragment float4 basic_fragment(
     if (params.toneMapped != 0 && params.toneMappingType != 0) {
         color = toneMapping(color, params.toneMappingType, params.toneMappingExposure);
     }
-    color = applyFog(color, in.fogDepth, params);
-    color = linearToOutputColor(color, params.outputEncodeSRGB);
+    color = applyOutputSpaceFog(color, in.fogDepth, params);
     return float4(color, alpha);
 #endif
 }
@@ -1715,16 +1735,24 @@ struct LineVertexInput {
 
 struct LineUniforms {
     float4x4 mvp;
+    float4x4 modelViewMatrix;
     float4 color;
     uint toneMappingType;
     float toneMappingExposure;
     uint toneMapped;
     uint outputEncodeSRGB;
+    float4 fogColor;
+    float4 fogParams;
+    uint outputColorSpaceSRGB;
+    float outputPadding0;
+    float outputPadding1;
+    float outputPadding2;
 };
 
 struct LineVertexOutput {
     float4 position [[position]];
     float4 color;
+    float fogDepth;
 };
 
 vertex LineVertexOutput line_vertex(
@@ -1734,6 +1762,8 @@ vertex LineVertexOutput line_vertex(
 {
     LineVertexOutput out;
     out.position = uniforms.mvp * float4(in.position, 1.0);
+    float4 modelViewPosition = uniforms.modelViewMatrix * float4(in.position, 1.0);
+    out.fogDepth = -modelViewPosition.z;
 #if USE_VERTEX_COLORS
     out.color = float4(in.color, 1.0) * uniforms.color;
 #else
@@ -1750,7 +1780,23 @@ using namespace metal;
 struct LineFragmentInput {
     float4 position [[position]];
     float4 color;
+    float fogDepth;
 };
+
+float3 outputToLinearColor(float3 value, uint outputDecodeSRGB) {
+    if (outputDecodeSRGB == 0) return value;
+
+    value = max(value, float3(0.0));
+    float3 high = pow((value + float3(0.055)) / 1.055, float3(2.4));
+    float3 low = value / 12.92;
+    return select(high, low, value <= float3(0.04045));
+}
+
+float3 applyLineOutputSpaceFog(float3 linearColor, float fogDepth, constant LineUniforms& uniforms) {
+    float3 outputColor = linearToOutputColor(linearColor, uniforms.outputColorSpaceSRGB);
+    outputColor = applyFog(outputColor, fogDepth, uniforms.fogColor, uniforms.fogParams);
+    return outputToLinearColor(outputColor, uniforms.outputColorSpaceSRGB != 0 && uniforms.outputEncodeSRGB == 0 ? 1 : 0);
+}
 
 fragment float4 line_fragment(
     LineFragmentInput in [[stage_in]],
@@ -1761,7 +1807,7 @@ fragment float4 line_fragment(
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
-    color.rgb = linearToOutputColor(color.rgb, uniforms.outputEncodeSRGB);
+    color.rgb = applyLineOutputSpaceFog(color.rgb, in.fogDepth, uniforms);
     return color;
 }
 )metal";
@@ -1789,6 +1835,7 @@ struct PointVertexInput {
 
 struct PointUniforms {
     float4x4 mvp;
+    float4x4 modelViewMatrix;
     float4 color;
     float pointSize;
     float scale;
@@ -1800,8 +1847,8 @@ struct PointUniforms {
     uint toneMapped;
     float alphaTest;
     uint outputEncodeSRGB;
-    float padding2;
-    float padding3;
+    uint outputColorSpaceSRGB;
+    float padding;
     float3x3 uvTransform;
     float4 fogColor;
     float4 fogParams;
@@ -1837,9 +1884,8 @@ vertex PointVertexOutput points_vertex(
 #endif
     float4 projected = uniforms.mvp * float4(localPosition, 1.0);
     out.position = projected;
-    // 透视投影下 projected.w 等于视图空间 -Z；正交投影下 projected.w 恒为 1.0，
-    // 因此正交相机的 points 雾化深度会退化为常量。
-    out.fogDepth = projected.w;
+    float4 modelViewPosition = uniforms.modelViewMatrix * float4(localPosition, 1.0);
+    out.fogDepth = -modelViewPosition.z;
     out.pointSize = uniforms.pointSize;
     if (uniforms.sizeAttenuation != 0) {
         // 对齐透视点大小衰减，同时钳制裁剪空间 w，避免贴近相机平面时除零。
@@ -1867,6 +1913,21 @@ struct PointFragmentInput {
     float fogDepth;
 };
 
+float3 outputToLinearColor(float3 value, uint outputDecodeSRGB) {
+    if (outputDecodeSRGB == 0) return value;
+
+    value = max(value, float3(0.0));
+    float3 high = pow((value + float3(0.055)) / 1.055, float3(2.4));
+    float3 low = value / 12.92;
+    return select(high, low, value <= float3(0.04045));
+}
+
+float3 applyPointOutputSpaceFog(float3 linearColor, float fogDepth, constant PointUniforms& uniforms) {
+    float3 outputColor = linearToOutputColor(linearColor, uniforms.outputColorSpaceSRGB);
+    outputColor = applyFog(outputColor, fogDepth, uniforms.fogColor, uniforms.fogParams);
+    return outputToLinearColor(outputColor, uniforms.outputColorSpaceSRGB != 0 && uniforms.outputEncodeSRGB == 0 ? 1 : 0);
+}
+
 fragment float4 points_fragment(
     PointFragmentInput in [[stage_in]],
     constant PointUniforms& uniforms [[buffer(4)]],
@@ -1891,8 +1952,7 @@ fragment float4 points_fragment(
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
-    color.rgb = applyFog(color.rgb, in.fogDepth, uniforms.fogColor, uniforms.fogParams);
-    color.rgb = linearToOutputColor(color.rgb, uniforms.outputEncodeSRGB);
+    color.rgb = applyPointOutputSpaceFog(color.rgb, in.fogDepth, uniforms);
     return color;
 }
 )metal";
@@ -2175,7 +2235,8 @@ struct SpriteUniforms {
     float4 fogColor;
     float4 fogParams;
     uint outputEncodeSRGB;
-    float3 padding;
+    uint outputColorSpaceSRGB;
+    float2 padding;
 };
 
 struct SpriteVertexOutput {
@@ -2224,6 +2285,21 @@ vertex SpriteVertexOutput sprite_vertex(
 #include <metal_stdlib>
 using namespace metal;
 
+float3 outputToLinearColor(float3 value, uint outputDecodeSRGB) {
+    if (outputDecodeSRGB == 0) return value;
+
+    value = max(value, float3(0.0));
+    float3 high = pow((value + float3(0.055)) / 1.055, float3(2.4));
+    float3 low = value / 12.92;
+    return select(high, low, value <= float3(0.04045));
+}
+
+float3 applySpriteOutputSpaceFog(float3 linearColor, float fogDepth, constant SpriteUniforms& uniforms) {
+    float3 outputColor = linearToOutputColor(linearColor, uniforms.outputColorSpaceSRGB);
+    outputColor = applyFog(outputColor, fogDepth, uniforms.fogColor, uniforms.fogParams);
+    return outputToLinearColor(outputColor, uniforms.outputColorSpaceSRGB != 0 && uniforms.outputEncodeSRGB == 0 ? 1 : 0);
+}
+
 fragment float4 sprite_fragment(
     SpriteVertexOutput in [[stage_in]],
     constant SpriteUniforms& uniforms [[buffer(4)]],
@@ -2249,9 +2325,11 @@ fragment float4 sprite_fragment(
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
 #if USE_FOG
-    color.rgb = applyFog(color.rgb, in.fogDepth, uniforms.fogColor, uniforms.fogParams);
-#endif
+    color.rgb = applySpriteOutputSpaceFog(color.rgb, in.fogDepth, uniforms);
+#else
     color.rgb = linearToOutputColor(color.rgb, uniforms.outputEncodeSRGB);
+    return color;
+#endif
     return color;
 }
 )metal";
@@ -2633,6 +2711,8 @@ struct WaterUniforms {
     float toneMappingExposure;
     uint toneMapped;
     uint outputEncodeSRGB;
+    uint outputColorSpaceSRGB;
+    float2 outputPadding;
     float4 fogColor;
     float4 fogParams;
 };
@@ -2684,6 +2764,8 @@ struct WaterUniforms {
     float toneMappingExposure;
     uint toneMapped;
     uint outputEncodeSRGB;
+    uint outputColorSpaceSRGB;
+    float2 outputPadding;
     float4 fogColor;
     float4 fogParams;
 };
@@ -2771,6 +2853,21 @@ float3 applyFog(float3 color, float fogDepth, constant WaterUniforms& uniforms) 
     return applyFog(color, fogDepth, uniforms.fogColor, uniforms.fogParams);
 }
 
+float3 outputToLinearColor(float3 value, uint outputDecodeSRGB) {
+    if (outputDecodeSRGB == 0) return value;
+
+    value = max(value, float3(0.0));
+    float3 high = pow((value + float3(0.055)) / 1.055, float3(2.4));
+    float3 low = value / 12.92;
+    return select(high, low, value <= float3(0.04045));
+}
+
+float3 applyWaterOutputSpaceFog(float3 linearColor, float fogDepth, constant WaterUniforms& uniforms) {
+    float3 outputColor = linearToOutputColor(linearColor, uniforms.outputColorSpaceSRGB);
+    outputColor = applyFog(outputColor, fogDepth, uniforms.fogColor, uniforms.fogParams);
+    return outputToLinearColor(outputColor, uniforms.outputColorSpaceSRGB != 0 && uniforms.outputEncodeSRGB == 0 ? 1 : 0);
+}
+
 float4 waterNoise(texture2d<float> normalSampler, sampler mapSampler, float2 uv, float time) {
     float2 uv0 = (uv / 103.0) + float2(time / 17.0, time / 29.0);
     float2 uv1 = (uv / 107.0) - float2(time / -19.0, time / 31.0);
@@ -2819,8 +2916,7 @@ fragment float4 water_fragment(
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         albedo = toneMapping(albedo, uniforms.toneMappingType, uniforms.toneMappingExposure);
     }
-    albedo = applyFog(albedo, in.fogDepth, uniforms);
-    albedo = linearToOutputColor(albedo, uniforms.outputEncodeSRGB);
+    albedo = applyWaterOutputSpaceFog(albedo, in.fogDepth, uniforms);
     return float4(albedo, alpha);
 }
 )metal";

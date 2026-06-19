@@ -497,6 +497,7 @@ namespace threepp {
                                   std::optional<GeometryGroup> group = std::nullopt);
 
         void renderLine(id<MTLRenderCommandEncoder> encoder,
+                        Scene& scene,
                         Line& line,
                         BufferGeometry& geometry,
                         Material& material,

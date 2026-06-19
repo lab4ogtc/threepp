@@ -27,7 +27,6 @@ cmake_dependent_option(THREEPP_WITH_GLFW "Build with GLFW frontend" ON "NOT DEFI
 cmake_dependent_option(THREEPP_USE_EXTERNAL_GLFW "Use externally supplied GLFW" OFF "THREEPP_WITH_GLFW" OFF)
 
 cmake_dependent_option(THREEPP_BUILD_EXAMPLE_PROJECTS "Build example projects" ON "THREEPP_BUILD_EXAMPLES" OFF)
-cmake_dependent_option(THREEPP_FETCH_ASSIMP "Make assimp available for examples" OFF "THREEPP_BUILD_EXAMPLES" OFF)
 option(THREEPP_FETCH_DATA "Fetch threepp_data assets when the local data submodule is unavailable" OFF)
 
 
@@ -128,16 +127,7 @@ endif ()
 
 if (NOT DEFINED EMSCRIPTEN AND THREEPP_BUILD_TESTS)
 
-    find_package(Catch2 CONFIG QUIET)
-    if (NOT Catch2_FOUND)
-        include(FetchContent)
-        FetchContent_Declare(
-                Catch2
-                GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-                GIT_TAG v3.4.0
-        )
-        FetchContent_MakeAvailable(Catch2)
-    endif ()
+    find_package(Catch2 CONFIG REQUIRED)
 
     enable_testing()
     add_subdirectory(tests)
@@ -166,9 +156,6 @@ install(
 
 if (BUILD_SHARED_LIBS AND NOT THREEPP_USE_EXTERNAL_GLFW)
     install(TARGETS glfw EXPORT threepp-targets)
-endif ()
-if (THREEPP_WGPU_GLSL_COMPAT AND NOT EMSCRIPTEN)
-    install(TARGETS glslang SPIRV glslang-default-resource-limits EXPORT threepp-targets)
 endif ()
 if (THREEPP_WITH_USD)
     install(TARGETS tinyusdz_static EXPORT threepp-targets)

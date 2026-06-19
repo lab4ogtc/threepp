@@ -4146,7 +4146,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             }
 
             if (auto* line = dynamic_cast<Line*>(obj)) {
-                renderLine(encoder, *line, *geometry, *material, camera, colorPixelFormat, item.group);
+                renderLine(encoder, scene, *line, *geometry, *material, camera, colorPixelFormat, item.group);
                 invokeAfterRenderCallback(*obj, geometry, material, item.group);
                 continue;
             }

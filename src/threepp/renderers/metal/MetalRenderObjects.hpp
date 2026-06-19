@@ -172,8 +172,9 @@ namespace threepp {
         float transmissionParams[4];
         float attenuationColor[4];
         std::uint32_t outputEncodeSRGB;
+        std::uint32_t outputColorSpaceSRGB;
         std::uint32_t isOrthographicCamera;
-        std::uint32_t outputPadding[2];
+        std::uint32_t outputPadding[1];
     };
 
     struct alignas(16) SpriteUniforms {
@@ -192,20 +193,27 @@ namespace threepp {
         float fogColor[4];
         float fogParams[4];
         std::uint32_t outputEncodeSRGB;
-        float padding[3];
+        std::uint32_t outputColorSpaceSRGB;
+        float padding[2];
     };
 
     struct alignas(16) LineUniforms {
         float mvp[16];
+        float modelViewMatrix[16];
         float color[4];
         std::uint32_t toneMappingType;
         float toneMappingExposure;
         std::uint32_t toneMapped;
         std::uint32_t outputEncodeSRGB;
+        float fogColor[4];
+        float fogParams[4];
+        std::uint32_t outputColorSpaceSRGB;
+        float outputPadding[3];
     };
 
     struct alignas(16) PointUniforms {
         float mvp[16];
+        float modelViewMatrix[16];
         float color[4];
         float pointSize;
         float scale;
@@ -217,7 +225,8 @@ namespace threepp {
         std::uint32_t toneMapped;
         float alphaTest;
         std::uint32_t outputEncodeSRGB;
-        float padding[2];
+        std::uint32_t outputColorSpaceSRGB;
+        float padding[1];
         float uvTransform[12];
         float fogColor[4];
         float fogParams[4];
@@ -286,6 +295,8 @@ namespace threepp {
         float toneMappingExposure;
         std::uint32_t toneMapped;
         std::uint32_t outputEncodeSRGB;
+        std::uint32_t outputColorSpaceSRGB;
+        float outputPadding[2];
         float fogColor[4];
         float fogParams[4];
     };
@@ -480,6 +491,9 @@ namespace threepp {
         Matrix4 mvp;
         computeMVP(camera, line, mvp);
         copyMatrix(mvp, out.mvp);
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *line.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
         out.color[0] = material.color.r;
         out.color[1] = material.color.g;
         out.color[2] = material.color.b;
@@ -490,6 +504,9 @@ namespace threepp {
         Matrix4 mvp;
         computeMVP(camera, points, mvp);
         copyMatrix(mvp, out.mvp);
+        Matrix4 modelViewMatrix;
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *points.matrixWorld);
+        copyMatrix(modelViewMatrix, out.modelViewMatrix);
         out.color[0] = material.color.r;
         out.color[1] = material.color.g;
         out.color[2] = material.color.b;
@@ -1165,6 +1182,7 @@ namespace threepp {
         params.cameraPosition[2] = cameraPosition.z;
         params.cameraPosition[3] = 1.f;
         fillToneMappingUniforms(renderer, material, params, outputEncodeSRGB);
+        params.outputColorSpaceSRGB = renderer.outputColorSpace == ColorSpace::sRGB || renderer.outputColorSpace == ColorSpace::Gamma ? 1u : 0u;
         params.useLegacyLights = renderer.useLegacyLights ? 1u : 0u;
         params.isOrthographicCamera = camera.is<OrthographicCamera>() ? 1u : 0u;
         fillFogUniforms(scene, material, params);

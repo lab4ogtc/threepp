@@ -104,6 +104,7 @@ namespace threepp::metal {
             source += "#define USE_VERTEX_COLORS ";
             source += useVertexColors ? "1\n" : "0\n";
             source += tone_mapping_functions;
+            source += fog_functions;
             source += line_vertex;
             source += line_fragment;
             return source;
