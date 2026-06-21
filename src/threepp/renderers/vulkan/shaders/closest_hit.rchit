@@ -49,15 +49,16 @@ layout(buffer_reference, scalar) readonly buffer VertexBuf { float p[]; };
 layout(buffer_reference, scalar) readonly buffer NormalBuf  { float n[]; };
 layout(buffer_reference, scalar) readonly buffer IndexBuf   { uint  i[]; };
 layout(buffer_reference, scalar) readonly buffer UvBuf      { float u[]; };
-layout(buffer_reference, scalar) readonly buffer FoamBuf    { float f[]; };
+layout(buffer_reference, scalar) readonly buffer ColorBuf   { float c[]; };// per-vertex RGB (vertexColors)
 
 struct GeometryDesc {
     uint64_t vertexAddress;
     uint64_t normalAddress;
     uint64_t indexAddress;
     uint64_t uvAddress;// 0 == no UV attribute
-    uint64_t foamAddress;// 0 == no foam attribute (per-vertex float; written by water_displace.comp for ocean meshes)
+    uint64_t foamAddress;// 0/1 flag (not an address): 1 == FFT-displaced ocean surface (world-space foam + thin-shell water)
     uint64_t prevVertexAddress;// previous frame deformed positions (skinned/displaced); == vertexAddress for static
+    uint64_t colorAddress;// 0 == no per-vertex color (material.vertexColors off or geometry has no "color")
     uint     indexed;
     uint     _pad;
 };
@@ -642,10 +643,20 @@ void main() {
             const vec2 uvA = (mdesc.uvTransform * vec3(unlitUv, 1.0)).xy;
             albedoSample = texture(albedoMaps[idxClamped], uvA).rgb;
         }
+        // Per-vertex color (material.vertexColors) — MeshBasicMaterial honours
+        // it in three.js too. Same linear-space multiply as the lit path.
+        vec3 unlitVtxCol = vec3(1.0);
+        if (gdesc.colorAddress != 0ul) {
+            ColorBuf cb = ColorBuf(gdesc.colorAddress);
+            const vec3 c0 = vec3(cb.c[idx.x * 3 + 0], cb.c[idx.x * 3 + 1], cb.c[idx.x * 3 + 2]);
+            const vec3 c1 = vec3(cb.c[idx.y * 3 + 0], cb.c[idx.y * 3 + 1], cb.c[idx.y * 3 + 2]);
+            const vec3 c2 = vec3(cb.c[idx.z * 3 + 0], cb.c[idx.z * 3 + 1], cb.c[idx.z * 3 + 2]);
+            unlitVtxCol = w * c0 + attribs.x * c1 + attribs.y * c2;
+        }
         const vec3 hitPosUnlit = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
         // Unlit: emit base color as direct radiance. Route to diff channel
         // (unlit is view-independent by definition).
-        payload.radianceDiff  = mdesc.albedo * albedoSample;
+        payload.radianceDiff  = mdesc.albedo * albedoSample * unlitVtxCol;
         payload.radianceSpec  = vec3(0.0);
         payload.brdfWeight    = vec3(0.0);
         payload.nextOrigin    = vec3(0.0);
@@ -763,6 +774,20 @@ void main() {
         albedoSample = texture(albedoMaps[idxClamped], uvAlbedo).rgb;
     }
     vec3 albedo = mdesc.albedo * albedoSample;
+
+    // Per-vertex color (material.vertexColors). Barycentric-interpolated RGB,
+    // modulates albedo — matches three.js and the raster gbuffer's vColor
+    // multiply so RasterFirst and ReferencePT agree. colorAddress is 0 when the
+    // material doesn't opt in or the geometry has no "color" attribute. Vertex
+    // colors are authored in the working (linear) space, same as mdesc.albedo,
+    // so a plain multiply is correct.
+    if (gdesc.colorAddress != 0ul) {
+        ColorBuf cb = ColorBuf(gdesc.colorAddress);
+        const vec3 c0 = vec3(cb.c[idx.x * 3 + 0], cb.c[idx.x * 3 + 1], cb.c[idx.x * 3 + 2]);
+        const vec3 c1 = vec3(cb.c[idx.y * 3 + 0], cb.c[idx.y * 3 + 1], cb.c[idx.y * 3 + 2]);
+        const vec3 c2 = vec3(cb.c[idx.z * 3 + 0], cb.c[idx.z * 3 + 1], cb.c[idx.z * 3 + 2]);
+        albedo *= w * c0 + attribs.x * c1 + attribs.y * c2;
+    }
 
     // glTF packs roughness in .g and metalness in .b; threepp's metalnessMap /
     // roughnessMap typically point at the same packed texture, so the bindless
@@ -1090,7 +1115,7 @@ void main() {
         if (isThinShell) {
             // ── Deterministic split (variance reduction for thin shells) ──
             const vec3 reflectDir    = reflect(I, H);
-            const vec3 reflectOrigin = hitPos + N * 1e-3;
+            const vec3 reflectOrigin = hitPos + N * rtSelfEps(hitPos);
             shadowVisibility = 1.0;
             traceRayEXT(topAS,
                         gl_RayFlagsTerminateOnFirstHitEXT |
@@ -1106,7 +1131,7 @@ void main() {
 
             if (!tir) {
                 wDir    = normalize(refr);
-                wOrigin = hitPos - N * 1e-3;
+                wOrigin = hitPos - N * rtSelfEps(hitPos);
                 tWeight = (1.0 - F) * glassTint * channelMask / (eta * eta);
             } else {
                 // TIR — Schlick gave F=1 already, full reflection captured by
@@ -1117,18 +1142,18 @@ void main() {
             // ── Stochastic split (original — multi-bounce intact for closed glass) ──
             if (urand(seed) < F) {
                 wDir       = reflect(I, H);
-                wOrigin    = hitPos + N * 1e-3;
+                wOrigin    = hitPos + N * rtSelfEps(hitPos);
                 tWeight    = vec3(1.0);
                 wasReflect = true;
             } else if (tir) {
                 // TIR — fall back to mirror reflect.
                 wDir       = reflect(I, H);
-                wOrigin    = hitPos + N * 1e-3;
+                wOrigin    = hitPos + N * rtSelfEps(hitPos);
                 tWeight    = vec3(1.0);
                 wasReflect = true;
             } else {
                 wDir    = normalize(refr);
-                wOrigin = hitPos - N * 1e-3;
+                wOrigin = hitPos - N * rtSelfEps(hitPos);
                 tWeight = glassTint * channelMask / (eta * eta);
                 // Closed-mesh refract — update the ray's current medium so
                 // the next bounce knows where it is (entering glass: medium
@@ -1434,7 +1459,7 @@ void main() {
                             gl_RayFlagsSkipClosestHitShaderEXT |
                             gl_RayFlagsNoOpaqueEXT,
                             0xff, 1, 0, 1,
-                            hitPos + N * 1e-3, 0.0, liV.dir, liV.maxDist, 1);
+                            hitPos + N * rtSelfEps(hitPos), 0.0, liV.dir, liV.maxDist, 1);
                 if (shadowVisibility <= 0.0) {
                     r.W = 0.0; r.W_sum = 0.0;// occluded — let reuse recover a visible sample
                 }
@@ -1536,7 +1561,17 @@ void main() {
             const ivec2 sz = imageSize(prevGbufImage);
             if (sz.x > 0 && sz.y > 0) {
                 const bool camMoving = (pc.motionFlags & 2u) != 0u;
-                const uint spMax     = camMoving ? 2u : 5u;
+                // Convergence-skip: once a STATIC pixel's temporal history is
+                // deep, its DI estimate is converged and further spatial taps
+                // only add cost — and risk re-injecting the very fireflies
+                // spatial reuse can perpetuate (see the W-cap at line ~1522).
+                // Skip taps past FC 48 (matches WGPU's spatial-skip threshold).
+                // FC is halved on motion and the camMoving branch keeps 2 taps
+                // regardless, so moving pixels are unaffected. spMax==0 ⇒ the
+                // loop below no-ops; the pre-spatial snapshot/persist (above)
+                // and finalizeReservoir (below) still run unchanged.
+                const float pixelFc  = imageLoad(accumImage, ivec2(gl_LaunchIDEXT.xy)).w;
+                const uint spMax     = camMoving ? 2u : (pixelFc > 48.0 ? 0u : 5u);
                 const float mTarget  = 20.0;
                 const uint curMeshId = uint(gl_InstanceCustomIndexEXT) + 1u;
                 const float curDistC = length(hitPos - pcam.prevCamPosX.xyz);
@@ -1628,7 +1663,7 @@ void main() {
                             gl_RayFlagsSkipClosestHitShaderEXT |
                             gl_RayFlagsNoOpaqueEXT,
                             0xff, 1, 0, 1,
-                            hitPos + N * 1e-3, 0.0, lDir, lMaxDist, 1);
+                            hitPos + N * rtSelfEps(hitPos), 0.0, lDir, lMaxDist, 1);
                 if (shadowVisibility > 0.0) {
                     // BRDF eval at chosen direction (mirrors per-light eval below).
                     const vec3 H = normalize(V + lDir);
@@ -1870,7 +1905,7 @@ void main() {
         giSubPayload.hitNormal       = vec3(0.0);
 
         traceRayEXT(topAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
-                    hitPos + N * 1e-3, 0.001, bs.dir, 10000.0, 2);
+                    hitPos + N * rtSelfEps(hitPos), 0.001, bs.dir, 10000.0, 2);
 
         seed = giSubPayload.seed;
 
@@ -2016,7 +2051,7 @@ void main() {
         giSubPayload.hitNormal       = vec3(0.0);
 
         traceRayEXT(topAS, gl_RayFlagsNoneEXT, 0xff, 0, 0, 0,
-                    hitPos + N * 1e-3, 0.001, bs.dir, 10000.0, 2);
+                    hitPos + N * rtSelfEps(hitPos), 0.001, bs.dir, 10000.0, 2);
 
         seed = giSubPayload.seed;
 
@@ -2259,7 +2294,13 @@ void main() {
                 // M ≈ 10-15, and with M-cap-per-tap of 4, 3 taps already
                 // reach ~12-16 added M. Saves ~40% of spatial cost for
                 // imperceptible variance increase on the cases GI targets.
-                const uint  spMax    = camMoving ? 1u : 3u;
+                // Convergence-skip: drop spatial taps once the pixel is
+                // converged. GI converges slower than DI, so this uses the
+                // SAME FC>100 threshold the GI fast-path (above) treats as
+                // converged — not DI's 48 — to avoid under-converging indirect
+                // light. spMax==0 ⇒ loop no-ops; finalizeGiReservoir still runs.
+                const float pixelFc  = imageLoad(accumImage, ivec2(gl_LaunchIDEXT.xy)).w;
+                const uint  spMax    = camMoving ? 1u : (pixelFc > 100.0 ? 0u : 3u);
                 const float mTarget  = 20.0;
                 const uint  curMeshId = uint(gl_InstanceCustomIndexEXT) + 1u;
                 const float curDistC  = length(hitPos - pcam.prevCamPosX.xyz);
@@ -2339,7 +2380,7 @@ void main() {
                             gl_RayFlagsSkipClosestHitShaderEXT |
                             gl_RayFlagsNoOpaqueEXT,
                             0xff, 1, 0, 1,
-                            hitPos + N * 1e-3, 0.0, omegaI_chosen,
+                            hitPos + N * rtSelfEps(hitPos), 0.0, omegaI_chosen,
                             distChosen - 1e-2, 1);
                 const float vis = shadowVisibility;
 
@@ -2413,7 +2454,7 @@ void main() {
                             gl_RayFlagsSkipClosestHitShaderEXT |
                             gl_RayFlagsNoOpaqueEXT,
                             0xff, 1, 0, 1,
-                            hitPos + N * 1e-3, 0.0, omegaI_chosen,
+                            hitPos + N * rtSelfEps(hitPos), 0.0, omegaI_chosen,
                             distChosen - 1e-2, 1);
                 const float vis = shadowVisibility;
                 if (vis > 0.0) {
@@ -2456,7 +2497,7 @@ void main() {
         payload.radianceDiff = emissiveOut + ambient + lit;
         payload.radianceSpec = vec3(0.0);
         payload.brdfWeight   = brdfWeight;
-        payload.nextOrigin   = hitPos + N * 1e-3;
+        payload.nextOrigin   = hitPos + N * rtSelfEps(hitPos);
         payload.nextDir      = bounceDir;
         payload.flags        = pathFlags;
     }

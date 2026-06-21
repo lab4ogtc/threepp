@@ -9,8 +9,8 @@
 
 namespace threepp::vulkan {
 
-    static_assert(sizeof(WaterDisplacePipeline::PushConstants) == 128,
-                  "WaterDisplacePipeline::PushConstants must match water_displace.comp's Pc layout (128 bytes)");
+    static_assert(sizeof(WaterDisplacePipeline::PushConstants) == 120,
+                  "WaterDisplacePipeline::PushConstants must match water_displace.comp's Pc layout (120 bytes)");
 
     WaterDisplacePipeline::WaterDisplacePipeline(VulkanContext& ctx)
         : ctx_(ctx) {
@@ -75,7 +75,7 @@ namespace threepp::vulkan {
         cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpci.stage  = stage;
         cpci.layout = pipelineLayout_;
-        check(vkCreateComputePipelines(ctx_.device(), VK_NULL_HANDLE,
+        check(vkCreateComputePipelines(ctx_.device(), ctx_.pipelineCache(),
                                        1, &cpci, nullptr, &pipeline_),
               "vkCreateComputePipelines(displace)");
         vkDestroyShaderModule(ctx_.device(), mod, nullptr);

@@ -195,6 +195,7 @@ set(publicHeaders
         "threepp/objects/TextSprite.hpp"
         "threepp/objects/Water.hpp"
         "threepp/objects/DisplacedMesh.hpp"
+        "threepp/objects/GrassMesh.hpp"
 
         "threepp/textures/CubeTexture.hpp"
         "threepp/textures/DataArrayTexture.hpp"
@@ -346,6 +347,7 @@ set(sources
         "threepp/core/Uniform.cpp"
 
         "threepp/extras/ShapeUtils.cpp"
+        "threepp/extras/terrain/TerrainGenerator.cpp"
         "threepp/extras/core/Curve.cpp"
         "threepp/extras/core/CurvePath.cpp"
         "threepp/extras/core/Font.cpp"
@@ -496,6 +498,7 @@ set(sources
         "threepp/objects/TextSprite.cpp"
         "threepp/objects/Water.cpp"
         "threepp/objects/DisplacedMesh.cpp"
+        "threepp/objects/GrassMesh.cpp"
 
         "threepp/textures/Texture.cpp"
         "threepp/textures/DataArrayTexture.cpp"
@@ -649,6 +652,7 @@ if (THREEPP_WITH_VULKAN)
             "threepp/renderers/vulkan/VulkanFrameTypes.hpp"
             "threepp/renderers/vulkan/TaaResolve.hpp"
             "threepp/renderers/vulkan/WaterDisplacePipeline.hpp"
+            "threepp/renderers/vulkan/GrassWindPipeline.hpp"
             "threepp/renderers/vulkan/water/OceanFFT.hpp"
     )
     list(APPEND sources
@@ -670,6 +674,7 @@ if (THREEPP_WITH_VULKAN)
             "threepp/renderers/vulkan/DeferredShade.cpp"
             "threepp/renderers/vulkan/WaterDisplacePipeline.cpp"
             "threepp/renderers/vulkan/FoamWorldPipeline.cpp"
+            "threepp/renderers/vulkan/GrassWindPipeline.cpp"
             "threepp/renderers/vulkan/water/OceanFFT.cpp"
     )
 endif ()
@@ -1081,6 +1086,10 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/foam_world.comp"
         kFoamWorldCompSpv
         _foam_world_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/grass_wind.comp"
+        kGrassWindCompSpv
+        _grass_wind_spv_h)
     # Hybrid raster G-buffer prepass — produces depth/normal/motion/IDs
     # for the path tracer to skip its primary BVH trace. See raygen.rgen
     # for the consumer side.
@@ -1170,6 +1179,27 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_sprite.frag"
         kOverlaySpriteFragSpv
         _overlay_sprite_frag_spv_h)
+    # World-space particle billboards (ParticleSystem). The Vulkan backend has no
+    # generic ShaderMaterial path, so the particle Mesh is drawn by a dedicated
+    # billboard pass in the post-TAA overlay block — depth-tested against the
+    # G-buffer depth, composited onto the swapchain. Two blend variants (alpha /
+    # additive) selected per material at draw time.
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/particle.vert"
+        kParticleVertSpv
+        _particle_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/particle.frag"
+        kParticleFragSpv
+        _particle_frag_spv_h)
+    # World-space Sprite billboards (screenSpace == false) — perspective,
+    # depth-tested counterpart to the ortho overlay_sprite HUD path. Shares
+    # overlay_sprite.frag; only the vertex shader differs (perspective reverse-Z,
+    # no GL z-remap). Drawn in the post-TAA overlay block.
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/sprite3d.vert"
+        kSprite3dVertSpv
+        _sprite3d_vert_spv_h)
 endif ()
 
 

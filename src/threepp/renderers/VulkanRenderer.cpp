@@ -39,6 +39,7 @@
 #include "vulkan/DeferredShade.hpp"
 #include "vulkan/WaterDisplacePipeline.hpp"
 #include "vulkan/FoamWorldPipeline.hpp"
+#include "vulkan/GrassWindPipeline.hpp"
 #include "vulkan/shaders/vulkan_shared.h"// MaterialDesc + kMaxMaterialTextures + photon-grid constants — same source the shaders read
 #include "wgpu/pathtracer/WgpuPathTracerEnvCdf.hpp"// reused: pure C++ template, no WGPU deps
 
@@ -64,12 +65,15 @@
 #include "threepp/math/Vector3.hpp"
 #include "threepp/objects/Bone.hpp"
 #include "threepp/objects/DisplacedMesh.hpp"
+#include "threepp/objects/GrassMesh.hpp"
 #include "threepp/objects/InstancedMesh.hpp"
 #include "threepp/objects/Mesh.hpp"
+#include "threepp/objects/ParticleSystem.hpp"
 #include "threepp/objects/Skeleton.hpp"
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/objects/Sprite.hpp"
 #include "threepp/materials/SpriteMaterial.hpp"
+#include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/renderers/VulkanRenderer.hpp"
 #include "threepp/renderers/vulkan/water/OceanFFT.hpp"
 #include "threepp/scenes/Scene.hpp"
@@ -105,6 +109,9 @@
 #include "threepp/renderers/vulkan/shaders/event_shade.comp.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/particle.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/particle.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/sprite3d.vert.spv.h"
 
 #include "threepp/renderers/wgpu/pathtracer/WgpuPathTracerBCn.hpp"
 
@@ -115,6 +122,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <random>
 #include <cstring>
@@ -191,6 +199,17 @@ namespace threepp {
         Vector4 viewport;
         Vector4 scissor;
         bool scissorTest = false;
+        bool autoClear_ = true;// mirrored from Renderer::autoClear each render()
+
+        // Split-screen (Increment 0): the primary PT pane is clipped to the
+        // scissor sub-rect. The PT pipeline renders the pane region-sized AT THE
+        // IMAGE ORIGIN (gbuf/raygen/denoise/bloom); only the final TAA write is
+        // offset to the scissor position. All default to the full frame, so the
+        // single-scene path is byte-identical when scissorTest is off.
+        VkExtent2D regionRenderExt_{};// render-extent-space pane size
+        VkExtent2D regionSwapExt_{};  // swapchain-space pane size (TAA output)
+        int32_t    regionDstX_ = 0;   // swapchain write offset (image space)
+        int32_t    regionDstY_ = 0;
 
         // Mirrored from VulkanRenderer (Renderer base) at the start of each
         // render() so the renderFrame path can read them without a pointer back
@@ -214,7 +233,17 @@ namespace threepp {
             Buffer index;// .handle == VK_NULL_HANDLE for non-indexed geometry
             Buffer normal;
             Buffer uv;   // .handle == VK_NULL_HANDLE if geometry has no "uv"
-            Buffer foam; // .handle == VK_NULL_HANDLE unless this is an FFT-displaced ocean mesh
+            // Per-vertex RGB color (BufferGeometry "color" attribute, itemSize 3).
+            // .handle == VK_NULL_HANDLE when the geometry has no usable "color".
+            // Surfaced to the shaders via GeometryDesc::colorAddress / DrawInfo::
+            // colorAddr, gated on the material's vertexColors flag at fill time.
+            Buffer color;
+            // True for FFT-displaced ocean meshes — gates world-space foam +
+            // thin-shell water shading downstream (surfaced to the shaders via
+            // GeometryDesc::foamAddress, now a 0/1 flag). Replaces a per-vertex
+            // foam buffer that used to live on the BLAS but was never read for
+            // its contents — only its non-null address served as this marker.
+            bool isOceanSurface = false;
             // Previous-frame vertex positions, allocated for skinned + displaced
             // meshes only. Used by the hybrid raster prepass to compute
             // per-vertex motion vectors (skinned/displaced surfaces deform
@@ -249,6 +278,19 @@ namespace threepp {
             // dynamic ParticleSystems).
             uint32_t blasRefitCounter = 0;
             static constexpr uint32_t kBlasFullRebuildInterval = 64;
+            // Position-buffer byte size, captured at build, for the prevVertex
+            // re-sync copy below.
+            VkDeviceSize vbBytes = 0;
+            // Set when refreshGeomBlasBatch snapshots OLD positions into
+            // prevVertex on an in-place vertex update. The change frame
+            // correctly reports old→new motion; the NEXT clean frame we re-sync
+            // prevVertex := vertex so a now-static re-rolled mesh returns to
+            // prevVertex == vertex (zero motion), matching initial-build
+            // geometry. Without this, prevVertex stays frozen at the pre-update
+            // positions and the mesh emits a constant bogus per-vertex motion
+            // vector every frame → persistent denoiser/TAA history rejection
+            // (runtime-updated geometry stays noisy / visibly shakes).
+            bool prevVertexResyncPending = false;
         };
         std::unordered_map<const BufferGeometry*, std::unique_ptr<BlasRecord>> blasCache;
 
@@ -459,10 +501,50 @@ namespace threepp {
         // frame; replaces the per-vertex foam buffer.
         std::unique_ptr<vulkan::FoamWorldPipeline> foamWorld_;
 
+        // ── GrassMesh (GPU wind-deformed foliage) ────────────────────────
+        // Same deform-on-GPU + BLAS-refit-in-place pattern as DisplacedMesh,
+        // but FFT-free: a wind compute shader bends each blade vertex from an
+        // immutable rest pose. The whole grass field is ONE mesh → one BLAS →
+        // one TLAS instance, so animating it is a cheap per-frame BLAS/TLAS
+        // refit instead of the O(all-instances) TLAS rebuild an animated
+        // InstancedMesh would force.
+        struct GrassMeshState {
+            std::unique_ptr<BlasRecord> blas;
+            Buffer   restPos{};   // immutable rest xyz (device addr, host-written once)
+            Buffer   heightFrac{};// per-vertex height fraction (device addr)
+            uint32_t vertexCount = 0;
+            std::weak_ptr<BufferGeometry> liveCheck;
+            uint32_t blasRefitCounter = 0;
+            static constexpr uint32_t kBlasFullRebuildInterval = 64;
+        };
+        std::unordered_map<const GrassMesh*, std::unique_ptr<GrassMeshState>> grassStates;
+        // Shared grass-wind compute pipeline (no descriptor sets — all I/O by
+        // device address). See vulkan/GrassWindPipeline.{hpp,cpp}.
+        std::unique_ptr<vulkan::GrassWindPipeline> grassWind_;
+        // GrassMesh deforms queued in ensureSceneBuilt, recorded into the frame
+        // command buffer in recordCommandBuffer (no blocking submit) — same
+        // pattern as pendingSkinnedRebuilds_. Cleared at end of recordCommandBuffer.
+        std::vector<std::pair<GrassMesh*, GrassMeshState*>> pendingGrassDeforms_;
+
         // Single TLAS over all mesh instances in the scene.
         VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
         Buffer tlasBuffer;
-        Buffer tlasInstancesBuffer;
+        // Per-in-flight-frame instance buffers. The per-frame TLAS refit is
+        // recorded into the frame command buffer (not a one-shot drain), so the
+        // host instance write for frame N must not clobber the buffer frame N-1
+        // is still reading — hence one buffer per in-flight slot, indexed by
+        // currentFrame. The structural full build (buildTlas) writes all slots.
+        Buffer tlasInstancesBuffers[kFramesInFlight];
+        // Persistent scratch for the in-frame TLAS refit (sized once; reused —
+        // the frame command buffers execute in submit order so it never races).
+        Buffer tlasRefitScratch_{};
+        VkDeviceSize tlasRefitScratchSize_ = 0;
+        // Per-frame TLAS refit, staged by ensureSceneBuilt and recorded into the
+        // frame command buffer by recordCommandBuffer (after the deformable BLAS
+        // rebuilds). Replaces the old mid-frame refitTlas one-shot drain.
+        std::vector<VkAccelerationStructureInstanceKHR> pendingTlasInstances_;
+        bool pendingTlasRefit_ = false;
+        bool pendingTlasFullBuild_ = false;
 
         // Per-instance descriptor tables the closest-hit shader indexes by
         // gl_InstanceCustomIndexEXT. Layout matches the matching shader
@@ -481,6 +563,10 @@ namespace threepp {
             // rigid-only meshes: set equal to vertexAddress, in which case the
             // chit reads the same data twice (no harm; equals current pos).
             VkDeviceAddress prevVertexAddress;
+            // Per-vertex RGB color buffer (BlasRecord::color). 0 when the mesh's
+            // material has vertexColors off or the geometry has no "color" — the
+            // chit then skips the vertex-color multiply. Set per-instance below.
+            VkDeviceAddress colorAddress;
             uint32_t indexed;
             uint32_t _pad;
         };
@@ -646,11 +732,18 @@ namespace threepp {
         // (vulkan_shared.h, included near the top of this file). Editing any of
         // them there propagates to every shader on the next clean rebuild.
         std::vector<Image2D> materialTextures;// owns image + view (sampler is shared)
-        // Cache value pairs (weak_ptr, slot). The weak_ptr is the liveness tag —
-        // when a Texture is destroyed (model unloaded), the entry is pruned in
-        // ensureSceneBuilt so a future Texture* address-collision doesn't read
-        // back stale GPU data.
-        std::unordered_map<const Texture*, std::pair<std::weak_ptr<Texture>, uint32_t>> textureCache;
+        // Cache value: (weak_ptr liveness tag, bindless slot, uploaded version).
+        // The weak_ptr lets ensureSceneBuilt prune entries when a Texture is
+        // destroyed (so a future Texture* address-collision doesn't read stale
+        // GPU data). `version` is the Texture::version() at last upload; when it
+        // changes (setData + needsUpdate on a DataTexture), refreshDirtyMaterialTextures
+        // re-uploads the slot in place so live texture edits are honoured.
+        struct CachedTexture {
+            std::weak_ptr<Texture> ref;
+            uint32_t slot = 0;
+            unsigned int version = 0;
+        };
+        std::unordered_map<const Texture*, CachedTexture> textureCache;
         std::vector<uint32_t> freeTextureSlots;// slots reclaimed by prune
         VkSampler textureSampler_ = VK_NULL_HANDLE;
 
@@ -761,6 +854,12 @@ namespace threepp {
             // raster G-buffer, and emissive-tri NEE so PT can't see/shadow
             // them; drawn instead by the post-TAA overlay pass.
             bool     isOverlay = false;
+            // ParticleSystem billboard mesh (material name == kParticleMaterialName).
+            // Implies isOverlay (so all the PT-exclusion guards apply), but is
+            // drawn by the dedicated billboard particle pass — NOT the wireframe/
+            // basic overlay-mesh loop, which would render its un-expanded quads as
+            // zero-area triangles. The overlay-mesh loop skips on this flag.
+            bool     isParticle = false;
             // Cached type probes. Resolved once per Mesh in ensureSceneBuilt's
             // traverseVisible callback (before the InstancedMesh fork so an
             // N-instance mesh costs 3 dynamic_casts, not 3·N). Consumers
@@ -769,6 +868,7 @@ namespace threepp {
             // casting every frame.
             bool     isSkinned   = false;
             bool     isDisplaced = false;
+            bool     isGrass     = false;// GPU wind-deformed grass field
             bool     isMorphed   = false;
             bool     isTet       = false;
             bool     isInstanced = false;// entry came from an InstancedMesh expansion
@@ -835,6 +935,7 @@ namespace threepp {
         static constexpr uint32_t kSnapWire       = 16u;
         static constexpr uint32_t kSnapOverlay    = 32u;
         static constexpr uint32_t kSnapTet        = 64u;
+        static constexpr uint32_t kSnapParticle   = 128u;
         std::vector<SnapNode> sceneSnapshot_;
 
         // Classification-routing flags for a mesh — shared by the snapshot
@@ -849,6 +950,10 @@ namespace threepp {
             if (overlayLayer_ >= 0 &&
                 m.layers.isEnabled(static_cast<unsigned>(overlayLayer_))) fl |= kSnapOverlay;
             if (auto mat = m.material(); mat && mat->tetSkinning && mat->tetTexture) fl |= kSnapTet;
+            // ParticleSystem billboard mesh — detected by the unique material-name
+            // marker (cheap: a length-mismatch reject for the empty-named common
+            // case). Routed to the dedicated billboard pass and excluded from PT.
+            if (auto mat = m.material(); mat && mat->name == kParticleMaterialName) fl |= kSnapParticle;
             return fl;
         }
 
@@ -896,9 +1001,11 @@ namespace threepp {
                 const bool over = overlayLayer_ >= 0 &&
                                   o.layers.isEnabled(static_cast<unsigned>(overlayLayer_));
                 const bool tet = sn.mat && sn.mat->tetSkinning && sn.mat->tetTexture != nullptr;
+                const bool particle = sn.mat && sn.mat->name == kParticleMaterialName;
                 if (wire != ((sn.flags & kSnapWire) != 0u) ||
                     over != ((sn.flags & kSnapOverlay) != 0u) ||
-                    tet != ((sn.flags & kSnapTet) != 0u)) {
+                    tet != ((sn.flags & kSnapTet) != 0u) ||
+                    particle != ((sn.flags & kSnapParticle) != 0u)) {
                     ok = false;
                     return;
                 }
@@ -1163,7 +1270,13 @@ namespace threepp {
         // images. Shares rtDsLayout so a single per-frame descriptor set
         // drives RT raygen, atrous, and finalize.
         std::unique_ptr<vulkan::Denoiser> denoiser_;
-        bool                              denoiseEnabled_ = true;
+        // THREEPP_DENOISE=0 disables denoising from the environment — an A/B
+        // discriminator for "is this artifact shading or temporal/denoise?"
+        // without plumbing a flag through every example.
+        bool denoiseEnabled_ = []() {
+            const char* e = std::getenv("THREEPP_DENOISE");
+            return !(e && e[0] == '0');
+        }();
 
         // ── GPU skinning compute pipeline ──────────────────────────────────
         // Replaces the cpuSkin() loop. One dispatch per skinned mesh per
@@ -1285,6 +1398,82 @@ namespace threepp {
         // recordRasterGbufPass and only renders non-overlay geometry.
         VkPipeline       overlayDepthPrepassPipeline = VK_NULL_HANDLE;
 
+        // ── ParticleSystem billboard pass ───────────────────────────────────
+        // The Vulkan backend has no generic ShaderMaterial path, so the particle
+        // Mesh (a custom billboard ShaderMaterial whose quad is expanded in the
+        // vertex shader) is drawn here, in the post-TAA overlay block: depth-
+        // tested against unjitDepth, composited onto the swapchain. Two blend
+        // variants chosen per material at draw time. See createParticlePipeline /
+        // the particle draw loop in the overlay block, and particle.vert/.frag.
+        VkDescriptorSetLayout particleDescSetLayout_  = VK_NULL_HANDLE;
+        VkPipelineLayout      particlePipelineLayout_ = VK_NULL_HANDLE;
+        VkPipeline particlePipelineNormal_   = VK_NULL_HANDLE;// alpha blend, depth-test on
+        VkPipeline particlePipelineAdditive_ = VK_NULL_HANDLE;// additive blend, depth-test off
+        // Per-frame combined-image-sampler pool, reset at the top of the draw
+        // loop (mirrors OverlayPass::spriteDescPools_).
+        std::array<VkDescriptorPool, kFramesInFlight> particleDescPools_{};
+        // 1×1 white default bound when a particle system has no texture.
+        Image2D particleWhiteTex_{};
+        static constexpr uint32_t kMaxParticleTexPerFrame = 64;
+
+        // Per-BufferGeometry vertex/index buffers for particle billboards. The
+        // animated attributes (position/normal/color) are re-uploaded every frame
+        // (version-gated); uv + index are static (uploaded once). Particles own
+        // these buffers directly — they never build a BLAS. Single-buffered with
+        // in-place memcpy, exactly like ensureLineGeometryUploaded: a write-during-
+        // read race with the other in-flight frame is benign for an overlay visual
+        // (at most a sub-pixel tear on a fast-moving particle for one frame).
+        struct ParticleGeomRec {
+            Buffer   position;// vec3 — particle centers (all 4 quad verts equal)
+            Buffer   normal;  // vec3 — {size, angle, opacity}
+            Buffer   uv;      // vec2 — corner offset
+            Buffer   color;   // vec3 — RGB
+            Buffer   index;   // uint32
+            uint32_t indexCount  = 0;
+            uint32_t vertexCount = 0;
+            unsigned int animVersion = ~0u;// pos+normal+color composite version
+            std::weak_ptr<BufferGeometry> liveCheck;
+        };
+        std::unordered_map<const BufferGeometry*, ParticleGeomRec> particleGeomCache_;
+
+        // Per-Texture sampled image for particle textures. Keyed on the raw
+        // Texture* (the ShaderMaterial uniform holds no shared_ptr) + version;
+        // re-upload is vkDeviceWaitIdle-guarded. Pointer-recycle with an
+        // identical version is a documented edge case.
+        struct ParticleTexRec {
+            Image2D      image{};
+            unsigned int version = ~0u;
+            uint32_t     width   = 0;
+            uint32_t     height  = 0;
+        };
+        std::unordered_map<const Texture*, ParticleTexRec> particleTexCache_;
+
+        // ── World-space Sprite billboards (screenSpace == false) ────────────
+        // 3D-positioned camera-facing sprites (e.g. the TPS shooter's impact
+        // "particles"). The Vulkan renderer only composites screen-space (HUD)
+        // sprites via OverlayPass; world-space ones are drawn here in the
+        // depth-tested overlay block. Reuses particlePipelineLayout_ +
+        // particleDescSetLayout_ + particleDescPools_ + particleTexCache_ (the
+        // push-constant size, set-0 sampler layout, and texture cache all match);
+        // only the pipeline (perspective billboard vertex shader + interleaved
+        // pos/uv vertex input) and the shared static quad are new.
+        VkPipeline spriteWorldPipeline_ = VK_NULL_HANDLE;
+        // Shared canonical sprite quad (4 interleaved pos.xyz+uv.xy verts + 6
+        // indices) — identical for every Sprite, so one static copy serves all.
+        Buffer spriteQuadVtx_{};
+        Buffer spriteQuadIdx_{};
+        // Per-frame snapshot of visible world-space sprites, rebuilt each
+        // perspective frame by collectWorldSprites() (sprites move/spawn/expire
+        // constantly, so this is a fresh walk, not snapshot-cached).
+        struct WorldSpriteEntry {
+            std::array<float, 16> world;
+            std::array<float, 4>  color;   // rgb + opacity
+            Vector2               center;
+            float                 rotation = 0.f;
+            const Texture*        tex = nullptr;
+        };
+        std::vector<WorldSpriteEntry> lastVisibleSprites_;
+
         // Per-Line scene snapshot, refreshed in ensureSceneBuilt alongside
         // lastVisibleEntries_. Lives only for the overlay record's draw
         // loop — neither PT nor the raster G-buffer touches this.
@@ -1307,6 +1496,13 @@ namespace threepp {
         // uploadRasterCameraUbo and read by recordOverlayPass to build
         // the per-draw mvp = vpUnjit · model push constant.
         std::array<float, 16> currVPunjit_{};
+        // Cached unjittered view and reverse-Z projection matrices, mirrored
+        // alongside currVPunjit_ each frame. The particle billboard pass needs
+        // them SEPARATELY (not the combined VP): the distance-attenuated
+        // billboard scale uses view-space depth and proj[1][1] individually, so
+        // it pushes modelView = currViewUnjit_ · meshWorld and currProjUnjit_.
+        std::array<float, 16> currViewUnjit_{};
+        std::array<float, 16> currProjUnjit_{};
 
         // Per-frame raster camera data. currVPjittered drives gl_Position;
         // currVPunjittered + prevVP drive the motion-vector computation
@@ -1537,7 +1733,13 @@ namespace threepp {
         // any command recording, so this is just two size/flag checks.
         bool sceneHasOverlayContent() const {
             if (!lastVisibleLines_.empty()) return true;
+            // World-space sprites are drawn in the overlay pass and depth-test
+            // against unjitDepth, so they need the prepass + overlay pass too.
+            if (!lastVisibleSprites_.empty()) return true;
             for (const auto& en : lastVisibleEntries_) {
+                // isOverlay covers particle billboards too (kSnapParticle folds
+                // into isOverlay), so a scene with only particles still triggers
+                // the depth prepass + overlay pass the billboard loop needs.
                 if (en.isOverlay) return true;
             }
             return false;
@@ -1681,6 +1883,7 @@ namespace threepp {
             photon_ = std::make_unique<vulkan::PhotonCaustics>(*ctx, rtPipelineLayout);
             waterDisplace_ = std::make_unique<vulkan::WaterDisplacePipeline>(*ctx);
             foamWorld_     = std::make_unique<vulkan::FoamWorldPipeline>(*ctx);
+            grassWind_     = std::make_unique<vulkan::GrassWindPipeline>(*ctx);
             // Hybrid raster G-buffer infrastructure. Costs a few hundred MB
             // at 1080p for six attachments × kFramesInFlight.
             ensureHybridResources();
@@ -1774,7 +1977,8 @@ namespace threepp {
 
             if (tlas) ctx->rt().destroyAccelerationStructure(d, tlas, nullptr);
             destroyBuffer(ctx->allocator(), tlasBuffer);
-            destroyBuffer(ctx->allocator(), tlasInstancesBuffer);
+            for (auto& b : tlasInstancesBuffers) destroyBuffer(ctx->allocator(), b);
+            destroyBuffer(ctx->allocator(), tlasRefitScratch_);
             destroyBuffer(ctx->allocator(), geometryDescsBuffer);
             for (auto& b : materialDescsBuffers) destroyBuffer(ctx->allocator(), b);
             destroyBuffer(ctx->allocator(), sceneCaptureBuf_);
@@ -1791,7 +1995,7 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
-                destroyBuffer(ctx->allocator(), rec->foam);
+                destroyBuffer(ctx->allocator(), rec->color);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
@@ -1814,7 +2018,6 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
-                destroyBuffer(ctx->allocator(), rec->foam);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
@@ -1838,7 +2041,6 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
-                destroyBuffer(ctx->allocator(), rec->foam);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
@@ -1853,7 +2055,6 @@ namespace threepp {
                     destroyBuffer(ctx->allocator(), rec->index);
                     destroyBuffer(ctx->allocator(), rec->normal);
                     destroyBuffer(ctx->allocator(), rec->uv);
-                    destroyBuffer(ctx->allocator(), rec->foam);
                     destroyBuffer(ctx->allocator(), rec->prevVertex);
                     destroyBuffer(ctx->allocator(), rec->blasScratch);
                 }
@@ -1871,6 +2072,23 @@ namespace threepp {
             }
             displacedStates.clear();
 
+            for (auto& [_, st] : grassStates) {
+                if (st->blas) {
+                    auto& rec = st->blas;
+                    if (rec->as) ctx->rt().destroyAccelerationStructure(d, rec->as, nullptr);
+                    destroyBuffer(ctx->allocator(), rec->storage);
+                    destroyBuffer(ctx->allocator(), rec->vertex);
+                    destroyBuffer(ctx->allocator(), rec->index);
+                    destroyBuffer(ctx->allocator(), rec->normal);
+                    destroyBuffer(ctx->allocator(), rec->uv);
+                    destroyBuffer(ctx->allocator(), rec->prevVertex);
+                    destroyBuffer(ctx->allocator(), rec->blasScratch);
+                }
+                destroyBuffer(ctx->allocator(), st->restPos);
+                destroyBuffer(ctx->allocator(), st->heightFrac);
+            }
+            grassStates.clear();
+
             for (auto& [_, st] : morphedMeshStates) {
                 auto& rec = st->blas;
                 if (!rec) continue;
@@ -1880,7 +2098,6 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
-                destroyBuffer(ctx->allocator(), rec->foam);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
@@ -1925,6 +2142,9 @@ namespace threepp {
             // World-space foam pipeline; foam ping-pong images are owned by
             // each DisplacedMeshState and destroyed there.
             foamWorld_.reset();
+            // Grass-wind pipeline; per-mesh buffers freed in the grassStates
+            // loop above.
+            grassWind_.reset();
 
             // Hybrid raster G-buffer cleanup. Resources are lazy-created on
             // first render(); if render() was never called, all handles stay
@@ -1950,6 +2170,38 @@ namespace threepp {
             if (overlayPointListPipeline)         vkDestroyPipeline(d, overlayPointListPipeline, nullptr);
             if (overlayDepthPrepassPipeline)      vkDestroyPipeline(d, overlayDepthPrepassPipeline, nullptr);
             if (overlayPipelineLayout)      vkDestroyPipelineLayout(d, overlayPipelineLayout, nullptr);
+            // Particle billboard pass resources.
+            if (particlePipelineNormal_)    vkDestroyPipeline(d, particlePipelineNormal_, nullptr);
+            if (particlePipelineAdditive_)  vkDestroyPipeline(d, particlePipelineAdditive_, nullptr);
+            if (particlePipelineLayout_)    vkDestroyPipelineLayout(d, particlePipelineLayout_, nullptr);
+            if (particleDescSetLayout_)     vkDestroyDescriptorSetLayout(d, particleDescSetLayout_, nullptr);
+            for (auto& pool : particleDescPools_) {
+                if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
+            }
+            if (spriteWorldPipeline_)       vkDestroyPipeline(d, spriteWorldPipeline_, nullptr);
+            destroyBuffer(ctx->allocator(), spriteQuadVtx_);
+            destroyBuffer(ctx->allocator(), spriteQuadIdx_);
+            if (particleWhiteTex_.view != VK_NULL_HANDLE)
+                destroyImage2D(ctx->allocator(), d, particleWhiteTex_);
+            for (auto& [t, rec] : particleTexCache_) {
+                destroyImage2D(ctx->allocator(), d, rec.image);
+            }
+            particleTexCache_.clear();
+            for (auto& [g, rec] : particleGeomCache_) {
+                destroyParticleGeomRec(rec);
+            }
+            particleGeomCache_.clear();
+            // 3D hybrid-overlay line/point geometry cache (GridHelper, AxesHelper,
+            // live point clouds). Pre-existing: this Impl-level cache had no
+            // teardown, so its vertex/index/color buffers leaked at device
+            // destroy (VUID-vkDestroyDevice-device-05137) for any scene with a
+            // Line/Points overlay. Mirror OverlayPass's own lineGeomCache_ cleanup.
+            for (auto& [g, rec] : lineGeomCache_) {
+                destroyBuffer(ctx->allocator(), rec.vertex);
+                if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.index);
+                if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.color);
+            }
+            lineGeomCache_.clear();
             overlayPass_.reset();// destroy sprite/line pipelines + caches while device is alive
             if (gbufSampler_)           vkDestroySampler(d, gbufSampler_, nullptr);
             destroyBuffer(ctx->allocator(), dummyUvBuffer_);
@@ -2029,6 +2281,7 @@ namespace threepp {
             if (auto* a = g.getAttribute<float>("normal"))   v += a->version;
             if (auto* idx = g.getIndex())                     v += idx->version;
             if (auto* a = g.getAttribute<float>("uv"))        v += a->version;
+            if (auto* a = g.getAttribute<float>("color"))     v += a->version;
             return v;
         }
 
@@ -2133,6 +2386,41 @@ namespace threepp {
                     vmaMapMemory(ctx->allocator(), rec->uv.alloc, &mapped);
                     std::memcpy(mapped, uvs.data(), uvBytes);
                     vmaUnmapMemory(ctx->allocator(), rec->uv.alloc);
+                }
+            }
+
+            // Optional per-vertex color (material.vertexColors). closest_hit and
+            // the raster gbuffer interpolate this and modulate albedo. Stored as
+            // tightly-packed vec3 (the shaders fetch 3 floats/vertex); itemSize-4
+            // colors are repacked to RGB, dropping the alpha. Whether it actually
+            // applies is decided per-instance from the material's vertexColors
+            // flag when GeometryDesc / DrawInfo are filled — the buffer is always
+            // uploaded if present so a shared geometry works under either material.
+            if (auto* colAttr = geom.getAttribute<float>("color")) {
+                const int itemSize = colAttr->itemSize();
+                if (colAttr->count() == static_cast<int>(vertexCount) &&
+                    (itemSize == 3 || itemSize == 4)) {
+                    const auto& cols = colAttr->array();
+                    const VkDeviceSize cbBytes = static_cast<VkDeviceSize>(vertexCount) * 3 * sizeof(float);
+                    rec->color = createBuffer(
+                            ctx->allocator(), ctx->device(), cbBytes,
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            VMA_MEMORY_USAGE_AUTO,
+                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                    vmaMapMemory(ctx->allocator(), rec->color.alloc, &mapped);
+                    if (itemSize == 3) {
+                        std::memcpy(mapped, cols.data(), cbBytes);
+                    } else {
+                        auto* dst = static_cast<float*>(mapped);
+                        for (uint32_t v = 0; v < vertexCount; ++v) {
+                            dst[v * 3 + 0] = cols[v * 4 + 0];
+                            dst[v * 3 + 1] = cols[v * 4 + 1];
+                            dst[v * 3 + 2] = cols[v * 4 + 2];
+                        }
+                    }
+                    vmaUnmapMemory(ctx->allocator(), rec->color.alloc);
                 }
             }
 
@@ -2251,6 +2539,7 @@ namespace threepp {
             rec->geomVersion = geomVersionOf(geom);
             rec->vertexCount = vertexCount;
             rec->indexCount  = indexed ? static_cast<uint32_t>(idxAttr->count()) : 0u;
+            rec->vbBytes     = vbBytes;// for the prevVertex re-sync copy
 
             return rec;
         }
@@ -2872,6 +3161,11 @@ namespace threepp {
                     VkBufferCopy region{};
                     region.size = posAttr->array().size() * sizeof(float);
                     vkCmdCopyBuffer(cb, rec.vertex.handle, rec.prevVertex.handle, 1, &region);
+                    // This snapshot is the PRE-update geometry. It is correct for
+                    // the change frame's motion vector, but must be re-synced to
+                    // the new positions on the next clean frame (see the resync
+                    // pass in ensureSceneBuilt) or the mesh shakes forever.
+                    rec.prevVertexResyncPending = true;
                     any = true;
                 }
                 if (any) {
@@ -3238,30 +3532,13 @@ namespace threepp {
             if (!blas) return nullptr;
             blas->liveCheck = dm.geometry();
 
-            // Per-vertex foam coverage (1 float per vertex, [0..1]). Written
-            // by water_displace.comp via Jacobian of horizontal displacement;
-            // read by closest_hit.rchit to lerp roughness/albedo toward white
-            // where the surface is folding (= breaking-wave whitewater).
-            blas->foam = createBuffer(
-                    ctx->allocator(), ctx->device(),
-                    VkDeviceSize(vertexCount) * sizeof(float),
-                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
-                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    VMA_MEMORY_USAGE_AUTO);
-            // Zero-init: water_displace.comp's decay path reads the previous
-            // frame's foam at this vertex and computes max(foamInstant, prev*
-            // decay). Without explicit init the first frame reads undefined
-            // GPU memory — often huge garbage values (NaN/Inf bit patterns
-            // or just large floats) that decay slowly enough to be visible
-            // for tens of seconds, bilinear-interpolated across the plane's
-            // triangulation as a hex-tile foam pattern.
-            {
-                VkCommandBuffer cb = beginOneShot();
-                vkCmdFillBuffer(cb, blas->foam.handle, 0, VK_WHOLE_SIZE, 0);
-                endAndSubmitOneShot(cb);
-            }
+            // FFT-displaced ocean mesh: mark it so the chit / deferred passes
+            // apply world-space foam + thin-shell water shading. Foam itself
+            // lives in a world-space texture built by foam_world.comp, so the
+            // only per-mesh state needed here is this "is water" marker (it
+            // used to be a zero-filled per-vertex foam buffer, read solely for
+            // its non-null address — the contents were dead).
+            blas->isOceanSurface = true;
 
             // Per-vertex previous-pose buffer for hybrid raster motion vec.
             // Same size as vertex (R32G32B32 SFLOAT × vertexCount). Filled
@@ -3780,7 +4057,6 @@ namespace threepp {
             vulkan::WaterDisplacePipeline::PushConstants pc{};
             pc.posOut       = st.blas->vertex.address;
             pc.normOut      = st.blas->normal.address;
-            pc.foamOut      = st.blas->foam.address;
             pc.disturbAddr  = st.foamDisturbBuffer.address;
             pc.vertexCount  = st.vertexCount;
             pc.gridDim      = st.gridDim;
@@ -3987,6 +4263,181 @@ namespace threepp {
             }
         }
 
+        // ── GrassMesh helpers ────────────────────────────────────────────
+        // Lazy create the per-GrassMesh state: a BLAS over the rest geometry
+        // (built ALLOW_UPDATE, refit each frame) plus an immutable copy of the
+        // rest positions and the per-vertex height fractions the wind shader
+        // reads. Returns nullptr if the geometry lacks position / heightFrac.
+        GrassMeshState* ensureGrassState(GrassMesh& gm) {
+            auto it = grassStates.find(&gm);
+            if (it != grassStates.end()) return it->second.get();
+
+            auto* posAttr = gm.geometry()->getAttribute<float>("position");
+            auto* hfAttr  = gm.geometry()->getAttribute<float>("heightFrac");
+            if (!posAttr || !hfAttr) return nullptr;
+            const uint32_t vertexCount = static_cast<uint32_t>(posAttr->count());
+            if (vertexCount == 0 || static_cast<uint32_t>(hfAttr->count()) != vertexCount) return nullptr;
+
+            auto blas = buildBlasFor(*gm.geometry());
+            if (!blas) return nullptr;
+            blas->liveCheck = gm.geometry();
+
+            auto state = std::make_unique<GrassMeshState>();
+            state->vertexCount = vertexCount;
+            state->liveCheck = gm.geometry();
+
+            // Immutable rest positions — the shader reads these and writes the
+            // displaced result into the (separate) BLAS vertex buffer.
+            const VkDeviceSize posBytes = VkDeviceSize(vertexCount) * 3u * sizeof(float);
+            state->restPos = createBuffer(
+                    ctx->allocator(), ctx->device(), posBytes,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            {
+                void* mapped = nullptr;
+                vmaMapMemory(ctx->allocator(), state->restPos.alloc, &mapped);
+                std::memcpy(mapped, posAttr->array().data(), posBytes);
+                vmaUnmapMemory(ctx->allocator(), state->restPos.alloc);
+            }
+
+            const VkDeviceSize hfBytes = VkDeviceSize(vertexCount) * sizeof(float);
+            state->heightFrac = createBuffer(
+                    ctx->allocator(), ctx->device(), hfBytes,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            {
+                void* mapped = nullptr;
+                vmaMapMemory(ctx->allocator(), state->heightFrac.alloc, &mapped);
+                std::memcpy(mapped, hfAttr->array().data(), hfBytes);
+                vmaUnmapMemory(ctx->allocator(), state->heightFrac.alloc);
+            }
+
+            state->blas = std::move(blas);
+            auto* raw = state.get();
+            grassStates.emplace(&gm, std::move(state));
+            return raw;
+        }
+
+        // Record the grass wind deform (rest → displaced positions in the BLAS
+        // vertex buffer) + in-place BLAS refit into `cb`. No submit — the caller
+        // batches these into the main frame command buffer (recordCommandBuffer),
+        // exactly like the skinned-mesh path, so there is NO mid-frame
+        // vkQueueWaitIdle. Uses the persistent per-BLAS scratch (grass geometry
+        // is fixed-size, so it's allocated once on first use). Normals are left
+        // static, so only the position buffer is written/barriered.
+        void recordGrassDeform(VkCommandBuffer cb, GrassMesh& gm, GrassMeshState& st) {
+            vulkan::GrassWindPipeline::PushConstants pc{};
+            pc.posOut       = st.blas->vertex.address;
+            pc.restIn       = st.restPos.address;
+            pc.hfracIn      = st.heightFrac.address;
+            pc.vertexCount  = st.vertexCount;
+            pc.time         = gm.params.time;
+            pc.windStrength = gm.params.windStrength;
+            pc.windDirX     = gm.params.windDir.x;
+            pc.windDirZ     = gm.params.windDir.y;
+            grassWind_->recordDispatch(cb, pc);
+
+            // Compute write → AS-build read (BLAS refit) + vertex-attribute read
+            // (raster G-buffer prepass reads the deformed positions). Mirrors the
+            // skinned path's post-dispatch barrier.
+            {
+                VkMemoryBarrier2 mb{};
+                mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+                mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                                   VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                                   VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                                   VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                                   VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                VkDependencyInfo dep{};
+                dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers    = &mb;
+                vkCmdPipelineBarrier2(cb, &dep);
+            }
+
+            // Refit the BLAS in place (periodic full rebuild keeps it balanced).
+            auto* posAttr = gm.geometry()->getAttribute<float>("position");
+            auto* idxAttr = gm.geometry()->getIndex();
+            const uint32_t vc = static_cast<uint32_t>(posAttr->count());
+            const bool indexed = idxAttr != nullptr;
+            const uint32_t primCount = indexed ? static_cast<uint32_t>(idxAttr->count() / 3)
+                                               : vc / 3;
+
+            VkAccelerationStructureGeometryTrianglesDataKHR triData{};
+            triData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            triData.vertexData.deviceAddress = st.blas->vertex.address;
+            triData.vertexStride = 3 * sizeof(float);
+            triData.maxVertex = vc - 1;
+            if (indexed) {
+                triData.indexType = VK_INDEX_TYPE_UINT32;
+                triData.indexData.deviceAddress = st.blas->index.address;
+            } else {
+                triData.indexType = VK_INDEX_TYPE_NONE_KHR;
+            }
+
+            VkAccelerationStructureGeometryKHR blasGeom{};
+            blasGeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            blasGeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            blasGeom.geometry.triangles = triData;
+            blasGeom.flags = 0;
+
+            const bool fullRebuild =
+                    st.blasRefitCounter >= GrassMeshState::kBlasFullRebuildInterval;
+            st.blasRefitCounter = fullRebuild ? 0u : (st.blasRefitCounter + 1u);
+
+            VkAccelerationStructureBuildGeometryInfoKHR build{};
+            build.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+            build.type  = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                          VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+            build.mode  = fullRebuild
+                    ? VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR
+                    : VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR;
+            build.geometryCount = 1;
+            build.pGeometries = &blasGeom;
+            build.srcAccelerationStructure = fullRebuild ? VK_NULL_HANDLE : st.blas->as;
+            build.dstAccelerationStructure = st.blas->as;
+
+            VkAccelerationStructureBuildSizesInfoKHR sizes{};
+            sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+            ctx->rt().getAccelerationStructureBuildSizes(
+                    ctx->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                    &build, &primCount, &sizes);
+
+            // Persistent scratch (sized once; buildScratchSize ≥ updateScratchSize).
+            if (st.blas->blasScratch.handle == VK_NULL_HANDLE ||
+                st.blas->blasScratchSize < sizes.buildScratchSize) {
+                if (st.blas->blasScratch.handle != VK_NULL_HANDLE)
+                    destroyBuffer(ctx->allocator(), st.blas->blasScratch);
+                st.blas->blasScratch = createAsScratchBuffer(
+                        ctx->allocator(), ctx->device(), sizes.buildScratchSize);
+                st.blas->blasScratchSize = sizes.buildScratchSize;
+            }
+            build.scratchData.deviceAddress = st.blas->blasScratch.address;
+
+            VkAccelerationStructureBuildRangeInfoKHR range{};
+            range.primitiveCount = primCount;
+            const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
+            ctx->rt().cmdBuildAccelerationStructures(cb, 1, &build, &pRange);
+        }
+
+        // One-shot wrapper — used only for the initial prime during scene build
+        // (rare). The per-frame path records into the frame cb via the pending
+        // queue, so it never drains.
+        void refreshGrassBlas(GrassMesh& gm, GrassMeshState& st, float /*elapsedSeconds*/) {
+            VkCommandBuffer cb = beginOneShot();
+            recordGrassDeform(cb, gm, st);
+            endAndSubmitOneShot(cb, "grass prime");
+        }
+
         // Build a TLAS over the supplied instance descriptors. Empty input is
         // legal — produces an empty TLAS that always misses.
         void buildTlas(const std::vector<VkAccelerationStructureInstanceKHR>& instances) {
@@ -3995,24 +4446,30 @@ namespace threepp {
                     instanceCount * sizeof(VkAccelerationStructureInstanceKHR),
                     sizeof(VkAccelerationStructureInstanceKHR));// keep buf non-empty
 
-            tlasInstancesBuffer = createBuffer(
-                    ctx->allocator(), ctx->device(), instBytes,
-                    VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
-                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                    VMA_MEMORY_USAGE_AUTO,
-                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-            if (instanceCount > 0) {
-                void* mapped = nullptr;
-                vmaMapMemory(ctx->allocator(), tlasInstancesBuffer.alloc, &mapped);
-                std::memcpy(mapped, instances.data(),
-                            instanceCount * sizeof(VkAccelerationStructureInstanceKHR));
-                vmaUnmapMemory(ctx->allocator(), tlasInstancesBuffer.alloc);
+            // (Re)allocate all in-flight instance buffers and seed every slot
+            // with the current instances, so whichever slot the next per-frame
+            // refit overwrites is already a valid build input.
+            for (uint32_t s = 0; s < kFramesInFlight; ++s) {
+                destroyBuffer(ctx->allocator(), tlasInstancesBuffers[s]);
+                tlasInstancesBuffers[s] = createBuffer(
+                        ctx->allocator(), ctx->device(), instBytes,
+                        VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                if (instanceCount > 0) {
+                    void* mapped = nullptr;
+                    vmaMapMemory(ctx->allocator(), tlasInstancesBuffers[s].alloc, &mapped);
+                    std::memcpy(mapped, instances.data(),
+                                instanceCount * sizeof(VkAccelerationStructureInstanceKHR));
+                    vmaUnmapMemory(ctx->allocator(), tlasInstancesBuffers[s].alloc);
+                }
             }
 
             VkAccelerationStructureGeometryInstancesDataKHR instData{};
             instData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
             instData.arrayOfPointers = VK_FALSE;
-            instData.data.deviceAddress = tlasInstancesBuffer.address;
+            instData.data.deviceAddress = tlasInstancesBuffers[0].address;
 
             VkAccelerationStructureGeometryKHR tlasGeom{};
             tlasGeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
@@ -4065,26 +4522,29 @@ namespace threepp {
             destroyBuffer(ctx->allocator(), scratch);
         }
 
-        // Refit the existing TLAS in-place with new instance transforms.
-        // Cheaper than a full rebuild and crucially leaves the TLAS handle
-        // unchanged so descriptor binding 0 keeps pointing at it. Caller
-        // must hold the same instance count as the previous build (only
-        // matrices may change) — topology growth requires a full rebuild.
-        void refitTlas(const std::vector<VkAccelerationStructureInstanceKHR>& instances,
-                       bool fullBuild = false) {
+        // Record a per-frame TLAS refit/rebuild into `cb` — NO blocking submit.
+        // The host instance write goes to tlasInstancesBuffers[currentFrame]
+        // (safe: recordCommandBuffer runs after this slot's fence wait), and the
+        // build uses the persistent scratch. Leaves the TLAS handle unchanged so
+        // descriptor binding 0 keeps pointing at it. Must be recorded AFTER all
+        // deformable BLAS rebuilds in the same cb.
+        void recordTlasRefit(VkCommandBuffer cb,
+                             const std::vector<VkAccelerationStructureInstanceKHR>& instances,
+                             bool fullBuild) {
             const uint32_t instanceCount = static_cast<uint32_t>(instances.size());
             if (instanceCount == 0 || tlas == VK_NULL_HANDLE) return;
 
+            Buffer& instBuf = tlasInstancesBuffers[currentFrame];
             void* mapped = nullptr;
-            vmaMapMemory(ctx->allocator(), tlasInstancesBuffer.alloc, &mapped);
+            vmaMapMemory(ctx->allocator(), instBuf.alloc, &mapped);
             std::memcpy(mapped, instances.data(),
                         instanceCount * sizeof(VkAccelerationStructureInstanceKHR));
-            vmaUnmapMemory(ctx->allocator(), tlasInstancesBuffer.alloc);
+            vmaUnmapMemory(ctx->allocator(), instBuf.alloc);
 
             VkAccelerationStructureGeometryInstancesDataKHR instData{};
             instData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_INSTANCES_DATA_KHR;
             instData.arrayOfPointers = VK_FALSE;
-            instData.data.deviceAddress = tlasInstancesBuffer.address;
+            instData.data.deviceAddress = instBuf.address;
 
             VkAccelerationStructureGeometryKHR tlasGeom{};
             tlasGeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
@@ -4114,19 +4574,21 @@ namespace threepp {
                     VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     &tlasBuild, &instanceCount, &sizes);
 
-            const VkDeviceSize scratchSize = fullBuild
-                    ? sizes.buildScratchSize : sizes.updateScratchSize;
-            Buffer scratch = createAsScratchBuffer(ctx->allocator(), ctx->device(), scratchSize);
-            tlasBuild.scratchData.deviceAddress = scratch.address;
+            // Persistent scratch (sized once; build ≥ update). The TLAS build is
+            // ordered after the prior frame's by submit order, so reuse is safe.
+            const VkDeviceSize need = std::max(sizes.buildScratchSize, sizes.updateScratchSize);
+            if (tlasRefitScratch_.handle == VK_NULL_HANDLE || tlasRefitScratchSize_ < need) {
+                if (tlasRefitScratch_.handle != VK_NULL_HANDLE)
+                    destroyBuffer(ctx->allocator(), tlasRefitScratch_);
+                tlasRefitScratch_ = createAsScratchBuffer(ctx->allocator(), ctx->device(), need);
+                tlasRefitScratchSize_ = need;
+            }
+            tlasBuild.scratchData.deviceAddress = tlasRefitScratch_.address;
 
             VkAccelerationStructureBuildRangeInfoKHR range{};
             range.primitiveCount = instanceCount;
             const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
-
-            VkCommandBuffer cb = beginOneShot();
             ctx->rt().cmdBuildAccelerationStructures(cb, 1, &tlasBuild, &pRange);
-            endAndSubmitOneShot(cb, "refitTlas");
-            destroyBuffer(ctx->allocator(), scratch);
         }
 
         template<typename DescT>
@@ -4205,7 +4667,7 @@ namespace threepp {
                 // (skinned/displaced/morphed/tet) are here because their cached local
                 // AABB doesn't reflect the per-frame deformed extents, so frustum-
                 // culling them risks popping a still-on-screen body out of the gbuffer.
-                if (en.isOverlay || en.isSkinned || en.isDisplaced || en.isMorphed || en.isTet) {
+                if (en.isOverlay || en.isSkinned || en.isDisplaced || en.isGrass || en.isMorphed || en.isTet) {
                     en.inFrustum = true;
                 } else {
                     auto geom = en.mesh->geometry();
@@ -4303,6 +4765,23 @@ namespace threepp {
                 d.transmission = tr->transmission;
                 d.ior          = std::max(1.0f, tr->ior);
                 d.dispersion   = std::max(0.0f, tr->dispersion);
+                // glTF permits transmission + alphaMode BLEND together; alpha
+                // is COVERAGE, independent of the transmission tint, and the
+                // spec composite is α·glassResult + (1−α)·background. Smoked
+                // car windows ship exactly this pattern (BLACK baseColor as
+                // the tint + low alpha): taking the tint alone renders them
+                // opaque-black in both render modes, while GL — which ignores
+                // the transmission extension and plain alpha-blends — shows
+                // the background through. Fold the coverage into the tint,
+                // tint' = mix(1, tint, α): for the dominant straight-through
+                // path this reproduces the blend composite exactly, with no
+                // second blend pass in either pipeline.
+                if (d.transmission > 0.0f && mat->transparent && mat->opacity < 1.0f) {
+                    const float a = std::clamp(mat->opacity, 0.0f, 1.0f);
+                    for (float& c : d.albedo) {
+                        c = (1.0f - a) + a * c;
+                    }
+                }
             }
             // Additive-blend effects (muzzle flashes, sparks, energy glows): the
             // surface GLOWS over the scene rather than occluding/refracting it.
@@ -4494,6 +4973,11 @@ namespace threepp {
             // ms/frame on Bistro's node count, static or not).
             scene.updateMatrixWorld();
 
+            // Honour live edits to already-uploaded material textures (e.g. a
+            // DataTexture re-baked via setData + needsUpdate). Cheap version
+            // scan; only re-uploads + rewrites descriptors when something changed.
+            refreshDirtyMaterialTextures();
+
             // First call each render(): start with no motion. Camera + mesh
             // motion checks below + in updateCameraUbo OR true into this flag
             // before dispatch.
@@ -4622,7 +5106,13 @@ namespace threepp {
                 auto geom = m->geometry();
                 if (!geom || !geom->hasAttribute("position")) return;
                 if (!geom->hasAttribute("normal")) return;
-                const bool isOverlay = (sn.flags & (kSnapWire | kSnapOverlay)) != 0u;
+                // Particle billboard meshes are excluded from PT exactly like
+                // overlays (kSnapParticle folds into isOverlay so every
+                // `if (en.isOverlay) continue;` guard applies) but carry their
+                // own isParticle flag so the billboard pass claims them and the
+                // overlay-mesh loop skips them.
+                const bool isParticle = (sn.flags & kSnapParticle) != 0u;
+                const bool isOverlay = (sn.flags & (kSnapWire | kSnapOverlay | kSnapParticle)) != 0u;
                 // One-shot type probes: an N-instance InstancedMesh costs 3
                 // dynamic_casts total, not 3·N — and on snapshot-match frames
                 // none at all (the cached entry flags are reused). Consumed by
@@ -4630,12 +5120,13 @@ namespace threepp {
                 // dirty-detection.
                 const bool isSkinned   = (dynamic_cast<SkinnedMesh*>(m)   != nullptr);
                 const bool isDisplaced = (dynamic_cast<DisplacedMesh*>(m) != nullptr);
+                const bool isGrass     = (dynamic_cast<GrassMesh*>(m)     != nullptr);
                 const bool isMorphed   = isMorphedMesh(*m);
                 // Tet-skinned PhysX soft body — detected via the material flag set by
                 // SoftBody::enableGpuSkinning() (which also carries the per-frame tet
                 // texture and the static tetIndex/tetWeight/tetRestInv* attributes).
                 // Mutually exclusive with the other deformers.
-                const bool isTet = !isSkinned && !isDisplaced && !isMorphed &&
+                const bool isTet = !isSkinned && !isDisplaced && !isGrass && !isMorphed &&
                                    m->material() && m->material()->tetSkinning &&
                                    m->material()->tetTexture != nullptr;
                 if (inst && inst->count() > 0) {
@@ -4648,8 +5139,10 @@ namespace threepp {
                         e.mesh = m;
                         e.instanceIndex = static_cast<uint32_t>(j);
                         e.isOverlay    = isOverlay;
+                        e.isParticle   = isParticle;
                         e.isSkinned    = isSkinned;
                         e.isDisplaced  = isDisplaced;
+                        e.isGrass      = isGrass;
                         e.isMorphed    = isMorphed;
                         e.isTet        = isTet;
                         e.isInstanced  = true;
@@ -4661,8 +5154,10 @@ namespace threepp {
                     e.mesh = m;
                     e.instanceIndex = 0u;
                     e.isOverlay    = isOverlay;
+                    e.isParticle   = isParticle;
                     e.isSkinned    = isSkinned;
                     e.isDisplaced  = isDisplaced;
+                    e.isGrass      = isGrass;
                     e.isMorphed    = isMorphed;
                     e.isTet        = isTet;
                     std::memcpy(e.worldMatrix.data(), m->matrixWorld->elements.data(), 64);
@@ -4680,10 +5175,17 @@ namespace threepp {
             bool materialValuesSame = true;
             bool bonesDirtyAny = false;
             bool displacedDirtyAny = false;
+            bool grassDirtyAny = false;
             bool tetDirtyAny = false;
             bool geomDirtyAny = false;
             bool morphDirtyAny = false;
             std::vector<bool> entryGeomDirty(entries.size(), false);
+            // Per-entry "material values bumped" bits — the ONLY entries whose
+            // MaterialDesc must be re-derived in the material-values fast path
+            // (materialFromMesh is a ~25-dynamic_cast + shared_ptr-churn walk).
+            // Filled by both the LEAN in-place diff and the generic compare so
+            // a single material toggle costs O(changed) instead of O(scene).
+            std::vector<bool> entryMatDirty(entries.size(), false);
 
             // LEAN IN-PLACE DIFF: prevSceneFingerprint IS this frame's
             // fingerprint state — diff against the live objects and update it
@@ -4750,16 +5252,23 @@ namespace threepp {
                     const bool geomChanged = (gv != fp.geomVersion);
                     if (geomChanged) {
                         fp.geomVersion = gv;
-                        geomDirtyAny = true;
-                        entryGeomDirty[i] = true;
-                        // boundingBox invalidation — mirrors the generic loop.
-                        if (auto gg = en.mesh->geometry()) gg->boundingBox.reset();
+                        // Particle billboard meshes mutate their attributes every
+                        // frame but own no BLAS — flagging geomDirty would fire a
+                        // per-frame vkDeviceWaitIdle for a refit that skips them
+                        // anyway (blasCache miss). The billboard pass re-uploads
+                        // their vertex cache itself, version-gated.
+                        if (!en.isParticle) {
+                            geomDirtyAny = true;
+                            entryGeomDirty[i] = true;
+                            // boundingBox invalidation — mirrors the generic loop.
+                            if (auto gg = en.mesh->geometry()) gg->boundingBox.reset();
+                        }
                     }
                     if (xfmChanged) {
                         matricesSame = false;
                         fp.matrix = en.worldMatrix;
                     }
-                    if (matChanged) materialValuesSame = false;
+                    if (matChanged) { materialValuesSame = false; entryMatDirty[i] = true; }
                     if (xfmChanged || matChanged || geomChanged) {
                         const size_t w = i >> 5;
                         if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
@@ -4884,6 +5393,12 @@ namespace threepp {
                 if (entries[i].isDisplaced) entryDisplacedDirty[i] = true;
             }
 
+            // GrassMesh — same: intrinsically dirty every frame (wind advances).
+            std::vector<bool> entryGrassDirty(entries.size(), false);
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (entries[i].isGrass) entryGrassDirty[i] = true;
+            }
+
             // Morphed meshes — dirty when morphTargetInfluences changed.
             // Skinned meshes that also carry morph targets are handled by the
             // bone path above (GPU-skinned BLAS rebuild) so we skip them
@@ -4916,10 +5431,12 @@ namespace threepp {
                 for (size_t i = 0; i < entries.size(); ++i) {
                     const bool b = entryBonesDirty[i];
                     const bool d = entryDisplacedDirty[i];
+                    const bool gr = entryGrassDirty[i];
                     const bool mo = entryMorphDirty[i];
-                    if (!(b || d || mo)) continue;
+                    if (!(b || d || gr || mo)) continue;
                     if (b) bonesDirtyAny = true;
                     if (d) displacedDirtyAny = true;
+                    if (gr) grassDirtyAny = true;
                     if (mo) morphDirtyAny = true;
                     const size_t w = i >> 5;
                     if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
@@ -4974,13 +5491,19 @@ namespace threepp {
                                               || a.matVersion != b.matVersion;
                     const bool bonesChanged = entryBonesDirty[i];
                     const bool dispChanged  = entryDisplacedDirty[i];
+                    const bool grassChanged = entryGrassDirty[i];
                     const bool geomChanged  = (a.geomVersion != b.geomVersion);
                     const bool morphChanged = entryMorphDirty[i];
                     if (xfmChanged) matricesSame = false;
-                    if (matChanged) materialValuesSame = false;
+                    if (matChanged) { materialValuesSame = false; entryMatDirty[i] = true; }
                     if (bonesChanged) bonesDirtyAny = true;
                     if (dispChanged)  displacedDirtyAny = true;
-                    if (geomChanged) {
+                    if (grassChanged) grassDirtyAny = true;
+                    // Particle billboard meshes mutate attributes every frame but
+                    // own no BLAS; never flag them geomDirty (would fire a per-
+                    // frame vkDeviceWaitIdle for a refit that skips them). The
+                    // billboard pass re-uploads their vertex cache itself.
+                    if (geomChanged && !entries[i].isParticle) {
                         geomDirtyAny = true;
                         entryGeomDirty[i] = true;
                         // Invalidate the cached boundingBox so the next
@@ -5007,7 +5530,7 @@ namespace threepp {
                     }
                 }
                 if (structuralSame) {
-                    if (!matricesSame || !materialValuesSame || bonesDirtyAny || displacedDirtyAny || geomDirtyAny || morphDirtyAny) {
+                    if (!matricesSame || !materialValuesSame || bonesDirtyAny || displacedDirtyAny || grassDirtyAny || geomDirtyAny || morphDirtyAny) {
                         motionThisFrame_ = true;
                     }
                     if (bonesDirtyAny) {
@@ -5041,6 +5564,20 @@ namespace threepp {
                             ++dm->frameTick;
                         }
                     }
+                    if (grassDirtyAny) {
+                        // Queue each GrassMesh deform; the grass_wind dispatch +
+                        // BLAS refit are recorded into the frame command buffer
+                        // in recordCommandBuffer (no blocking submit), mirroring
+                        // the skinned-mesh path. One mesh = one TLAS instance.
+                        for (size_t i = 0; i < entries.size(); ++i) {
+                            if (!entryGrassDirty[i]) continue;
+                            auto* gm = static_cast<GrassMesh*>(entries[i].mesh);
+                            auto stIt = grassStates.find(gm);
+                            if (stIt == grassStates.end()) continue;
+                            pendingGrassDeforms_.emplace_back(gm, stIt->second.get());
+                            ++gm->frameTick;
+                        }
+                    }
                     if (morphDirtyAny) {
                         std::unordered_set<Mesh*> refreshed;
                         for (size_t i = 0; i < entries.size(); ++i) {
@@ -5066,6 +5603,11 @@ namespace threepp {
                         meshMovedBits_[w] |= (1u << (i & 31u));
                     }
                     if (tetDirtyAny) motionThisFrame_ = true;
+                    // Geometries whose prevVertex was re-snapshotted (to OLD
+                    // positions) this frame. The prevVertex re-sync pass below
+                    // must SKIP these so their legitimate change-frame deformation
+                    // motion survives — they settle on the next clean frame.
+                    std::unordered_set<const BufferGeometry*> geomRefreshedThisFrame;
                     if (geomDirtyAny) {
                         // Re-upload vertex data for geometries whose
                         // BufferAttribute versions changed and rebuild their
@@ -5095,6 +5637,7 @@ namespace threepp {
                             if (!entryGeomDirty[i]) continue;
                             if (entries[i].isSkinned)   continue;
                             if (entries[i].isDisplaced) continue;
+                            if (entries[i].isGrass)     continue;
 
                             const BufferGeometry* geomKey = entries[i].mesh->geometry().get();
                             if (refreshedGeoms.count(geomKey)) continue;
@@ -5124,8 +5667,53 @@ namespace threepp {
                             goto fullRebuild;
                         }
                         refreshGeomBlasBatch(refreshOps);
+                        for (const auto& op : refreshOps) geomRefreshedThisFrame.insert(op.geom);
                     }
-                    if (!matricesSame || bonesDirtyAny || displacedDirtyAny || tetDirtyAny || geomDirtyAny || morphDirtyAny) {
+
+                    // ── prevVertex re-sync ──────────────────────────────────
+                    // A plain mesh updated in place (e.g. a re-rolled terrain)
+                    // keeps prevVertex frozen at its PRE-update positions once it
+                    // stops being geom-dirty: refreshGeomBlasBatch's Phase B only
+                    // runs on the change frame. The G-buffer VS then reads a stale
+                    // inPrevPos every subsequent frame → a constant nonzero motion
+                    // vector on a static surface → the denoiser/TAA reject history
+                    // forever → the mesh stays noisy and visibly shakes. One frame
+                    // after the update settles (the record is no longer refreshed
+                    // this frame) we copy vertex → prevVertex so motion collapses
+                    // back to zero, exactly like initial-build static geometry.
+                    // Skinned/displaced/tet own their own every-frame snapshot and
+                    // never enter refreshGeomBlasBatch, so they are untouched.
+                    {
+                        std::vector<BlasRecord*> resyncRecs;
+                        for (auto& [geomKey, recPtr] : blasCache) {
+                            BlasRecord* rec = recPtr.get();
+                            if (!rec->prevVertexResyncPending) continue;
+                            // Re-snapshotted this frame → keep its change-frame
+                            // motion; settle on the next clean frame instead.
+                            if (geomRefreshedThisFrame.count(geomKey)) continue;
+                            resyncRecs.push_back(rec);
+                        }
+                        if (!resyncRecs.empty()) {
+                            // Same in-flight hazard as the refresh above: prior
+                            // frames may still read prevVertex as a vertex buffer,
+                            // so drain device-wide before overwriting it.
+                            check(vkDeviceWaitIdle(ctx->device()),
+                                  "vkDeviceWaitIdle (pre-prevVertex-resync)");
+                            VkCommandBuffer cb = beginOneShot();
+                            for (BlasRecord* rec : resyncRecs) {
+                                if (rec->prevVertex.handle != VK_NULL_HANDLE && rec->vbBytes > 0) {
+                                    VkBufferCopy region{};
+                                    region.size = rec->vbBytes;
+                                    vkCmdCopyBuffer(cb, rec->vertex.handle,
+                                                    rec->prevVertex.handle, 1, &region);
+                                }
+                                rec->prevVertexResyncPending = false;
+                            }
+                            endAndSubmitOneShot(cb, "prevVertex resync");
+                        }
+                    }
+
+                    if (!matricesSame || bonesDirtyAny || displacedDirtyAny || grassDirtyAny || tetDirtyAny || geomDirtyAny || morphDirtyAny) {
                         // TLAS refit: needed when instance transforms change
                         // (matricesSame=false) AND when any skinned BLAS was
                         // just rebuilt — the TLAS's per-instance wrapped AABB
@@ -5156,6 +5744,11 @@ namespace threepp {
                                 auto dmIt = displacedStates.find(dm);
                                 if (dmIt == displacedStates.end()) continue;
                                 blasAddr = dmIt->second->blas->address;
+                            } else if (en.isGrass) {
+                                auto* gm = static_cast<GrassMesh*>(en.mesh);
+                                auto gIt = grassStates.find(gm);
+                                if (gIt == grassStates.end()) continue;
+                                blasAddr = gIt->second->blas->address;
                             } else if (en.isTet) {
                                 auto tIt = tetMeshStates.find(en.mesh);
                                 if (tIt == tetMeshStates.end()) continue;
@@ -5192,8 +5785,12 @@ namespace threepp {
                             inst.accelerationStructureReference = blasAddr;
                             instances.push_back(inst);
                         }
-                        const bool blasDeformed = bonesDirtyAny || displacedDirtyAny || tetDirtyAny || morphDirtyAny || geomDirtyAny;
-                        refitTlas(instances, blasDeformed);
+                        const bool blasDeformed = bonesDirtyAny || displacedDirtyAny || grassDirtyAny || tetDirtyAny || morphDirtyAny || geomDirtyAny;
+                        // Stage the refit; recordCommandBuffer records it into the
+                        // frame cb after the deformable BLAS rebuilds (no drain).
+                        pendingTlasInstances_ = std::move(instances);
+                        pendingTlasFullBuild_ = blasDeformed;
+                        pendingTlasRefit_ = true;
                     }
                     if (!materialValuesSame) {
                         // Material-values-only update: rebuild MaterialDescs into
@@ -5212,18 +5809,38 @@ namespace threepp {
                         // slots left default) to match the full-rebuild layout so
                         // gl_InstanceCustomIndexEXT (== entry index) keeps indexing
                         // the right material. Dummy slots are never sampled.
-                        matDescsCached_.assign(entries.size(), MaterialDesc{});
-                        // Same dedup as the full-rebuild path below: entries
-                        // order is identical (overlay skip matches), so
-                        // identical Material* pointers produce identical
-                        // materialAssetIdx values frame-to-frame.
+                        // TARGETED PATCH: only entries whose material version
+                        // actually bumped (entryMatDirty) get their MaterialDesc
+                        // re-derived. materialFromMesh is a ~25-dynamic_cast walk
+                        // (plus each albedoTexOf/…/occlusionTexOf is another typed
+                        // probe + shared_ptr churn); re-deriving EVERY entry here
+                        // turned a single brake-light / blinker emissive toggle into
+                        // an O(scene) stall — tens of ms once InstancedMesh foliage
+                        // expands the scene to tens of thousands of entries, firing
+                        // several times a second while a blinker ticks. matDescsCached_
+                        // already holds correct values for every unchanged entry (it
+                        // survives matrix-only frames untouched), and a changed
+                        // material keeps its pointer + textures (a texture swap aborts
+                        // to the full structural rebuild), so its dedup index stays
+                        // valid. Full fallback only if the cache size somehow doesn't
+                        // match (never on the fast path that reaches here).
+                        const bool patchMatDescs = matDescsCached_.size() == entries.size();
+                        if (!patchMatDescs) matDescsCached_.assign(entries.size(), MaterialDesc{});
+                        // Same dedup as the full-rebuild path below (consulted only on
+                        // the full-rebuild fallback): entries order is identical
+                        // (overlay skip matches), so identical Material* pointers
+                        // produce identical materialAssetIdx values frame-to-frame.
                         std::unordered_map<const Material*, uint32_t> matAssetMap;
                         for (size_t i = 0; i < entries.size(); ++i) {
                             const MeshEntry& en = entries[i];
                             if (en.isOverlay) continue;// raster-overlay only — no MaterialDesc slot
+                            if (patchMatDescs && !entryMatDirty[i]) continue;// unchanged → keep cached desc
                             Mesh* m = en.mesh;
                             MaterialDesc md = materialFromMesh(*m);
-                            {
+                            if (patchMatDescs) {
+                                // Material* unchanged → its dedup index is stable.
+                                md.materialAssetIdx = matDescsCached_[i].materialAssetIdx;
+                            } else {
                                 const Material* matKey = m->material().get();
                                 auto [matIt, inserted] = matAssetMap.try_emplace(
                                         matKey, static_cast<uint32_t>(matAssetMap.size()));
@@ -5318,14 +5935,13 @@ namespace threepp {
                     tlas = VK_NULL_HANDLE;
                 }
                 destroyBuffer(ctx->allocator(), tlasBuffer);
-                destroyBuffer(ctx->allocator(), tlasInstancesBuffer);
+                for (auto& b : tlasInstancesBuffers) { destroyBuffer(ctx->allocator(), b); b = {}; }
                 destroyBuffer(ctx->allocator(), geometryDescsBuffer);
                 for (auto& b : materialDescsBuffers) {
                     destroyBuffer(ctx->allocator(), b);
                     b = {};
                 }
                 tlasBuffer = {};
-                tlasInstancesBuffer = {};
                 geometryDescsBuffer = {};
 
                 // Prune stale cache entries whose underlying objects have been
@@ -5342,7 +5958,7 @@ namespace threepp {
                         destroyBuffer(ctx->allocator(), rec->index);
                         destroyBuffer(ctx->allocator(), rec->normal);
                         destroyBuffer(ctx->allocator(), rec->uv);
-                        destroyBuffer(ctx->allocator(), rec->foam);
+                        destroyBuffer(ctx->allocator(), rec->color);
                         destroyBuffer(ctx->allocator(), rec->prevVertex);
                         destroyBuffer(ctx->allocator(), rec->blasScratch);
                         it = blasCache.erase(it);
@@ -5366,7 +5982,6 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
-                            destroyBuffer(ctx->allocator(), rec->foam);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         // Return the skinning descriptor set to the pool, else
@@ -5401,7 +6016,6 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
-                            destroyBuffer(ctx->allocator(), rec->foam);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         if (it->second->tetDescSet != VK_NULL_HANDLE) {
@@ -5424,7 +6038,6 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
-                            destroyBuffer(ctx->allocator(), rec->foam);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         if (st->scratchA.view  != VK_NULL_HANDLE) vkDestroyImageView(ctx->device(), st->scratchA.view, nullptr);
@@ -5434,6 +6047,26 @@ namespace threepp {
                         // PhillipsSpectrum / DynamicSpectrum / IFFT destructors
                         // run on unique_ptr reset.
                         it = displacedStates.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                for (auto it = grassStates.begin(); it != grassStates.end(); ) {
+                    if (it->second->liveCheck.expired()) {
+                        auto& st = it->second;
+                        if (st->blas) {
+                            auto& rec = st->blas;
+                            if (rec->as) ctx->rt().destroyAccelerationStructure(ctx->device(), rec->as, nullptr);
+                            destroyBuffer(ctx->allocator(), rec->storage);
+                            destroyBuffer(ctx->allocator(), rec->vertex);
+                            destroyBuffer(ctx->allocator(), rec->index);
+                            destroyBuffer(ctx->allocator(), rec->normal);
+                            destroyBuffer(ctx->allocator(), rec->uv);
+                            destroyBuffer(ctx->allocator(), rec->prevVertex);
+                        }
+                        destroyBuffer(ctx->allocator(), st->restPos);
+                        destroyBuffer(ctx->allocator(), st->heightFrac);
+                        it = grassStates.erase(it);
                     } else {
                         ++it;
                     }
@@ -5448,7 +6081,6 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
-                            destroyBuffer(ctx->allocator(), rec->foam);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         it = morphedMeshStates.erase(it);
@@ -5457,8 +6089,8 @@ namespace threepp {
                     }
                 }
                 for (auto it = textureCache.begin(); it != textureCache.end(); ) {
-                    if (it->second.first.expired()) {
-                        const uint32_t slot = it->second.second;
+                    if (it->second.ref.expired()) {
+                        const uint32_t slot = it->second.slot;
                         if (slot < materialTextures.size()) {
                             destroyImage2D(ctx->allocator(), ctx->device(), materialTextures[slot]);
                             materialTextures[slot] = {};
@@ -5496,6 +6128,11 @@ namespace threepp {
             for (size_t i = 0; i < entries.size(); ++i) {
                 const MeshEntry& en = entries[i];
                 Mesh* m = en.mesh;
+                // Particle billboard meshes own their vertex buffers in the
+                // dedicated billboard pass — they need no BLAS and never enter
+                // the TLAS. Skip before the geometry-keyed build so we don't
+                // allocate (or per-frame refit) an AS for them.
+                if (en.isParticle) continue;
                 const BufferGeometry* geomKey = m->geometry().get();
 
                 // Skinned meshes get a per-instance deformed BLAS rather than
@@ -5520,6 +6157,13 @@ namespace threepp {
                     // contents (rest grid right now) become the displaced
                     // surface before the first ray-trace sees it.
                     refreshDisplacedBlas(*dm, *st, static_cast<float>(glfwGetTime()));
+                } else if (en.isGrass) {
+                    auto* gm = static_cast<GrassMesh*>(m);
+                    auto* st = ensureGrassState(*gm);
+                    if (!st) continue;
+                    recPtr = st->blas.get();
+                    // Prime the BLAS with the first wind pose before the first trace.
+                    refreshGrassBlas(*gm, *st, static_cast<float>(glfwGetTime()));
                 } else if (en.isTet) {
                     auto* st = ensureTetBlas(*m);
                     if (!st) continue;
@@ -5540,7 +6184,7 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), old->index);
                             destroyBuffer(ctx->allocator(), old->normal);
                             destroyBuffer(ctx->allocator(), old->uv);
-                            destroyBuffer(ctx->allocator(), old->foam);
+                            destroyBuffer(ctx->allocator(), old->color);
                             destroyBuffer(ctx->allocator(), old->prevVertex);
                             destroyBuffer(ctx->allocator(), old->blasScratch);
                             blasCache.erase(it);
@@ -5588,7 +6232,7 @@ namespace threepp {
                 gdesc.normalAddress = recPtr->normal.address;
                 gdesc.indexAddress  = recPtr->index.address;
                 gdesc.uvAddress     = recPtr->uv.address;// 0 if no UV attribute
-                gdesc.foamAddress   = recPtr->foam.address;// 0 unless this is an FFT-displaced ocean mesh
+                gdesc.foamAddress   = recPtr->isOceanSurface ? 1ull : 0ull;// 0/1 flag (not an address); 1 == FFT-displaced ocean surface
                 // prevVertexAddress: skinned + displaced meshes have a real
                 // prev-vertex buffer (different from current). Static meshes
                 // get vertex.address as a fallback — the chit reads the same
@@ -5610,6 +6254,15 @@ namespace threepp {
                                 ? recPtr->prevVertex.address
                                 : recPtr->vertex.address;
                 gdesc.indexed = recPtr->index.handle != VK_NULL_HANDLE ? 1u : 0u;
+                // Per-vertex color only when the material opts in (three.js
+                // semantics: vertexColors == true) AND the geometry uploaded a
+                // color buffer. 0 otherwise → chit skips the modulation.
+                {
+                    const auto mat = m->material();
+                    const bool useVtxColor = recPtr->color.handle != VK_NULL_HANDLE &&
+                                             mat && mat->vertexColors;
+                    gdesc.colorAddress = useVtxColor ? recPtr->color.address : 0;
+                }
                 gdesc._pad = 0;
                 geomDescs[i] = gdesc;
 
@@ -5745,10 +6398,22 @@ namespace threepp {
             // count exceeds the current capacity. The descriptor write below
             // (or the initial allocate, on first build) will pick up the new
             // buffer handles.
-            const uint32_t instanceCount = static_cast<uint32_t>(instances.size());
-            const uint32_t neededBitWords = std::max<uint32_t>((instanceCount + 31u) / 32u, 1u);
+            // motionMat[] and meshMovedBits[] are indexed by ENTRY index
+            // (== instanceCustomIndex == the meshID the gbuffer writes; see the
+            // geomDescs/matDescs "ONE index space" note above), NOT by the
+            // compact TLAS instance count. Size them to entries.size(): when
+            // leading entries are overlay (e.g. wireframe PointLightHelpers
+            // added to the scene before the PT meshes), the PT meshes land at
+            // entry indices >= instances.size(), so a buffer sized to the
+            // instance count is read out of bounds in the shader — a GPU fault
+            // that surfaces at the next AS one-shot fence wait (looks like a
+            // "tblas refit" crash). computeAndUploadMotionMatrices uploads
+            // entries.size() matrices, so the instance-count sizing overflowed
+            // the host buffer too.
+            const uint32_t motionSlots    = static_cast<uint32_t>(entries.size());
+            const uint32_t neededBitWords = std::max<uint32_t>((motionSlots + 31u) / 32u, 1u);
             for (uint32_t f = 0; f < kFramesInFlight; ++f) {
-                ensureMotionMatCapacity(f, std::max<uint32_t>(instanceCount, 1u));
+                ensureMotionMatCapacity(f, std::max<uint32_t>(motionSlots, 1u));
                 ensureMeshMovedBitsCapacity(f, neededBitWords);
             }
             meshMovedBits_.resize(neededBitWords, 0u);
@@ -6481,6 +7146,13 @@ namespace threepp {
                     return it->second->blas.get();
                 return nullptr;
             }
+            if (en.isGrass) {
+                auto* gm = static_cast<GrassMesh*>(en.mesh);
+                auto it = grassStates.find(gm);
+                if (it != grassStates.end() && it->second->blas)
+                    return it->second->blas.get();
+                return nullptr;
+            }
             if (en.isTet) {
                 auto it = tetMeshStates.find(en.mesh);
                 if (it != tetMeshStates.end() && it->second->blas)
@@ -6567,6 +7239,11 @@ namespace threepp {
             // the raster prepass + TAA used so wireframes register pixel-
             // exact with the post-TAA path-traced silhouette.
             std::memcpy(currVPunjit_.data(), vpUnj.elements.data(), 64);
+            // Mirror the unjittered view + reverse-Z projection separately for
+            // the particle billboard pass (it can't use the combined VP — see
+            // currViewUnjit_/currProjUnjit_).
+            std::memcpy(currViewUnjit_.data(), view.elements.data(), 64);
+            std::memcpy(currProjUnjit_.data(), proj.elements.data(), 64);
             // First frame: self-seed prevVP so motion vectors are zero. The
             // following frame picks up the real history.
             std::memcpy(ubo.prevVP,
@@ -6708,12 +7385,13 @@ namespace threepp {
             uint64_t uvAddr;           // 8
             uint64_t prevPosAddr;      // 8
             uint64_t indexAddr;        // 8 (0 → non-indexed)
+            uint64_t colorAddr;        // 8 (0 → no per-vertex color / vertexColors off)
             uint32_t instanceCustomIndex;
             uint32_t flags;
             uint32_t indexed;
             float    polygonOffset;    // clip-z depth bias (reverse-Z: + = toward near = on top)
         };
-        static_assert(sizeof(DrawInfoGpu) == 120,
+        static_assert(sizeof(DrawInfoGpu) == 128,
                       "DrawInfoGpu layout drifted from gbuffer_indirect.vert");
 
         // Per-cull-mode dispatch span into indirectCmdBuffers[frame].
@@ -6838,6 +7516,16 @@ namespace threepp {
                                          ? rec->prevVertex.address
                                          : rec->vertex.address;
                 di.indexAddr   = indexed ? rec->index.address : 0ull;
+                // Per-vertex color: only when the material opts in (vertexColors)
+                // and the geometry uploaded a color buffer — matches the
+                // GeometryDesc::colorAddress gate so RasterFirst and ReferencePT
+                // agree. gbuffer.frag multiplies albedo by the interpolated value.
+                {
+                    const auto dmat = en.mesh->material();
+                    di.colorAddr = (rec->color.handle != VK_NULL_HANDLE && dmat && dmat->vertexColors)
+                                           ? rec->color.address
+                                           : 0ull;
+                }
                 di.instanceCustomIndex = static_cast<uint32_t>(i);
                 // Flag bits match the old gbuffer.vert push-constant layout:
                 //   bit 0 = is_water (DisplacedMesh), bit 3 = is_skinned.
@@ -6973,17 +7661,21 @@ namespace threepp {
             rpbi.pClearValues    = clears;
             vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
+            // Split-screen: draw the pane region-sized at the origin (the render
+            // pass still clears the whole gbuf, so outside the pane reads as sky).
+            // regionRenderExt_ == full render extent when scissorTest is off.
+            const VkExtent2D gbufReg = regionRenderExt_;
             VkViewport viewport{};
             viewport.x = 0.f;
             viewport.y = 0.f;
-            viewport.width  = float(ext.width);
-            viewport.height = float(ext.height);
+            viewport.width  = float(gbufReg.width);
+            viewport.height = float(gbufReg.height);
             viewport.minDepth = 0.f;
             viewport.maxDepth = 1.f;
             vkCmdSetViewport(cb, 0, 1, &viewport);
             VkRect2D scissor{};
             scissor.offset = {0, 0};
-            scissor.extent = ext;
+            scissor.extent = gbufReg;
             vkCmdSetScissor(cb, 0, 1, &scissor);
 
             if (indirectTotalDraws_ == 0u) {
@@ -7111,10 +7803,15 @@ namespace threepp {
             }
 
             // Restore src attachment to its original SHADER_READ layout (so
-            // raygen can sample on the next frame). Leave dst in
-            // TRANSFER_DST_OPTIMAL — the caller in recordCommandBuffer
-            // handles the overlay (ImGui) draw and the final PRESENT_SRC
-            // transition uniformly with the existing PT path.
+            // raygen can sample on the next frame), and bring dst (the
+            // swapchain) to GENERAL — the SAME exit layout the full PT path
+            // leaves behind. The caller returns immediately after this, so
+            // endFrame()'s recordOverlayAndPresentTransition (which assumes
+            // GENERAL) composites the overlay and does the single PRESENT_SRC
+            // transition uniformly with the PT path. Leaving dst in
+            // TRANSFER_DST here (the old behavior) collided with that unified
+            // finalize — double vkEndCommandBuffer + a GENERAL-vs-TRANSFER_DST
+            // layout mismatch that crashed the --shot writeFramebuffer readback.
             VkImageMemoryBarrier2 toShaderRead{};
             toShaderRead.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
             toShaderRead.srcStageMask  = VK_PIPELINE_STAGE_2_BLIT_BIT;
@@ -7130,10 +7827,38 @@ namespace threepp {
             toShaderRead.subresourceRange.levelCount = 1;
             toShaderRead.subresourceRange.layerCount = 1;
 
+            // dst: TRANSFER_DST_OPTIMAL → GENERAL. For the Depth view the blit
+            // above is skipped, but toDst still moved dst to TRANSFER_DST, so
+            // this transition is valid for every view. dstStage/access mirror
+            // the ortho-only clear path's TRANSFER_DST→GENERAL transition so the
+            // downstream overlay/present/readback all observe a settled image.
+            VkImageMemoryBarrier2 toGeneral{};
+            toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            toGeneral.srcStageMask  = VK_PIPELINE_STAGE_2_BLIT_BIT;
+            toGeneral.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+            toGeneral.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                      VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+            toGeneral.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                      VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                      VK_ACCESS_2_TRANSFER_READ_BIT |
+                                      VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                      VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+            toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toGeneral.image = dst;
+            toGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toGeneral.subresourceRange.levelCount = 1;
+            toGeneral.subresourceRange.layerCount = 1;
+
+            VkImageMemoryBarrier2 post[2] = {toShaderRead, toGeneral};
             VkDependencyInfo depPost{};
             depPost.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            depPost.imageMemoryBarrierCount = 1;
-            depPost.pImageMemoryBarriers = &toShaderRead;
+            depPost.imageMemoryBarrierCount = 2;
+            depPost.pImageMemoryBarriers = post;
             vkCmdPipelineBarrier2(cb, &depPost);
         }
 
@@ -7555,6 +8280,188 @@ namespace threepp {
                 ctx->setObjectName(out.view,  debugName);
             }
             return out;
+        }
+
+        // ── ParticleSystem billboard resources ──────────────────────────────
+
+        // Lazily build the 1×1 white texel bound for untextured particle
+        // systems (matches the GL path, where an unset `tex` sampler reads
+        // white). Created once; freed in deinit.
+        void ensureParticleWhiteTexture() {
+            if (particleWhiteTex_.view != VK_NULL_HANDLE) return;
+            const uint8_t white[4] = {255, 255, 255, 255};
+            particleWhiteTex_ = createSampledImage2D(
+                    1, 1, VK_FORMAT_R8G8B8A8_UNORM, white, sizeof(white),
+                    VK_FILTER_LINEAR,
+                    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                    "particleWhiteDefault");
+        }
+
+        // Upload/refresh a particle texture, keyed on the raw Texture* (the
+        // ShaderMaterial uniform holds no shared_ptr). Returns the cached
+        // Image2D, or nullptr (caller falls back to the white default). Mirrors
+        // OverlayPass::ensureSpriteAtlasTexture, minus the weak_ptr liveCheck.
+        const Image2D* ensureParticleTexture(const Texture* tex) {
+            if (!tex) return nullptr;
+            Image& img = const_cast<Texture*>(tex)->image();
+            const uint32_t w = img.width();
+            const uint32_t h = img.height();
+            if (w == 0 || h == 0) return nullptr;
+
+            const unsigned int curVersion = tex->version();
+            auto it = particleTexCache_.find(tex);
+            if (it != particleTexCache_.end()) {
+                ParticleTexRec& rec = it->second;
+                const bool stale = rec.version != curVersion ||
+                                   rec.width != w || rec.height != h;
+                if (!stale) return &rec.image;
+                vkDeviceWaitIdle(ctx->device());
+                destroyImage2D(ctx->allocator(), ctx->device(), rec.image);
+                particleTexCache_.erase(it);
+            }
+
+            std::vector<unsigned char> rgba;
+            const size_t pixels = static_cast<size_t>(w) * h;
+            try {
+                auto& src = img.data<unsigned char>();
+                if (src.size() == pixels * 4) {
+                    rgba.assign(src.begin(), src.end());
+                } else if (src.size() == pixels * 3) {
+                    rgba.resize(pixels * 4);
+                    for (size_t i = 0; i < pixels; ++i) {
+                        rgba[i * 4 + 0] = src[i * 3 + 0];
+                        rgba[i * 4 + 1] = src[i * 3 + 1];
+                        rgba[i * 4 + 2] = src[i * 3 + 2];
+                        rgba[i * 4 + 3] = 255u;
+                    }
+                } else {
+                    return nullptr;
+                }
+            } catch (const std::bad_variant_access&) {
+                return nullptr;
+            }
+
+            // Same colorSpace→format rule as the sprite/bindless paths: only an
+            // explicitly sRGB-tagged texture gets hardware sRGB decode on sample;
+            // particle.frag re-encodes the linear product for the UNORM swapchain.
+            const VkFormat fmt = (tex->colorSpace == ColorSpace::sRGB)
+                                         ? VK_FORMAT_R8G8B8A8_SRGB
+                                         : VK_FORMAT_R8G8B8A8_UNORM;
+            char name[64];
+            std::snprintf(name, sizeof(name), "particleTex[%p]",
+                          static_cast<const void*>(tex));
+            Image2D up = createSampledImage2D(
+                    w, h, fmt, rgba.data(), rgba.size(),
+                    VK_FILTER_LINEAR,
+                    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                    VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                    name);
+            ParticleTexRec rec{};
+            rec.image   = up;
+            rec.version = curVersion;
+            rec.width   = w;
+            rec.height  = h;
+            auto [ins, _] = particleTexCache_.emplace(tex, std::move(rec));
+            return &ins->second.image;
+        }
+
+        void destroyParticleGeomRec(ParticleGeomRec& rec) {
+            destroyBuffer(ctx->allocator(), rec.position);
+            destroyBuffer(ctx->allocator(), rec.normal);
+            destroyBuffer(ctx->allocator(), rec.uv);
+            destroyBuffer(ctx->allocator(), rec.color);
+            destroyBuffer(ctx->allocator(), rec.index);
+        }
+
+        // Ensure the per-geometry particle vertex/index buffers exist and the
+        // animated attributes (position/normal/color) are current. uv + index
+        // are static (uploaded once). Returns nullptr on malformed geometry.
+        ParticleGeomRec* ensureParticleGeom(const std::shared_ptr<BufferGeometry>& geomSp) {
+            BufferGeometry* geom = geomSp.get();
+            if (!geom) return nullptr;
+            auto* posAttr  = geom->getAttribute<float>("position");
+            auto* normAttr = geom->getAttribute<float>("normal");
+            auto* uvAttr   = geom->getAttribute<float>("uv");
+            auto* colAttr  = geom->getAttribute<float>("color");
+            auto* idxAttr  = geom->getIndex();
+            if (!posAttr || !normAttr || !uvAttr || !colAttr || !idxAttr) return nullptr;
+
+            const uint32_t vtx = static_cast<uint32_t>(posAttr->count());
+            const uint32_t idxCount = static_cast<uint32_t>(idxAttr->count());
+            if (vtx == 0 || idxCount == 0) return nullptr;
+            // Particle attributes are vec3/vec3/vec2/vec3 — bail if a custom
+            // geometry doesn't match (the billboard pipeline assumes this layout).
+            if (normAttr->count() != static_cast<int>(vtx) ||
+                uvAttr->count()   != static_cast<int>(vtx) ||
+                colAttr->count()  != static_cast<int>(vtx)) return nullptr;
+
+            const unsigned int ver = geomVersionOf(*geom);
+
+            auto uploadAnim = [&](ParticleGeomRec& rec) {
+                void* m = nullptr;
+                vmaMapMemory(ctx->allocator(), rec.position.alloc, &m);
+                std::memcpy(m, posAttr->array().data(), vtx * 3 * sizeof(float));
+                vmaUnmapMemory(ctx->allocator(), rec.position.alloc);
+                vmaMapMemory(ctx->allocator(), rec.normal.alloc, &m);
+                std::memcpy(m, normAttr->array().data(), vtx * 3 * sizeof(float));
+                vmaUnmapMemory(ctx->allocator(), rec.normal.alloc);
+                vmaMapMemory(ctx->allocator(), rec.color.alloc, &m);
+                std::memcpy(m, colAttr->array().data(), vtx * 3 * sizeof(float));
+                vmaUnmapMemory(ctx->allocator(), rec.color.alloc);
+            };
+
+            auto it = particleGeomCache_.find(geom);
+            if (it != particleGeomCache_.end()) {
+                ParticleGeomRec& rec = it->second;
+                const bool stale = rec.vertexCount != vtx || rec.indexCount != idxCount ||
+                                   rec.liveCheck.expired() || rec.liveCheck.lock().get() != geom;
+                if (!stale) {
+                    if (rec.animVersion != ver) {
+                        uploadAnim(rec);
+                        rec.animVersion = ver;
+                    }
+                    return &rec;
+                }
+                // Topology change / recycled address — rebuild from scratch.
+                vkDeviceWaitIdle(ctx->device());
+                destroyParticleGeomRec(rec);
+                particleGeomCache_.erase(it);
+            }
+
+            // Fresh build. All buffers host-visible; pos/normal/color re-uploaded
+            // each frame, uv + index written once here.
+            const VkBufferUsageFlags vbUsage =
+                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            ParticleGeomRec rec{};
+            rec.vertexCount = vtx;
+            rec.indexCount  = idxCount;
+            rec.liveCheck   = geomSp;
+            auto mkBuf = [&](VkDeviceSize bytes) {
+                return createBuffer(ctx->allocator(), ctx->device(), bytes, vbUsage,
+                                    VMA_MEMORY_USAGE_AUTO,
+                                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            };
+            rec.position = mkBuf(vtx * 3 * sizeof(float));
+            rec.normal   = mkBuf(vtx * 3 * sizeof(float));
+            rec.uv       = mkBuf(vtx * 2 * sizeof(float));
+            rec.color    = mkBuf(vtx * 3 * sizeof(float));
+            rec.index    = createBuffer(ctx->allocator(), ctx->device(),
+                                        idxCount * sizeof(uint32_t),
+                                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                        VMA_MEMORY_USAGE_AUTO,
+                                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            void* m = nullptr;
+            vmaMapMemory(ctx->allocator(), rec.uv.alloc, &m);
+            std::memcpy(m, uvAttr->array().data(), vtx * 2 * sizeof(float));
+            vmaUnmapMemory(ctx->allocator(), rec.uv.alloc);
+            vmaMapMemory(ctx->allocator(), rec.index.alloc, &m);
+            std::memcpy(m, idxAttr->array().data(), idxCount * sizeof(uint32_t));
+            vmaUnmapMemory(ctx->allocator(), rec.index.alloc);
+            auto [ins, _] = particleGeomCache_.emplace(geom, std::move(rec));
+            uploadAnim(ins->second);
+            ins->second.animVersion = ver;
+            return &ins->second;
         }
 
         // Storage-image (rgba32f, GENERAL layout) used as the
@@ -8137,7 +9044,8 @@ namespace threepp {
         }
 
         void createRasterDsLayoutAndPool() {
-            // binding 0: per-frame CameraUbo (vertex)
+            // binding 0: per-frame CameraUbo (vertex + fragment — gbuffer.frag
+            //            reads cam.jitter for the alpha-hash cutout discard)
             // binding 1: motionMat[] storage (vertex; same VkBuffer as raygen's binding 10)
             // binding 2: mats[] storage (fragment; for normal-map index + uvTransformNormal)
             // binding 3: albedoMaps[] bindless sampler array (fragment;
@@ -8150,7 +9058,7 @@ namespace threepp {
             bindings[0].binding         = 0;
             bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             bindings[0].descriptorCount = 1;
-            bindings[0].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
+            bindings[0].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             bindings[1].binding         = 1;
             bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[1].descriptorCount = 1;
@@ -8357,7 +9265,7 @@ namespace threepp {
             gpci.layout              = rasterPipelineLayout;
             gpci.renderPass          = rasterGbufRenderPass;
             gpci.subpass             = 0;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpci, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
                                             &rasterGbufPipeline),
                   "vkCreateGraphicsPipelines(rasterGbuf)");
 
@@ -8406,7 +9314,7 @@ namespace threepp {
             gpciInd.pStages           = stagesInd;
             gpciInd.pVertexInputState = &viInd;
 
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciInd, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciInd, nullptr,
                                             &rasterGbufIndirectPipeline),
                   "vkCreateGraphicsPipelines(rasterGbufIndirect)");
 
@@ -8452,7 +9360,7 @@ namespace threepp {
             gpciDecal.pStages            = stagesDecal;
             gpciDecal.pDepthStencilState = &dsDecal;
             gpciDecal.pColorBlendState   = &cbDecal;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciDecal, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDecal, nullptr,
                                             &rasterGbufDecalPipeline),
                   "vkCreateGraphicsPipelines(rasterGbufDecal)");
 
@@ -8612,7 +9520,7 @@ namespace threepp {
             gpci.pColorBlendState    = &cb;
             gpci.pDynamicState       = &dyn;
             gpci.layout              = overlayPipelineLayout;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpci, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
                                             &overlayWireframePipeline),
                   "vkCreateGraphicsPipelines(overlayWireframe)");
 
@@ -8626,7 +9534,7 @@ namespace threepp {
             rsBasic.cullMode    = VK_CULL_MODE_BACK_BIT;
             VkGraphicsPipelineCreateInfo gpciBasic = gpci;
             gpciBasic.pRasterizationState = &rsBasic;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciBasic, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasic, nullptr,
                                             &overlayBasicPipeline),
                   "vkCreateGraphicsPipelines(overlayBasic)");
 
@@ -8655,7 +9563,7 @@ namespace threepp {
             cbBlend.pAttachments    = &cbasBlend;
             VkGraphicsPipelineCreateInfo gpciBasicTr = gpciBasic;
             gpciBasicTr.pColorBlendState = &cbBlend;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciBasicTr, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicTr, nullptr,
                                             &overlayBasicTransparentPipeline),
                   "vkCreateGraphicsPipelines(overlayBasicTransparent)");
 
@@ -8675,7 +9583,7 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciLineList = gpci;
             gpciLineList.pInputAssemblyState = &iaLineList;
             gpciLineList.pRasterizationState = &rsLine;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciLineList, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineList, nullptr,
                                             &overlayLineListPipeline),
                   "vkCreateGraphicsPipelines(overlayLineList)");
 
@@ -8685,7 +9593,7 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciLineStrip = gpci;
             gpciLineStrip.pInputAssemblyState = &iaLineStrip;
             gpciLineStrip.pRasterizationState = &rsLine;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciLineStrip, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStrip, nullptr,
                                             &overlayLineStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStrip)");
 
@@ -8745,7 +9653,7 @@ namespace threepp {
             gpciLineListColored.stageCount        = 2;
             gpciLineListColored.pStages           = cStages;
             gpciLineListColored.pVertexInputState = &cvi;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciLineListColored, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListColored, nullptr,
                                             &overlayLineListColoredPipeline),
                   "vkCreateGraphicsPipelines(overlayLineListColored)");
 
@@ -8753,7 +9661,7 @@ namespace threepp {
             gpciLineStripColored.stageCount        = 2;
             gpciLineStripColored.pStages           = cStages;
             gpciLineStripColored.pVertexInputState = &cvi;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciLineStripColored, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripColored, nullptr,
                                             &overlayLineStripColoredPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStripColored)");
 
@@ -8799,7 +9707,7 @@ namespace threepp {
             gpciPointList.pStages           = pStages;
             gpciPointList.pVertexInputState = &cvi;
             gpciPointList.pInputAssemblyState = &iaPointList;
-            check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &gpciPointList, nullptr,
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciPointList, nullptr,
                                             &overlayPointListPipeline),
                   "vkCreateGraphicsPipelines(overlayPointList)");
 
@@ -8923,13 +9831,389 @@ namespace threepp {
                 dgpci.pColorBlendState    = &dcb;
                 dgpci.pDynamicState       = &ddyn;
                 dgpci.layout              = rasterPipelineLayout;
-                check(vkCreateGraphicsPipelines(ctx->device(), VK_NULL_HANDLE, 1, &dgpci, nullptr,
+                check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &dgpci, nullptr,
                                                 &overlayDepthPrepassPipeline),
                       "vkCreateGraphicsPipelines(overlayDepthPrepass)");
 
                 vkDestroyShaderModule(ctx->device(), dvert, nullptr);
                 vkDestroyShaderModule(ctx->device(), dfrag, nullptr);
             }
+        }
+
+        // ParticleSystem billboard pipelines. Two variants (alpha-blended /
+        // additive) that differ only in blend + depth-test state. Both: 4 vertex
+        // bindings (pos/normal/uv/color), a combined-image-sampler set 0, a 128B
+        // push constant (modelView + proj), dynamic viewport/scissor, dynamic
+        // rendering onto the swapchain + unjitDepth (read-only). Modeled on
+        // createOverlayPipeline + OverlayPass::createSpriteOverlayPipeline.
+        void createParticlePipeline() {
+            if (particlePipelineNormal_ != VK_NULL_HANDLE) return;
+
+            // set 0, binding 0: combined image sampler (particle texture).
+            VkDescriptorSetLayoutBinding b{};
+            b.binding         = 0;
+            b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            b.descriptorCount = 1;
+            b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo dslci{};
+            dslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            dslci.bindingCount = 1;
+            dslci.pBindings    = &b;
+            check(vkCreateDescriptorSetLayout(ctx->device(), &dslci, nullptr, &particleDescSetLayout_),
+                  "vkCreateDescriptorSetLayout(particle)");
+
+            VkPushConstantRange pcRange{};
+            pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            pcRange.offset     = 0;
+            pcRange.size       = 128;// mat4 modelView (64) + mat4 proj (64)
+            VkPipelineLayoutCreateInfo plci{};
+            plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            plci.setLayoutCount         = 1;
+            plci.pSetLayouts            = &particleDescSetLayout_;
+            plci.pushConstantRangeCount = 1;
+            plci.pPushConstantRanges    = &pcRange;
+            check(vkCreatePipelineLayout(ctx->device(), &plci, nullptr, &particlePipelineLayout_),
+                  "vkCreatePipelineLayout(particle)");
+
+            for (uint32_t f = 0; f < kFramesInFlight; ++f) {
+                VkDescriptorPoolSize ps{};
+                ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                ps.descriptorCount = kMaxParticleTexPerFrame;
+                VkDescriptorPoolCreateInfo dpci{};
+                dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                dpci.maxSets       = kMaxParticleTexPerFrame;
+                dpci.poolSizeCount = 1;
+                dpci.pPoolSizes    = &ps;
+                check(vkCreateDescriptorPool(ctx->device(), &dpci, nullptr, &particleDescPools_[f]),
+                      "vkCreateDescriptorPool(particle)");
+            }
+
+            VkShaderModuleCreateInfo vsmci{};
+            vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vsmci.codeSize = sizeof(kParticleVertSpv);
+            vsmci.pCode    = kParticleVertSpv;
+            VkShaderModule vert = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &vsmci, nullptr, &vert),
+                  "vkCreateShaderModule(particle.vert)");
+            VkShaderModuleCreateInfo fsmci{};
+            fsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fsmci.codeSize = sizeof(kParticleFragSpv);
+            fsmci.pCode    = kParticleFragSpv;
+            VkShaderModule frag = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &fsmci, nullptr, &frag),
+                  "vkCreateShaderModule(particle.frag)");
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vert;
+            stages[0].pName  = "main";
+            stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = frag;
+            stages[1].pName  = "main";
+
+            // 4 separate vertex bindings: pos(0), normal(1), uv(2), color(3).
+            VkVertexInputBindingDescription vibs[4]{};
+            vibs[0].binding = 0; vibs[0].stride = 3 * sizeof(float); vibs[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[1].binding = 1; vibs[1].stride = 3 * sizeof(float); vibs[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[2].binding = 2; vibs[2].stride = 2 * sizeof(float); vibs[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[3].binding = 3; vibs[3].stride = 3 * sizeof(float); vibs[3].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            VkVertexInputAttributeDescription vias[4]{};
+            vias[0].location = 0; vias[0].binding = 0; vias[0].format = VK_FORMAT_R32G32B32_SFLOAT; vias[0].offset = 0;
+            vias[1].location = 1; vias[1].binding = 1; vias[1].format = VK_FORMAT_R32G32B32_SFLOAT; vias[1].offset = 0;
+            vias[2].location = 2; vias[2].binding = 2; vias[2].format = VK_FORMAT_R32G32_SFLOAT;    vias[2].offset = 0;
+            vias[3].location = 3; vias[3].binding = 3; vias[3].format = VK_FORMAT_R32G32B32_SFLOAT; vias[3].offset = 0;
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vi.vertexBindingDescriptionCount   = 4;
+            vi.pVertexBindingDescriptions      = vibs;
+            vi.vertexAttributeDescriptionCount = 4;
+            vi.pVertexAttributeDescriptions    = vias;
+
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount  = 1;
+
+            // Side::Double — particles are billboards, draw both faces.
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode    = VK_CULL_MODE_NONE;
+            rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth   = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dyn{};
+            dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dyn.dynamicStateCount = 2;
+            dyn.pDynamicStates    = dynStates;
+
+            const VkFormat colorFmt = ctx->swapchainFormat();
+            VkPipelineRenderingCreateInfo prci{};
+            prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            prci.colorAttachmentCount    = 1;
+            prci.pColorAttachmentFormats = &colorFmt;
+            prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
+
+            // ── Normal variant: non-premultiplied alpha, depth-tested ──────────
+            // depthTest GREATER_OR_EQUAL (reverse-Z) so particles are occluded by
+            // scene geometry; depthWrite OFF (transparent, read-only unjitDepth).
+            VkPipelineDepthStencilStateCreateInfo dsNormal{};
+            dsNormal.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            dsNormal.depthTestEnable  = VK_TRUE;
+            dsNormal.depthWriteEnable = VK_FALSE;
+            dsNormal.depthCompareOp   = VK_COMPARE_OP_GREATER_OR_EQUAL;
+
+            VkPipelineColorBlendAttachmentState cbasAlpha{};
+            cbasAlpha.blendEnable         = VK_TRUE;
+            cbasAlpha.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            cbasAlpha.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cbasAlpha.colorBlendOp        = VK_BLEND_OP_ADD;
+            cbasAlpha.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cbasAlpha.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cbasAlpha.alphaBlendOp        = VK_BLEND_OP_ADD;
+            cbasAlpha.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cbAlpha{};
+            cbAlpha.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cbAlpha.attachmentCount = 1;
+            cbAlpha.pAttachments    = &cbasAlpha;
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.pNext               = &prci;
+            gpci.stageCount          = 2;
+            gpci.pStages             = stages;
+            gpci.pVertexInputState   = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState      = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState   = &ms;
+            gpci.pDepthStencilState  = &dsNormal;
+            gpci.pColorBlendState    = &cbAlpha;
+            gpci.pDynamicState       = &dyn;
+            gpci.layout              = particlePipelineLayout_;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
+                                            &particlePipelineNormal_),
+                  "vkCreateGraphicsPipelines(particleNormal)");
+
+            // ── Additive variant: src·srcAlpha + dst, depth-test OFF ───────────
+            // Matches ParticleSystem's depthTest=false for non-Normal blending
+            // (fireball / firework draw over the scene).
+            VkPipelineDepthStencilStateCreateInfo dsAdd = dsNormal;
+            dsAdd.depthTestEnable = VK_FALSE;
+            VkPipelineColorBlendAttachmentState cbasAdd = cbasAlpha;
+            cbasAdd.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+            cbasAdd.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cbasAdd.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            VkPipelineColorBlendStateCreateInfo cbAdd = cbAlpha;
+            cbAdd.pAttachments = &cbasAdd;
+            VkGraphicsPipelineCreateInfo gpciAdd = gpci;
+            gpciAdd.pDepthStencilState = &dsAdd;
+            gpciAdd.pColorBlendState   = &cbAdd;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciAdd, nullptr,
+                                            &particlePipelineAdditive_),
+                  "vkCreateGraphicsPipelines(particleAdditive)");
+
+            vkDestroyShaderModule(ctx->device(), vert, nullptr);
+            vkDestroyShaderModule(ctx->device(), frag, nullptr);
+
+            ensureParticleWhiteTexture();
+            createSpriteWorldPipeline();
+        }
+
+        // World-space Sprite billboard pipeline. Perspective billboard
+        // (sprite3d.vert) + the shared overlay_sprite.frag, alpha-blended and
+        // depth-tested against unjitDepth (occluded by scene geometry,
+        // depth-write off). Reuses particlePipelineLayout_ (128B SpritePC + set-0
+        // sampler) and builds the shared static quad. Called from
+        // createParticlePipeline so the shared layout already exists.
+        void createSpriteWorldPipeline() {
+            if (spriteWorldPipeline_ != VK_NULL_HANDLE) return;
+
+            // Shared canonical quad: 4 interleaved (pos.xyz, uv.xy) verts +
+            // 6 indices — matches Sprite's geometry (src/objects/Sprite.cpp).
+            {
+                static const float quad[] = {
+                        -0.5f, -0.5f, 0.f, 0.f, 0.f,
+                         0.5f, -0.5f, 0.f, 1.f, 0.f,
+                         0.5f,  0.5f, 0.f, 1.f, 1.f,
+                        -0.5f,  0.5f, 0.f, 0.f, 1.f};
+                static const uint32_t idx[] = {0, 1, 2, 0, 2, 3};
+                spriteQuadVtx_ = createBuffer(
+                        ctx->allocator(), ctx->device(), sizeof(quad),
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                spriteQuadIdx_ = createBuffer(
+                        ctx->allocator(), ctx->device(), sizeof(idx),
+                        VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                void* m = nullptr;
+                vmaMapMemory(ctx->allocator(), spriteQuadVtx_.alloc, &m);
+                std::memcpy(m, quad, sizeof(quad));
+                vmaUnmapMemory(ctx->allocator(), spriteQuadVtx_.alloc);
+                vmaMapMemory(ctx->allocator(), spriteQuadIdx_.alloc, &m);
+                std::memcpy(m, idx, sizeof(idx));
+                vmaUnmapMemory(ctx->allocator(), spriteQuadIdx_.alloc);
+            }
+
+            VkShaderModuleCreateInfo vsmci{};
+            vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vsmci.codeSize = sizeof(kSprite3dVertSpv);
+            vsmci.pCode    = kSprite3dVertSpv;
+            VkShaderModule vert = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &vsmci, nullptr, &vert),
+                  "vkCreateShaderModule(sprite3d.vert)");
+            VkShaderModuleCreateInfo fsmci{};
+            fsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fsmci.codeSize = sizeof(kOverlaySpriteFragSpv);
+            fsmci.pCode    = kOverlaySpriteFragSpv;
+            VkShaderModule frag = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &fsmci, nullptr, &frag),
+                  "vkCreateShaderModule(overlay_sprite.frag for sprite3d)");
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vert;
+            stages[0].pName  = "main";
+            stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = frag;
+            stages[1].pName  = "main";
+
+            // One interleaved binding: pos.xyz at 0, uv.xy at offset 12.
+            VkVertexInputBindingDescription vib{};
+            vib.binding   = 0;
+            vib.stride    = 5 * sizeof(float);
+            vib.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            VkVertexInputAttributeDescription vias[2]{};
+            vias[0].location = 0; vias[0].binding = 0; vias[0].format = VK_FORMAT_R32G32B32_SFLOAT; vias[0].offset = 0;
+            vias[1].location = 1; vias[1].binding = 0; vias[1].format = VK_FORMAT_R32G32_SFLOAT;    vias[1].offset = 3 * sizeof(float);
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vi.vertexBindingDescriptionCount   = 1;
+            vi.pVertexBindingDescriptions      = &vib;
+            vi.vertexAttributeDescriptionCount = 2;
+            vi.pVertexAttributeDescriptions    = vias;
+
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount  = 1;
+
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode    = VK_CULL_MODE_NONE;
+            rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth   = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            // Depth-tested (occluded by scene), depth-write off (transparent).
+            VkPipelineDepthStencilStateCreateInfo ds{};
+            ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            ds.depthTestEnable  = VK_TRUE;
+            ds.depthWriteEnable = VK_FALSE;
+            ds.depthCompareOp   = VK_COMPARE_OP_GREATER_OR_EQUAL;// reverse-Z
+
+            VkPipelineColorBlendAttachmentState cbas{};
+            cbas.blendEnable         = VK_TRUE;
+            cbas.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            cbas.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cbas.colorBlendOp        = VK_BLEND_OP_ADD;
+            cbas.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cbas.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cbas.alphaBlendOp        = VK_BLEND_OP_ADD;
+            cbas.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb{};
+            cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.attachmentCount = 1;
+            cb.pAttachments    = &cbas;
+
+            VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dyn{};
+            dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dyn.dynamicStateCount = 2;
+            dyn.pDynamicStates    = dynStates;
+
+            const VkFormat colorFmt = ctx->swapchainFormat();
+            VkPipelineRenderingCreateInfo prci{};
+            prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            prci.colorAttachmentCount    = 1;
+            prci.pColorAttachmentFormats = &colorFmt;
+            prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.pNext               = &prci;
+            gpci.stageCount          = 2;
+            gpci.pStages             = stages;
+            gpci.pVertexInputState   = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState      = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState   = &ms;
+            gpci.pDepthStencilState  = &ds;
+            gpci.pColorBlendState    = &cb;
+            gpci.pDynamicState       = &dyn;
+            gpci.layout              = particlePipelineLayout_;// 128B SpritePC + set-0 sampler
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
+                                            &spriteWorldPipeline_),
+                  "vkCreateGraphicsPipelines(spriteWorld)");
+
+            vkDestroyShaderModule(ctx->device(), vert, nullptr);
+            vkDestroyShaderModule(ctx->device(), frag, nullptr);
+        }
+
+        // Walk the scene for visible world-space Sprites (screenSpace == false)
+        // with a texture map, snapshotting their world transform + material into
+        // lastVisibleSprites_. Run every perspective frame (sprites move / spawn
+        // / expire constantly — no snapshot caching). Mirrors OverlayPass's
+        // sprite collection, minus the screen-space branch.
+        void collectWorldSprites(Object3D& scene) {
+            lastVisibleSprites_.clear();
+            scene.traverseVisible([&](Object3D& o) {
+                auto* sp = dynamic_cast<Sprite*>(&o);
+                if (!sp || sp->screenSpace) return;
+                auto mat = sp->material();
+                if (!mat || !mat->visible) return;
+                auto* mm = dynamic_cast<MaterialWithMap*>(mat.get());
+                if (!mm || !mm->map) return;// untextured world sprites aren't drawn
+                WorldSpriteEntry e{};
+                std::memcpy(e.world.data(), sp->matrixWorld->elements.data(), 64);
+                e.color = {1.f, 1.f, 1.f, 1.f};
+                if (auto* mc = dynamic_cast<MaterialWithColor*>(mat.get())) {
+                    e.color[0] = mc->color.r;
+                    e.color[1] = mc->color.g;
+                    e.color[2] = mc->color.b;
+                }
+                e.color[3] = mat->opacity;
+                if (auto* mr = dynamic_cast<MaterialWithRotation*>(mat.get())) {
+                    e.rotation = mr->rotation;
+                }
+                e.center = sp->center;
+                e.tex = mm->map.get();
+                lastVisibleSprites_.push_back(e);
+            });
         }
 
         // Line geometry cache shared between the ortho overlay (via
@@ -9290,6 +10574,9 @@ namespace threepp {
             if (overlayWireframePipeline == VK_NULL_HANDLE) {
                 createOverlayPipeline();
             }
+            if (particlePipelineNormal_ == VK_NULL_HANDLE) {
+                createParticlePipeline();
+            }
             // Raster G-buffer matches the PT render extent — in hybrid mode
             // raygen reads it 1:1 by launch coord, so it must launch at the
             // same resolution the gbuffer rasterized at.
@@ -9388,17 +10675,38 @@ namespace threepp {
             if (!texSp) return -1;
             const Texture* tex = texSp.get();
             if (auto it = textureCache.find(tex); it != textureCache.end()) {
-                return static_cast<int32_t>(it->second.second);
+                return static_cast<int32_t>(it->second.slot);
             }
             if (freeTextureSlots.empty() && materialTextures.size() >= kMaxMaterialTextures) {
                 std::cerr << "[VulkanRenderer] material texture slots exhausted ("
                           << kMaxMaterialTextures << "); using -1 fallback\n";
                 return -1;
             }
+            Image2D out = buildMaterialImage2D(tex);
+            if (!out.view) return -1;
+            uint32_t slot;
+            if (!freeTextureSlots.empty()) {
+                slot = freeTextureSlots.back();
+                freeTextureSlots.pop_back();
+                materialTextures[slot] = out;
+            } else {
+                slot = static_cast<uint32_t>(materialTextures.size());
+                materialTextures.push_back(out);
+            }
+            textureCache.emplace(tex, CachedTexture{std::weak_ptr<Texture>(texSp), slot, tex->version()});
+            return static_cast<int32_t>(slot);
+        }
+
+        // Build a tightly-packed RGBA8 sampled image from a material texture's
+        // CPU image (BCn decompress / channel pad / float quantize). Returns a
+        // null Image2D ({}) on unsupported/degenerate input. Slot-agnostic so the
+        // initial upload (ensureMaterialTexture) and the in-place re-upload
+        // (refreshDirtyMaterialTextures) share one code path.
+        Image2D buildMaterialImage2D(const Texture* tex) {
             Image& img = const_cast<Texture*>(tex)->image();
             const uint32_t w = img.width();
             const uint32_t h = img.height();
-            if (w == 0 || h == 0) return -1;
+            if (w == 0 || h == 0) return {};
 
             // Normalise everything to tightly-packed RGBA8. The pipeline
             // treats the bindless array as a uniform u8x4 sampler set, so
@@ -9421,7 +10729,7 @@ namespace threepp {
                     std::cerr << "[VulkanRenderer] unsupported compressed format 0x"
                               << std::hex << *img.compressedFormat << std::dec
                               << " for material tex (" << w << "x" << h << ")\n";
-                    return -1;
+                    return {};
                 }
                 srcPtr = bcnRgba.data();
                 channels = 4;
@@ -9432,13 +10740,13 @@ namespace threepp {
                     if (src.size() % pixels != 0) {
                         std::cerr << "[VulkanRenderer] unsupported pixel layout for material tex ("
                                   << src.size() << " bytes for " << w << "x" << h << ")\n";
-                        return -1;
+                        return {};
                     }
                     channels = static_cast<int>(src.size() / pixels);
                     if (channels < 1 || channels > 4) {
                         std::cerr << "[VulkanRenderer] unsupported channel count " << channels
                                   << " for material tex (" << w << "x" << h << ")\n";
-                        return -1;
+                        return {};
                     }
                     srcPtr = src.data();
                 } catch (const std::bad_variant_access&) {
@@ -9454,13 +10762,13 @@ namespace threepp {
                         std::cerr << "[VulkanRenderer] unsupported float-pixel layout for material tex ("
                                   << srcF.size() * sizeof(float) << " bytes for "
                                   << w << "x" << h << ")\n";
-                        return -1;
+                        return {};
                     }
                     const int fch = static_cast<int>(srcF.size() / pixels);
                     if (fch < 1 || fch > 4) {
                         std::cerr << "[VulkanRenderer] unsupported float channel count " << fch
                                   << " for material tex\n";
-                        return -1;
+                        return {};
                     }
                     rgba.resize(pixels * 4);
                     for (size_t i = 0; i < pixels; ++i) {
@@ -9507,34 +10815,52 @@ namespace threepp {
             const VkFormat fmt = (tex->colorSpace == ColorSpace::sRGB)
                                          ? VK_FORMAT_R8G8B8A8_SRGB
                                          : VK_FORMAT_R8G8B8A8_UNORM;
-            // Pre-compute the slot so the debug name can include it. The
-            // allocation order below (free list pop, else push_back) is
-            // mirrored in the actual assignment below.
-            const uint32_t plannedSlot = freeTextureSlots.empty()
-                    ? static_cast<uint32_t>(materialTextures.size())
-                    : freeTextureSlots.back();
             char texName[80];
             std::snprintf(texName, sizeof(texName),
-                          "materialTexture[%u] (%ux%u, tex=%p)",
-                          plannedSlot, w, h, static_cast<const void*>(tex));
-            Image2D out = createSampledImage2D(
+                          "materialTexture (%ux%u, tex=%p)",
+                          w, h, static_cast<const void*>(tex));
+            return createSampledImage2D(
                     w, h, fmt,
                     rgba.data(), rgba.size(),
                     VK_FILTER_LINEAR,
                     wrapToVk(tex->wrapS),
                     wrapToVk(tex->wrapT),
                     texName);
-            uint32_t slot;
-            if (!freeTextureSlots.empty()) {
-                slot = freeTextureSlots.back();
-                freeTextureSlots.pop_back();
-                materialTextures[slot] = out;
-            } else {
-                slot = static_cast<uint32_t>(materialTextures.size());
-                materialTextures.push_back(out);
+        }
+
+        // Re-upload any cached material texture whose Texture::version() changed
+        // since last upload (e.g. a DataTexture edited via setData + needsUpdate),
+        // in place at its existing bindless slot. ensureMaterialTexture caches by
+        // pointer and the bindless image array is only rewritten on a full scene
+        // rebuild, so without this a live texture edit would never reach the GPU.
+        // Cheap version scan each frame; only drains + rewrites when dirty.
+        void refreshDirtyMaterialTextures() {
+            bool any = false;
+            for (auto& kv : textureCache) {
+                const auto sp = kv.second.ref.lock();
+                if (sp && sp->version() != kv.second.version) { any = true; break; }
             }
-            textureCache.emplace(tex, std::make_pair(std::weak_ptr<Texture>(texSp), slot));
-            return static_cast<int32_t>(slot);
+            if (!any) return;
+            // Prior in-flight frames may still sample these images; drain first.
+            check(vkDeviceWaitIdle(ctx->device()), "vkDeviceWaitIdle (material texture refresh)");
+            for (auto& kv : textureCache) {
+                const auto sp = kv.second.ref.lock();
+                if (!sp || sp->version() == kv.second.version) continue;
+                if (kv.second.slot >= materialTextures.size()) continue;
+                Image2D rebuilt = buildMaterialImage2D(kv.first);
+                if (!rebuilt.view) continue;// keep the old image on failure
+                destroyImage2D(ctx->allocator(), ctx->device(), materialTextures[kv.second.slot]);
+                materialTextures[kv.second.slot] = rebuilt;// same slot index, new view
+                kv.second.version = sp->version();
+            }
+            // The bindless material array is referenced by three descriptor sets:
+            // the PT set (binding 8) and deferred-compute set (binding 11) are
+            // rewritten here; the gbuffer raster set (binding 3) is refreshed
+            // lazily by invalidating its per-frame validity flag. All three must
+            // see the new image views or the (default RasterFirst) gbuffer keeps
+            // sampling the freed view.
+            rewriteSceneDescriptors();
+            rasterMatTexValid_.fill(0);
         }
 
         // (Re)allocate envCdfImage / envMargImage from a built EnvCdfResult.
@@ -10637,7 +11963,7 @@ namespace threepp {
 
             const uint32_t idx = rtVariantIndex(useSer, restirDISpec);
             check(ctx->rt().createRayTracingPipelines(
-                          ctx->device(), VK_NULL_HANDLE, VK_NULL_HANDLE,
+                          ctx->device(), VK_NULL_HANDLE, ctx->pipelineCache(),
                           1, &rci, nullptr, &rtVariants_[idx].pipeline),
                   "vkCreateRayTracingPipelinesKHR (single)");
             createShaderBindingTable(useSer, restirDISpec);
@@ -11666,6 +12992,41 @@ namespace threepp {
         // endFrame transitions can rely on a known layout.
         void recordCommandBuffer(VkCommandBuffer cb, uint32_t imageIndex) {
 
+            // ── Split-screen pane region ───────────────────────────────────
+            // When scissorTest is on, clip the PT pane to the scissor sub-rect:
+            // render region-sized at the image origin (gbuf/raygen/denoise/bloom
+            // all read the members below), and offset only the final TAA write
+            // to the scissor position. Defaults to the full frame (byte-identical
+            // single-scene path) when scissorTest is off.
+            {
+                const VkExtent2D fullSwap   = ctx->swapchainExtent();
+                const VkExtent2D fullRender = renderExtent();
+                regionSwapExt_   = fullSwap;
+                regionRenderExt_ = fullRender;
+                regionDstX_ = 0;
+                regionDstY_ = 0;
+                if (scissorTest && scissor.z >= 1.f && scissor.w >= 1.f &&
+                    fullSwap.width > 0 && fullSwap.height > 0) {
+                    // Cap sx at width-1 (not width) so the sw clamp below always
+                    // has hi = width-sx >= 1; a degenerate scissor.x >= width
+                    // would otherwise make std::clamp(.., 1, 0) — lo > hi is UB.
+                    const int sx  = std::clamp(static_cast<int>(scissor.x), 0, static_cast<int>(fullSwap.width) - 1);
+                    const int sw  = std::clamp(static_cast<int>(scissor.z), 1, static_cast<int>(fullSwap.width) - sx);
+                    const int sh  = std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(fullSwap.height));
+                    const int syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(fullSwap.height) - sh);
+                    regionSwapExt_ = {static_cast<uint32_t>(sw), static_cast<uint32_t>(sh)};
+                    regionDstX_    = sx;
+                    // GL scissor y is from the bottom; the swapchain image is
+                    // top-left origin → flip. Full-height panes map to 0.
+                    regionDstY_    = static_cast<int>(fullSwap.height) - (syB + sh);
+                    regionRenderExt_ = {
+                            std::max(1u, static_cast<uint32_t>(std::lround(
+                                                 static_cast<double>(sw) * fullRender.width / fullSwap.width))),
+                            std::max(1u, static_cast<uint32_t>(std::lround(
+                                                 static_cast<double>(sh) * fullRender.height / fullSwap.height)))};
+                }
+            }
+
             // ── Skinned-mesh GPU pipeline ──────────────────────────────────
             // ensureSceneBuilt populated pendingSkinnedRebuilds_ with the
             // states whose bones changed this frame and uploaded the new
@@ -11910,6 +13271,54 @@ namespace threepp {
                 pendingTetRebuilds_.clear();
             }
 
+            // ── GrassMesh wind deform (GPU) + BLAS refit ────────────────────
+            // Recorded into the frame cb (no blocking submit), like the skinned
+            // and tet paths above. recordGrassDeform issues the grass_wind
+            // dispatch + a compute→AS barrier + the in-place BLAS refit per mesh;
+            // a final AS-write→RT-read barrier publishes the rebuilt geometry to
+            // the trace. (The TLAS sees last frame's bounds — fine for the small
+            // sway envelope, same 1-frame-late deal as skinned.)
+            if (!pendingGrassDeforms_.empty() && grassWind_) {
+                for (auto& [gm, st] : pendingGrassDeforms_) {
+                    recordGrassDeform(cb, *gm, *st);
+                }
+                VkMemoryBarrier2 mb{};
+                mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                mb.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                mb.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                                   VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                VkDependencyInfo dep{};
+                dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers    = &mb;
+                vkCmdPipelineBarrier2(cb, &dep);
+                pendingGrassDeforms_.clear();
+            }
+
+            // ── Per-frame TLAS refit ────────────────────────────────────────
+            // Recorded here (after every deformable BLAS rebuild above) instead
+            // of a mid-frame one-shot drain in ensureSceneBuilt — this is what
+            // removes the resolution-scaled stall (the old drain blocked on the
+            // previous frame's path trace). One submit per frame; CPU/GPU
+            // overlap restored.
+            if (pendingTlasRefit_) {
+                recordTlasRefit(cb, pendingTlasInstances_, pendingTlasFullBuild_);
+                VkMemoryBarrier2 mb{};
+                mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                mb.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                mb.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                mb.dstStageMask  = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                VkDependencyInfo dep{};
+                dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                dep.memoryBarrierCount = 1;
+                dep.pMemoryBarriers    = &mb;
+                vkCmdPipelineBarrier2(cb, &dep);
+                pendingTlasRefit_ = false;
+            }
+
             // ── Hybrid raster G-buffer pass ─────────────────────────────────
             // Runs ahead of any RT work so the gbuffer is ready when raygen
             // wants to read primary visibility. In G-buffer debug mode we blit
@@ -11983,9 +13392,16 @@ namespace threepp {
                     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                             rasterPipelineLayout, 0, 1,
                                             &rasterDescSets[currentFrame], 0, nullptr);
-                    VkViewport dvp{0.f, 0.f, float(dext.width), float(dext.height), 0.f, 1.f};
+                    // Split-screen: clip the overlay depth prepass to the pane
+                    // region. unjitDepth is full-res but the PT pane lands at
+                    // regionDst (size regionSwapExt) after the TAA write, so the
+                    // overlay's occluder depth must be laid down at the same
+                    // place the color pass reads it. Both default to the full
+                    // frame when scissorTest is off (byte-identical single-scene).
+                    VkViewport dvp{float(regionDstX_), float(regionDstY_),
+                                   float(regionSwapExt_.width), float(regionSwapExt_.height), 0.f, 1.f};
                     vkCmdSetViewport(cb, 0, 1, &dvp);
-                    VkRect2D dsc{{0, 0}, dext};
+                    VkRect2D dsc{{regionDstX_, regionDstY_}, regionSwapExt_};
                     vkCmdSetScissor(cb, 0, 1, &dsc);
 
                     for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
@@ -12053,94 +13469,16 @@ namespace threepp {
                     gpuTimings_->end(cb, TP_OverlayDepth, currentFrame);
                 }
                 if (hybridDebugView_ != HybridDebugView::Off) {
+                    // Blit the chosen G-buffer channel to the swapchain and
+                    // leave it in GENERAL with the cmd buffer still open — the
+                    // exact exit contract of the full PT path. The shared
+                    // tail (overlayPass_ screen-space sprites in beginFrameForPT,
+                    // then endFrame()'s overlay composite + single PRESENT_SRC
+                    // transition + submit/present) finalizes the frame
+                    // uniformly. This keeps the --shot writeFramebuffer readback
+                    // (which expects PRESENT_SRC) consistent and avoids the
+                    // double vkEndCommandBuffer the bespoke finalize used to do.
                     recordHybridDebugBlit(cb, imageIndex, currentFrame);
-                    // Blit left swapchain in TRANSFER_DST_OPTIMAL. Same
-                    // overlay + present sequence the PT path uses, just
-                    // with a different srcLayout entering the transition.
-                    const VkImage swap = ctx->swapchainImages()[imageIndex];
-                    const VkExtent2D ext = ctx->swapchainExtent();
-                    if (overlayCallback) {
-                        VkImageMemoryBarrier2 toColor{};
-                        toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                        toColor.srcStageMask  = VK_PIPELINE_STAGE_2_BLIT_BIT;
-                        toColor.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                        toColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-                        toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-                                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                        toColor.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                        toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                        toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        toColor.image = swap;
-                        toColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                        toColor.subresourceRange.levelCount = 1;
-                        toColor.subresourceRange.layerCount = 1;
-                        VkDependencyInfo depColor{};
-                        depColor.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                        depColor.imageMemoryBarrierCount = 1;
-                        depColor.pImageMemoryBarriers = &toColor;
-                        vkCmdPipelineBarrier2(cb, &depColor);
-
-                        VkRenderingAttachmentInfo colorAtt{};
-                        colorAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                        colorAtt.imageView = ctx->swapchainImageViews()[imageIndex];
-                        colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                        colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-                        colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-
-                        VkRenderingInfo ri{};
-                        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
-                        ri.renderArea.offset = {0, 0};
-                        ri.renderArea.extent = ext;
-                        ri.layerCount = 1;
-                        ri.colorAttachmentCount = 1;
-                        ri.pColorAttachments = &colorAtt;
-                        vkCmdBeginRendering(cb, &ri);
-                        overlayCallback(static_cast<void*>(cb));
-                        vkCmdEndRendering(cb);
-
-                        VkImageMemoryBarrier2 toPresent{};
-                        toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                        toPresent.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-                        toPresent.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                        toPresent.dstStageMask  = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-                        toPresent.dstAccessMask = 0;
-                        toPresent.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                        toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        toPresent.image = swap;
-                        toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                        toPresent.subresourceRange.levelCount = 1;
-                        toPresent.subresourceRange.layerCount = 1;
-                        VkDependencyInfo depPresent{};
-                        depPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                        depPresent.imageMemoryBarrierCount = 1;
-                        depPresent.pImageMemoryBarriers = &toPresent;
-                        vkCmdPipelineBarrier2(cb, &depPresent);
-                    } else {
-                        VkImageMemoryBarrier2 toPresent{};
-                        toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                        toPresent.srcStageMask  = VK_PIPELINE_STAGE_2_BLIT_BIT;
-                        toPresent.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                        toPresent.dstStageMask  = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-                        toPresent.dstAccessMask = 0;
-                        toPresent.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                        toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-                        toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                        toPresent.image = swap;
-                        toPresent.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                        toPresent.subresourceRange.levelCount = 1;
-                        toPresent.subresourceRange.layerCount = 1;
-                        VkDependencyInfo depPresent{};
-                        depPresent.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                        depPresent.imageMemoryBarrierCount = 1;
-                        depPresent.pImageMemoryBarriers = &toPresent;
-                        vkCmdPipelineBarrier2(cb, &depPresent);
-                    }
-                    check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
-                    gpuTimings_->finishRecord();
                     return;
                 }
             }
@@ -12308,6 +13646,47 @@ namespace threepp {
             dep.pImageMemoryBarriers = preBarriers.data();
             vkCmdPipelineBarrier2(cb, &dep);
 
+            // Split-screen: clear the whole frame to clearColor once so the area
+            // outside the PT pane's scissor shows the clear colour. Gated on
+            // scissorTest so the default full-screen path is byte-identical (the
+            // TAA write covers the whole frame there anyway).
+            if (autoClear_ && scissorTest) {
+                Color cc;
+                cc.copy(clearColor);
+                ColorManagement::workingToColorSpace(cc, SRGBColorSpace);
+                VkClearColorValue cv{};
+                cv.float32[0] = cc.r;
+                cv.float32[1] = cc.g;
+                cv.float32[2] = cc.b;
+                cv.float32[3] = clearAlpha;
+                VkImageSubresourceRange clrRange{};
+                clrRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                clrRange.levelCount = 1;
+                clrRange.layerCount = 1;
+                vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &clrRange);
+                // Clear (transfer write) → the TAA swapchain store (compute write).
+                VkImageMemoryBarrier2 clrBar{};
+                clrBar.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                clrBar.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                clrBar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                clrBar.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                clrBar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                clrBar.oldLayout            = VK_IMAGE_LAYOUT_GENERAL;
+                clrBar.newLayout            = VK_IMAGE_LAYOUT_GENERAL;
+                clrBar.srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+                clrBar.dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
+                clrBar.image                = img;
+                clrBar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                clrBar.subresourceRange.levelCount = 1;
+                clrBar.subresourceRange.layerCount = 1;
+                VkDependencyInfo clrDep{};
+                clrDep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                clrDep.imageMemoryBarrierCount = 1;
+                clrDep.pImageMemoryBarriers    = &clrBar;
+                vkCmdPipelineBarrier2(cb, &clrDep);
+            }
+
             // descriptorSets index is shared by photon and primary RT pipelines.
             const uint32_t setIdx = currentFrame * imageCount_ + imageIndex;
 
@@ -12459,7 +13838,7 @@ namespace threepp {
             // (ext / ptExt hoisted above the mode branch.)
             gpuTimings_->begin(cb, TP_PathTrace, currentFrame);
             ctx->rt().cmdTraceRays(cb, &rtv.rgenRegion, &rtv.missRegion, &rtv.hitRegion,
-                                   &callRegion, ptExt.width, ptExt.height, 1);
+                                   &callRegion, regionRenderExt_.width, regionRenderExt_.height, 1);
             gpuTimings_->end(cb, TP_PathTrace, currentFrame);
 
             // ── Spatial denoiser: 2-pass à-trous + finalize tonemap + sRGB ──────
@@ -12469,7 +13848,7 @@ namespace threepp {
             // RT_SHADER → COMPUTE_SHADER barrier is recorded inside
             // Denoiser::recordDispatch.
             gpuTimings_->begin(cb, TP_Denoise, currentFrame);
-            denoiser_->recordDispatch(cb, descriptorSets[setIdx], ptExt,
+            denoiser_->recordDispatch(cb, descriptorSets[setIdx], regionRenderExt_,
                                       denoiseEnabled_,
                                       static_cast<uint32_t>(toneMapping_),
                                       exposureBits,
@@ -12514,7 +13893,7 @@ namespace threepp {
                 }
                 gpuTimings_->begin(cb, TP_PathTrace, currentFrame);
                 deferredShade_->recordDispatch(cb, currentFrame,
-                                               ptExt.width, ptExt.height,
+                                               regionRenderExt_.width, regionRenderExt_.height,
                                                envImage.mipLevels, /*shadows=*/true,
                                                /*ao=*/deferredAO_, sampleIndex,
                                                emissiveTriCountThisFrame_,
@@ -12545,7 +13924,7 @@ namespace threepp {
                     denoiseDep.pMemoryBarriers = &denoiseBar;
                     vkCmdPipelineBarrier2(cb, &denoiseDep);
                     gpuTimings_->begin(cb, TP_Denoise, currentFrame);// denoiseMs = deferred SVGF (4 GI passes + reflection pass)
-                    deferredShade_->recordDenoiseDispatch(cb, currentFrame, ptExt.width, ptExt.height);
+                    deferredShade_->recordDenoiseDispatch(cb, currentFrame, regionRenderExt_.width, regionRenderExt_.height);
                     gpuTimings_->end(cb, TP_Denoise, currentFrame);
                 }
             }
@@ -12557,7 +13936,7 @@ namespace threepp {
             // input image. With bloomIntensity_ == 0 the bloom passes are
             // skipped and the composite reproduces the old finalize output
             // (tone map + sRGB + solid-bg bypass) exactly.
-            bloom_->recordDispatch(cb, currentFrame, ptExt.width, ptExt.height,
+            bloom_->recordDispatch(cb, currentFrame, regionRenderExt_.width, regionRenderExt_.height,
                                    static_cast<uint32_t>(toneMapping_),
                                    exposureBits, envIsBgColor,
                                    bloomIntensity_, bloomThreshold_, bloomClamp_);
@@ -12603,10 +13982,12 @@ namespace threepp {
             }
             gpuTimings_->begin(cb, TP_TAA, currentFrame);
             taa_->recordResolve(cb, currentFrame, imageIndex,
-                                ptExt.width, ptExt.height,
-                                ext.width, ext.height, effAlpha, taaDtFrames,
+                                regionRenderExt_.width, regionRenderExt_.height,
+                                regionSwapExt_.width, regionSwapExt_.height, effAlpha, taaDtFrames,
                                 sharpenStrength_ > 0.0f, sharpenStrength_,
-                                taaSkyReproj_.data());
+                                taaSkyReproj_.data(),
+                                static_cast<uint32_t>(regionDstX_), static_cast<uint32_t>(regionDstY_),
+                                ptExt.width, ptExt.height, ext.width, ext.height);
             gpuTimings_->end(cb, TP_TAA, currentFrame);
             // ── End raster TAA ─────────────────────────────────────────────────
 
@@ -12691,10 +14072,15 @@ namespace threepp {
 
                     // Pipeline is selected per-draw based on material.wireframe.
                     // Set viewport/scissor once — they're dynamic state shared
-                    // across the wireframe + basic pipelines.
-                    VkViewport vpDyn{0.f, 0.f, float(ext.width), float(ext.height), 0.f, 1.f};
+                    // across the wireframe + basic pipelines. Split-screen: clip
+                    // to the pane region (same as the depth prepass above) so the
+                    // scene overlays — live point cloud, wireframes, lines — land
+                    // in the PT pane instead of spanning the whole window.
+                    // regionSwapExt_ == full extent when scissorTest is off.
+                    VkViewport vpDyn{float(regionDstX_), float(regionDstY_),
+                                     float(regionSwapExt_.width), float(regionSwapExt_.height), 0.f, 1.f};
                     vkCmdSetViewport(cb, 0, 1, &vpDyn);
-                    VkRect2D scDyn{{0, 0}, ext};
+                    VkRect2D scDyn{{regionDstX_, regionDstY_}, regionSwapExt_};
                     vkCmdSetScissor(cb, 0, 1, &scDyn);
 
                     Matrix4 vpUnjitMat;
@@ -12708,6 +14094,10 @@ namespace threepp {
                     for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                         const auto& en = lastVisibleEntries_[i];
                         if (!en.mesh || !en.isOverlay) continue;
+                        // Particle billboards are isOverlay but drawn by the
+                        // dedicated billboard loop below — their un-expanded
+                        // quads would render as zero-area triangles here.
+                        if (en.isParticle) continue;
                         Color color(1.f, 1.f, 1.f);
                         float opacity = 1.0f;
                         bool wireframe = false;
@@ -12885,6 +14275,198 @@ namespace threepp {
                             const uint32_t cnt   = std::min(cap,
                                     static_cast<uint32_t>(std::max(0, drawRange.count)));
                             if (cnt > 0) vkCmdDraw(cb, cnt, 1, start, 0);
+                        }
+                    }
+
+                    // ── Particle billboards ────────────────────────────────
+                    // ParticleSystem meshes (isParticle) are drawn here, after
+                    // the wireframe/line/point overlays, in the same render-pass
+                    // instance (reuses the viewport/scissor set above — split-
+                    // screen aware). Each is a billboard quad expanded in
+                    // particle.vert from per-vertex {size,angle,opacity}; depth-
+                    // tested against unjitDepth (Normal) or unconditionally drawn
+                    // (Additive). The vertex data lives in particleGeomCache_, the
+                    // texture in particleTexCache_ (white default if untextured).
+                    if (particlePipelineNormal_ != VK_NULL_HANDLE) {
+                        bool anyParticle = false;
+                        for (const auto& en : lastVisibleEntries_) {
+                            if (en.isParticle && en.mesh) { anyParticle = true; break; }
+                        }
+                        const bool anySprite = !lastVisibleSprites_.empty();
+                        if (anyParticle || anySprite) {
+                            // Shared per-frame descriptor pool + unjittered camera
+                            // for both billboard kinds (particles + world sprites).
+                            vkResetDescriptorPool(ctx->device(), particleDescPools_[currentFrame], 0);
+                            Matrix4 viewM, projM;
+                            std::memcpy(viewM.elements.data(), currViewUnjit_.data(), 64);
+                            std::memcpy(projM.elements.data(), currProjUnjit_.data(), 64);
+                            VkPipeline curParticlePipe = VK_NULL_HANDLE;
+
+                            for (const auto& en : lastVisibleEntries_) {
+                                if (!en.isParticle || !en.mesh) continue;
+                                auto geomSp = en.mesh->geometry();
+                                const ParticleGeomRec* prec = ensureParticleGeom(geomSp);
+                                if (!prec) continue;
+
+                                auto matPtr = en.mesh->material();
+                                auto* sm = dynamic_cast<ShaderMaterial*>(matPtr.get());
+                                if (!sm) continue;
+                                const bool additive = (sm->blending != Blending::Normal);
+                                const Texture* tex = nullptr;
+                                if (auto uit = sm->uniforms.find("tex");
+                                    uit != sm->uniforms.end() && uit->second.hasValue()) {
+                                    if (auto** t = std::get_if<Texture*>(&uit->second.value())) {
+                                        tex = *t;
+                                    }
+                                }
+
+                                VkPipeline want = additive ? particlePipelineAdditive_
+                                                           : particlePipelineNormal_;
+                                if (want != curParticlePipe) {
+                                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+                                    curParticlePipe = want;
+                                }
+
+                                // Resolve the texture (or white default) into a
+                                // per-draw descriptor set from this frame's pool.
+                                const Image2D* texImg = ensureParticleTexture(tex);
+                                if (!texImg) texImg = &particleWhiteTex_;
+                                VkDescriptorSetAllocateInfo asi{};
+                                asi.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                                asi.descriptorPool     = particleDescPools_[currentFrame];
+                                asi.descriptorSetCount = 1;
+                                asi.pSetLayouts        = &particleDescSetLayout_;
+                                VkDescriptorSet set = VK_NULL_HANDLE;
+                                if (vkAllocateDescriptorSets(ctx->device(), &asi, &set) != VK_SUCCESS) continue;
+                                VkDescriptorImageInfo dii{};
+                                dii.imageView   = texImg->view;
+                                dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                                dii.sampler     = texImg->sampler;
+                                VkWriteDescriptorSet w{};
+                                w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                w.dstSet          = set;
+                                w.dstBinding      = 0;
+                                w.descriptorCount = 1;
+                                w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                                w.pImageInfo      = &dii;
+                                vkUpdateDescriptorSets(ctx->device(), 1, &w, 0, nullptr);
+                                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                        particlePipelineLayout_, 0, 1, &set, 0, nullptr);
+
+                                Matrix4 modelM, mvM;
+                                std::memcpy(modelM.elements.data(), en.worldMatrix.data(), 64);
+                                mvM.multiplyMatrices(viewM, modelM);
+                                struct ParticlePC {
+                                    float modelView[16];
+                                    float proj[16];
+                                } pc{};
+                                std::memcpy(pc.modelView, mvM.elements.data(), 64);
+                                std::memcpy(pc.proj, projM.elements.data(), 64);
+                                vkCmdPushConstants(cb, particlePipelineLayout_,
+                                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                   0, sizeof(pc), &pc);
+
+                                VkBuffer vbufs[4] = {prec->position.handle, prec->normal.handle,
+                                                     prec->uv.handle, prec->color.handle};
+                                VkDeviceSize voffs[4] = {0, 0, 0, 0};
+                                vkCmdBindVertexBuffers(cb, 0, 4, vbufs, voffs);
+                                vkCmdBindIndexBuffer(cb, prec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                                vkCmdDrawIndexed(cb, prec->indexCount, 1, 0, 0, 0);
+                            }
+
+                            // ── World-space sprites ────────────────────────
+                            // Camera-facing textured billboards positioned in 3D
+                            // (TPS impact particles etc.). Shared static quad +
+                            // per-sprite push constant (SpritePC). One descriptor
+                            // set per unique texture this frame (deduped) since a
+                            // burst shares one material/map across many sprites.
+                            if (anySprite && spriteWorldPipeline_ != VK_NULL_HANDLE) {
+                                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, spriteWorldPipeline_);
+                                VkBuffer qv[1] = {spriteQuadVtx_.handle};
+                                VkDeviceSize qo[1] = {0};
+                                vkCmdBindVertexBuffers(cb, 0, 1, qv, qo);
+                                vkCmdBindIndexBuffer(cb, spriteQuadIdx_.handle, 0, VK_INDEX_TYPE_UINT32);
+
+                                std::unordered_map<const Texture*, VkDescriptorSet> setCache;
+                                const Texture* curTex = nullptr;
+                                bool curTexBound = false;
+                                for (const auto& sd : lastVisibleSprites_) {
+                                    // Resolve (and cache) the descriptor set for
+                                    // this sprite's texture; white default on miss.
+                                    if (!curTexBound || sd.tex != curTex) {
+                                        VkDescriptorSet set = VK_NULL_HANDLE;
+                                        auto cIt = setCache.find(sd.tex);
+                                        if (cIt != setCache.end()) {
+                                            set = cIt->second;
+                                        } else {
+                                            const Image2D* texImg = ensureParticleTexture(sd.tex);
+                                            if (!texImg) texImg = &particleWhiteTex_;
+                                            VkDescriptorSetAllocateInfo asi{};
+                                            asi.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                                            asi.descriptorPool     = particleDescPools_[currentFrame];
+                                            asi.descriptorSetCount = 1;
+                                            asi.pSetLayouts        = &particleDescSetLayout_;
+                                            if (vkAllocateDescriptorSets(ctx->device(), &asi, &set) != VK_SUCCESS) continue;
+                                            VkDescriptorImageInfo dii{};
+                                            dii.imageView   = texImg->view;
+                                            dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                                            dii.sampler     = texImg->sampler;
+                                            VkWriteDescriptorSet w{};
+                                            w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                            w.dstSet          = set;
+                                            w.dstBinding      = 0;
+                                            w.descriptorCount = 1;
+                                            w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                                            w.pImageInfo      = &dii;
+                                            vkUpdateDescriptorSets(ctx->device(), 1, &w, 0, nullptr);
+                                            setCache.emplace(sd.tex, set);
+                                        }
+                                        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                                particlePipelineLayout_, 0, 1, &set, 0, nullptr);
+                                        curTex = sd.tex;
+                                        curTexBound = true;
+                                    }
+
+                                    // modelView = view · spriteWorld; the billboard
+                                    // is rebuilt camera-facing in sprite3d.vert from
+                                    // the view-space center + world scale.
+                                    Matrix4 modelM, mvM;
+                                    std::memcpy(modelM.elements.data(), sd.world.data(), 64);
+                                    mvM.multiplyMatrices(viewM, modelM);
+                                    Vector3 worldScale;
+                                    worldScale.setFromMatrixScale(modelM);
+                                    Vector3 mvPos;
+                                    mvPos.setFromMatrixPosition(mvM);
+
+                                    struct SpritePC {
+                                        float projection[16];
+                                        float mvPos[4];
+                                        float scale[2];
+                                        float center[2];
+                                        float color[4];
+                                        float rotation;
+                                        float pad[3];
+                                    } pc{};
+                                    std::memcpy(pc.projection, projM.elements.data(), 64);
+                                    pc.mvPos[0] = static_cast<float>(mvPos.x);
+                                    pc.mvPos[1] = static_cast<float>(mvPos.y);
+                                    pc.mvPos[2] = static_cast<float>(mvPos.z);
+                                    pc.mvPos[3] = 1.f;
+                                    pc.scale[0] = static_cast<float>(worldScale.x);
+                                    pc.scale[1] = static_cast<float>(worldScale.y);
+                                    pc.center[0] = sd.center.x;
+                                    pc.center[1] = sd.center.y;
+                                    pc.color[0] = sd.color[0];
+                                    pc.color[1] = sd.color[1];
+                                    pc.color[2] = sd.color[2];
+                                    pc.color[3] = sd.color[3];
+                                    pc.rotation = sd.rotation;
+                                    vkCmdPushConstants(cb, particlePipelineLayout_,
+                                                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                                                       0, sizeof(pc), &pc);
+                                    vkCmdDrawIndexed(cb, 6, 1, 0, 0, 0);
+                                }
+                            }
                         }
                     }
 
@@ -13080,7 +14662,7 @@ namespace threepp {
             cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
             cpci.stage  = ssci;
             cpci.layout = eventShadePipelineLayout_;
-            check(vkCreateComputePipelines(ctx->device(), VK_NULL_HANDLE, 1, &cpci, nullptr, &eventShadePipeline_),
+            check(vkCreateComputePipelines(ctx->device(), ctx->pipelineCache(), 1, &cpci, nullptr, &eventShadePipeline_),
                   "vkCreateComputePipelines(event_shade)");
             vkDestroyShaderModule(ctx->device(), mod, nullptr);
 
@@ -13715,8 +15297,25 @@ namespace threepp {
 
             // Frame already in flight from a prior render() call this iteration.
             if (!isOrtho) {
-                // User issued a second perspective render — finalize the
-                // prior frame, then re-enter from Idle for the new one.
+                // Split-screen secondary pane: when a scissor sub-rect is set, a
+                // second perspective render() composes overlay-only (Points /
+                // Lines / Sprites of THIS scene+camera) into that region of the
+                // open frame, beside the primary PT pane — without touching the
+                // PT accumulation/TLAS state. Without a scissor, fall back to the
+                // old behavior (finalize the prior frame, restart for this one).
+                if (scissorTest && scissor.z >= 1.f && scissor.w >= 1.f) {
+                    const VkExtent2D full = ctx->swapchainExtent();
+                    const uint32_t rx = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.x), 0, static_cast<int>(full.width)));
+                    const uint32_t rw = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.z), 1, static_cast<int>(full.width) - static_cast<int>(rx)));
+                    const uint32_t rh = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(full.height)));
+                    const int      syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(full.height) - static_cast<int>(rh));
+                    const uint32_t ry = static_cast<uint32_t>(static_cast<int>(full.height) - (syB + static_cast<int>(rh)));
+                    overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                         scene, camera, /*screenSpaceOnly=*/false, rx, ry, rw, rh);
+                    return;
+                }
+                // User issued a second full-frame perspective render — finalize
+                // the prior frame, then re-enter from Idle for the new one.
                 endFrame();
                 renderFrame(scene, camera);
                 return;
@@ -13757,6 +15356,7 @@ namespace threepp {
         // can flip toneMapping / toneMappingExposure freely between frames.
         pimpl_->toneMapping_         = toneMapping;
         pimpl_->toneMappingExposure_ = toneMappingExposure;
+        pimpl_->autoClear_           = autoClear;
         // Only the PT-bound (perspective-camera) render() call needs the
         // scene-build pass — it populates lastVisibleEntries_, the BLAS
         // cache, motion bits and the per-mesh fingerprint state the PT
@@ -13768,6 +15368,12 @@ namespace threepp {
         if (!camera.is<OrthographicCamera>()) {
             const auto sceneStart = std::chrono::high_resolution_clock::now();
             pimpl_->ensureSceneBuilt(scene);
+            // World-space Sprites (screenSpace == false) are drawn by the overlay
+            // billboard pass, not the PT/G-buffer path. Snapshot them each frame
+            // with fresh world matrices (ensureSceneBuilt just ran
+            // updateMatrixWorld) — independent of the snapshot/lean machinery,
+            // since impact sprites move/spawn/expire every frame.
+            pimpl_->collectWorldSprites(scene);
             pimpl_->pendingCpuEnsureSceneMs_ =
                     std::chrono::duration<float, std::milli>(
                             std::chrono::high_resolution_clock::now() - sceneStart)

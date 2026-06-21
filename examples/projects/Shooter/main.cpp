@@ -43,6 +43,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -468,7 +469,7 @@ namespace {
                 const std::string gunFile = assets + "freesound_community-submachine-gun-79846.mp3";
                 const std::string reloadFile = assets + "freesound_community-1911-reload-6248.mp3";
                 const std::string metalFile = assets + "freesound_community-hard-metal-impact-43052.mp3";
-                const std::string boomFile = "grenade_explosion.mp3";
+                const std::string boomFile = assets + "grenade_explosion.mp3";
                 std::vector<Spec> specs{
                         {"shot", {synthShot()}, &shot, 6, fs::exists(gunFile) ? gunFile : std::string{}},
                         {"empty", {synthClick()}, &empty, 2, {}},

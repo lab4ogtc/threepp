@@ -27,7 +27,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 const float PI         = 3.14159265358979;
 const float TWO_PI     = 6.28318530717959;
-const float SHADOW_EPS = 1e-3;// surface offset along N (avoids self-shadow / self-reflection acne)
+// Surface offset along N (avoids self-shadow / self-reflection acne). NOT a
+// const: main() rescales it per-pixel from the shading point's world-coordinate
+// magnitude (see rtSelfEps rationale). A float32 ULP grows with |coord|, so the
+// fixed 1mm offset is swallowed by rounding at ~1e3-1e4 units and the sun's
+// tmin=0.0 shadow ray (shadowVis) self-intersects the surface → the plane
+// flickers under the directional light in large outdoor scenes. The per-pixel
+// rescale floors at 1e-3, so geometry within ~100 units of origin is unchanged.
+float SHADOW_EPS = 1e-3;
 
 layout(set = 0, binding = 0) uniform CameraUbo {
     mat4 viewInverse;
@@ -72,6 +79,7 @@ struct GeometryDesc {
     uint64_t uvAddress;
     uint64_t foamAddress;
     uint64_t prevVertexAddress;
+    uint64_t colorAddress;// unused here, kept for layout match with closest_hit.rchit
     uint     indexed;
     uint     _pad;
 };
@@ -199,7 +207,23 @@ bool reflReproject(vec2 uv, vec3 N, float rough, float viewDist, out vec2 pUv, o
     bool valid = all(greaterThanEqual(pUv, vec2(0.0))) && all(lessThanEqual(pUv, vec2(1.0)));
     if (valid) {
         const vec3 pn = texture(gbufNormalPrevTex, pUv).xyz * 2.0 - 1.0;
-        valid = dot(pn, pn) > 1e-6 && dot(N, normalize(pn)) > 0.9;// surface match (disocclusion)
+        // DEPTH-discontinuity disocclusion (mirrors the GI reproject below, ~line
+        // 2630 — the reason GI doesn't smear at silhouettes but the reflection did).
+        // The reflection channel did a NORMAL-only match (dot>0.9); at a car-body
+        // SILHOUETTE under camera ROTATION the bilinear prev-normal tap stays inside
+        // that cone, so stale reflection from ACROSS the edge bled into the temporal
+        // history → "edges smear when turning". motion .b carries THIS surface's prev
+        // NDC depth; gbufDepthPrevTex at pUv is the prev depth BUFFER there — a
+        // mismatch means the reproject crossed the silhouette onto a DIFFERENT surface
+        // ⇒ reject ⇒ the edge resets to a fresh (noisy, un-smeared) reflection. Normal
+        // loosened to 0.7 to match the GI (depth is now the primary disocclusion gate).
+        const float surfD = texture(gbufMotionTex, uv).b;     // this surface's prev NDC depth
+        const float bufD  = texture(gbufDepthPrevTex, pUv).x; // prev depth buffer at the reproject
+        const vec4  svh   = cam.projInverse * vec4(pNdc, surfD, 1.0);
+        const vec4  bvh   = cam.projInverse * vec4(pNdc, bufD,  1.0);
+        const float svz   = svh.z / svh.w;
+        valid = dot(pn, pn) > 1e-6 && dot(N, normalize(pn)) > 0.7 &&
+                abs(svz - bvh.z / bvh.w) <= 0.1 * max(abs(svz), 1e-3);// same-surface depth gate
     }
     // Static-view cap: 512 (was 32). The reflection ray is GGX-sampled with a
     // per-frame seed, so a held-still view keeps integrating fresh stochastic
@@ -1251,10 +1275,23 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 V, vec3 albedo, float roughness,
     // estimator noise; the PRIMARY path keeps the exhaustive loops.
     uint  pickIdx = 0xFFFFFFFFu;
     float wPick   = 1.0;
-    if (cheapHit) pickIdx = pickAnalyticLight(P, seed, wPick);
+    // cheapHit (reflection / denoised hits) normally samples ONE analytic light
+    // to keep reflected-hit cost down, leaning on SVGF to average the pick. But
+    // with only a handful of analytic lights that stochastic 1-of-N pick is pure
+    // variance for no real saving — and in VIEW-DEPENDENT reflections SVGF can't
+    // fully average it (the reflection history resets under camera motion), so it
+    // shows up as non-deterministic point/spot-light shimmer on metals. (The
+    // DIFFUSE/primary path is clean precisely because it always loops every
+    // light.) For small light counts, loop them all here too: deterministic,
+    // noise-free, at ~nLights shadow rays per reflected hit — no more than the
+    // exhaustive eval the primary path already runs. Keep the 1-pick only when
+    // there are many lights, where looping all would be the real cost.
+    const uint nLights = lights.dirCount + lights.pointCount + lights.spotCount;
+    const bool pickOne = cheapHit && (nLights > 8u);
+    if (pickOne) pickIdx = pickAnalyticLight(P, seed, wPick);
 
     for (uint i = 0u; i < lights.dirCount; ++i) {
-        if (cheapHit && i != pickIdx) continue;
+        if (pickOne && i != pickIdx) continue;
         const vec3 L = normalize(lights.dirLights[i].direction);
         if (dot(N, L) <= 0.0) continue;
         const float vis = (doShadows ? shadowVis(shadowOrig, L, 1e30) : 1.0) * wPick;
@@ -1263,7 +1300,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 V, vec3 albedo, float roughness,
                * lights.dirLights[i].color * vis;
     }
     for (uint i = 0u; i < lights.pointCount; ++i) {
-        if (cheapHit && (lights.dirCount + i) != pickIdx) continue;
+        if (pickOne && (lights.dirCount + i) != pickIdx) continue;
         vec3        toL  = lights.pointLights[i].position - P;
         const float dist = length(toL);
         if (dist < 1e-4) continue;
@@ -1284,7 +1321,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 V, vec3 albedo, float roughness,
                * lights.pointLights[i].color * atten * vis;
     }
     for (uint i = 0u; i < lights.spotCount; ++i) {
-        if (cheapHit && (lights.dirCount + lights.pointCount + i) != pickIdx) continue;
+        if (pickOne && (lights.dirCount + lights.pointCount + i) != pickIdx) continue;
         vec3        toL  = lights.spotLights[i].position - P;
         const float dist = length(toL);
         if (dist < 1e-4) continue;
@@ -1344,9 +1381,24 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 V, vec3 albedo, float roughness,
                 if (ff > 0.0) {
                     float vis = 1.0;
                     if (doShadows) {
-                        const uvec2 sx = gl_GlobalInvocationID.xy;
-                        const float jx = float(pcgHash(sx.x + pcgHash(sx.y))) * (1.0 / 4294967296.0);
-                        const float jy = float(pcgHash(sx.y + pcgHash(sx.x + 0x9e3779b9u))) * (1.0 / 4294967296.0);
+                        // Blue-noise-like jitter via Interleaved Gradient Noise (Jiménez
+                        // 2014), replacing the old white-noise PCG hash so the per-pixel
+                        // penumbra error is spectrally blue (reads smooth, not clumpy).
+                        //
+                        // PRIMARY hits (SIDE=4, the clean raster base — NOT temporally
+                        // accumulated) keep a STATIC per-pixel pattern: deterministic, no
+                        // flicker (the property the static jitter was protecting).
+                        // REFLECTION / denoised hits (cheapHit, SIDE=1) are fed through the
+                        // reflection SVGF temporal pass, so ANIMATE the pattern per frame:
+                        // a static 1-sample shadow is a fixed pattern the temporal denoiser
+                        // cannot average — that's what baked in as a static weave + black
+                        // speckle on the reflections of distant metals. Per-frame rotation
+                        // lets SVGF integrate the single sample into a smooth soft shadow
+                        // (it joins the GGX ray + light pick, already animated via reflSeed).
+                        vec2 fpx = vec2(gl_GlobalInvocationID.xy);
+                        if (cheapHit) fpx += float(pc.frame & 0xFFFFu) * vec2(0.7548776662, 0.5698402910);
+                        const float jx  = fract(52.9829189 * fract(dot(fpx,    vec2(0.06711056, 0.00583715))));
+                        const float jy  = fract(52.9829189 * fract(dot(fpx.yx, vec2(0.06711056, 0.00583715)) + 0.5));
                         const uint SIDE = cheapHit ? 1u : 4u;// 1-ray jittered at reflection hits
                         float vsum = 0.0;
                         for (uint sj = 0u; sj < SIDE; ++sj)
@@ -1461,6 +1513,16 @@ vec3 hitTex(int texIndex, mat3 uvXform, vec2 uv, vec3 fallback) {
     return fallback * textureLod(albedoMaps[i], (uvXform * vec3(uv, 1.0)).xy, 0.0).rgb;
 }
 
+// Albedo-texture ALPHA at a hit — for alpha-testing cutouts and weighting
+// blend surfaces along secondary rays (the queries run force-opaque, so no
+// any-hit ever evaluates alpha for us). 1.0 when untextured, matching the
+// gbuffer screen-door (factor-only opacity routes through transmission).
+float hitTexAlpha(int texIndex, mat3 uvXform, vec2 uv) {
+    if (texIndex < 0) return 1.0;
+    const int i = clamp(texIndex, 0, int(kMaxMaterialTextures) - 1);
+    return textureLod(albedoMaps[i], (uvXform * vec3(uv, 1.0)).xy, 0.0).a;
+}
+
 // GGX NDF importance-sampled microfacet half-vector around N (alpha=roughness²).
 // Tight cone at r→0, wide at high r. Plain NDF (not VNDF) sampling — cheap and
 // fine across the moderate roughness range we use. The caller frame-jitters the
@@ -1563,20 +1625,35 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
         const int    primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
         const vec2   bary   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
         const float  tHit   = rayQueryGetIntersectionTEXT(rq, true);
+        const mat4x3 w2o    = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+        vec3 hitN; vec2 hitUv;
+        fetchHit(hitId, primId, bary, w2o, hitN, hitUv);
 
-        // Blend surfaces (alphaCutoff < 0, no transmission — text decals, alpha
-        // quads): pass straight through. Shading them as opaque painted the
-        // decal's full quad into reflections/refractions as a dark plate. The
-        // tint is skipped (decals hug their receiver, which dominates the ray).
-        // Burns one of the bounce budget — fine, stacked decals are rare.
-        if (hm.alphaCutoff < 0.0 && hm.transmission <= 0.0) {
+        // Cutout (MASK): the query runs force-opaque, so alpha-test here —
+        // sub-cutoff texels pass through (mirrors gbuffer.frag / shadow_anyhit).
+        // Without this a masked plane behind glass shaded fully opaque,
+        // painting its transparent regions as a solid wall.
+        if (hm.alphaCutoff > 0.0 &&
+            hitTexAlpha(hm.albedoTexIndex, hm.uvTransform, hitUv) < hm.alphaCutoff) {
             o = o + d * (tHit + 1e-3);
             continue;
         }
 
-        const mat4x3 w2o    = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
-        vec3 hitN; vec2 hitUv;
-        fetchHit(hitId, primId, bary, w2o, hitN, hitUv);
+        // Blend surfaces (alphaCutoff < 0, no transmission — alpha quads, text
+        // decals): COMPOSITE them src-over along the ray instead of skipping.
+        // Skipping made every blend surface invisible through glass/reflections
+        // (the TransmissionOrderTest "missing alpha blend" failure); shading
+        // them fully opaque painted the whole quad as a dark plate. The texel
+        // alpha weights a diffuse shade, the remainder carries on through.
+        const bool blendThrough = (hm.alphaCutoff < 0.0 && hm.transmission <= 0.0);
+        float hitAlpha = 1.0;
+        if (blendThrough) {
+            hitAlpha = hitTexAlpha(hm.albedoTexIndex, hm.uvTransform, hitUv);
+            if (hitAlpha <= 0.01) {// nothing to composite
+                o = o + d * (tHit + 1e-3);
+                continue;
+            }
+        }
 
         const vec3 hAlbedo = hitTex(hm.albedoTexIndex, hm.uvTransform, hitUv, hm.albedo);
         if (hm.roughness < 0.0) { radiance += tput * hAlbedo; break; }// unlit hit
@@ -1597,7 +1674,7 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
                                       hm.emissive * hm.emissiveIntensity);
         const vec3 hitP = o + d * tHit;
         const vec3 hitDiffInd = sampleEnvLod(hitN, maxLod) + lights.ambient;
-        radiance += tput * shadeDiffuseDirect(hitP, hitN, hitV, hAlbedo, hRough, hMetal,
+        radiance += tput * hitAlpha * shadeDiffuseDirect(hitP, hitN, hitV, hAlbedo, hRough, hMetal,
                                               hEmissive * gReflEmitterScale,
                                               doShadows, hitDiffInd,
                                               hm.sheenColor, hm.sheenRoughness,
@@ -1605,6 +1682,16 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
                                               hm.iridescence, hm.iridescenceIOR, hm.iridescenceThicknessNm, seed,
                                               /*addEmissive=*/true,// reflected hit: no per-pixel reservoir → coherent emissiveNEE
                                               /*cheapHit=*/cheapHits);// caller decides (see header comment)
+
+        // Blend hit composited — carry the remaining (1−α) through along the
+        // same ray. No specular continuation for the blend layer itself (its
+        // alpha-weighted diffuse is the visually dominant term).
+        if (blendThrough) {
+            tput *= (1.0 - hitAlpha);
+            if (max(max(tput.r, tput.g), tput.b) < 0.02) break;
+            o = o + d * (tHit + 1e-3);
+            continue;
+        }
 
         const float hitNdotV = max(dot(hitN, hitV), 1e-4);
         const vec3  hitF0 = mix(vec3(0.04) * hm.specularIntensity * hm.specularColor, hAlbedo, hMetal);
@@ -1672,63 +1759,63 @@ vec3 giRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, inout uint 
     // that's legitimate INDIRECT. Same principle as gSuppressReflEmitter for reflections.
     // Was `lit = hEmissive`, which over-brightened every emitter-lit surface (worst where
     // GI rays point at the emitter — e.g. a floor under it = the floor>wall over-count).
-    // ONE stochastically-picked analytic light per GI hit (was: shadow-test
-    // EVERY light). Uniform pick with ×nL compensation — unbiased; the GI
-    // channel is temporally accumulated + SVGF-denoised, which absorbs the
-    // selection noise. Cuts per-hit shadow rays from nLights to 1: the
-    // dominant AO/GI cost in lamp-heavy scenes (bistro interiors).
+    // Analytic direct at the GI hit. With MANY lights, sample ONE (×wL
+    // compensation, unbiased) — the GI channel is temporally accumulated +
+    // SVGF-denoised, which absorbs the selection noise, and this keeps lamp-
+    // heavy interiors cheap (1 shadow ray vs nLights). But for a SMALL light
+    // count that 1-of-N pick is pure variance the denoiser only SMEARS — worst
+    // for concentrated lights like SPOTLIGHTS, whose tight cone makes "is this
+    // bounce point in the cone?" a high-contrast coin-flip per gather ray. So
+    // for nLights<=8 loop them ALL (deterministic, ~nLights shadow rays/hit) —
+    // mirrors the cheapHit reflection path; the 1-pick stays only where looping
+    // all would be the real cost.
     vec3 lit = vec3(0.0);
-    float wL;
-    const uint pick = pickAnalyticLight(hitP, seed, wL);
-    if (pick != 0xFFFFFFFFu) {
-        if (pick < lights.dirCount) {
-            const uint  i   = pick;
-            const vec3  L   = normalize(lights.dirLights[i].direction);
-            const float ndl = dot(hitN, L);
-            if (ndl > 0.0) {
-                const float vis = doShadows ? shadowVis(shadowOrig, L, 1e30) : 1.0;
-                lit += diff * ndl * lights.dirLights[i].color * (vis * wL);
-            }
-        } else if (pick < lights.dirCount + lights.pointCount) {
-            const uint  i    = pick - lights.dirCount;
-            vec3        toL  = lights.pointLights[i].position - hitP;
-            const float dist = length(toL);
-            if (dist >= 1e-4) {
-                toL /= dist;
-                const float ndl = dot(hitN, toL);
-                if (ndl > 0.0) {
-                    float atten = 1.0 / max(pow(dist, lights.pointLights[i].decay), 0.01);
-                    const float range = lights.pointLights[i].range;
-                    if (range > 0.0) { const float tt = dist / range; const float t4 = tt*tt*tt*tt; const float wnd = max(1.0 - t4, 0.0); atten *= wnd * wnd; }
-                    if (atten > 1e-6) {
-                        const float vis = doShadows ? shadowVis(shadowOrig, toL, dist - 1e-2) : 1.0;
-                        lit += diff * ndl * lights.pointLights[i].color * (atten * vis * wL);
-                    }
-                }
-            }
-        } else {
-            const uint  i    = pick - lights.dirCount - lights.pointCount;
-            vec3        toL  = lights.spotLights[i].position - hitP;
-            const float dist = length(toL);
-            if (dist >= 1e-4) {
-                toL /= dist;
-                const float ndl = dot(hitN, toL);
-                if (ndl > 0.0) {
-                    const float spotCos   = dot(-toL, lights.spotLights[i].direction);
-                    const float spotAtten = smoothstep(lights.spotLights[i].cosAngleOuter,
-                                                       lights.spotLights[i].cosAngleInner, spotCos);
-                    if (spotAtten > 0.0) {
-                        float atten = spotAtten / max(pow(dist, lights.spotLights[i].decay), 0.01);
-                        const float range = lights.spotLights[i].range;
-                        if (range > 0.0) { const float tt = dist / range; const float t4 = tt*tt*tt*tt; const float wnd = max(1.0 - t4, 0.0); atten *= wnd * wnd; }
-                        if (atten > 1e-6) {
-                            const float vis = doShadows ? shadowVis(shadowOrig, toL, dist - 1e-2) : 1.0;
-                            lit += diff * ndl * lights.spotLights[i].color * (atten * vis * wL);
-                        }
-                    }
-                }
-            }
-        }
+    const uint nLights = lights.dirCount + lights.pointCount + lights.spotCount;
+    const bool pickOne = nLights > 8u;
+    float wL = 1.0;
+    const uint pick = pickOne ? pickAnalyticLight(hitP, seed, wL) : 0xFFFFFFFFu;
+
+    for (uint i = 0u; i < lights.dirCount; ++i) {
+        if (pickOne && i != pick) continue;
+        const vec3  L   = normalize(lights.dirLights[i].direction);
+        const float ndl = dot(hitN, L);
+        if (ndl <= 0.0) continue;
+        const float vis = doShadows ? shadowVis(shadowOrig, L, 1e30) : 1.0;
+        lit += diff * ndl * lights.dirLights[i].color * (vis * wL);
+    }
+    for (uint i = 0u; i < lights.pointCount; ++i) {
+        if (pickOne && (lights.dirCount + i) != pick) continue;
+        vec3        toL  = lights.pointLights[i].position - hitP;
+        const float dist = length(toL);
+        if (dist < 1e-4) continue;
+        toL /= dist;
+        const float ndl = dot(hitN, toL);
+        if (ndl <= 0.0) continue;
+        float atten = 1.0 / max(pow(dist, lights.pointLights[i].decay), 0.01);
+        const float range = lights.pointLights[i].range;
+        if (range > 0.0) { const float tt = dist / range; const float t4 = tt*tt*tt*tt; const float wnd = max(1.0 - t4, 0.0); atten *= wnd * wnd; }
+        if (atten <= 1e-6) continue;
+        const float vis = doShadows ? shadowVis(shadowOrig, toL, dist - 1e-2) : 1.0;
+        lit += diff * ndl * lights.pointLights[i].color * (atten * vis * wL);
+    }
+    for (uint i = 0u; i < lights.spotCount; ++i) {
+        if (pickOne && (lights.dirCount + lights.pointCount + i) != pick) continue;
+        vec3        toL  = lights.spotLights[i].position - hitP;
+        const float dist = length(toL);
+        if (dist < 1e-4) continue;
+        toL /= dist;
+        const float ndl = dot(hitN, toL);
+        if (ndl <= 0.0) continue;
+        const float spotCos   = dot(-toL, lights.spotLights[i].direction);
+        const float spotAtten = smoothstep(lights.spotLights[i].cosAngleOuter,
+                                           lights.spotLights[i].cosAngleInner, spotCos);
+        if (spotAtten <= 0.0) continue;
+        float atten = spotAtten / max(pow(dist, lights.spotLights[i].decay), 0.01);
+        const float range = lights.spotLights[i].range;
+        if (range > 0.0) { const float tt = dist / range; const float t4 = tt*tt*tt*tt; const float wnd = max(1.0 - t4, 0.0); atten *= wnd * wnd; }
+        if (atten <= 1e-6) continue;
+        const float vis = doShadows ? shadowVis(shadowOrig, toL, dist - 1e-2) : 1.0;
+        lit += diff * ndl * lights.spotLights[i].color * (atten * vis * wL);
     }
     // Emitter 1-bounce (e.g. enclosed scene lit only by an emissive sphere) —
     // cheap small-sample diffuse NEE so the colour bleed survives the denoiser.
@@ -1952,25 +2039,82 @@ vec3 shadeWater(vec3 P, vec3 N, vec3 V, MaterialDesc pm, int instIdx,
     return col;
 }
 
-// Trace a ray and return the HIT GEOMETRY (point/normal/distance) instead of a
-// shaded colour — used by the glass branch to find the refraction exit face and
-// bend the ray a second time. miss=true if the ray escapes.
-void traceHit(vec3 origin, vec3 dir, out vec3 hitP, out vec3 hitN, out float dist, out bool miss) {
-    rayQueryEXT rq;
-    rayQueryInitializeEXT(rq, topAS, gl_RayFlagsOpaqueEXT, 0xFFu, origin, 1e-3, dir, 1e30);
-    while (rayQueryProceedEXT(rq)) {}
-    if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
-        miss = true; hitP = origin; hitN = vec3(0.0, 1.0, 0.0); dist = 0.0; return;
+// In-glass transit for the refraction path. Marches from the entry point along
+// the refracted ray to find the EXIT INTERFACE (the next transmissive surface —
+// normally the glass's own back face), while handling content embedded inside
+// the volume on the way (TransmissionOrderTest middle column):
+//   • blend surfaces composite src-over into (over, overT),
+//   • cutout surfaces alpha-test (holes pass, solid texels BLOCK),
+//   • opaque surfaces BLOCK — the caller stops the refraction there and lets
+//     the behind-ray shade the blocker instead of mistaking it for an exit
+//     face (which bent the ray with the blocker's normal and never shaded it).
+// miss=true if the ray escapes the scene.
+void traceGlassInterior(vec3 origin, vec3 dir, float maxLod, bool doShadows, inout uint seed,
+                        out vec3 hitP, out vec3 hitN, out float dist, out bool miss, out bool blocked,
+                        inout vec3 over, inout float overT) {
+    vec3  o         = origin;
+    float travelled = 0.0;
+    miss = false; blocked = false;
+    hitP = origin; hitN = vec3(0.0, 1.0, 0.0); dist = 0.0;
+    for (int s = 0; s < 4; ++s) {
+        rayQueryEXT rq;
+        rayQueryInitializeEXT(rq, topAS, gl_RayFlagsOpaqueEXT, 0xFFu, o, 1e-3, dir, 1e30);
+        while (rayQueryProceedEXT(rq)) {}
+        if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
+            miss = true; hitP = o; dist = travelled;
+            return;
+        }
+        const int          hitId  = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
+        const MaterialDesc hm     = mats[hitId];
+        const int    primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
+        const vec2   bary   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
+        const float  tHit   = rayQueryGetIntersectionTEXT(rq, true);
+        const mat4x3 w2o    = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
+        vec2 uv;
+        fetchHit(hitId, primId, bary, w2o, hitN, uv);
+        hitP = o + dir * tHit;
+        dist = travelled + tHit;
+
+        if (hm.transmission > 0.0) return;// exit interface (glass back face / nested glass)
+
+        if (hm.alphaCutoff > 0.0) {// cutout: holes pass, solid texels block
+            if (hitTexAlpha(hm.albedoTexIndex, hm.uvTransform, uv) < hm.alphaCutoff) {
+                o = o + dir * (tHit + 1e-3);
+                travelled += tHit + 1e-3;
+                continue;
+            }
+            blocked = true;
+            return;
+        }
+        if (hm.alphaCutoff < 0.0) {// blend content inside the glass: composite
+            const float a = hitTexAlpha(hm.albedoTexIndex, hm.uvTransform, uv);
+            if (a > 0.01) {
+                vec3 n = hitN;
+                if (dot(n, -dir) < 0.0) n = -n;
+                const vec3 alb     = hitTex(hm.albedoTexIndex, hm.uvTransform, uv, hm.albedo);
+                const vec3 diffInd = sampleEnvLod(n, maxLod) + lights.ambient;
+                over  += overT * a * shadeDiffuseDirect(hitP, n, -dir, alb,
+                                                        clamp(hm.roughness, 0.04, 1.0), clamp(hm.metalness, 0.0, 1.0),
+                                                        hm.emissive * hm.emissiveIntensity,
+                                                        doShadows, diffInd,
+                                                        hm.sheenColor, hm.sheenRoughness,
+                                                        hm.specularIntensity, hm.specularColor,
+                                                        hm.iridescence, hm.iridescenceIOR, hm.iridescenceThicknessNm, seed,
+                                                        /*addEmissive=*/true, /*cheapHit=*/true);
+                overT *= (1.0 - a);
+                if (overT < 0.02) {// effectively solid — nothing left to transmit
+                    blocked = true;
+                    return;
+                }
+            }
+            o = o + dir * (tHit + 1e-3);
+            travelled += tHit + 1e-3;
+            continue;
+        }
+        blocked = true;// embedded opaque content
+        return;
     }
-    miss = false;
-    const int    hitId  = rayQueryGetIntersectionInstanceCustomIndexEXT(rq, true);
-    const int    primId = rayQueryGetIntersectionPrimitiveIndexEXT(rq, true);
-    const vec2   bary   = rayQueryGetIntersectionBarycentricsEXT(rq, true);
-    dist = rayQueryGetIntersectionTEXT(rq, true);
-    const mat4x3 w2o    = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
-    vec2 uvTmp;
-    fetchHit(hitId, primId, bary, w2o, hitN, uvTmp);
-    hitP = origin + dir * dist;
+    blocked = true;// layer budget exhausted — treat the last hit as the blocker
 }
 
 // Refractive glass (CLOSED transmissive mesh — sphere / bottle / goblet, NOT the
@@ -1990,25 +2134,41 @@ void traceHit(vec3 origin, vec3 dir, out vec3 hitP, out vec3 hitN, out float dis
 // softer/dreamier glass, drop to 0 for a perfect lens; raise GSAMP if the soft
 // shows residual grain on moving glass (costs proportionally).
 const float kGlassFrost = 0.04;// near-sharp glass: a wide frost lobe scatters the HDR sun into static speckle
+const float kGlassMaxRough = 0.14;// PT parity: the path tracer clamps the primary refraction lobe to
+                              // alpha 0.02 (≈ roughness 0.14) because a wide refraction lobe is
+                              // per-pixel variance no denoiser can fix. Deferred used the raw material
+                              // roughness here, so asset glass with a mid-grey roughness map (e.g. the
+                              // OpenChessSet pawn domes) blurred into a milky ball — structureless,
+                              // duller than the PT reference. Same trade as the PT: frosted glass
+                              // renders polished at primary, but it stays GLASS.
 const int   kGlassSamples = 1;// ONE sharp Fresnel reflect+refract sample → NO discrete-microfacet ghost
                               // copies. The frost (roughness blur) is applied afterwards by the reflection
                               // denoise (deferred_denoise channel 1), exactly like opaque reflections.
+
+// Effective glass shading/blur roughness — used by shadeGlass AND the demod
+// recombine below; both must agree or the denoise blur mismatches the lobe.
+float glassRough(float matRoughness) {
+    return clamp(matRoughness, kGlassFrost, kGlassMaxRough);
+}
 
 vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                 bool doShadows, float maxLod, inout uint seed) {
     const float ior     = max(pm.ior, 1.0);
     const float r0      = pow((1.0 - ior) / (1.0 + ior), 2.0);
-    // Microfacet roughness: the material's, floored to kGlassFrost. The slight
-    // softening is the "less perfect" the user wanted AND it lets the multi-bounce
-    // surface REFLECTIONS read through the refraction (a perfectly clear lens
-    // hides them — "no recursive reflections"). Averaged over kGlassSamples so it
-    // converges clean. The reflection itself is the multi-bounce traceRadiance,
-    // so it's genuinely recursive (reflected metal/glossy reflects on too).
-    const float gr      = max(clamp(pm.roughness, 0.04, 1.0), kGlassFrost);
-    // Env MISSES (sky) read a BLURRED mip so the HDR sun doesn't appear as a sharp
-    // bright speckle on curved glass (the env is plain equirect mips, not a smooth
-    // PMREM — a sharp sample shows the raw sun). Scene hits stay sharp.
-    const float missLod = max(gr, 0.30) * maxLod;
+    // Microfacet roughness: the material's, floored to kGlassFrost and capped at
+    // kGlassMaxRough (PT parity — see the const). The slight softening is the
+    // "less perfect" the user wanted AND it lets the multi-bounce surface
+    // REFLECTIONS read through the refraction (a perfectly clear lens hides
+    // them — "no recursive reflections"). The reflection itself is the
+    // multi-bounce traceRadiance, so it's genuinely recursive (reflected
+    // metal/glossy reflects on too).
+    const float gr      = glassRough(pm.roughness);
+    // Env MISSES (sky) read a slightly blurred mip so the HDR sun's single hot
+    // texel doesn't speckle on curved glass (the env is plain equirect mips,
+    // not a smooth PMREM). The old 0.30 floor smeared the whole sky into the
+    // glass — with the lobe now capped near-mirror, a gentle floor keeps the
+    // sky crisp and the sun reads as a real glint. Scene hits stay sharp.
+    const float missLod = max(gr, 0.10) * maxLod;
 
     vec3 sum = vec3(0.0);
     for (int s = 0; s < kGlassSamples; ++s) {
@@ -2049,11 +2209,22 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                 transmitColor = reflectColor;// TIR at the front face
             } else {
                 dIn = normalize(dIn);
-                vec3 exitP, exitN; float inDist; bool exitMiss;
-                traceHit(P - N * SHADOW_EPS, dIn, exitP, exitN, inDist, exitMiss);
+                vec3 exitP, exitN; float inDist; bool exitMiss, blockedInside;
+                vec3  overC = vec3(0.0);
+                float overT = 1.0;
+                traceGlassInterior(P - N * SHADOW_EPS, dIn, maxLod, doShadows, seed,
+                                   exitP, exitN, inDist, exitMiss, blockedInside, overC, overT);
                 vec3 dOut;
                 if (exitMiss) {
                     dOut = dIn; inDist = 0.0;// open/odd geometry — straight through
+                } else if (blockedInside) {
+                    // Opaque content inside the volume: stop the refraction at
+                    // it. Back the origin off so the behind-ray re-hits the
+                    // blocker and traceRadiance shades it (with its own
+                    // cutout/blend handling) — no exit bend through a surface
+                    // the ray never actually leaves.
+                    dOut  = dIn;
+                    exitP = exitP - dIn * (4.0 * SHADOW_EPS);
                 } else {
                     vec3 nb = exitN;
                     if (dot(nb, dIn) < 0.0) nb = -nb;           // orient outward
@@ -2066,18 +2237,51 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                 vec3 tint = albedo;
                 if (pm.attenuationDistance > 0.0)
                     tint *= pow(max(pm.attenuationColor, vec3(1e-6)), vec3(inDist / pm.attenuationDistance));
-                transmitColor = behind * tint;
+                // Blend content composited inside the volume layers over the
+                // (remaining) behind term; the glass tint applies to both —
+                // an embedded symbol is seen through the front surface, so it
+                // picks up the glass colour like the PT reference shows.
+                transmitColor = (overC + overT * behind) * tint;
             }
         }
         // Firefly-clamp the glass env contribution — the HDR sun reflected/
         // refracted through curved glass otherwise scatters into bright STATIC
-        // speckle. The cap keeps the sky/scene reflection but tames the sun spike.
+        // speckle. 6.0 (was 2.5): with the lobe capped near-mirror the scatter
+        // is coherent, and the old cap flattened every highlight — glass needs
+        // its bright glints or it reads dull.
         vec3 contrib = mix(transmitColor, reflectColor, F);
         const float cl = max(max(contrib.r, contrib.g), contrib.b);
-        if (cl > 2.5) contrib *= 2.5 / cl;
+        if (cl > 6.0) contrib *= 6.0 / cl;
         sum += contrib;
     }
-    return sum / float(kGlassSamples);
+
+    // Direct-light glint. The recombine scales the opaque base by
+    // (1 − transmission), which erases its analytic specular entirely for
+    // transmission=1 glass — so glass under a sun/dir light had NO surface
+    // glint at all, a big part of the "dull" look. Spec-only Cook-Torrance at
+    // the glass lobe + Fresnel from the ior (no diffuse — the transmit path
+    // carries that energy). Deterministic, so it's added sharp on top of the
+    // (possibly denoise-blurred) reflect/refract channel, like a real
+    // highlight rides on frosted glass.
+    vec3 glint = vec3(0.0);
+    {
+        const float NdotV = max(dot(N, V), 1e-4);
+        const float kG    = (gr + 1.0) * (gr + 1.0) / 8.0;
+        for (uint i = 0u; i < lights.dirCount; ++i) {
+            const vec3  L     = normalize(lights.dirLights[i].direction);
+            const float NdotL = max(dot(N, L), 0.0);
+            if (NdotL <= 0.0) continue;
+            const float vis = doShadows ? shadowVis(P + N * SHADOW_EPS, L, 1e30) : 1.0;
+            if (vis <= 0.0) continue;
+            const vec3  H = normalize(V + L);
+            const float D = distGGX(max(dot(N, H), 0.0), gr);
+            const float G = geomSmithG1(NdotV, kG) * geomSmithG1(NdotL, kG);
+            const float F = r0 + (1.0 - r0) * pow(1.0 - max(dot(V, H), 0.0), 5.0);
+            // spec·NdotL = D·G·F / (4·NdotV·NdotL) · NdotL
+            glint += lights.dirLights[i].color * (D * G * F / max(4.0 * NdotV, 1e-4)) * vis;
+        }
+    }
+    return sum / float(kGlassSamples) + glint;
 }
 
 // ── Volumetric SPOT-light beams (single scattering, ray-marched) ─────────────
@@ -2272,6 +2476,12 @@ void main() {
     const float depth    = texelFetch(gbufDepthTex, px, 0).x;
     const vec4  viewH    = cam.projInverse * vec4(ndc, depth, 1.0);
     const vec3  worldPos = (cam.viewInverse * vec4(viewH.xyz / viewH.w, 1.0)).xyz;
+
+    // World-scale-aware self-intersection offset for this pixel's shadow /
+    // reflection rays. Floored at 1e-3 (scenes within ~100 units unchanged),
+    // grows ~linearly past that so the sun's tmin=0.0 shadow ray clears the
+    // surface even when float precision at large |worldPos| swallows 1mm.
+    SHADOW_EPS = max(1e-3, max(max(abs(worldPos.x), abs(worldPos.y)), abs(worldPos.z)) * 1e-5);
 
     vec3        N         = normalize(nTap.xyz * 2.0 - 1.0);// mutable: FFT chop below
     const float roughness = clamp(nTap.w, 0.04, 1.0);
@@ -2596,7 +2806,9 @@ void main() {
                 // Demodulate the mix(): hand glassCol·t to the reflection denoise
                 // (which ADDS blur(reflect)) and scale the opaque base by (1-t), so
                 // the recombine reconstructs mix(lit, blur(glass), t) — frosted.
-                const float gr = max(clamp(pm.roughness, 0.04, 1.0), kGlassFrost);
+                // Same clamped roughness as shadeGlass (PT-parity cap) so the
+                // denoise blur matches the lobe that produced the sample.
+                const float gr = glassRough(pm.roughness);
                 // .a NEGATIVE = glass marker: the denoise gives it a minimum AA blur
                 // + an ID-based (not normal) edge stop so the blur smooths ACROSS the
                 // curved surface — refraction is far more normal-sensitive than
