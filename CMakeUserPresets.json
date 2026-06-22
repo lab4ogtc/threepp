@@ -32,7 +32,11 @@
       },
       "cacheVariables": {
         "THREEPP_BUILD_EXAMPLES": "ON",
+        "THREEPP_WITH_FBX": "ON",
         "THREEPP_WITH_METAL": "ON",
+        "THREEPP_WITH_RLTOOLS": "ON",
+        "THREEPP_WITH_USD": "ON",
+        "VCPKG_MANIFEST_FEATURES": "assimp",
         "THREEPP_WITH_SLANG": "ON"
       }
     }

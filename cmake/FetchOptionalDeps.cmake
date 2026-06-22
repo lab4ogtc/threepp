@@ -11,6 +11,7 @@ if (THREEPP_WITH_USD)
     set(TINYUSDZ_WITH_PYTHON        OFF CACHE BOOL "" FORCE)
     set(TINYUSDZ_WITH_USDMTLX       OFF CACHE BOOL "" FORCE)
     set(TINYUSDZ_WITH_USDVOX        OFF CACHE BOOL "" FORCE)
+    set(TINYUSDZ_NO_WERROR          ON CACHE BOOL "" FORCE)
 
     # Local patches applied to the pinned tinyusdz tag.
     # PATCH_COMMAND runs once after FetchContent populates the source tree.

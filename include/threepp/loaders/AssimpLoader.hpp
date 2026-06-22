@@ -418,35 +418,29 @@ namespace threepp {
             }
         }
 
-        static void handleWrapping(const aiMaterial* mat, aiTextureType mode, Texture& tex) {
+        static TextureWrapping toTextureWrapping(aiTextureMapMode mode) {
+            switch (mode) {
+                case aiTextureMapMode_Wrap:
+                    return TextureWrapping::Repeat;
+                case aiTextureMapMode_Mirror:
+                    return TextureWrapping::MirroredRepeat;
+                case aiTextureMapMode_Clamp:
+                case aiTextureMapMode_Decal:
+                case _aiTextureMapMode_Force32Bit:
+                    return TextureWrapping::ClampToEdge;
+            }
 
+            return TextureWrapping::ClampToEdge;
+        }
+
+        static void handleWrapping(const aiMaterial* mat, aiTextureType mode, Texture& tex) {
             aiTextureMapMode wrapS;
             if (AI_SUCCESS == mat->Get(AI_MATKEY_MAPPINGMODE_U(mode, 0), wrapS)) {
-                switch (wrapS) {
-                    case aiTextureMapMode_Wrap:
-                        tex.wrapS = TextureWrapping::Repeat;
-                        break;
-                    case aiTextureMapMode_Mirror:
-                        tex.wrapS = TextureWrapping::MirroredRepeat;
-                        break;
-                    case aiTextureMapMode_Clamp:
-                        tex.wrapS = TextureWrapping::ClampToEdge;
-                        break;
-                }
+                tex.wrapS = toTextureWrapping(wrapS);
             }
             aiTextureMapMode wrapT;
             if (AI_SUCCESS == mat->Get(AI_MATKEY_MAPPINGMODE_V(mode, 0), wrapT)) {
-                switch (wrapT) {
-                    case aiTextureMapMode_Wrap:
-                        tex.wrapT = TextureWrapping::Repeat;
-                        break;
-                    case aiTextureMapMode_Mirror:
-                        tex.wrapT = TextureWrapping::MirroredRepeat;
-                        break;
-                    case aiTextureMapMode_Clamp:
-                        tex.wrapT = TextureWrapping::ClampToEdge;
-                        break;
-                }
+                tex.wrapT = toTextureWrapping(wrapT);
             }
         }
 
