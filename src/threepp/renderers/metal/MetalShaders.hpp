@@ -1930,22 +1930,30 @@ float3 applyPointOutputSpaceFog(float3 linearColor, float fogDepth, constant Poi
 
 fragment float4 points_fragment(
     PointFragmentInput in [[stage_in]],
-    constant PointUniforms& uniforms [[buffer(4)]],
-    float2 pointCoord [[point_coord]],
-    texture2d<float> map [[texture(0)]],
-    sampler mapSampler [[sampler(0)]],
-    texture2d<float> alphaMap [[texture(1)]],
-    sampler alphaMapSampler [[sampler(1)]]
+    constant PointUniforms& uniforms [[buffer(4)]]
+#if USE_POINT_MAP || USE_POINT_ALPHAMAP
+    , float2 pointCoord [[point_coord]]
+#endif
+#if USE_POINT_MAP
+    , texture2d<float> map [[texture(0)]]
+    , sampler mapSampler [[sampler(0)]]
+#endif
+#if USE_POINT_ALPHAMAP
+    , texture2d<float> alphaMap [[texture(1)]]
+    , sampler alphaMapSampler [[sampler(1)]]
+#endif
 )
 {
     float4 color = in.color;
+#if USE_POINT_MAP || USE_POINT_ALPHAMAP
     float2 pointUv = (uniforms.uvTransform * float3(pointCoord.x, 1.0 - pointCoord.y, 1.0)).xy;
-    if (uniforms.useMap != 0) {
-        color *= map.sample(mapSampler, pointUv);
-    }
-    if (uniforms.useAlphaMap != 0) {
-        color.a *= alphaMap.sample(alphaMapSampler, pointUv).g;
-    }
+#endif
+#if USE_POINT_MAP
+    color *= map.sample(mapSampler, pointUv);
+#endif
+#if USE_POINT_ALPHAMAP
+    color.a *= alphaMap.sample(alphaMapSampler, pointUv).g;
+#endif
     if (color.a < uniforms.alphaTest) {
         discard_fragment();
     }

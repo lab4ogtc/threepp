@@ -1,9 +1,12 @@
 
 #include "threepp/threepp.hpp"
 
+#include "PointsExampleData.hpp"
+
 #include <threepp/extras/imgui/ImguiContext.hpp>
 
 using namespace threepp;
+using namespace threepp::examples::points;
 
 int main() {
 
@@ -25,28 +28,13 @@ int main() {
     constexpr std::pair minMaxParticles = {1000, 500000};
 
     int numParticles = minMaxParticles.second;
-    std::vector<float> positions(numParticles * 3);
-    std::vector<float> colors(numParticles * 3);
-
     constexpr float n = 1000;
-    constexpr float n2 = n / 2;
-
-    for (int i = 0; i < numParticles; i += 3) {
-        positions[i] = (math::randFloat() * n - n2);
-        positions[i + 1] = (math::randFloat() * n - n2);
-        positions[i + 2] = (math::randFloat() * n - n2);
-
-        colors[i] = ((positions[i] / n) + 0.5f);
-        colors[i + 1] = ((positions[i + 1] / n) + 0.5f);
-        colors[i + 2] = ((positions[i + 2] / n) + 0.5f);
-    }
-
-    std::vector<float> positions_clone = positions;
-    std::vector<float> colors_clone = colors;
+    const auto pointData = makeRandomPointCloudData(numParticles, n);
 
     auto geometry = BufferGeometry::create();
-    geometry->setAttribute("position", FloatBufferAttribute::create(positions, 3));
-    geometry->setAttribute("color", FloatBufferAttribute::create(colors, 3));
+    geometry->setAttribute("position", FloatBufferAttribute::create(pointData.positions, 3));
+    geometry->setAttribute("color", FloatBufferAttribute::create(pointData.colors, 3));
+    setActivePointCount(*geometry, numParticles, minMaxParticles.second);
 
     geometry->computeBoundingSphere();
 
@@ -63,19 +51,7 @@ int main() {
 
         ImGui::Begin("Settings");
         if (ImGui::SliderInt("Num points", &numParticles, minMaxParticles.first, minMaxParticles.second)) {
-            auto& pos = geometry->getAttribute<float>("position")->array();
-            for (int i = 0; i < numParticles; i += 3) {
-                pos[i] = positions_clone[i];
-                pos[i + 1] = positions_clone[i + 1];
-                pos[i + 2] = positions_clone[i + 2];
-            }
-            for (int i = numParticles; i < minMaxParticles.second; i += 3) {
-                pos[i] = positions_clone[0];
-                pos[i + 1] = positions_clone[0];
-                pos[i + 2] = positions_clone[0];
-            }
-
-            geometry->getAttribute<float>("position")->needsUpdate();
+            setActivePointCount(*geometry, numParticles, minMaxParticles.second);
         }
         ImGui::End();
     });

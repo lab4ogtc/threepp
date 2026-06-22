@@ -841,13 +841,15 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     auto* colorAttr = getFloatAttribute(geometry, "color");
     const bool useVertexColors = pointsMaterial->vertexColors && colorAttr && colorAttr->itemSize() == 3;
     const bool useMorphTargets = wantsMorphTargets(*pointsMaterial, geometry);
+    const bool useMap = static_cast<bool>(pointsMaterial->map);
+    const bool useAlphaMap = static_cast<bool>(pointsMaterial->alphaMap);
     if (useMorphTargets && morphTargets) {
         morphTargets->update(&points, &geometry, pointsMaterial, false);
     }
 
     metal::PipelineKey pipelineKey;
     pipelineKey.vertexFunction = shaderManager->getOrCreatePointsVertexFunction(useVertexColors, useMorphTargets);
-    pipelineKey.fragmentFunction = shaderManager->getOrCreatePointsFragmentFunction(useVertexColors);
+    pipelineKey.fragmentFunction = shaderManager->getOrCreatePointsFragmentFunction(useVertexColors, useMap, useAlphaMap);
     configurePipelineBlending(pipelineKey, *pointsMaterial);
     pipelineKey.vertexLayoutBitmask = vertexLayoutPosition;
     if (useVertexColors) pipelineKey.vertexLayoutBitmask |= vertexLayoutColor;
@@ -880,9 +882,13 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
-    bindTextureOrPlaceholder(encoder, pointsMaterial->map, whiteTexture, 0);
-    bindTextureOrPlaceholder(encoder, pointsMaterial->alphaMap, whiteTexture, 1);
-    [encoder setFragmentSamplerState:samplerForTexture(pointsMaterial->alphaMap.get()) atIndex:1];
+    if (useMap) {
+        bindTextureOrPlaceholder(encoder, pointsMaterial->map, whiteTexture, 0);
+    }
+    if (useAlphaMap) {
+        bindTextureOrPlaceholder(encoder, pointsMaterial->alphaMap, whiteTexture, 1);
+        [encoder setFragmentSamplerState:samplerForTexture(pointsMaterial->alphaMap.get()) atIndex:1];
+    }
 
     drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
 }

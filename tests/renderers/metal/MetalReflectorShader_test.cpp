@@ -210,6 +210,20 @@ TEST_CASE("Metal points fog uses GL view-space depth and output-space mixing") {
     CHECK(pointsFragment.find("color.rgb = applyPointOutputSpaceFog(color.rgb, in.fogDepth, uniforms);") != std::string::npos);
 }
 
+TEST_CASE("Metal points shader has no-map and texture variants") {
+
+    void* device = MTLCreateSystemDefaultDevice();
+    if (device == nullptr) {
+        SKIP("default Metal device is unavailable");
+    }
+
+    threepp::metal::MetalShaderManager shaderManager(device);
+
+    CHECK_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true, false, false));
+    CHECK_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true, true, false));
+    CHECK_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true, false, true));
+}
+
 TEST_CASE("Metal sprite and water fog are mixed in GL output color space") {
 
     const auto testFile = std::filesystem::path(__FILE__);

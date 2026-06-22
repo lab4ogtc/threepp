@@ -110,12 +110,16 @@ namespace threepp::metal {
             return source;
         }
 
-        std::string buildPointsShaderSource(bool useVertexColors, bool useMorphTargets) {
+        std::string buildPointsShaderSource(bool useVertexColors, bool useMorphTargets, bool useMap, bool useAlphaMap) {
             std::string source;
             source += "#define USE_VERTEX_COLORS ";
             source += useVertexColors ? "1\n" : "0\n";
             source += "#define USE_MORPHTARGETS ";
             source += useMorphTargets ? "1\n" : "0\n";
+            source += "#define USE_POINT_MAP ";
+            source += useMap ? "1\n" : "0\n";
+            source += "#define USE_POINT_ALPHAMAP ";
+            source += useAlphaMap ? "1\n" : "0\n";
             source += tone_mapping_functions;
             source += fog_functions;
             source += points_vertex;
@@ -445,12 +449,18 @@ namespace threepp::metal {
         if (useMorphTargets) {
             cacheKey += "_morph";
         }
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, useMorphTargets), "points_vertex");
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, useMorphTargets, false, false), "points_vertex");
     }
 
-    void* MetalShaderManager::getOrCreatePointsFragmentFunction(bool useVertexColors) {
-        const auto cacheKey = useVertexColors ? "points_fragment_color" : "points_fragment";
-        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, false), "points_fragment");
+    void* MetalShaderManager::getOrCreatePointsFragmentFunction(bool useVertexColors, bool useMap, bool useAlphaMap) {
+        std::string cacheKey = useVertexColors ? "points_fragment_color" : "points_fragment";
+        if (useMap) {
+            cacheKey += "_map";
+        }
+        if (useAlphaMap) {
+            cacheKey += "_alphamap";
+        }
+        return (__bridge void*) pimpl_->getOrCreateBuiltInFunction(cacheKey, buildPointsShaderSource(useVertexColors, false, useMap, useAlphaMap), "points_fragment");
     }
 
     void* MetalShaderManager::getOrCreateParticleVertexFunction(bool useMap) {

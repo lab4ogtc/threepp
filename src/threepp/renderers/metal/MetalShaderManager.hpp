@@ -140,7 +140,7 @@ namespace threepp::metal {
 
         void* getOrCreatePointsVertexFunction(bool useVertexColors = false, bool useMorphTargets = false);
 
-        void* getOrCreatePointsFragmentFunction(bool useVertexColors = false);
+        void* getOrCreatePointsFragmentFunction(bool useVertexColors = false, bool useMap = false, bool useAlphaMap = false);
 
         void* getOrCreateParticleVertexFunction(bool useMap = false);
 
