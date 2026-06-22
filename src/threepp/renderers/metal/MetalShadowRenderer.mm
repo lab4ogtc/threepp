@@ -118,7 +118,7 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                             }
 
                             const auto* wf = dynamic_cast<MaterialWithWireframe*>(&material);
-                            const bool isWireframe = wf && wf->wireframe;
+                            const bool isWireframe = dynamic_cast<Mesh*>(&object) && wf && wf->wireframe;
                             const auto faceCullingState = metal::computeShadowFaceCullingState(
                                     material.side,
                                     material.shadowSide,
@@ -127,10 +127,12 @@ void MetalRenderer::Impl::renderDepthObject(id<MTLRenderCommandEncoder> encoder,
                                     shadowMapState.type == ShadowMap::VSM);
                             [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
                             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
-                            [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+                            [encoder setTriangleFillMode:MTLTriangleFillModeFill];
 
                             if (dynamic_cast<LineLoop*>(&object)) {
                                 drawLineLoopGeometry(encoder, *geometry, *posAttr, group);
+                            } else if (isWireframe) {
+                                drawWireframeGeometry(encoder, *geometry, instanceCount, group);
                             } else {
                                 drawGeometry(encoder, *geometry, *posAttr, shadowPrimitiveTypeForObject(object), instanceCount, group);
                             }
@@ -221,7 +223,7 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                             }
 
                             const auto* wf = dynamic_cast<MaterialWithWireframe*>(&material);
-                            const bool isWireframe = wf && wf->wireframe;
+                            const bool isWireframe = dynamic_cast<Mesh*>(&object) && wf && wf->wireframe;
                             const auto faceCullingState = metal::computeShadowFaceCullingState(
                                     material.side,
                                     material.shadowSide,
@@ -230,10 +232,12 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
                                     shadowMapState.type == ShadowMap::VSM);
                             [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
                             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
-                            [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+                            [encoder setTriangleFillMode:MTLTriangleFillModeFill];
 
                             if (dynamic_cast<LineLoop*>(&object)) {
                                 drawLineLoopGeometry(encoder, *geometry, *posAttr, group);
+                            } else if (isWireframe) {
+                                drawWireframeGeometry(encoder, *geometry, instanceCount, group);
                             } else {
                                 drawGeometry(encoder, *geometry, *posAttr, shadowPrimitiveTypeForObject(object), instanceCount, group);
                             }

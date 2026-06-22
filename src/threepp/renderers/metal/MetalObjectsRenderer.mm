@@ -655,6 +655,40 @@ void MetalRenderer::Impl::drawLineLoopGeometry(id<MTLRenderCommandEncoder> encod
                  indexBufferOffset:0];
 }
 
+void MetalRenderer::Impl::drawWireframeGeometry(id<MTLRenderCommandEncoder> encoder,
+                                                BufferGeometry& geometry,
+                                                NSUInteger instanceCount,
+                                                std::optional<GeometryGroup> group) {
+
+    auto& wireframeAttribute = metal::getOrUpdateWireframeAttribute(geometry, wireframeAttributes[&geometry]);
+
+    const DrawRange wireframeRange{
+            geometry.drawRange.start * 2,
+            geometry.drawRange.count * 2};
+    std::optional<GeometryGroup> wireframeGroup;
+    if (group) {
+        wireframeGroup = GeometryGroup{
+                group->start * 2,
+                group->count * 2,
+                group->materialIndex};
+    }
+
+    const auto drawSpan = computeDrawSpan(wireframeAttribute.count(), wireframeRange, wireframeGroup);
+    if (!drawSpan) return;
+
+    auto* indexBuffer = (__bridge id<MTLBuffer>) bufferManager->getBuffer(
+            wireframeAttribute,
+            wireframeAttribute.count() * wireframeAttribute.itemSize() * sizeof(unsigned int),
+            wireframeAttribute.array().data());
+
+    [encoder drawIndexedPrimitives:MTLPrimitiveTypeLine
+                        indexCount:drawSpan->count
+                         indexType:MTLIndexTypeUInt32
+                       indexBuffer:indexBuffer
+                 indexBufferOffset:drawSpan->start * sizeof(unsigned int)
+                     instanceCount:instanceCount];
+}
+
 void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
                                      Scene& scene,
                                      Line& line,

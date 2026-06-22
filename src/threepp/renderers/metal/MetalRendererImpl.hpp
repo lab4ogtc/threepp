@@ -10,6 +10,7 @@
 #import "MetalRenderList.hpp"
 #import "MetalRenderObjects.hpp"
 #import "MetalRenderStateUtils.hpp"
+#import "MetalWireframeGeometry.hpp"
 #import "MetalShaderManager.hpp"
 #import "MetalTextureManager.hpp"
 
@@ -133,6 +134,7 @@ namespace threepp {
         };
         std::unordered_map<BufferAttribute*, ConvertedSkinIndexBuffer> convertedSkinIndexBuffers;
         std::unordered_map<BufferGeometry*, bool> geometries;
+        std::unordered_map<BufferGeometry*, metal::WireframeIndexAttribute> wireframeAttributes;
         std::shared_ptr<BufferGeometry> backgroundCubeGeometry;
         std::vector<unsigned int> lineLoopIndices;
 
@@ -495,6 +497,11 @@ namespace threepp {
                                   BufferGeometry& geometry,
                                   FloatBufferAttribute& position,
                                   std::optional<GeometryGroup> group = std::nullopt);
+
+        void drawWireframeGeometry(id<MTLRenderCommandEncoder> encoder,
+                                   BufferGeometry& geometry,
+                                   NSUInteger instanceCount = 1,
+                                   std::optional<GeometryGroup> group = std::nullopt);
 
         void renderLine(id<MTLRenderCommandEncoder> encoder,
                         Scene& scene,

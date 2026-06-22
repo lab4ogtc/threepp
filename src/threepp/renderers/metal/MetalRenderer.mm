@@ -1225,6 +1225,13 @@ void MetalRenderer::Impl::removeAttribute(BufferAttribute* attribute) {
 void MetalRenderer::Impl::deallocateGeometry(BufferGeometry& geometry) {
     removeAttribute(geometry.getIndex());
 
+    if (auto it = wireframeAttributes.find(&geometry); it != wireframeAttributes.end()) {
+        if (it->second.attribute) {
+            removeAttribute(it->second.attribute.get());
+        }
+        wireframeAttributes.erase(it);
+    }
+
     for (const auto& [_, attribute] : geometry.getAttributes()) {
         removeAttribute(attribute.get());
     }
@@ -4272,7 +4279,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             const auto faceCullingState = metal::computeFaceCullingState(material->side, frontFaceCW, isWireframe);
             [encoder setFrontFacingWinding:faceCullingState.frontFaceWinding == metal::FrontFaceWinding::Clockwise ? MTLWindingClockwise : MTLWindingCounterClockwise];
             [encoder setCullMode:faceCullingState.cullMode == metal::CullMode::None ? MTLCullModeNone : MTLCullModeBack];
-            [encoder setTriangleFillMode:isWireframe ? MTLTriangleFillModeLines : MTLTriangleFillModeFill];
+            [encoder setTriangleFillMode:MTLTriangleFillModeFill];
             applyDepthBias(encoder, *material);
 
             bindDrawAttributes(encoder, *geometry, *posAttr, normAttr, uvAttr, colorAttr, useNormal, useUv, useVertexColors, useTangent, useMorphTargets, useMorphNormals);
@@ -4356,7 +4363,11 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 [encoder setFragmentSamplerState:samplerForTexture(transmissionRenderTarget ? transmissionRenderTarget->texture.get() : nullptr) atIndex:3];
             }
 
-            drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount, item.group);
+            if (isWireframe) {
+                drawWireframeGeometry(encoder, *geometry, instanceCount, item.group);
+            } else {
+                drawGeometry(encoder, *geometry, *posAttr, MTLPrimitiveTypeTriangle, instanceCount, item.group);
+            }
             invokeAfterRenderCallback(*obj, geometry, material, item.group);
         }
     };
