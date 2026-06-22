@@ -52,16 +52,20 @@ namespace {
 
 }// namespace
 
-TEST_CASE("Metal reflector shader relies on textureMatrix for render-target Y orientation") {
+TEST_CASE("Metal reflector and water shaders rely on textureMatrix for render-target Y orientation") {
 
     const auto testFile = std::filesystem::path(__FILE__);
     const auto projectRoot = testFile.parent_path().parent_path().parent_path().parent_path();
     const auto shaderSource = readFile(projectRoot / "src/threepp/renderers/metal/MetalShaders.hpp");
     const auto reflectorFragment = reflectorFragmentSource(shaderSource);
+    const auto waterFragment = metalStringSource(shaderSource, "water_fragment");
 
     REQUIRE(reflectorFragment.find("texture2d<float> tDiffuse") != std::string::npos);
     REQUIRE(reflectorFragment.find("tDiffuse.sample") != std::string::npos);
     CHECK(reflectorFragment.find("uv.y = 1.0 - uv.y") == std::string::npos);
+    REQUIRE(waterFragment.find("texture2d<float> mirrorSampler") != std::string::npos);
+    REQUIRE(waterFragment.find("mirrorSampler.sample") != std::string::npos);
+    CHECK(waterFragment.find("mirrorUv.y = 1.0 - mirrorUv.y") == std::string::npos);
 }
 
 TEST_CASE("Metal basic shader includes RectAreaLight LTC path") {

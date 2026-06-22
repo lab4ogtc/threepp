@@ -2900,7 +2900,6 @@ fragment float4 water_fragment(
     float distanceToEye = length(uniforms.eye.xyz - in.worldPosition.xyz);
     float2 distortion = surfaceNormal.xz * (0.001 + 1.0 / max(distanceToEye, 0.0001)) * distortionScale;
     float2 mirrorUv = in.mirrorCoord.xy / in.mirrorCoord.w + distortion;
-    mirrorUv.y = 1.0 - mirrorUv.y;
     float3 reflectionSample = mirrorSampler.sample(mirrorMapSampler, mirrorUv).rgb;
 
     float3 sunDirection = normalize(uniforms.sunDirection.xyz);
