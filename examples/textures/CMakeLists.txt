@@ -2,6 +2,9 @@
 add_example(NAME "cubemap")
 add_example(NAME "hdr_envmap")
 add_example(NAME "texture3d" LINK_IMGUI)
+if (APPLE AND THREEPP_WITH_SLANG)
+    add_example(NAME "texture3d_metal" LINK_IMGUI)
+endif ()
 add_example(NAME "texture2d" WEB WEB_EMBED
         "${THREEPP_DATA_DIR}/textures/crate.gif@data/textures/crate.gif"
         "${THREEPP_DATA_DIR}/textures/checker.png@data/textures/checker.png"

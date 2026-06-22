@@ -60,7 +60,7 @@ namespace {
 int main() {
 
     Canvas canvas("DataTexture3D", {{"aa", 4}});
-    auto renderer = createRenderer(canvas);
+    auto renderer = createRenderer(canvas, GraphicsAPI::OpenGL);
     renderer->checkShaderErrors = true;
     renderer->setClearColor(Color::blue);
 
