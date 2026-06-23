@@ -3,6 +3,7 @@
 #include "threepp/cameras/OrthographicCamera.hpp"
 #include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/lights/RectAreaLightUniformsLib.hpp"
+#include "threepp/renderers/metal/MetalScreenSpace.hpp"
 #include "threepp/renderers/shaders/ShaderCompiler.hpp"
 #include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/DataArrayTexture.hpp"
@@ -4475,20 +4476,22 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::renderScreenSpaceSprites");
         const auto attachmentWidth = colorTexture ? static_cast<float>(colorTexture.width) : static_cast<float>(fbWidth);
         const auto attachmentHeight = colorTexture ? static_cast<float>(colorTexture.height) : static_cast<float>(fbHeight);
-        if (attachmentWidth > 0.f && attachmentHeight > 0.f) {
+        const auto screenLayout = metal::computeScreenSpaceSpriteLayout(attachmentWidth, attachmentHeight, pixelRatio, renderTarget != nullptr);
+        if (screenLayout.logicalWidth > 0.f && screenLayout.logicalHeight > 0.f &&
+            screenLayout.viewportWidth > 0.f && screenLayout.viewportHeight > 0.f) {
             if (!screenSpaceCamera) {
-                screenSpaceCamera = OrthographicCamera::create(0.f, attachmentWidth, attachmentHeight, 0.f, 0.1f, 10.f);
+                screenSpaceCamera = OrthographicCamera::create(0.f, screenLayout.logicalWidth, screenLayout.logicalHeight, 0.f, 0.1f, 10.f);
                 screenSpaceCamera->position.z = 1.f;
             } else {
                 screenSpaceCamera->left = 0.f;
-                screenSpaceCamera->right = attachmentWidth;
-                screenSpaceCamera->top = attachmentHeight;
+                screenSpaceCamera->right = screenLayout.logicalWidth;
+                screenSpaceCamera->top = screenLayout.logicalHeight;
                 screenSpaceCamera->bottom = 0.f;
             }
             screenSpaceCamera->updateProjectionMatrix();
             screenSpaceCamera->updateMatrixWorld(true);
 
-            const MTLViewport screenViewport{0.0, 0.0, attachmentWidth, attachmentHeight, 0.0, 1.0};
+            const MTLViewport screenViewport{0.0, 0.0, screenLayout.viewportWidth, screenLayout.viewportHeight, 0.0, 1.0};
             [encoder setViewport:screenViewport];
 
             for (const auto& item : renderList.screenSpaceSprites) {
@@ -4502,8 +4505,8 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 const auto savedDepthWrite = material->depthWrite;
                 const auto savedDepthFunc = material->depthFunc;
 
-                const auto pixelX = sprite->screenAnchor.x * attachmentWidth + sprite->position.x;
-                const auto pixelY = sprite->screenAnchor.y * attachmentHeight + sprite->position.y;
+                const auto pixelX = sprite->screenAnchor.x * screenLayout.logicalWidth + sprite->position.x;
+                const auto pixelY = sprite->screenAnchor.y * screenLayout.logicalHeight + sprite->position.y;
                 sprite->matrixWorld->compose(
                         Vector3(pixelX, pixelY, 0.f),
                         sprite->quaternion,

@@ -279,6 +279,7 @@ set(privateHeaders
         "threepp/renderers/metal/MetalRenderList.hpp"
         "threepp/renderers/metal/MetalCameraUtils.hpp"
         "threepp/renderers/metal/MetalRenderStateUtils.hpp"
+        "threepp/renderers/metal/MetalScreenSpace.hpp"
         "threepp/renderers/metal/MetalDynamicShaderCache.hpp"
         "threepp/renderers/metal/MetalPipelineCache.hpp"
         "threepp/renderers/metal/MetalQueuePriority.hpp"
