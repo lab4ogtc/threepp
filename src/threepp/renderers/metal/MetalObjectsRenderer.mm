@@ -801,8 +801,8 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
         const bool useMap = map != nullptr;
 
         metal::PipelineKey pipelineKey;
-        pipelineKey.vertexFunction = shaderManager->getOrCreateParticleVertexFunction(useMap);
-        pipelineKey.fragmentFunction = shaderManager->getOrCreateParticleFragmentFunction(useMap);
+        pipelineKey.vertexFunction = shaderManager->getOrCreateParticlePointVertexFunction(useMap);
+        pipelineKey.fragmentFunction = shaderManager->getOrCreateParticlePointFragmentFunction(useMap);
         configurePipelineBlending(pipelineKey, *particleMaterial);
         pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutParticleSystem;
         configurePipelineColorFormats(pipelineKey, colorPixelFormat);
@@ -891,6 +891,62 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
     }
 
     drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypePoint, 1, group);
+}
+
+void MetalRenderer::Impl::renderParticleSystem(id<MTLRenderCommandEncoder> encoder,
+                                               Mesh& mesh,
+                                               BufferGeometry& geometry,
+                                               Material& material,
+                                               Camera& camera,
+                                               MTLPixelFormat colorPixelFormat,
+                                               std::optional<GeometryGroup> group) {
+    auto* shaderMaterial = material.as<ShaderMaterial>();
+    if (!shaderMaterial || !shaderMaterial->visible) return;
+    trackGeometry(geometry);
+
+    auto* posAttr = getFloatAttribute(geometry, "position");
+    auto* normalAttr = getFloatAttribute(geometry, "normal");
+    auto* uvAttr = getFloatAttribute(geometry, "uv");
+    auto* colorAttr = getFloatAttribute(geometry, "color");
+    if (!posAttr || posAttr->itemSize() != 3 ||
+        !normalAttr || normalAttr->itemSize() != 3 ||
+        !uvAttr || uvAttr->itemSize() != 2 ||
+        !colorAttr || colorAttr->itemSize() != 3) {
+        return;
+    }
+
+    auto* map = uniformTexture(shaderMaterial->uniforms, "tex");
+    const bool useMap = map != nullptr;
+
+    metal::PipelineKey pipelineKey;
+    pipelineKey.vertexFunction = shaderManager->getOrCreateParticleVertexFunction(useMap);
+    pipelineKey.fragmentFunction = shaderManager->getOrCreateParticleFragmentFunction(useMap);
+    configurePipelineBlending(pipelineKey, *shaderMaterial);
+    pipelineKey.vertexLayoutBitmask = vertexLayoutPosition | vertexLayoutNormal | vertexLayoutUv | vertexLayoutColor;
+    configurePipelineColorFormats(pipelineKey, colorPixelFormat);
+    pipelineKey.rasterSampleCount = static_cast<std::uint64_t>(activeRenderSampleCount);
+
+    id<MTLRenderPipelineState> pso = (__bridge id<MTLRenderPipelineState>) pipelineCache->getOrCreatePipelineState(pipelineKey);
+    [encoder setRenderPipelineState:pso];
+    id<MTLDepthStencilState> materialDepthStencilState = (__bridge id<MTLDepthStencilState>) pipelineCache->getOrCreateDepthStencilState(
+            shaderMaterial->depthTest,
+            shaderMaterial->depthWrite,
+            shaderMaterial->depthFunc);
+    [encoder setDepthStencilState:materialDepthStencilState];
+    [encoder setCullMode:MTLCullModeNone];
+    [encoder setTriangleFillMode:MTLTriangleFillModeFill];
+    applyDepthBias(encoder, *shaderMaterial);
+
+    bindDrawAttributes(encoder, geometry, *posAttr, normalAttr, uvAttr, colorAttr, true, true, true, false);
+
+    ParticleUniforms uniforms{};
+    computeParticleUniforms(camera, mesh, uniforms);
+    fillToneMappingUniforms(renderer, *shaderMaterial, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
+    [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:6];
+    [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:6];
+
+    bindTextureOrPlaceholder(encoder, map, whiteTexture, 0);
+    drawGeometry(encoder, geometry, *posAttr, MTLPrimitiveTypeTriangle, 1, group);
 }
 
 MaterialPrewarmStatus MetalRenderer::Impl::prewarmMaterial(const MaterialPrewarmRequest& request) {

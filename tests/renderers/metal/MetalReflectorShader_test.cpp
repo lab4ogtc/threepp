@@ -224,6 +224,51 @@ TEST_CASE("Metal points shader has no-map and texture variants") {
     CHECK_NOTHROW(shaderManager.getOrCreatePointsFragmentFunction(true, false, true));
 }
 
+TEST_CASE("Metal particle shader follows ParticleSystem quad billboard layout") {
+
+    const auto testFile = std::filesystem::path(__FILE__);
+    const auto projectRoot = testFile.parent_path().parent_path().parent_path().parent_path();
+    const auto shaderSource = readFile(projectRoot / "src/threepp/renderers/metal/MetalShaders.hpp");
+    const auto rendererSource = readFile(projectRoot / "src/threepp/renderers/metal/MetalRenderer.mm");
+    const auto objectsSource = readFile(projectRoot / "src/threepp/renderers/metal/MetalObjectsRenderer.mm");
+    const auto particleSystemSource = readFile(projectRoot / "src/threepp/objects/ParticleSystem.cpp");
+    const auto particleVertex = metalStringSource(shaderSource, "particle_system_vertex");
+    const auto particleFragment = metalStringSource(shaderSource, "particle_system_fragment");
+
+    REQUIRE(particleSystemSource.find("particleMaterial->name = kParticleMaterialName;") != std::string::npos);
+    REQUIRE(particleSystemSource.find("Mesh::create(this->particleGeometry, this->particleMaterial)") != std::string::npos);
+
+    CHECK(rendererSource.find("kParticleMaterialName") != std::string::npos);
+    CHECK(objectsSource.find("renderParticleSystem") != std::string::npos);
+    CHECK(objectsSource.find("MTLPrimitiveTypeTriangle") != std::string::npos);
+
+    CHECK(particleVertex.find("float3 position [[attribute(0)]]") != std::string::npos);
+    CHECK(particleVertex.find("float3 normal [[attribute(1)]]") != std::string::npos);
+    CHECK(particleVertex.find("float2 uv [[attribute(2)]]") != std::string::npos);
+    CHECK(particleVertex.find("float3 color [[attribute(3)]]") != std::string::npos);
+    CHECK(particleVertex.find("customVisible") == std::string::npos);
+    CHECK(particleVertex.find("[[point_size]]") == std::string::npos);
+    CHECK(particleFragment.find("[[point_coord]]") == std::string::npos);
+    CHECK(particleFragment.find("texture2d<float> tex [[texture(0)]]") != std::string::npos);
+}
+
+TEST_CASE("Metal particle shader variants compile") {
+
+    void* device = MTLCreateSystemDefaultDevice();
+    if (device == nullptr) {
+        SKIP("default Metal device is unavailable");
+    }
+
+    threepp::metal::MetalShaderManager shaderManager(device);
+
+    CHECK_NOTHROW(shaderManager.getOrCreateParticleVertexFunction(false));
+    CHECK_NOTHROW(shaderManager.getOrCreateParticleFragmentFunction(false));
+    CHECK_NOTHROW(shaderManager.getOrCreateParticleVertexFunction(true));
+    CHECK_NOTHROW(shaderManager.getOrCreateParticleFragmentFunction(true));
+    CHECK_NOTHROW(shaderManager.getOrCreateParticlePointVertexFunction(true));
+    CHECK_NOTHROW(shaderManager.getOrCreateParticlePointFragmentFunction(true));
+}
+
 TEST_CASE("Metal sprite and water fog are mixed in GL output color space") {
 
     const auto testFile = std::filesystem::path(__FILE__);

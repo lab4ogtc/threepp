@@ -531,6 +531,14 @@ namespace threepp {
                              MTLPixelFormat colorPixelFormat,
                              std::optional<GeometryGroup> group = std::nullopt);
 
+        void renderParticleSystem(id<MTLRenderCommandEncoder> encoder,
+                                  Mesh& mesh,
+                                  BufferGeometry& geometry,
+                                  Material& material,
+                                  Camera& camera,
+                                  MTLPixelFormat colorPixelFormat,
+                                  std::optional<GeometryGroup> group = std::nullopt);
+
         void renderDepthTexture(id<MTLRenderCommandEncoder> encoder,
                                 Mesh& mesh,
                                 BufferGeometry& geometry,

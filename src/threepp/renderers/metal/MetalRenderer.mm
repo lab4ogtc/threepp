@@ -3,6 +3,7 @@
 #include "threepp/cameras/OrthographicCamera.hpp"
 #include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/lights/RectAreaLightUniformsLib.hpp"
+#include "threepp/objects/ParticleSystem.hpp"
 #include "threepp/renderers/metal/MetalScreenSpace.hpp"
 #include "threepp/renderers/shaders/ShaderCompiler.hpp"
 #include "threepp/textures/CubeTexture.hpp"
@@ -4160,6 +4161,11 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             }
 
             if (auto* mesh = dynamic_cast<Mesh*>(obj)) {
+                if (!hasOverrideMaterial && material->name == kParticleMaterialName) {
+                    renderParticleSystem(encoder, *mesh, *geometry, *material, camera, colorPixelFormat, item.group);
+                    invokeAfterRenderCallback(*obj, geometry, material, item.group);
+                    continue;
+                }
                 if (material->is<RawShaderMaterial>()) {
                     renderRawShader(encoder, *mesh, *geometry, *material, camera, colorPixelFormat, item.group);
                     invokeAfterRenderCallback(*obj, geometry, material, item.group);

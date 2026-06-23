@@ -242,6 +242,8 @@ namespace threepp {
         float toneMappingExposure;
         std::uint32_t toneMapped;
         std::uint32_t outputEncodeSRGB;
+        float projectionScale;
+        float padding[3];
     };
 
     struct alignas(16) RawShaderUniforms {
@@ -530,14 +532,15 @@ namespace threepp {
         resetMorphTargetUniforms(out);
     }
 
-    inline void computeParticleUniforms(const Camera& camera, const Points& points, ParticleUniforms& out) {
+    inline void computeParticleUniforms(const Camera& camera, const Object3D& object, ParticleUniforms& out) {
         Matrix4 mvp;
-        computeMVP(camera, points, mvp);
+        computeMVP(camera, object, mvp);
         copyMatrix(mvp, out.mvp);
 
         Matrix4 modelViewMatrix;
-        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *points.matrixWorld);
+        modelViewMatrix.multiplyMatrices(camera.matrixWorldInverse, *object.matrixWorld);
         copyMatrix(modelViewMatrix, out.modelViewMatrix);
+        out.projectionScale = camera.projectionMatrix.elements[5];
     }
 
     inline void computeRawShaderUniforms(const Camera& camera, const Mesh& mesh, float time, RawShaderUniforms& out) {

@@ -1965,7 +1965,7 @@ fragment float4 points_fragment(
 }
 )metal";
 
-    constexpr auto particle_system_vertex = R"metal(
+    constexpr auto particle_points_vertex = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -2009,7 +2009,7 @@ vertex ParticleVertexOutput particle_system_vertex(
 }
 )metal";
 
-    constexpr auto particle_system_fragment = R"metal(
+    constexpr auto particle_points_fragment = R"metal(
 #include <metal_stdlib>
 using namespace metal;
 
@@ -2040,6 +2040,96 @@ fragment float4 particle_system_fragment(
         c * centered.y - s * centered.x + 0.5
     );
     color *= tex.sample(texSampler, rotatedUV);
+#endif
+    if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
+        color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);
+    }
+    color.rgb = linearToOutputColor(color.rgb, uniforms.outputEncodeSRGB);
+    return color;
+}
+)metal";
+
+    constexpr auto particle_system_vertex = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ParticleVertexInput {
+    float3 position [[attribute(0)]];
+    float3 normal [[attribute(1)]];
+    float2 uv [[attribute(2)]];
+    float3 color [[attribute(3)]];
+};
+
+struct ParticleUniforms {
+    float4x4 mvp;
+    float4x4 modelViewMatrix;
+    uint toneMappingType;
+    float toneMappingExposure;
+    uint toneMapped;
+    uint outputEncodeSRGB;
+    float projectionScale;
+    float3 padding;
+};
+
+struct ParticleVertexOutput {
+    float4 position [[position]];
+    float4 color;
+    float2 uv;
+};
+
+vertex ParticleVertexOutput particle_system_vertex(
+    ParticleVertexInput in [[stage_in]],
+    constant ParticleUniforms& uniforms [[buffer(6)]]
+)
+{
+    ParticleVertexOutput out;
+
+    float particleSize = in.normal.x;
+    float particleAngle = in.normal.y;
+    float particleOpacity = in.normal.z;
+    out.color = float4(in.color, particleOpacity);
+
+    float c = cos(particleAngle);
+    float s = sin(particleAngle);
+    float2 rotated = float2(
+        c * in.uv.x - s * in.uv.y,
+        s * in.uv.x + c * in.uv.y
+    );
+
+    float4 mvPosition = uniforms.modelViewMatrix * float4(in.position, 1.0);
+    float4 clipPosition = uniforms.mvp * float4(in.position, 1.0);
+    float distanceToCamera = max(length(mvPosition.xyz), 0.0001);
+    float scale = particleSize * uniforms.projectionScale / distanceToCamera;
+    clipPosition.xy += rotated * scale * clipPosition.w;
+
+    out.position = clipPosition;
+    out.uv = in.uv + float2(0.5);
+    return out;
+}
+)metal";
+
+    constexpr auto particle_system_fragment = R"metal(
+#include <metal_stdlib>
+using namespace metal;
+
+struct ParticleFragmentInput {
+    float4 position [[position]];
+    float4 color;
+    float2 uv;
+};
+
+fragment float4 particle_system_fragment(
+    ParticleFragmentInput in [[stage_in]],
+    constant ParticleUniforms& uniforms [[buffer(6)]]
+#if USE_MAP
+    , texture2d<float> tex [[texture(0)]]
+    , sampler texSampler [[sampler(0)]]
+#endif
+)
+{
+    float4 color = in.color;
+#if USE_MAP
+    color *= tex.sample(texSampler, in.uv);
 #endif
     if (uniforms.toneMapped != 0 && uniforms.toneMappingType != 0) {
         color.rgb = toneMapping(color.rgb, uniforms.toneMappingType, uniforms.toneMappingExposure);

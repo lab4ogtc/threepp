@@ -10,12 +10,8 @@
 
 namespace threepp {
 
-    // Material-name marker identifying the ParticleSystem billboard mesh. GL/WGPU
-    // compile the custom particle ShaderMaterial directly, but the Vulkan renderer
-    // has no generic ShaderMaterial path — it recognizes the particle Mesh by
-    // material()->name == kParticleMaterialName and routes it to a dedicated
-    // world-space billboard overlay pass instead of the PT/G-buffer path (where
-    // the un-expanded quad would be a zero-area, invisible triangle).
+    // ParticleSystem billboard mesh 的材质标记。GL/WGPU 直接编译自定义 ShaderMaterial；
+    // Vulkan 和 Metal 没有通用 GLSL ShaderMaterial 路径，因此通过该名称转入专用粒子渲染路径。
     inline constexpr const char* kParticleMaterialName = "__threepp_particle__";
 
     class ParticleSystem: public Object3D {
