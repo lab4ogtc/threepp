@@ -256,6 +256,7 @@ void MetalRenderer::Impl::renderPointDepthObject(id<MTLRenderCommandEncoder> enc
 void MetalRenderer::Impl::renderShadowForLight(Scene& scene, Light& light, LightShadow& shadow, id<MTLTexture> shadowTexture) {
     if (!shouldUpdateShadow(shadow)) return;
 
+    shadow.camera->updateProjectionMatrix();
     shadow.updateMatrices(light);
 
     MTLRenderPassDescriptor* passDesc = [MTLRenderPassDescriptor renderPassDescriptor];

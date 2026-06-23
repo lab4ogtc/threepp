@@ -1,6 +1,7 @@
 add_test_executable(MetalRenderList_test)
 add_test_executable(MetalReflectorShader_test)
 add_test_executable(MetalDepthTextureShader_test)
+add_test_executable(MetalShadowRenderer_test)
 add_test_executable(MetalScreenSpace_test)
 add_test_executable(MetalWireframeGeometry_test)
 add_test_executable(Texture3DMetalShader_test)
