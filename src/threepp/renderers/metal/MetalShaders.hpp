@@ -2213,6 +2213,8 @@ struct DepthTextureUniforms {
     float4x4 mvp;
     float cameraNear;
     float cameraFar;
+    float flipUv;
+    float padding;
 };
 
 struct DepthTextureVertexOutput {
@@ -2226,7 +2228,7 @@ vertex DepthTextureVertexOutput depth_texture_vertex(
 )
 {
     DepthTextureVertexOutput out;
-    out.uv = in.uv;
+    out.uv = float2(in.uv.x, mix(in.uv.y, 1.0 - in.uv.y, uniforms.flipUv));
     out.position = uniforms.mvp * float4(in.position, 1.0);
     return out;
 }
@@ -2245,6 +2247,8 @@ struct DepthTextureUniforms {
     float4x4 mvp;
     float cameraNear;
     float cameraFar;
+    float flipUv;
+    float padding;
 };
 
 float perspectiveDepthToViewZ(float invClipZ, float nearPlane, float farPlane) {
@@ -2264,11 +2268,10 @@ fragment float4 depth_texture_fragment(
     sampler tDepthSampler [[sampler(1)]]
 )
 {
-    float unusedDiffuse = tDiffuse.sample(tDiffuseSampler, in.uv).r;
     float fragCoordZ = tDepth.sample(tDepthSampler, in.uv);
     float viewZ = perspectiveDepthToViewZ(fragCoordZ, uniforms.cameraNear, uniforms.cameraFar);
     float depth = viewZToOrthographicDepth(viewZ, uniforms.cameraNear, uniforms.cameraFar);
-    float color = 1.0 - depth + unusedDiffuse * 0.0;
+    float color = 1.0 - depth;
     return float4(float3(color), 1.0);
 }
 )metal";
@@ -2286,6 +2289,8 @@ struct DepthTextureUniforms {
     float4x4 mvp;
     float cameraNear;
     float cameraFar;
+    float flipUv;
+    float padding;
 };
 
 float perspectiveDepthToViewZ(float invClipZ, float nearPlane, float farPlane) {

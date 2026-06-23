@@ -1252,6 +1252,7 @@ void MetalRenderer::Impl::renderDepthTexture(id<MTLRenderCommandEncoder> encoder
     copyMatrix(mvp, uniforms.mvp);
     uniforms.cameraNear = uniformFloat(depthMaterial->uniforms, "cameraNear", camera.nearPlane);
     uniforms.cameraFar = uniformFloat(depthMaterial->uniforms, "cameraFar", camera.farPlane);
+    uniforms.flipUv = uniformFloat(depthMaterial->uniforms, "flipUv", 0.f);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 
@@ -1333,6 +1334,7 @@ void MetalRenderer::Impl::renderLinearDepthTexture(id<MTLRenderCommandEncoder> e
     copyMatrix(mvp, uniforms.mvp);
     uniforms.cameraNear = uniformFloat(depthMaterial->uniforms, "cameraNear", camera.nearPlane);
     uniforms.cameraFar = uniformFloat(depthMaterial->uniforms, "cameraFar", camera.farPlane);
+    uniforms.flipUv = uniformFloat(depthMaterial->uniforms, "flipUv", 0.f);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
 

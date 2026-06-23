@@ -256,6 +256,8 @@ namespace threepp {
         float mvp[16];
         float cameraNear;
         float cameraFar;
+        float flipUv;
+        float padding;
     };
 
     struct alignas(16) SkyUniforms {

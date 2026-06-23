@@ -4,6 +4,7 @@
 #include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/lights/RectAreaLightUniformsLib.hpp"
 #include "threepp/objects/ParticleSystem.hpp"
+#include "threepp/renderers/metal/MetalDepthMaterialUtils.hpp"
 #include "threepp/renderers/metal/MetalScreenSpace.hpp"
 #include "threepp/renderers/shaders/ShaderCompiler.hpp"
 #include "threepp/textures/CubeTexture.hpp"
@@ -4175,10 +4176,10 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                     if (shaderMaterial->uniforms.count("tDepth") > 0 &&
                         shaderMaterial->uniforms.count("cameraNear") > 0 &&
                         shaderMaterial->uniforms.count("cameraFar") > 0) {
-                        if (shaderMaterial->uniforms.count("tDiffuse") > 0) {
-                            renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
-                        } else {
+                        if (metal::isPackedLinearDepthMaterial(*shaderMaterial)) {
                             renderLinearDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
+                        } else {
+                            renderDepthTexture(encoder, *mesh, *geometry, *shaderMaterial, camera, colorPixelFormat, item.group);
                         }
                         invokeAfterRenderCallback(*obj, geometry, material, item.group);
                         continue;
