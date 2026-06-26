@@ -77,6 +77,16 @@ namespace {
         bytes.insert(bytes.end(), raw, raw + value.elements.size() * sizeof(float));
     }
 
+    bool appendUint4Array(std::vector<std::uint8_t>& bytes, const std::vector<std::uint32_t>& value) {
+        if (value.empty() || value.size() % 4u != 0u) {
+            return false;
+        }
+        alignBytes(bytes, 16);
+        const auto* raw = reinterpret_cast<const std::uint8_t*>(value.data());
+        bytes.insert(bytes.end(), raw, raw + value.size() * sizeof(std::uint32_t));
+        return true;
+    }
+
     std::string uniformValueTypeName(const UniformValue& value) {
         if (std::holds_alternative<bool>(value)) return "bool";
         if (std::holds_alternative<int>(value)) return "int";
@@ -91,6 +101,7 @@ namespace {
         if (std::holds_alternative<Matrix4*>(value)) return "Matrix4*";
         if (std::holds_alternative<Texture*>(value)) return "Texture*";
         if (std::holds_alternative<std::vector<float>>(value)) return "std::vector<float>";
+        if (std::holds_alternative<std::vector<std::uint32_t>>(value)) return "std::vector<std::uint32_t>";
         if (std::holds_alternative<std::vector<Vector2>>(value)) return "std::vector<Vector2>";
         if (std::holds_alternative<std::vector<Vector3>>(value)) return "std::vector<Vector3>";
         if (std::holds_alternative<std::vector<Matrix3>>(value)) return "std::vector<Matrix3>";
@@ -136,6 +147,8 @@ namespace {
             appendMatrix4(bytes, *v);
         } else if (auto* v = std::get_if<Matrix4*>(&value); v && *v) {
             appendMatrix4(bytes, **v);
+        } else if (auto* v = std::get_if<std::vector<std::uint32_t>>(&value)) {
+            return appendUint4Array(bytes, *v);
         } else {
             return false;
         }
