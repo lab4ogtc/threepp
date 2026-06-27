@@ -37,6 +37,7 @@ namespace threepp {
             GLRenderer& renderer;
             std::unordered_map<Texture*, std::unique_ptr<GLCubeRenderTarget>> cubemaps;
             std::unordered_map<Texture*, std::unique_ptr<RenderTarget>> pmrems;
+            std::unordered_map<Texture*, unsigned int> pmremVersions;
             std::unique_ptr<GLPMREM> pmremGenerator;
         };
 

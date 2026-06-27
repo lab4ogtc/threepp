@@ -247,6 +247,7 @@ namespace threepp {
         int fbWidth = 0;
         int fbHeight = 0;
         float pixelRatio = 1;
+        std::optional<float> pixelRatioOverride;
         NSUInteger drawableSampleCount = 1;
         NSUInteger activeRenderSampleCount = 1;
         NSUInteger activeColorAttachmentCount = 1;

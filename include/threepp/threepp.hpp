@@ -41,6 +41,7 @@
 #include "threepp/cameras/PerspectiveCamera.hpp"
 
 #include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/CubeRenderTarget.hpp"
 #include "threepp/renderers/RendererFactory.hpp"
 #if __has_include("threepp/renderers/metal/MetalRenderer.hpp")
 #include "threepp/renderers/metal/MetalRenderer.hpp"

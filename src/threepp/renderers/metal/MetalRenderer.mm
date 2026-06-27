@@ -15,6 +15,10 @@
 #include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
 #endif
 
+#if defined(SPARK_ENABLE_PERFETTO)
+#include <spark/tracing.hpp>
+#endif
+
 #define GLFW_EXPOSE_NATIVE_COCOA
 #include <GLFW/glfw3.h>
 #include <GLFW/glfw3native.h>
@@ -505,6 +509,22 @@ kernel void sparkSplatDepth(texture2d_array<uint, access::read> generatedSplats 
         }
     }
 
+    NSUInteger textureSliceCount(id<MTLTexture> texture) {
+        if (!texture) return 0u;
+        if (texture.textureType == MTLTextureTypeCube ||
+            texture.textureType == MTLTextureTypeCubeArray) {
+            return static_cast<NSUInteger>(texture.arrayLength) * 6u;
+        }
+        if (texture.textureType == MTLTextureType2DArray ||
+            texture.textureType == MTLTextureType2DMultisampleArray) {
+            return static_cast<NSUInteger>(texture.arrayLength);
+        }
+        if (texture.textureType == MTLTextureType3D) {
+            return static_cast<NSUInteger>(texture.depth);
+        }
+        return 1u;
+    }
+
     bool pixelFormatIsFloat(MTLPixelFormat pixelFormat) {
         switch (pixelFormat) {
             case MTLPixelFormatR32Float:
@@ -865,8 +885,8 @@ kernel void sparkSplatDepth(texture2d_array<uint, access::read> generatedSplats 
         }
     }
 
-    MTLPixelFormat screenColorPixelFormatForOutputColorSpace(ColorSpace colorSpace) {
-        return usesSRGBColorEncoding(colorSpace) ? MTLPixelFormatBGRA8Unorm_sRGB : MTLPixelFormatBGRA8Unorm;
+    MTLPixelFormat screenColorPixelFormatForOutputColorSpace(ColorSpace) {
+        return MTLPixelFormatBGRA8Unorm;
     }
 
     Color encodedClearColorForTarget(const Color& color, ColorSpace outputColorSpace, MTLPixelFormat colorPixelFormat) {
@@ -1287,6 +1307,13 @@ void MetalRenderer::Impl::commitPendingFrame() {
               "threepp.metal",
               "MetalRenderer.inFlightCommandBuffers",
               static_cast<std::int64_t>(remaining));
+          const auto gpuDurationUs = (commandBuffer.GPUEndTime - commandBuffer.GPUStartTime) * 1'000'000.0;
+          if (gpuDurationUs > 0.0) {
+              SPARK_TRACE_COUNTER(
+                  "threepp.metal",
+                  "MetalRenderer.commandBufferGpuDurationUs",
+                  static_cast<std::int64_t>(gpuDurationUs));
+          }
         }];
     }
     {
@@ -1642,11 +1669,23 @@ MTLTextureType renderTargetTextureType(RenderTarget& target, Texture& texture) {
     return MTLTextureType2D;
 }
 
+bool filterRequiresMipmaps(Filter filter) {
+    return filter == Filter::NearestMipmapNearest ||
+           filter == Filter::NearestMipmapLinear ||
+           filter == Filter::LinearMipmapNearest ||
+           filter == Filter::LinearMipmapLinear;
+}
+
+bool renderTargetColorTextureNeedsMipmaps(Texture& texture) {
+    return texture.generateMipmaps ||
+           (dynamic_cast<CubeTexture*>(&texture) != nullptr && filterRequiresMipmaps(texture.minFilter));
+}
+
 MetalRenderer::Impl::RenderTargetColorTextureAllocation MetalRenderer::Impl::createRenderTargetColorTexture(RenderTarget& target, Texture& texture, MTLPixelFormat pixelFormat) const {
     const auto width = std::max<NSUInteger>(target.width, 1);
     const auto height = std::max<NSUInteger>(target.height, 1);
     const auto depth = std::max<NSUInteger>(target.depth, 1);
-    const auto mipmapped = texture.generateMipmaps ? YES : NO;
+    const auto mipmapped = renderTargetColorTextureNeedsMipmaps(texture) ? YES : NO;
     const auto textureType = renderTargetTextureType(target, texture);
     MTLTextureDescriptor* desc = nil;
     RenderTargetColorTextureAllocation allocation;
@@ -1819,7 +1858,7 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
     const auto height = static_cast<NSUInteger>(std::max(target.height, 1u));
     const auto depth = static_cast<NSUInteger>(std::max(target.depth, 1u));
     const auto colorTextureType = renderTargetTextureType(target, *target.texture);
-    const auto mipmapped = target.texture->generateMipmaps;
+    const auto mipmapped = renderTargetColorTextureNeedsMipmaps(*target.texture);
     std::vector<MTLPixelFormat> colorPixelFormats;
     colorPixelFormats.reserve(target.textures.size());
     for (const auto& texture : target.textures) {
@@ -1828,7 +1867,7 @@ MetalRenderer::Impl::MetalRenderTargetResources& MetalRenderer::Impl::getOrCreat
         }
         const auto attachmentFormat = toRenderTargetColorPixelFormat(*texture);
         colorPixelFormats.push_back(attachmentFormat);
-        if (texture->generateMipmaps != mipmapped) {
+        if (renderTargetColorTextureNeedsMipmaps(*texture) != mipmapped) {
             throw std::runtime_error("Metal RenderTarget MRT currently requires all color attachments to share mipmap settings");
         }
         const auto attachmentTextureType = renderTargetTextureType(target, *texture);
@@ -2130,9 +2169,15 @@ void MetalRenderer::Impl::createPlaceholderResources() {
 void MetalRenderer::Impl::setSize(std::pair<int, int> size) {
     commitPendingFrame();
 
-    GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window.windowPtr());
-    glfwGetFramebufferSize(glfwWin, &fbWidth, &fbHeight);
-    updatePixelRatio(WindowSize{size});
+    if (pixelRatioOverride) {
+        pixelRatio = *pixelRatioOverride > 0.0f ? *pixelRatioOverride : 1.0f;
+        fbWidth = std::max(1, static_cast<int>(std::floor(static_cast<float>(size.first) * pixelRatio)));
+        fbHeight = std::max(1, static_cast<int>(std::floor(static_cast<float>(size.second) * pixelRatio)));
+    } else {
+        GLFWwindow* glfwWin = static_cast<GLFWwindow*>(window.windowPtr());
+        glfwGetFramebufferSize(glfwWin, &fbWidth, &fbHeight);
+        updatePixelRatio(WindowSize{size});
+    }
     metalLayer.drawableSize = CGSizeMake(fbWidth, fbHeight);
     metalLayer.contentsScale = pixelRatio;
     releaseOwnedMetalObject(multisampleColorTexture);
@@ -2283,11 +2328,7 @@ std::future<void> MetalRenderer::Impl::copyTexturesToImagesAsync(const std::vect
 
             const auto width = static_cast<NSUInteger>(sourceTexture.width);
             const auto height = static_cast<NSUInteger>(sourceTexture.height);
-            const auto sourceDepth = sourceTexture.textureType == MTLTextureType2DArray ||
-                                             sourceTexture.textureType == MTLTextureTypeCube ||
-                                             sourceTexture.textureType == MTLTextureTypeCubeArray
-                                         ? static_cast<NSUInteger>(sourceTexture.arrayLength)
-                                         : (sourceTexture.textureType == MTLTextureType3D ? static_cast<NSUInteger>(sourceTexture.depth) : 1u);
+            const auto sourceDepth = textureSliceCount(sourceTexture);
             const auto sourceBytesPerPixel = pixelFormatBytesPerPixel(sourceTexture.pixelFormat);
             const auto sourceBytesPerRow = ((width * sourceBytesPerPixel) + 255u) & ~255u;
             const auto sourceBytesPerImage = sourceBytesPerRow * height;
@@ -2431,8 +2472,9 @@ std::future<PixelReadbackBuffer> MetalRenderer::Impl::readRenderTargetPixelsAsyn
         sourceSlice = static_cast<NSUInteger>(request.activeLayer);
     } else if (sourceTexture.textureType == MTLTextureTypeCube ||
                sourceTexture.textureType == MTLTextureTypeCubeArray) {
+        const auto cubeSliceCount = textureSliceCount(sourceTexture);
         if (request.activeCubeFace < 0 ||
-            static_cast<NSUInteger>(request.activeCubeFace) + depth > sourceTexture.arrayLength) {
+            static_cast<NSUInteger>(request.activeCubeFace) + depth > cubeSliceCount) {
             throw std::out_of_range("MetalRenderer::readRenderTargetPixelsAsync active cube face is outside the render target texture");
         }
         sourceSlice = static_cast<NSUInteger>(request.activeCubeFace);
@@ -3557,7 +3599,7 @@ void MetalRenderer::Impl::renderBackgroundCube(id<MTLRenderCommandEncoder> encod
     uniforms.toneMappingType = static_cast<std::uint32_t>(renderer.toneMapping);
     uniforms.toneMappingExposure = renderer.toneMappingExposure;
     uniforms.toneMapped = 1u;
-    uniforms.decodeColor = textureUsesManualCubeDecode(cubeTexture) ? 1.f : 0.f;
+    uniforms.decodeColor = envmap::textureUsesManualCubeDecode(cubeTexture) ? 1.f : 0.f;
     uniforms.outputEncodeSRGB = needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat) ? 1u : 0u;
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -3795,7 +3837,9 @@ void MetalRenderer::Impl::generateRenderTargetMipmapsIfNeeded(RenderTarget& targ
 void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
     SPARK_TRACE_SCOPE("threepp.metal", "MetalRenderer::render");
     if (insideRender_) return;
-    activeOutputColorSpace = renderer.outputColorSpace;
+    activeOutputColorSpace = renderTarget && renderTarget->texture
+                                     ? renderTarget->texture->colorSpace
+                                     : renderer.outputColorSpace;
 
     if (currentCommandBuffer) {
         const auto now = std::chrono::steady_clock::now();
@@ -3919,7 +3963,9 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 if (!material) continue;
 
                 const auto envMap = resolveEnvMap(scene, *material);
-                if (envMap.kind == EnvMapKind::Equirectangular) {
+                if (envMap.kind == EnvMapKind::Cube ||
+                    envMap.kind == EnvMapKind::Equirectangular ||
+                    envMap.kind == EnvMapKind::PMREM) {
                     prewarmTexture(envMap.texture.get());
                 }
             }
@@ -4335,17 +4381,23 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
                 }
             }
             if (useLights) {
-                bindCubeTextureOrPlaceholder(encoder, envMap.kind == EnvMapKind::Cube ? envMap.texture : nullptr, 6);
-                id<MTLTexture> equirectTexture = whiteTexture;
-                id<MTLSamplerState> envSampler = samplerForTexture(envMap.texture.get());
-                if (envMap.kind == EnvMapKind::Equirectangular && envMap.texture) {
+                bindCubeTextureOrPlaceholder(encoder, nullptr, 6);
+                id<MTLTexture> pmremTexture = whiteTexture;
+                id<MTLSamplerState> envSampler = pmremSampler ? pmremSampler : defaultSampler;
+                if ((envMap.kind == EnvMapKind::Cube ||
+                     envMap.kind == EnvMapKind::Equirectangular) &&
+                    envMap.texture) {
                     id<MTLTexture> sourceTexture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*envMap.texture);
                     if (sourceTexture) {
-                        equirectTexture = (__bridge id<MTLTexture>) pmremGenerator->getOrCreate(*envMap.texture, (__bridge void*) sourceTexture);
+                        pmremTexture = (__bridge id<MTLTexture>) pmremGenerator->getOrCreate(*envMap.texture, (__bridge void*) sourceTexture);
                     }
-                    envSampler = pmremSampler ? pmremSampler : defaultSampler;
+                } else if (envMap.kind == EnvMapKind::PMREM && envMap.texture) {
+                    if (auto texture = (__bridge id<MTLTexture>) textureManager->getOrCreateTexture(*envMap.texture)) {
+                        pmremTexture = texture;
+                    }
+                    envSampler = samplerForTexture(envMap.texture.get());
                 }
-                [encoder setFragmentTexture:equirectTexture atIndex:20];
+                [encoder setFragmentTexture:pmremTexture atIndex:20];
                 [encoder setFragmentSamplerState:envSampler atIndex:2];
 
                 if (useRectAreaLights) {
@@ -4600,8 +4652,8 @@ float MetalRenderer::getTargetPixelRatio() const {
 }
 
 void MetalRenderer::setPixelRatio(float value) {
-    pimpl_->pixelRatio = value;
-    pimpl_->updatePixelRatio(pimpl_->window.size());
+    pimpl_->pixelRatioOverride = value;
+    pimpl_->setSize({pimpl_->window.size().width(), pimpl_->window.size().height()});
 }
 
 void* MetalRenderer::device() const {

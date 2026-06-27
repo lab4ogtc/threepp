@@ -140,9 +140,11 @@ public:
                 metalRenderer_->setOverlayCallback([this](void* commandBuffer, void* commandEncoder) {
                     if (pendingDrawData_) {
                         auto sz = metalRenderer_->size();
+                        const auto pixelRatio = metalRenderer_->getTargetPixelRatio();
                         pendingDrawData_->DisplaySize = ImVec2(
                                 static_cast<float>(sz.width()),
                                 static_cast<float>(sz.height()));
+                        pendingDrawData_->FramebufferScale = ImVec2(pixelRatio, pixelRatio);
                         threepp::detail::imguiMetalRenderDrawData(pendingDrawData_, commandBuffer, commandEncoder);
                     }
                 });

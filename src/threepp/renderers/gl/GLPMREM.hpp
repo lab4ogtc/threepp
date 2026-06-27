@@ -34,6 +34,10 @@ namespace threepp {
             // Returns a RenderTarget owning a 2D texture with mapping CubeUVReflection.
             std::unique_ptr<RenderTarget> fromEquirectangular(Texture& equirect);
 
+            // Build a PMREM from a cube texture.
+            // Returns a RenderTarget owning a 2D texture with mapping CubeUVReflection.
+            std::unique_ptr<RenderTarget> fromCubemap(Texture& cubemap);
+
         private:
             GLRenderer& renderer;
 

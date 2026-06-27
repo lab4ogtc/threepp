@@ -231,6 +231,7 @@ set(publicHeaders
         "threepp/renderers/GLRenderer.hpp"
         "threepp/renderers/WgpuRenderer.hpp"
         "threepp/renderers/CrossRenderer.hpp"
+        "threepp/renderers/CubeRenderTarget.hpp"
         "threepp/renderers/RenderTarget.hpp"
         "threepp/renderers/GLRenderTarget.hpp"
         "threepp/renderers/metal/MetalRenderer.hpp"
@@ -265,6 +266,7 @@ set(privateHeaders
         "threepp/materials/MeshDistanceMaterial.hpp"
 
         "threepp/renderers/GLCubeRenderTarget.hpp"
+        "threepp/renderers/EnvMapUtils.hpp"
 
         "threepp/renderers/common/Lights.hpp"
         "threepp/renderers/common/RenderLists.hpp"

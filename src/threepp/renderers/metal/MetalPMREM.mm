@@ -1,6 +1,7 @@
 #import "MetalPMREM.hpp"
 
 #import "threepp/core/EventDispatcher.hpp"
+#import "threepp/renderers/EnvMapUtils.hpp"
 #import "threepp/textures/CubeTexture.hpp"
 #import "threepp/textures/Texture.hpp"
 
@@ -166,13 +167,43 @@ kernel void pmremPrefilterCube(texturecube<float, access::sample> sourceTexture 
     float2 uv = (float2(gid.x, stripY) + 0.5) / float2(EQ_STRIP_W, EQ_STRIP_H);
     float3 n = directionFromEquirectUv(uv);
 
-    float sourceMip = clamp(roughness * uniforms.maxSourceMip, 0.0, uniforms.maxSourceMip);
-    float3 sampleColor = sampleCube(sourceTexture, sourceSampler, n, sourceMip);
-    if (uniforms.decodeSourceColor != 0.0) {
-        sampleColor = sRGBToLinear(sampleColor);
+    if (roughness <= 0.0) {
+        float3 sampleColor = sampleCube(sourceTexture, sourceSampler, n, 0.0);
+        if (uniforms.decodeSourceColor != 0.0) {
+            sampleColor = sRGBToLinear(sampleColor);
+        }
+        outputTexture.write(float4(sampleColor, 1.0), gid);
+        return;
     }
 
-    outputTexture.write(float4(sampleColor, 1.0), gid);
+    float faceSize = float(max(sourceTexture.get_width(), sourceTexture.get_height()));
+    float saTexel = 4.0 * 3.14159265359 / max(6.0 * faceSize * faceSize, 1.0);
+    float roughFloor = roughness * max(uniforms.roughFloorBase, 0.0);
+    uint numSamples = roughness < 0.3 ? 256 : 128;
+
+    float3 accumColor = float3(0.0);
+    float accumWeight = 0.0;
+    for (uint i = 0; i < numSamples; ++i) {
+        float2 xi = hammersley(i, numSamples);
+        float3 h = importanceSampleGGX(xi, n, roughness);
+        float3 l = normalize(-n + 2.0 * dot(n, h) * h);
+        float nDotL = max(dot(n, l), 0.0);
+        if (nDotL > 0.0) {
+            float nDotH = max(dot(n, h), 0.0);
+            float pdf = ggxD(nDotH, roughness) * 0.25 + 1e-4;
+            float saSample = 1.0 / (float(numSamples) * pdf);
+            float mip = 0.5 * log2(saSample / saTexel);
+            mip = clamp(max(mip, roughFloor), 0.0, uniforms.maxSourceMip);
+            float3 sampleColor = min(sampleCube(sourceTexture, sourceSampler, l, mip), float3(50.0));
+            if (uniforms.decodeSourceColor != 0.0) {
+                sampleColor = sRGBToLinear(sampleColor);
+            }
+            accumColor += sampleColor * nDotL;
+            accumWeight += nDotL;
+        }
+    }
+
+    outputTexture.write(float4(accumColor / max(accumWeight, 0.001), 1.0), gid);
 }
 )metal";
 
@@ -195,12 +226,6 @@ kernel void pmremPrefilterCube(texturecube<float, access::sample> sourceTexture 
                 default:
                     return MTLPixelFormatRGBA16Float;
             }
-        }
-
-        bool textureUsesManualCubeDecode(const Texture& texture) {
-            return dynamic_cast<const CubeTexture*>(&texture) != nullptr &&
-                   (texture.colorSpace == ColorSpace::sRGB ||
-                    texture.colorSpace == ColorSpace::Gamma);
         }
 
         struct PMREMUniforms {
@@ -354,7 +379,7 @@ kernel void pmremPrefilterCube(texturecube<float, access::sample> sourceTexture 
 
             const auto sourceMaxMip = static_cast<float>(std::max<NSUInteger>(sourceTexture.mipmapLevelCount, 1u) - 1u);
             const auto roughFloorBase = std::max(std::log2(static_cast<float>(std::max<NSUInteger>(sourceTexture.width, 1u))) - 4.f, 0.f);
-            const PMREMUniforms uniforms{sourceMaxMip, roughFloorBase, textureUsesManualCubeDecode(texture) ? 1.f : 0.f, 0.f};
+            const PMREMUniforms uniforms{sourceMaxMip, roughFloorBase, envmap::textureUsesManualCubeDecode(texture) ? 1.f : 0.f, 0.f};
 
             id<MTLComputeCommandEncoder> encoder = [commandBuffer computeCommandEncoder];
             [encoder setComputePipelineState:pso];

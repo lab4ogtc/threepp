@@ -5,8 +5,8 @@
 
 #include "threepp/cameras/PerspectiveCamera.hpp"
 #include "threepp/core/Object3D.hpp"
-#include "threepp/renderers/GLRenderTarget.hpp"
-#include "threepp/renderers/GLRenderer.hpp"
+#include "threepp/renderers/RenderTarget.hpp"
+#include "threepp/renderers/Renderer.hpp"
 
 namespace threepp {
 
@@ -14,7 +14,7 @@ namespace threepp {
     class CubeCamera: public Object3D {
 
     public:
-        CubeCamera(float near, float far, GLRenderTarget& renderTarget)
+        CubeCamera(float near, float far, RenderTarget& renderTarget)
             : renderTarget(&renderTarget) {
 
             const auto fov = 90, aspect = 1;
@@ -61,7 +61,7 @@ namespace threepp {
             return "CubeCamera";
         }
 
-        void update(GLRenderer& renderer, Object3D& scene) {
+        void update(Renderer& renderer, Object3D& scene) {
 
             if (!this->parent) this->updateMatrixWorld();
 
@@ -101,13 +101,13 @@ namespace threepp {
             renderer.setRenderTarget(currentRenderTarget);
         }
 
-        static std::shared_ptr<CubeCamera> create(float near, float far, GLRenderTarget& renderTarget) {
+        static std::shared_ptr<CubeCamera> create(float near, float far, RenderTarget& renderTarget) {
 
             return std::make_shared<CubeCamera>(near, far, renderTarget);
         }
 
     private:
-        GLRenderTarget* renderTarget;
+        RenderTarget* renderTarget;
     };
 
 }// namespace threepp

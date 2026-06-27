@@ -1286,15 +1286,14 @@ fragment float4 basic_fragment(
 
     if (params.textureFlags1.z != 0) {
         float3 reflected = reflect(-v, n);
-        bool sourceIsEquirectEnvMap = params.textureFlags2.y != 0;
         bool usePmremEnvMap = params.envMapParams.w != 0.0;
         float cubeMaxMip = clamp(params.envMapParams.y, 0.0, float(envMap.get_num_mip_levels() - 1));
         float3 cubeReflected = float3(params.envMapParams.x * reflected.x, reflected.y, reflected.z);
         if (params.materialType == 2 || params.materialType == 3) {
-            float3 envColor = sourceIsEquirectEnvMap
+            float3 envColor = usePmremEnvMap
                 ? sampleEquirectPmrem(envMapEquirect, envMapSampler, reflected, 0.0)
                 : envMap.sample(envMapSampler, cubeReflected).rgb;
-            if (!sourceIsEquirectEnvMap && params.envMapParams.z != 0.0) {
+            if (!usePmremEnvMap && params.envMapParams.z != 0.0) {
                 envColor = sRGBToLinear(envColor);
             }
             color = mix(color, color * envColor, saturateFloat(envMapIntensity * specularStrength));

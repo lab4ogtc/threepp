@@ -79,25 +79,41 @@ Texture* GLCubeMaps::getPMREM(Texture* texture) {
     const auto mapping = texture->mapping;
     const bool isEquirect = mapping == Mapping::EquirectangularReflection ||
                             mapping == Mapping::EquirectangularRefraction;
-    if (!isEquirect) return texture;
+    const bool isCube = mapping == Mapping::CubeReflection ||
+                        mapping == Mapping::CubeRefraction;
+    const bool isPmrem = mapping == Mapping::CubeUVReflection ||
+                         mapping == Mapping::CubeUVRefraction;
+    if (isPmrem) return texture;
+    if (!isEquirect && !isCube) return texture;
 
-    if (pmrems.contains(texture)) {
+    const auto version = texture->version();
+    if (pmrems.contains(texture) &&
+        pmremVersions.contains(texture) &&
+        pmremVersions.at(texture) == version) {
         return pmrems.at(texture)->texture.get();
     }
 
-    const auto& image = texture->image();
-    if (image.height() == 0) return nullptr;
+    if (isEquirect) {
+        const auto& image = texture->image();
+        if (image.height() == 0) return nullptr;
+    } else if (isCube) {
+        const auto& images = texture->images();
+        if (images.empty() || images.front().height() == 0) return nullptr;
+    }
 
     if (!pmremGenerator) {
         pmremGenerator = std::make_unique<GLPMREM>(renderer);
     }
 
     auto* currentRenderTarget = renderer.getRenderTarget();
-    auto pmrem = pmremGenerator->fromEquirectangular(*texture);
+    auto pmrem = isCube
+                     ? pmremGenerator->fromCubemap(*texture)
+                     : pmremGenerator->fromEquirectangular(*texture);
     renderer.setRenderTarget(currentRenderTarget);
 
     auto* result = pmrem->texture.get();
     pmrems[texture] = std::move(pmrem);
+    pmremVersions[texture] = version;
     return result;
 }
 
@@ -105,5 +121,6 @@ void GLCubeMaps::dispose() {
 
     cubemaps.clear();
     pmrems.clear();
+    pmremVersions.clear();
     pmremGenerator.reset();
 }

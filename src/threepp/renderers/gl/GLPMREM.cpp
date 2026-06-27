@@ -6,11 +6,14 @@
 #include "threepp/core/BufferGeometry.hpp"
 #include "threepp/materials/RawShaderMaterial.hpp"
 #include "threepp/objects/Mesh.hpp"
+#include "threepp/renderers/EnvMapUtils.hpp"
 #include "threepp/renderers/GLRenderer.hpp"
 #include "threepp/renderers/RenderTarget.hpp"
+#include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/Texture.hpp"
 
 #include <algorithm>
+#include <string>
 #include <vector>
 
 using namespace threepp;
@@ -75,20 +78,29 @@ void main() {
 }
 )";
 
-    // GGX importance-sampled equirect prefilter. Identical math to the WGPU
+    // GGX importance-sampled env prefilter. Identical math to the WGPU
     // (WgpuPMREM.cpp) and Vulkan (prefilter_env.comp) prefilters: integrate the
-    // source equirect over a GGX lobe around the output direction (= N for the
+    // source env over a GGX lobe around the output direction (= N for the
     // prefilter), weighted by NdotL. roughness==0 collapses to a direct fetch.
     const char* const FRAGMENT_SRC = R"(#version 330 core
+#ifndef SOURCE_CUBE
+#define SOURCE_CUBE 0
+#endif
+
 precision highp float;
 precision highp int;
 
 in vec2 vUv;
 out vec4 fragColor;
 
+#if SOURCE_CUBE
+uniform samplerCube envMap;
+#else
 uniform sampler2D envMap;
+#endif
 uniform float roughness;
 uniform int numSamples;
+uniform int decodeSourceColor;
 
 #define PI        3.14159265359
 #define PI2       6.28318530718
@@ -107,6 +119,37 @@ vec2 equirectUv(vec3 dir) {
     float u = atan(dir.z, dir.x) * RECIP_2PI + 0.5;
     float v = asin(clamp(dir.y, -1.0, 1.0)) * RECIP_PI + 0.5;
     return vec2(u, v);
+}
+
+vec3 sRGBToLinear(vec3 value) {
+    vec3 high = pow(value * 0.9478672986 + vec3(0.0521327014), vec3(2.4));
+    vec3 low = value * 0.0773993808;
+    return mix(high, low, lessThanEqual(value, vec3(0.04045)));
+}
+
+vec2 sourceTextureSize() {
+#if SOURCE_CUBE
+    return vec2(textureSize(envMap, 0));
+#else
+    return vec2(textureSize(envMap, 0));
+#endif
+}
+
+float sourceTexelCount(vec2 srcSize) {
+#if SOURCE_CUBE
+    return max(6.0 * srcSize.x * srcSize.y, 1.0);
+#else
+    return max(srcSize.x * srcSize.y, 1.0);
+#endif
+}
+
+vec3 sampleEnv(vec3 dir, float mip) {
+#if SOURCE_CUBE
+    vec3 color = textureLod(envMap, normalize(dir), mip).rgb;
+#else
+    vec3 color = textureLod(envMap, equirectUv(dir), mip).rgb;
+#endif
+    return decodeSourceColor != 0 ? sRGBToLinear(color) : color;
 }
 
 float vdc(uint bits) {
@@ -143,7 +186,7 @@ void main() {
     vec3 N = normalize(dirFromUv(vUv));
 
     if (roughness <= 0.0) {
-        fragColor = vec4(texture(envMap, equirectUv(N)).rgb, 1.0);
+        fragColor = vec4(sampleEnv(N, 0.0), 1.0);
         return;
     }
 
@@ -153,8 +196,8 @@ void main() {
     // hit by a handful of samples (which produced a scattered-dots starburst on
     // the wide roughness lobes). The source equirect carries a full mip chain.
     float a = roughness * roughness;
-    vec2 srcSize = vec2(textureSize(envMap, 0));
-    float saTexel = 4.0 * PI / (srcSize.x * srcSize.y);
+    vec2 srcSize = sourceTextureSize();
+    float saTexel = 4.0 * PI / sourceTexelCount(srcSize);
 
     vec3 accumColor = vec3(0.0);
     float accumWeight = 0.0;
@@ -185,7 +228,7 @@ void main() {
             mip = max(mip, roughness * max(log2(srcSize.x) - 4.0, 0.0));
             mip = max(mip, 0.0);
             // Clamp per-channel to bound residual fireflies / RGBE Inf.
-            vec3 s = min(textureLod(envMap, equirectUv(L), mip).rgb, vec3(50.0));
+            vec3 s = min(sampleEnv(L, mip), vec3(50.0));
             accumColor += s * NdotL;
             accumWeight += NdotL;
         }
@@ -210,29 +253,132 @@ void main() {
         return geom;
     }
 
+    std::string fragmentSource(bool sourceCube) {
+        std::string source = FRAGMENT_SRC;
+        if (!sourceCube) {
+            return source;
+        }
+
+        const auto versionEnd = source.find('\n');
+        if (versionEnd == std::string::npos) {
+            return "#define SOURCE_CUBE 1\n" + source;
+        }
+        source.insert(versionEnd + 1, "#define SOURCE_CUBE 1\n");
+        return source;
+    }
+
+    std::shared_ptr<RawShaderMaterial> createPMREMMaterial(bool sourceCube) {
+        auto material = RawShaderMaterial::create();
+        material->name = sourceCube ? "PMREM.cubeGGX" : "PMREM.equirectGGX";
+        material->vertexShader = VERTEX_SRC;
+        material->fragmentShader = fragmentSource(sourceCube);
+        material->uniforms["envMap"] = Uniform();
+        material->uniforms["roughness"] = Uniform();
+        material->uniforms["roughness"].setValue(0.0f);
+        material->uniforms["numSamples"] = Uniform();
+        material->uniforms["numSamples"].setValue(128);
+        material->uniforms["decodeSourceColor"] = Uniform();
+        material->uniforms["decodeSourceColor"].setValue(0);
+        material->depthTest = false;
+        material->depthWrite = false;
+        material->blending = Blending::None;
+        material->side = Side::Double;
+        return material;
+    }
+
+    Mapping pmremMappingForSource(const Texture& texture) {
+        if (texture.mapping == Mapping::CubeRefraction ||
+            texture.mapping == Mapping::EquirectangularRefraction) {
+            return Mapping::CubeUVRefraction;
+        }
+        return Mapping::CubeUVReflection;
+    }
+
+    std::unique_ptr<RenderTarget> renderPMREM(
+        GLRenderer& renderer,
+        Texture& texture,
+        const std::shared_ptr<RawShaderMaterial>& material,
+        const std::shared_ptr<OrthographicCamera>& camera)
+    {
+        RenderTarget::Options options;
+        options.type = Type::HalfFloat;
+        options.format = Format::RGBA;
+        options.encoding = ColorSpace::Linear;
+        // Hardware bilinear — the shader samples the strips directly (no manual
+        // 4-tap). Repeat on U makes the equirect azimuth seam (atan2 at -X) wrap
+        // seamlessly; V is clamped per-strip in the shader to avoid bleeding into
+        // the neighbouring roughness strip.
+        options.magFilter = Filter::Linear;
+        options.minFilter = Filter::Linear;
+        options.wrapS = TextureWrapping::Repeat;
+        options.wrapT = TextureWrapping::ClampToEdge;
+        options.generateMipmaps = false;
+        options.depthBuffer = false;
+
+        auto target = RenderTarget::create(ATLAS_W, ATLAS_H, options);
+        // cube_uv_reflection_fragment.glsl activates via Mapping::CubeUVReflection
+        // — the signal to compile ENVMAP_TYPE_CUBE_UV (now the equirect-strip path).
+        target->texture->mapping = pmremMappingForSource(texture);
+        target->scissorTest = true;
+
+        material->uniforms["envMap"].setValue(&texture);
+
+        auto* oldTarget = renderer.getRenderTarget();
+        const bool oldAutoClear = renderer.autoClear;
+        renderer.autoClear = false;
+
+        // Clear the full atlas once so any uncovered region is defined.
+        target->viewport.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
+        target->scissor.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
+        renderer.setRenderTarget(target.get(), 0, 0);
+        renderer.clear(true, true, false);
+
+        auto geometry = createFullscreenQuad();
+        Mesh mesh(geometry, material);
+        mesh.frustumCulled = false;
+
+        for (int lod = 0; lod < N_LODS; ++lod) {
+            const int y = lod * STRIP_H;
+            target->viewport.set(0.f, static_cast<float>(y),
+                                 static_cast<float>(STRIP_W), static_cast<float>(STRIP_H));
+            target->scissor.set(0.f, static_cast<float>(y),
+                                static_cast<float>(STRIP_W), static_cast<float>(STRIP_H));
+
+            material->uniforms["roughness"].setValue(LOD_ROUGHNESS[lod]);
+            // LOD 0 is a direct fetch (1 sample); narrow low-roughness lobes need
+            // more samples to converge; wide rough lobes need fewer.
+            const int samples = (lod == 0) ? 1 : (LOD_ROUGHNESS[lod] < 0.3f ? 256 : 128);
+            material->uniforms["numSamples"].setValue(samples);
+
+            renderer.setRenderTarget(target.get(), 0, 0);
+            renderer.render(mesh, *camera);
+        }
+
+        geometry->dispose();
+
+        renderer.autoClear = oldAutoClear;
+        renderer.setRenderTarget(oldTarget, 0, 0);
+
+        target->scissorTest = false;
+        target->viewport.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
+        target->scissor.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
+
+        return target;
+    }
+
 }// namespace
 
 struct GLPMREM::Impl {
-    std::shared_ptr<RawShaderMaterial> material;
+    std::shared_ptr<RawShaderMaterial> equirectMaterial;
+    std::shared_ptr<RawShaderMaterial> cubeMaterial;
     std::shared_ptr<OrthographicCamera> camera;
 };
 
 GLPMREM::GLPMREM(GLRenderer& r)
     : renderer(r), impl(std::make_unique<Impl>()) {
 
-    impl->material = RawShaderMaterial::create();
-    impl->material->name = "PMREM.equirectGGX";
-    impl->material->vertexShader = VERTEX_SRC;
-    impl->material->fragmentShader = FRAGMENT_SRC;
-    impl->material->uniforms["envMap"] = Uniform();
-    impl->material->uniforms["roughness"] = Uniform();
-    impl->material->uniforms["roughness"].setValue(0.0f);
-    impl->material->uniforms["numSamples"] = Uniform();
-    impl->material->uniforms["numSamples"].setValue(128);
-    impl->material->depthTest = false;
-    impl->material->depthWrite = false;
-    impl->material->blending = Blending::None;
-    impl->material->side = Side::Double;
+    impl->equirectMaterial = createPMREMMaterial(false);
+    impl->cubeMaterial = createPMREMMaterial(true);
 
     impl->camera = OrthographicCamera::create();
 }
@@ -241,68 +387,12 @@ GLPMREM::~GLPMREM() = default;
 
 std::unique_ptr<RenderTarget> GLPMREM::fromEquirectangular(Texture& equirect) {
 
-    RenderTarget::Options options;
-    options.type = Type::HalfFloat;
-    options.format = Format::RGBA;
-    options.encoding = ColorSpace::Linear;
-    // Hardware bilinear — the shader samples the strips directly (no manual
-    // 4-tap). Repeat on U makes the equirect azimuth seam (atan2 at -X) wrap
-    // seamlessly; V is clamped per-strip in the shader to avoid bleeding into
-    // the neighbouring roughness strip.
-    options.magFilter = Filter::Linear;
-    options.minFilter = Filter::Linear;
-    options.wrapS = TextureWrapping::Repeat;
-    options.wrapT = TextureWrapping::ClampToEdge;
-    options.generateMipmaps = false;
-    options.depthBuffer = false;
+    impl->equirectMaterial->uniforms["decodeSourceColor"].setValue(0);
+    return renderPMREM(renderer, equirect, impl->equirectMaterial, impl->camera);
+}
 
-    auto target = RenderTarget::create(ATLAS_W, ATLAS_H, options);
-    // cube_uv_reflection_fragment.glsl activates via Mapping::CubeUVReflection
-    // — the signal to compile ENVMAP_TYPE_CUBE_UV (now the equirect-strip path).
-    target->texture->mapping = Mapping::CubeUVReflection;
-    target->scissorTest = true;
+std::unique_ptr<RenderTarget> GLPMREM::fromCubemap(Texture& cubemap) {
 
-    impl->material->uniforms["envMap"].setValue(&equirect);
-
-    auto* oldTarget = renderer.getRenderTarget();
-    const bool oldAutoClear = renderer.autoClear;
-    renderer.autoClear = false;
-
-    // Clear the full atlas once so any uncovered region is defined.
-    target->viewport.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
-    target->scissor.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
-    renderer.setRenderTarget(target.get(), 0, 0);
-    renderer.clear(true, true, false);
-
-    auto geometry = createFullscreenQuad();
-    Mesh mesh(geometry, impl->material);
-    mesh.frustumCulled = false;
-
-    for (int lod = 0; lod < N_LODS; ++lod) {
-        const int y = lod * STRIP_H;
-        target->viewport.set(0.f, static_cast<float>(y),
-                             static_cast<float>(STRIP_W), static_cast<float>(STRIP_H));
-        target->scissor.set(0.f, static_cast<float>(y),
-                            static_cast<float>(STRIP_W), static_cast<float>(STRIP_H));
-
-        impl->material->uniforms["roughness"].setValue(LOD_ROUGHNESS[lod]);
-        // LOD 0 is a direct fetch (1 sample); narrow low-roughness lobes need
-        // more samples to converge; wide rough lobes need fewer.
-        const int samples = (lod == 0) ? 1 : (LOD_ROUGHNESS[lod] < 0.3f ? 256 : 128);
-        impl->material->uniforms["numSamples"].setValue(samples);
-
-        renderer.setRenderTarget(target.get(), 0, 0);
-        renderer.render(mesh, *impl->camera);
-    }
-
-    geometry->dispose();
-
-    renderer.autoClear = oldAutoClear;
-    renderer.setRenderTarget(oldTarget, 0, 0);
-
-    target->scissorTest = false;
-    target->viewport.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
-    target->scissor.set(0, 0, static_cast<float>(ATLAS_W), static_cast<float>(ATLAS_H));
-
-    return target;
+    impl->cubeMaterial->uniforms["decodeSourceColor"].setValue(envmap::textureUsesManualCubeDecode(cubemap) ? 1 : 0);
+    return renderPMREM(renderer, cubemap, impl->cubeMaterial, impl->camera);
 }
