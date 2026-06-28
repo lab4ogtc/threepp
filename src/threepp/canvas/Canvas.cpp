@@ -696,8 +696,12 @@ std::pair<float, float> monitor::contentScale(int monitor) {
 
     int count;
     auto monitors = glfwGetMonitors(&count);
+    if (!monitors || monitor < 0 || monitor >= count) {
+        return {1, 1};
+    }
 
-    float xscale, yscale;
+    float xscale = 1;
+    float yscale = 1;
     glfwGetMonitorContentScale(monitors[monitor], &xscale, &yscale);
 
     return {xscale, yscale};
