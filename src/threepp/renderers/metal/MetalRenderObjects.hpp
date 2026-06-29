@@ -49,6 +49,7 @@
 #import "threepp/objects/Sky.hpp"
 #import "threepp/objects/Sprite.hpp"
 #import "threepp/objects/Water.hpp"
+#import "threepp/renderers/RenderColorSpace.hpp"
 #import "threepp/renderers/RenderTarget.hpp"
 #import "threepp/renderers/EnvMapUtils.hpp"
 #import "threepp/renderers/Renderer.hpp"
@@ -64,6 +65,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -953,7 +955,7 @@ namespace threepp {
                (options.includeLocal && renderer.localClippingEnabled && !material.clippingPlanes.empty());
     }
 
-    inline ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow, const ClippingExtractionOptions& clippingOptions = {}, bool outputEncodeSRGB = false) {
+    inline ShadingParams extractShadingParams(const Renderer& renderer, const Scene& scene, Material& material, const Camera& camera, bool receiveShadow, const ClippingExtractionOptions& clippingOptions = {}, bool outputEncodeSRGB = false, std::optional<ColorSpace> outputColorSpace = std::nullopt) {
         ShadingParams params{};
         params.baseColor[0] = 1.f;
         params.baseColor[1] = 1.f;
@@ -1066,7 +1068,7 @@ namespace threepp {
         params.cameraPosition[2] = cameraPosition.z;
         params.cameraPosition[3] = 1.f;
         fillToneMappingUniforms(renderer, material, params, outputEncodeSRGB);
-        params.outputColorSpaceSRGB = renderer.outputColorSpace == ColorSpace::sRGB || renderer.outputColorSpace == ColorSpace::Gamma ? 1u : 0u;
+        params.outputColorSpaceSRGB = outputColorSpaceSRGBUniformFlag(outputColorSpace.value_or(renderer.outputColorSpace));
         params.useLegacyLights = renderer.useLegacyLights ? 1u : 0u;
         params.isOrthographicCamera = camera.is<OrthographicCamera>() ? 1u : 0u;
         fillFogUniforms(scene, material, params);
@@ -1107,16 +1109,6 @@ namespace threepp {
     inline NSUInteger clampToSize(float value, NSUInteger maxValue) {
         const auto rounded = static_cast<long>(std::floor(value));
         return static_cast<NSUInteger>(std::clamp<long>(rounded, 0, static_cast<long>(maxValue)));
-    }
-
-    inline bool usesSRGBColorEncoding(ColorSpace colorSpace) {
-        switch (colorSpace) {
-            case ColorSpace::sRGB:
-            case ColorSpace::Gamma:
-                return true;
-            default:
-                return false;
-        }
     }
 
     inline bool metalPixelFormatUsesSRGBEncoding(MTLPixelFormat pixelFormat) {

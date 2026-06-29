@@ -35,6 +35,7 @@ ProgramParameters::ProgramParameters(
         Scene* scene,
         Material* material,
         Texture* resolvedEnvMap,
+        ColorSpace outputColorSpace,
         const std::unordered_map<std::string, std::string>& shaderIDs) {
 
     auto mapMaterial = dynamic_cast<MaterialWithMap*>(material);
@@ -94,7 +95,7 @@ ProgramParameters::ProgramParameters(
     instancingColor = instancedMesh != nullptr && instancedMesh->instanceColor() != nullptr;
 
     supportsVertexTextures = capabilities.vertexTextures;
-    outputEncoding = renderer.outputColorSpace;
+    outputEncoding = outputColorSpace;
 
     map = mapMaterial && mapMaterial->map;
     mapEncoding = getTextureEncodingFromMap(map ? mapMaterial->map : nullptr);

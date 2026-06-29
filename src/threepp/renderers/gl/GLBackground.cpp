@@ -3,6 +3,7 @@
 #include "threepp/renderers/gl/GLCubeMaps.hpp"
 #include "threepp/renderers/gl/GLObjects.hpp"
 #include "threepp/renderers/gl/GLRenderLists.hpp"
+#include "threepp/renderers/RenderColorSpace.hpp"
 #include "threepp/renderers/Renderer.hpp"
 
 #include "threepp/renderers/shaders/ShaderLib.hpp"
@@ -132,9 +133,7 @@ void GLBackground::setClear(const Color& color, float alpha) {
     // clear color would render too dark. Mirrors three.js WebGLBackground.setClear,
     // which does color.getRGB(_rgb, getUnlitUniformColorSpace(renderer)).
     // When ColorManagement is disabled this is a no-op (legacy raw behaviour).
-    Color c;
-    c.copy(color);
-    ColorManagement::workingToColorSpace(c, renderer.outputColorSpace);
+    const auto c = activeOutputClearColor(renderer, renderer.getRenderTarget(), color);
 
     state.colorBuffer.setClear(c.r, c.g, c.b, alpha, premultipliedAlpha);
 }

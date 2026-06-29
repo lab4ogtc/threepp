@@ -27,7 +27,9 @@ namespace threepp {
             if (options.format) this->texture->format = *options.format;
             if (options.type) this->texture->type = *options.type;
             if (options.anisotropy) this->texture->anisotropy = *options.anisotropy;
-            if (options.encoding) this->texture->colorSpace = *options.encoding;
+            if (auto colorSpace = options.effectiveColorSpace()) {
+                this->texture->colorSpace = *colorSpace;
+            }
 
             this->texture->generateMipmaps = options.generateMipmaps;
             this->texture->minFilter = options.minFilter.value_or(Filter::Linear);

@@ -29,6 +29,11 @@ namespace threepp {
             std::optional<Type> type;
             std::optional<int> anisotropy;
             std::optional<ColorSpace> encoding;
+            std::optional<ColorSpace> colorSpace;
+
+            [[nodiscard]] std::optional<ColorSpace> effectiveColorSpace() const {
+                return colorSpace ? colorSpace : encoding;
+            }
 
             bool generateMipmaps{false};
             bool depthBuffer{true};

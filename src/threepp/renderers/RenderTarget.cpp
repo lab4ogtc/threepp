@@ -25,7 +25,9 @@ namespace {
         if (options.format) texture->format = *options.format;
         if (options.type) texture->type = *options.type;
         if (options.anisotropy) texture->anisotropy = *options.anisotropy;
-        if (options.encoding) texture->colorSpace = *options.encoding;
+        if (auto colorSpace = options.effectiveColorSpace()) {
+            texture->colorSpace = *colorSpace;
+        }
         texture->generateMipmaps = options.generateMipmaps;
 
         return texture;

@@ -26,6 +26,7 @@
 #include "threepp/materials/SpriteMaterial.hpp"
 #include "threepp/materials/interfaces.hpp"
 #include "threepp/renderers/wgpu/WgpuTexture.hpp"
+#include "threepp/renderers/RenderColorSpace.hpp"
 #include "threepp/math/Matrix3.hpp"
 #include "threepp/math/Matrix4.hpp"
 #include "threepp/objects/Mesh.hpp"
@@ -416,15 +417,15 @@ struct WgpuRenderer::Impl {
         // pipelines[]: target = surfaceFormat (sRGB). Shader writes linear; the
         //   sRGB surface format does the encode in hardware. Use for surface blits.
         // linearPipelines[]: target = surfaceFormatLinear (e.g. BGRA8Unorm).
-        //   Shader does in-shader sRGB encode (when outputColorSpace == sRGB) so
-        //   the linear-format RT ends up with sRGB-encoded bytes.
+        //   Shader sRGB encode is keyed by active output color space so RT
+        //   textures can override renderer.outputColorSpace.
         // Indexed by toneMapPipelineIndex(): 0=Linear 1=Reinhard 2=Cineon
         // 3=ACES 4=None/sRGB-only 5=Neutral. Range-based cleanup loops below
         // adapt to the size automatically.
         WGPURenderPipeline pipelines[6]{};
-        WGPURenderPipeline linearPipelines[6]{};
+        WGPURenderPipeline linearPipelines[2][6]{};
         WGPUShaderModule shaderModules[6]{};        // for surface (no in-shader sRGB)
-        WGPUShaderModule linearShaderModules[6]{};  // for linear targets (in-shader sRGB)
+        WGPUShaderModule linearShaderModules[2][6]{};  // [sRGB encode][tone map]
 
         // Sister pipelines that reuse the linear shader module but target Rgba8Unorm,
         // used to write the tone-mapped + sRGB-encoded result into retainedFB so
@@ -448,6 +449,10 @@ struct WgpuRenderer::Impl {
     bool hasTransmissive_ = false;
     Texture* currentSceneEnv_ = nullptr;  // scene.environment for the current render call
 
+    [[nodiscard]] bool activeOutputUsesSRGBColorEncoding() const {
+        return threepp::usesSRGBColorEncoding(threepp::activeOutputColorSpace(scope, currentRenderTarget_));
+    }
+
     // Decide whether the render needs to go through the RGBA16Float
     // intermediate (then tone-map blit). Surface output no longer needs the
     // intermediate just for sRGB encoding — the surface format is sRGB now,
@@ -455,15 +460,15 @@ struct WgpuRenderer::Impl {
     // intermediate for HDR tone mapping math, framebuffer retain, and the
     // transmission pre-pass which samples the previous frame's color.
     //
-    // RT renders with outputColorSpace == sRGB also still need the
-    // intermediate so the linear-format RT receives sRGB-encoded bytes via
-    // the in-shader OETF in linearPipelines[].
+    // RT renders whose active output color space uses sRGB/Gamma encoding also
+    // still need the intermediate so the linear-format RT receives encoded
+    // bytes via the in-shader OETF in linearPipelines[].
     bool needsToneMapPass() const {
         if (scope.toneMapping != ToneMapping::None) return true;
         if (retainFramebuffer) return true;
         if (hasTransmissive_) return true;
-        // For RT renders, sRGB output still requires the intermediate path.
-        if (currentRenderTarget_ && scope.outputColorSpace == ColorSpace::sRGB) return true;
+        // For RT renders, encoded output still requires the intermediate path.
+        if (currentRenderTarget_ && activeOutputUsesSRGBColorEncoding()) return true;
         return false;
     }
 
@@ -1749,12 +1754,11 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
             toneMap_.pipelines[idx] = wgpuDeviceCreateRenderPipeline(device, &pipeDesc);
         }
 
-        // Linear-target shader module: same tone mapping math but with the
-        // in-shader sRGB OETF when outputColorSpace == sRGB. Used by both the
-        // RT blit (surfaceFormatLinear target) and retain blit (RGBA8Unorm).
-        const bool srgbInShader = (scope.outputColorSpace == ColorSpace::sRGB);
-        if (!toneMap_.linearShaderModules[idx]) {
-            auto wgsl = buildToneMapWGSL(scope.toneMapping, srgbInShader);
+        // Linear-target shader module: same tone mapping math, with shader
+        // sRGB/Gamma encoding selected from the active output color space.
+        const auto srgbSlot = static_cast<size_t>(activeOutputUsesSRGBColorEncoding() ? 1 : 0);
+        if (!toneMap_.linearShaderModules[srgbSlot][idx]) {
+            auto wgsl = buildToneMapWGSL(scope.toneMapping, srgbSlot == 1);
             WGPUShaderSourceWGSL wgslSrc{};
             wgslSrc.chain.sType = WGPUSType_ShaderSourceWGSL;
             wgslSrc.code = {.data = wgsl.c_str(), .length = static_cast<size_t>(wgsl.size())};
@@ -1762,18 +1766,18 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
             WGPUShaderModuleDescriptor smDesc{};
             smDesc.nextInChain = &wgslSrc.chain;
             smDesc.label = WGPUStringView{"tonemap_shader_linear", sizeof("tonemap_shader_linear") - 1};
-            toneMap_.linearShaderModules[idx] = wgpuDeviceCreateShaderModule(device, &smDesc);
+            toneMap_.linearShaderModules[srgbSlot][idx] = wgpuDeviceCreateShaderModule(device, &smDesc);
         }
 
         // Pipeline targeting the linear surface format — used by RT renders
         // that go through the intermediate (toneMapBlitToTexture).
-        if (!toneMap_.linearPipelines[idx]) {
+        if (!toneMap_.linearPipelines[srgbSlot][idx]) {
             WGPUColorTargetState linTarget{};
             linTarget.format = surfaceFormatLinear;
             linTarget.writeMask = WGPUColorWriteMask_All;
 
             WGPUFragmentState linFragment{};
-            linFragment.module = toneMap_.linearShaderModules[idx];
+            linFragment.module = toneMap_.linearShaderModules[srgbSlot][idx];
             linFragment.entryPoint = fsEntry;
             linFragment.targetCount = 1;
             linFragment.targets = &linTarget;
@@ -1781,7 +1785,7 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
             WGPURenderPipelineDescriptor linDesc{};
             linDesc.label = WGPUStringView{"tonemap_linear_pipe", sizeof("tonemap_linear_pipe") - 1};
             linDesc.layout = toneMap_.pipelineLayout;
-            linDesc.vertex.module = toneMap_.linearShaderModules[idx];
+            linDesc.vertex.module = toneMap_.linearShaderModules[srgbSlot][idx];
             linDesc.vertex.entryPoint = vsEntry;
             linDesc.vertex.bufferCount = 0;
             linDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
@@ -1790,19 +1794,29 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
             linDesc.multisample.mask = ~0u;
             linDesc.fragment = &linFragment;
 
-            toneMap_.linearPipelines[idx] = wgpuDeviceCreateRenderPipeline(device, &linDesc);
+            toneMap_.linearPipelines[srgbSlot][idx] = wgpuDeviceCreateRenderPipeline(device, &linDesc);
         }
 
-        // Sister pipeline targeting Rgba8Unorm for the retain blit. Same
-        // shader as the linear pipeline (in-shader sRGB encode) but a
-        // different target format.
+        // Sister pipeline targeting Rgba8Unorm for the retain blit. It always
+        // writes display-byte semantics, so it always uses the sRGB encode shader.
+        if (!toneMap_.linearShaderModules[1][idx]) {
+            auto wgsl = buildToneMapWGSL(scope.toneMapping, true);
+            WGPUShaderSourceWGSL wgslSrc{};
+            wgslSrc.chain.sType = WGPUSType_ShaderSourceWGSL;
+            wgslSrc.code = {.data = wgsl.c_str(), .length = static_cast<size_t>(wgsl.size())};
+
+            WGPUShaderModuleDescriptor smDesc{};
+            smDesc.nextInChain = &wgslSrc.chain;
+            smDesc.label = WGPUStringView{"tonemap_shader_retain", sizeof("tonemap_shader_retain") - 1};
+            toneMap_.linearShaderModules[1][idx] = wgpuDeviceCreateShaderModule(device, &smDesc);
+        }
         if (!toneMap_.retainPipelines[idx]) {
             WGPUColorTargetState retainTarget{};
             retainTarget.format = WGPUTextureFormat_RGBA8Unorm;
             retainTarget.writeMask = WGPUColorWriteMask_All;
 
             WGPUFragmentState retainFragment{};
-            retainFragment.module = toneMap_.linearShaderModules[idx];
+            retainFragment.module = toneMap_.linearShaderModules[1][idx];
             retainFragment.entryPoint = fsEntry;
             retainFragment.targetCount = 1;
             retainFragment.targets = &retainTarget;
@@ -1810,7 +1824,7 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
             WGPURenderPipelineDescriptor retainDesc{};
             retainDesc.label = WGPUStringView{"tonemap_retain_pipe", sizeof("tonemap_retain_pipe") - 1};
             retainDesc.layout = toneMap_.pipelineLayout;
-            retainDesc.vertex.module = toneMap_.linearShaderModules[idx];
+            retainDesc.vertex.module = toneMap_.linearShaderModules[1][idx];
             retainDesc.vertex.entryPoint = vsEntry;
             retainDesc.vertex.bufferCount = 0;
             retainDesc.primitive.topology = WGPUPrimitiveTopology_TriangleList;
@@ -1999,10 +2013,10 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
         ensureToneMapResources();
 
         int idx = toneMapPipelineIndex();
-        // RT destination is linear (surfaceFormatLinear); the in-shader sRGB
-        // encoding lives in linearPipelines[]. surface-targeted pipelines[]
-        // skip the encode (the sRGB surface format does it instead).
-        if (!toneMap_.linearPipelines[idx]) return;
+        const auto srgbSlot = static_cast<size_t>(activeOutputUsesSRGBColorEncoding() ? 1 : 0);
+        // RT destination is linear (surfaceFormatLinear); shader encoding is
+        // selected from the active output color space for the current target.
+        if (!toneMap_.linearPipelines[srgbSlot][idx]) return;
 
         const Color& encodedClear = lastFrameClearColor_;
         const float exposure = scope.toneMappingExposure;
@@ -2053,7 +2067,7 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
         rpDesc.colorAttachments = &ca;
 
         WGPURenderPassEncoder rp = wgpuCommandEncoderBeginRenderPass(renderEncoder_, &rpDesc);
-        wgpuRenderPassEncoderSetPipeline(rp, toneMap_.linearPipelines[idx]);
+        wgpuRenderPassEncoderSetPipeline(rp, toneMap_.linearPipelines[srgbSlot][idx]);
         wgpuRenderPassEncoderSetBindGroup(rp, 0, bg, 0, nullptr);
         wgpuRenderPassEncoderDraw(rp, 3, 1, 0, 0);
         wgpuRenderPassEncoderEnd(rp);
@@ -2458,7 +2472,7 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
                 // RT textures are allocated in the linear surface format
                 // (state_.surfaceFormat == surfaceFormatLinear) so the in-shader
                 // sRGB encode path at line ~2347 is the one that writes correct
-                // bytes into them when outputColorSpace == sRGB.
+                // bytes into them when the active output color space is encoded.
                 activeColorFormat_ = surfaceFormatLinear;
             }
             // Capture the depth attachment that the scene was rendered into; the
@@ -2719,7 +2733,7 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
                 case ToneMapping::Neutral:   frameCtx.tonemapBits = SF::TonemapNeutral; break;
                 default: break;
             }
-            if (scope.outputColorSpace == ColorSpace::sRGB) {
+            if (activeOutputUsesSRGBColorEncoding()) {
                 frameCtx.srgbOutput = true;
             }
         }
@@ -3911,10 +3925,14 @@ struct VSOutput { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> 
         if (toneMap_.cachedBindGroup)  { wgpuBindGroupRelease(toneMap_.cachedBindGroup);  }
         if (toneMap_.cachedInputView)  { wgpuTextureViewRelease(toneMap_.cachedInputView); }
         for (auto& p : toneMap_.pipelines) { if (p) wgpuRenderPipelineRelease(p); }
-        for (auto& p : toneMap_.linearPipelines) { if (p) wgpuRenderPipelineRelease(p); }
+        for (auto& row : toneMap_.linearPipelines) {
+            for (auto& p : row) { if (p) wgpuRenderPipelineRelease(p); }
+        }
         for (auto& p : toneMap_.retainPipelines) { if (p) wgpuRenderPipelineRelease(p); }
         for (auto& m : toneMap_.shaderModules) { if (m) wgpuShaderModuleRelease(m); }
-        for (auto& m : toneMap_.linearShaderModules) { if (m) wgpuShaderModuleRelease(m); }
+        for (auto& row : toneMap_.linearShaderModules) {
+            for (auto& m : row) { if (m) wgpuShaderModuleRelease(m); }
+        }
         if (toneMap_.sampler) wgpuSamplerRelease(toneMap_.sampler);
         if (toneMap_.uniformBuf) wgpuBufferRelease(toneMap_.uniformBuf);
         if (toneMap_.pipelineLayout) wgpuPipelineLayoutRelease(toneMap_.pipelineLayout);

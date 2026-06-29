@@ -4260,7 +4260,7 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
             auto* skinnedMesh = dynamic_cast<SkinnedMesh*>(obj);
 
             const auto outputEncodeSRGB = needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat);
-            const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow, {}, outputEncodeSRGB);
+            const auto shadingParams = extractShadingParams(renderer, scene, *material, camera, obj->receiveShadow, {}, outputEncodeSRGB, activeOutputColorSpace);
             const bool useClipping = shadingParams.numClippingPlanes > 0u;
             const bool useUv = uvAttr && needsUv(shadingParams);
             const bool useVertexColors = material->vertexColors && colorAttr;

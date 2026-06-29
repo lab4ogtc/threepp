@@ -232,6 +232,7 @@ set(publicHeaders
         "threepp/renderers/WgpuRenderer.hpp"
         "threepp/renderers/CrossRenderer.hpp"
         "threepp/renderers/CubeRenderTarget.hpp"
+        "threepp/renderers/RenderColorSpace.hpp"
         "threepp/renderers/RenderTarget.hpp"
         "threepp/renderers/GLRenderTarget.hpp"
         "threepp/renderers/metal/MetalRenderer.hpp"

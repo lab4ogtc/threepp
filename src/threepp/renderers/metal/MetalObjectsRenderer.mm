@@ -751,7 +751,7 @@ void MetalRenderer::Impl::renderLine(id<MTLRenderCommandEncoder> encoder,
     LineUniforms uniforms{};
     computeLineUniforms(camera, line, *lineMaterial, uniforms);
     fillToneMappingUniforms(renderer, *lineMaterial, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
-    uniforms.outputColorSpaceSRGB = renderer.outputColorSpace == ColorSpace::sRGB || renderer.outputColorSpace == ColorSpace::Gamma ? 1u : 0u;
+    uniforms.outputColorSpaceSRGB = outputColorSpaceSRGBUniformFlag(activeOutputColorSpace);
     fillFogUniforms(scene, *lineMaterial, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -890,7 +890,7 @@ void MetalRenderer::Impl::renderPoints(id<MTLRenderCommandEncoder> encoder,
         writeMorphTargetUniforms(*morphTargets, uniforms);
     }
     fillToneMappingUniforms(renderer, *pointsMaterial, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
-    uniforms.outputColorSpaceSRGB = renderer.outputColorSpace == ColorSpace::sRGB || renderer.outputColorSpace == ColorSpace::Gamma ? 1u : 0u;
+    uniforms.outputColorSpaceSRGB = outputColorSpaceSRGBUniformFlag(activeOutputColorSpace);
     fillFogUniforms(scene, *pointsMaterial, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -1419,7 +1419,7 @@ void MetalRenderer::Impl::renderSprite(id<MTLRenderCommandEncoder> encoder, Scen
     SpriteUniforms uniforms{};
     computeSpriteUniforms(camera, sprite, *material, uniforms);
     fillToneMappingUniforms(renderer, *material, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
-    uniforms.outputColorSpaceSRGB = renderer.outputColorSpace == ColorSpace::sRGB || renderer.outputColorSpace == ColorSpace::Gamma ? 1u : 0u;
+    uniforms.outputColorSpaceSRGB = outputColorSpaceSRGBUniformFlag(activeOutputColorSpace);
     fillFogUniforms(scene, *material, uniforms);
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];
     [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:4];
@@ -1545,7 +1545,7 @@ void MetalRenderer::Impl::renderWater(id<MTLRenderCommandEncoder> encoder, Scene
     uniforms.params[2] = uniformFloat(material->uniforms, "size", 1.f);
     uniforms.params[3] = uniformFloat(material->uniforms, "distortionScale", 20.f);
     fillToneMappingUniforms(renderer, *material, uniforms, needsShaderOutputSRGBEncoding(activeOutputColorSpace, colorPixelFormat));
-    uniforms.outputColorSpaceSRGB = renderer.outputColorSpace == ColorSpace::sRGB || renderer.outputColorSpace == ColorSpace::Gamma ? 1u : 0u;
+    uniforms.outputColorSpaceSRGB = outputColorSpaceSRGBUniformFlag(activeOutputColorSpace);
     fillFogUniforms(scene, *material, uniforms);
 
     [encoder setVertexBytes:&uniforms length:sizeof(uniforms) atIndex:4];

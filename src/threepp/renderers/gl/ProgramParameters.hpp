@@ -142,6 +142,7 @@ namespace threepp {
                     Scene* scene,
                     Material* material,
                     Texture* resolvedEnvMap,
+                    ColorSpace outputColorSpace,
                     const std::unordered_map<std::string, std::string>& shaderIDs);
 
             [[nodiscard]] std::string hash() const;

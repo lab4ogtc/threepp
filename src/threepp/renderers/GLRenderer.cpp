@@ -1,6 +1,7 @@
 
 #include "threepp/renderers/GLRenderer.hpp"
 
+#include "threepp/renderers/RenderColorSpace.hpp"
 #include "threepp/renderers/RenderTarget.hpp"
 
 #include "threepp/renderers/gl/GLAttributes.hpp"
@@ -765,7 +766,8 @@ struct GLRenderer::Impl {
             materialProperties->envMap = cubemaps.getPMREM(materialProperties->environment);
         }
 
-        auto parameters = gl::GLPrograms::getParameters(scope, shadowCfg, caps, clipping, material, lights.state, shadowsArray.size(), scene, object, materialProperties->envMap);
+        const auto outputColorSpace = activeOutputColorSpace(scope, _currentRenderTarget);
+        auto parameters = gl::GLPrograms::getParameters(scope, shadowCfg, caps, clipping, material, lights.state, shadowsArray.size(), scene, object, materialProperties->envMap, outputColorSpace);
         auto programCacheKey = gl::GLPrograms::getProgramCacheKey(scope, parameters);
 
         auto& programs = materialProperties->programs;
@@ -887,7 +889,7 @@ struct GLRenderer::Impl {
 
         auto& fog = scene->fog;
         auto environment = isMeshStandardMaterial ? scene->environment : nullptr;
-        ColorSpace encoding = (_currentRenderTarget == nullptr) ? scope.outputColorSpace : _currentRenderTarget->texture->colorSpace;
+        ColorSpace encoding = activeOutputColorSpace(scope, _currentRenderTarget);
 
         Texture* envMap;
         auto materialWithEnvMap = material->as<MaterialWithEnvMap>();
