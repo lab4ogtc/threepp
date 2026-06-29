@@ -885,8 +885,10 @@ kernel void sparkSplatDepth(texture2d_array<uint, access::read> generatedSplats 
         }
     }
 
-    MTLPixelFormat screenColorPixelFormatForOutputColorSpace(ColorSpace) {
-        return MTLPixelFormatBGRA8Unorm;
+    MTLPixelFormat screenColorPixelFormatForOutputColorSpace(ColorSpace colorSpace) {
+        return usesSRGBColorEncoding(colorSpace)
+            ? MTLPixelFormatBGRA8Unorm_sRGB
+            : MTLPixelFormatBGRA8Unorm;
     }
 
     Color encodedClearColorForTarget(const Color& color, ColorSpace outputColorSpace, MTLPixelFormat colorPixelFormat) {
