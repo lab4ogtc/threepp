@@ -89,7 +89,7 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Vulkan PT - Lights", {{"vsync", false}, {"size", WindowSize{1700, 900}}});
+    Canvas canvas("Vulkan PT - Lights", {{"vsync", true}, {"size", WindowSize{1700, 900}}});
     VulkanRenderer renderer(canvas);
 
     Scene scene;

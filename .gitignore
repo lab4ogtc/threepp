@@ -32,3 +32,5 @@ aaa_caps
 examples/vulkan/scratch/*
 !examples/vulkan/scratch/README.md
 _build_aaa.bat
+
+MEMORY.md

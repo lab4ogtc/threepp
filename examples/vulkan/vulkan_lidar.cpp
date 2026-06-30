@@ -133,7 +133,7 @@ namespace {
 int main() {
 
     Canvas canvas("Vulkan PT - physically correct LIDAR",
-                  {{"vsync", false}, {"size", WindowSize{1600, 900}}});
+                  {{"vsync", true}, {"size", WindowSize{1600, 900}}});
     VulkanRenderer renderer(canvas);
     renderer.toneMapping = ToneMapping::ACESFilmic;
     renderer.toneMappingExposure = 1.0f;

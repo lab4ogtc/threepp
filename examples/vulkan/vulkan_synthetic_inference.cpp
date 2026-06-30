@@ -102,7 +102,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    Canvas canvas("Synthetic perception - render+detect", {{"vsync", false}, {"size", WindowSize{1280, 720}}});
+    Canvas canvas("Synthetic perception - render+detect", {{"vsync", true}, {"size", WindowSize{1280, 720}}});
     VulkanRenderer renderer(canvas);
     renderer.outputColorSpace = ColorSpace::sRGB;
     renderer.toneMapping = ToneMapping::Neutral;

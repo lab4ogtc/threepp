@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
 
     // ---- Window & Renderer ----
     Canvas canvas("Bistro scene",
-                  {{"vsync", false}});
+                  {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     renderer.outputColorSpace = ColorSpace::sRGB;

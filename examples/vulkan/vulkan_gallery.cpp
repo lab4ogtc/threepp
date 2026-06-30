@@ -216,7 +216,7 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Vulkan Material Gallery", {{"vsync", false}, {"size", WindowSize{1280, 720}}});
+    Canvas canvas("Vulkan Material Gallery", {{"vsync", true}, {"size", WindowSize{1280, 720}}});
     VulkanRenderer renderer(canvas);
 
     // ---- Scene ----

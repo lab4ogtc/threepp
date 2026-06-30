@@ -108,7 +108,7 @@ namespace {
 int main() {
 
     Canvas canvas("Vulkan PT - event camera (DVS)",
-                  {{"vsync", false}, {"size", WindowSize{1280, 720}}});
+                  {{"vsync", true}, {"size", WindowSize{1280, 720}}});
     VulkanRenderer renderer(canvas);
     renderer.toneMapping = ToneMapping::ACESFilmic;
     renderer.toneMappingExposure = 1.0f;

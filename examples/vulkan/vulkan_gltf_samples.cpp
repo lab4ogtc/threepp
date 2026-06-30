@@ -88,7 +88,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "Found " << models.size() << " models. Use Left/Right (or P/N) to browse." << std::endl;
 
-    Canvas canvas("Vulkan PT - GLTF Samples", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - GLTF Samples", {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     renderer.setRenderMode(VulkanRenderer::RenderMode::RasterFirst);

@@ -39,12 +39,30 @@
         "VCPKG_MANIFEST_FEATURES": "assimp",
         "THREEPP_WITH_SLANG": "ON"
       }
+    },
+    {
+      "name": "dev-mswin",
+      "inherits":[
+        "dev-base",
+        "windows"
+      ],
+      "cacheVariables": {
+        "THREEPP_BUILD_EXAMPLES": "ON",
+        "THREEPP_BUILD_EXAMPLE_PROJECTS": "ON",
+        "THREEPP_BUILD_TESTS": "ON",
+        "THREEPP_WITH_VULKAN": "ON"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "dev-macos",
       "configurePreset": "dev-macos"
+    },
+    {
+      "name": "dev-mswin",
+      "configurePreset": "dev-mswin",
+      "configuration": "Debug"
     }
   ]
 }

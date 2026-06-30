@@ -245,7 +245,7 @@ int main() {
     float sceneScale = 1.f;     // debug: scale world/amplitude/feature (precision A/B)
     float ovSunAz = -1, ovSunEl = -1;// debug: override sun azimuth/elevation
 
-    Canvas canvas("Vulkan PT - Mountains", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - Mountains", {{"vsync", true}});
     auto renderer = createRenderer(canvas);
     renderer->toneMapping = ToneMapping::ACESFilmic;
     renderer->toneMappingExposure = 1.0f;

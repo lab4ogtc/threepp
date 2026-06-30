@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--pt") shotPT = true;
     }
 
-    Canvas canvas("Vulkan PT - Fog", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - Fog", {{"vsync", true}});
     VulkanRenderer renderer(canvas);
     renderer.toneMapping = ToneMapping::ACESFilmic;
     renderer.toneMappingExposure = 0.9f;

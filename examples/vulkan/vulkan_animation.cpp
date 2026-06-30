@@ -13,7 +13,7 @@ using namespace threepp;
 
 int main() {
 
-    Canvas canvas("Vulkan animation", {{"vsync", false}});
+    Canvas canvas("Vulkan animation", {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     renderer.outputColorSpace = ColorSpace::sRGB;

@@ -862,7 +862,7 @@ int main(int argc, char** argv) {
     const capture::Args capArgs = capture::parseArgs(argc, argv);
     int shotFrame = 0;
 
-    Canvas canvas("Vulkan PT  Ocean", {{"vsync", false}, {"size", WindowSize{1600, 900}}});
+    Canvas canvas("Vulkan PT  Ocean", {{"vsync", true}, {"size", WindowSize{1600, 900}}});
     VulkanRenderer renderer(canvas);
     renderer.setDenoise(true);
     renderer.setRestirDIEnabled(true);

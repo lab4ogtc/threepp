@@ -152,24 +152,26 @@ namespace threepp::vulkan {
     void EventCameraDetector::allocateDescriptorPool() {
         std::array<VkDescriptorPoolSize, 2> ps{};
         ps[0].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        ps[0].descriptorCount = 2;  // scene buf + event stream buf
+        ps[0].descriptorCount = 2 * kRingSize;// scene buf + event stream buf
         ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        ps[1].descriptorCount = 2;
+        ps[1].descriptorCount = 2 * kRingSize;
 
         VkDescriptorPoolCreateInfo dpci{};
         dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets       = 1;
+        dpci.maxSets       = kRingSize;
         dpci.poolSizeCount = static_cast<uint32_t>(ps.size());
         dpci.pPoolSizes    = ps.data();
         check(vkCreateDescriptorPool(ctx_.device(), &dpci, nullptr, &descPool_),
               "vkCreateDescriptorPool(event_detect)");
 
+        std::array<VkDescriptorSetLayout, kRingSize> layouts{};
+        layouts.fill(dsLayout_);
         VkDescriptorSetAllocateInfo dsai{};
         dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         dsai.descriptorPool     = descPool_;
-        dsai.descriptorSetCount = 1;
-        dsai.pSetLayouts        = &dsLayout_;
-        check(vkAllocateDescriptorSets(ctx_.device(), &dsai, &descSet_),
+        dsai.descriptorSetCount = kRingSize;
+        dsai.pSetLayouts        = layouts.data();
+        check(vkAllocateDescriptorSets(ctx_.device(), &dsai, descSets_.data()),
               "vkAllocateDescriptorSets(event_detect)");
     }
 
@@ -331,19 +333,43 @@ namespace threepp::vulkan {
         accInfo.imageLayout  = VK_IMAGE_LAYOUT_GENERAL;
         accInfo.imageView    = accumulatorImg_.view;
 
-        std::array<VkWriteDescriptorSet, 2> w{};
-        w[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[0].dstSet          = descSet_;
-        w[0].dstBinding      = 1;
-        w[0].descriptorCount = 1;
-        w[0].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[0].pImageInfo      = &histInfo;
-        w[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w[1].dstSet          = descSet_;
-        w[1].dstBinding      = 2;
-        w[1].descriptorCount = 1;
-        w[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w[1].pImageInfo      = &accInfo;
+        std::array<VkDescriptorBufferInfo, kRingSize> streamInfos{};
+        for (uint32_t slot = 0; slot < kRingSize; ++slot) {
+            streamInfos[slot].buffer = eventStreamRing_[slot].handle;
+            streamInfos[slot].offset = 0;
+            streamInfos[slot].range  = VK_WHOLE_SIZE;
+        }
+
+        std::vector<VkWriteDescriptorSet> w;
+        w.reserve(kRingSize * 3);
+        for (uint32_t slot = 0; slot < kRingSize; ++slot) {
+            VkWriteDescriptorSet histWrite{};
+            histWrite.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            histWrite.dstSet          = descSets_[slot];
+            histWrite.dstBinding      = 1;
+            histWrite.descriptorCount = 1;
+            histWrite.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            histWrite.pImageInfo      = &histInfo;
+            w.push_back(histWrite);
+
+            VkWriteDescriptorSet accWrite{};
+            accWrite.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            accWrite.dstSet          = descSets_[slot];
+            accWrite.dstBinding      = 2;
+            accWrite.descriptorCount = 1;
+            accWrite.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+            accWrite.pImageInfo      = &accInfo;
+            w.push_back(accWrite);
+
+            VkWriteDescriptorSet streamWrite{};
+            streamWrite.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            streamWrite.dstSet          = descSets_[slot];
+            streamWrite.dstBinding      = 3;
+            streamWrite.descriptorCount = 1;
+            streamWrite.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            streamWrite.pBufferInfo     = &streamInfos[slot];
+            w.push_back(streamWrite);
+        }
         vkUpdateDescriptorSets(ctx_.device(),
                                 static_cast<uint32_t>(w.size()), w.data(),
                                 0, nullptr);
@@ -362,14 +388,16 @@ namespace threepp::vulkan {
         info.offset = 0;
         info.range  = VK_WHOLE_SIZE;
 
-        VkWriteDescriptorSet w{};
-        w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        w.dstSet          = descSet_;
-        w.dstBinding      = 0;
-        w.descriptorCount = 1;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        w.pBufferInfo     = &info;
-        vkUpdateDescriptorSets(ctx_.device(), 1, &w, 0, nullptr);
+        std::array<VkWriteDescriptorSet, kRingSize> w{};
+        for (uint32_t slot = 0; slot < kRingSize; ++slot) {
+            w[slot].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w[slot].dstSet          = descSets_[slot];
+            w[slot].dstBinding      = 0;
+            w[slot].descriptorCount = 1;
+            w[slot].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            w[slot].pBufferInfo     = &info;
+        }
+        vkUpdateDescriptorSets(ctx_.device(), static_cast<uint32_t>(w.size()), w.data(), 0, nullptr);
         currentSceneBuf_ = sceneBuf;
     }
 
@@ -377,24 +405,6 @@ namespace threepp::vulkan {
         if (width_ == 0 || height_ == 0 || sceneBuf == VK_NULL_HANDLE) return;
 
         updateSceneBinding(sceneBuf);
-
-        // Rebind the current ring slot's event-stream buffer to binding 3.
-        // Slot rotates per frame so the host's readEventStreamInto (which
-        // reads the OLDEST slot) never collides with the GPU's writes.
-        {
-            VkDescriptorBufferInfo streamInfo{};
-            streamInfo.buffer = eventStreamRing_[writeSlot_].handle;
-            streamInfo.offset = 0;
-            streamInfo.range  = VK_WHOLE_SIZE;
-            VkWriteDescriptorSet w{};
-            w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w.dstSet          = descSet_;
-            w.dstBinding      = 3;
-            w.descriptorCount = 1;
-            w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            w.pBufferInfo     = &streamInfo;
-            vkUpdateDescriptorSets(ctx_.device(), 1, &w, 0, nullptr);
-        }
 
         // Zero the event-stream header for this slot. {count=0, capacity,
         // overflow=0, frameTimeUs} — capacity is constant and we don't
@@ -432,9 +442,10 @@ namespace threepp::vulkan {
                               static_cast<uint32_t>(preBarriers.size()), preBarriers.data(),
                               0, nullptr);
 
+        const VkDescriptorSet descSet = descSets_[writeSlot_];
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                 pipelineLayout_, 0, 1, &descSet_, 0, nullptr);
+                                 pipelineLayout_, 0, 1, &descSet, 0, nullptr);
 
         PC pc{};
         pc.width            = width_;

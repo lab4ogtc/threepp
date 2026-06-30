@@ -1252,7 +1252,7 @@ namespace threepp {
         VkPipelineLayout      eventShadePipelineLayout_ = VK_NULL_HANDLE;
         VkPipeline            eventShadePipeline_       = VK_NULL_HANDLE;
         VkDescriptorPool      eventShadeDescPool_       = VK_NULL_HANDLE;
-        VkDescriptorSet       eventShadeDescSet_        = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, kFramesInFlight> eventShadeDescSets_{};
         uint32_t              eventLumaW_ = 0;
         uint32_t              eventLumaH_ = 0;
 
@@ -1787,7 +1787,7 @@ namespace threepp {
         VkCommandPool                                cmdPool = VK_NULL_HANDLE;
         std::array<VkCommandBuffer, kFramesInFlight> cmdBuffers{};
         std::array<VkSemaphore,     kFramesInFlight> imageAvailable{};
-        std::array<VkSemaphore,     kFramesInFlight> renderFinished{};
+        std::vector<VkSemaphore>                     renderFinishedByImage_;
         std::array<VkFence,         kFramesInFlight> inFlight{};
 
         uint32_t currentFrame = 0;
@@ -1954,7 +1954,7 @@ namespace threepp {
             vkDeviceWaitIdle(d);
 
             for (auto s : imageAvailable) if (s) vkDestroySemaphore(d, s, nullptr);
-            for (auto s : renderFinished) if (s) vkDestroySemaphore(d, s, nullptr);
+            destroyRenderFinishedSemaphores();
             for (auto f : inFlight) if (f) vkDestroyFence(d, f, nullptr);
             if (cmdPool) vkDestroyCommandPool(d, cmdPool, nullptr);
             gpuTimings_.reset();// query pool destruction while device is still valid
@@ -2210,6 +2210,27 @@ namespace threepp {
             taa_.reset();
         }
 
+        void destroyRenderFinishedSemaphores() {
+            if (!ctx) return;
+            VkDevice d = ctx->device();
+            for (auto semaphore : renderFinishedByImage_) {
+                if (semaphore) vkDestroySemaphore(d, semaphore, nullptr);
+            }
+            renderFinishedByImage_.clear();
+        }
+
+        void createRenderFinishedSemaphoresForSwapchain() {
+            destroyRenderFinishedSemaphores();
+            renderFinishedByImage_.resize(ctx->swapchainImages().size(), VK_NULL_HANDLE);
+
+            VkSemaphoreCreateInfo sci{};
+            sci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+            for (auto& semaphore : renderFinishedByImage_) {
+                check(vkCreateSemaphore(ctx->device(), &sci, nullptr, &semaphore),
+                      "vkCreateSemaphore renderFinished image");
+            }
+        }
+
         void createCommandResources() {
             VkCommandPoolCreateInfo pci{};
             pci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -2233,9 +2254,9 @@ namespace threepp {
             fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
             for (uint32_t i = 0; i < kFramesInFlight; ++i) {
                 check(vkCreateSemaphore(ctx->device(), &sci, nullptr, &imageAvailable[i]), "vkCreateSemaphore A");
-                check(vkCreateSemaphore(ctx->device(), &sci, nullptr, &renderFinished[i]), "vkCreateSemaphore B");
                 check(vkCreateFence(ctx->device(), &fci, nullptr, &inFlight[i]), "vkCreateFence");
             }
+            createRenderFinishedSemaphoresForSwapchain();
         }
 
         // Allocate, begin, return a one-shot command buffer.
@@ -12958,6 +12979,7 @@ namespace threepp {
 
         void recreateSwapchainAndDescriptors() {
             ctx->recreateSwapchain();
+            createRenderFinishedSemaphoresForSwapchain();
             reallocateRenderExtentResources();
             size = WindowSize{static_cast<int>(ctx->swapchainExtent().width),
                               static_cast<int>(ctx->swapchainExtent().height)};
@@ -14666,29 +14688,30 @@ namespace threepp {
                   "vkCreateComputePipelines(event_shade)");
             vkDestroyShaderModule(ctx->device(), mod, nullptr);
 
-            // Single descriptor pool + set, reused every frame; descriptor
-            // writes per-frame because gbuf views + material/light buffers
-            // are per-frame and the swapchain can be resized.
+            // One descriptor set per frame-in-flight; recordEventShade updates
+            // only the current frame's set after that slot's fence has retired.
             std::array<VkDescriptorPoolSize, 3> ps{};
             ps[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-            ps[0].descriptorCount = 2;
+            ps[0].descriptorCount = 2 * kFramesInFlight;
             ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            ps[1].descriptorCount = 2;
+            ps[1].descriptorCount = 2 * kFramesInFlight;
             ps[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-            ps[2].descriptorCount = 1;
+            ps[2].descriptorCount = kFramesInFlight;
             VkDescriptorPoolCreateInfo dpci{};
             dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-            dpci.maxSets       = 1;
+            dpci.maxSets       = kFramesInFlight;
             dpci.poolSizeCount = static_cast<uint32_t>(ps.size());
             dpci.pPoolSizes    = ps.data();
             check(vkCreateDescriptorPool(ctx->device(), &dpci, nullptr, &eventShadeDescPool_),
                   "vkCreateDescriptorPool(event_shade)");
+            std::array<VkDescriptorSetLayout, kFramesInFlight> layouts{};
+            layouts.fill(eventShadeDsLayout_);
             VkDescriptorSetAllocateInfo dsai{};
             dsai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
             dsai.descriptorPool     = eventShadeDescPool_;
-            dsai.descriptorSetCount = 1;
-            dsai.pSetLayouts        = &eventShadeDsLayout_;
-            check(vkAllocateDescriptorSets(ctx->device(), &dsai, &eventShadeDescSet_),
+            dsai.descriptorSetCount = kFramesInFlight;
+            dsai.pSetLayouts        = layouts.data();
+            check(vkAllocateDescriptorSets(ctx->device(), &dsai, eventShadeDescSets_.data()),
                   "vkAllocateDescriptorSets(event_shade)");
         }
 
@@ -14747,27 +14770,28 @@ namespace threepp {
 
             std::array<VkWriteDescriptorSet, 5> w{};
             for (auto& it : w) it.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            w[0].dstSet = eventShadeDescSet_;
+            const VkDescriptorSet descSet = eventShadeDescSets_[frame];
+            w[0].dstSet = descSet;
             w[0].dstBinding = 0;
             w[0].descriptorCount = 1;
             w[0].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[0].pImageInfo = &normalInfo;
-            w[1].dstSet = eventShadeDescSet_;
+            w[1].dstSet = descSet;
             w[1].dstBinding = 1;
             w[1].descriptorCount = 1;
             w[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             w[1].pImageInfo = &idsInfo;
-            w[2].dstSet = eventShadeDescSet_;
+            w[2].dstSet = descSet;
             w[2].dstBinding = 2;
             w[2].descriptorCount = 1;
             w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             w[2].pBufferInfo = &matInfo;
-            w[3].dstSet = eventShadeDescSet_;
+            w[3].dstSet = descSet;
             w[3].dstBinding = 3;
             w[3].descriptorCount = 1;
             w[3].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             w[3].pBufferInfo = &lightsInfo;
-            w[4].dstSet = eventShadeDescSet_;
+            w[4].dstSet = descSet;
             w[4].dstBinding = 4;
             w[4].descriptorCount = 1;
             w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
@@ -14779,7 +14803,7 @@ namespace threepp {
 
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, eventShadePipeline_);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                     eventShadePipelineLayout_, 0, 1, &eventShadeDescSet_, 0, nullptr);
+                                     eventShadePipelineLayout_, 0, 1, &descSet, 0, nullptr);
 
             struct ShadePC {
                 uint32_t width;       // sensor (output) dims
@@ -15208,6 +15232,10 @@ namespace threepp {
 
             const uint32_t imageIndex = frameImageIndex_;
             VkCommandBuffer cb = cmdBuffers[currentFrame];
+            if (imageIndex >= renderFinishedByImage_.size()) {
+                throw std::runtime_error("VulkanRenderer swapchain image index exceeds present semaphore count");
+            }
+            const VkSemaphore presentReady = renderFinishedByImage_[imageIndex];
 
             recordOverlayAndPresentTransition(cb, imageIndex);
             check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
@@ -15220,7 +15248,7 @@ namespace threepp {
 
             VkSemaphoreSubmitInfo signalInfo{};
             signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
-            signalInfo.semaphore = renderFinished[currentFrame];
+            signalInfo.semaphore = presentReady;
             signalInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
             VkCommandBufferSubmitInfo cbInfo{};
@@ -15241,7 +15269,7 @@ namespace threepp {
             VkPresentInfoKHR pi{};
             pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
             pi.waitSemaphoreCount = 1;
-            pi.pWaitSemaphores = &renderFinished[currentFrame];
+            pi.pWaitSemaphores = &presentReady;
             VkSwapchainKHR sc = ctx->swapchain();
             pi.swapchainCount = 1;
             pi.pSwapchains = &sc;
