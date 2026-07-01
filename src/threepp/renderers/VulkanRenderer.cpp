@@ -100,6 +100,8 @@
 // (taa_resolve.comp.spv moved into vulkan/TaaResolve.cpp)
 #include "threepp/renderers/vulkan/shaders/overlay.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_composite.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_composite.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_depth.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_depth.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_color.vert.spv.h"
@@ -200,14 +202,22 @@ namespace threepp {
         Vector4 scissor;
         bool scissorTest = false;
         bool autoClear_ = true;// mirrored from Renderer::autoClear each render()
+        bool autoClearColor_ = true;
+        bool autoClearDepth_ = true;
+        bool autoClearStencil_ = true;
+        bool pendingClearColor_ = false;
+        bool pendingClearDepth_ = false;
+        bool pendingClearStencil_ = false;
+        bool depthMask_ = true;
+        RenderTarget* currentRenderTarget_ = nullptr;
+        int activeCubeFace_ = 0;
+        int activeMipmapLevel_ = 0;
 
-        // Split-screen (Increment 0): the primary PT pane is clipped to the
-        // scissor sub-rect. The PT pipeline renders the pane region-sized AT THE
-        // IMAGE ORIGIN (gbuf/raygen/denoise/bloom); only the final TAA write is
-        // offset to the scissor position. All default to the full frame, so the
-        // single-scene path is byte-identical when scissorTest is off.
-        VkExtent2D regionRenderExt_{};// render-extent-space pane size
-        VkExtent2D regionSwapExt_{};  // swapchain-space pane size (TAA output)
+        // Scissor region for the final default-framebuffer write. Rendering
+        // keeps the normal full-frame viewport/projection; scissor only clips
+        // which swapchain pixels are updated, matching GLRenderer semantics.
+        VkExtent2D regionRenderExt_{};// render extent used by gbuf/raygen
+        VkExtent2D regionSwapExt_{};  // swapchain-space write size
         int32_t    regionDstX_ = 0;   // swapchain write offset (image space)
         int32_t    regionDstY_ = 0;
 
@@ -662,6 +672,7 @@ namespace threepp {
         unsigned int envTextureIdUploaded = 0xFFFFFFFFu;
         bool envIsDefault  = true;
         bool envIsBgColor  = false;
+        Color envDefaultClearColor{0.f, 0.f, 0.f};
         Color envBgColor{0.f, 0.f, 0.f};
 
         // Ocean fine-cascade normal-map source (binding 21 in rtDsLayout).
@@ -747,6 +758,12 @@ namespace threepp {
         std::vector<uint32_t> freeTextureSlots;// slots reclaimed by prune
         VkSampler textureSampler_ = VK_NULL_HANDLE;
 
+        struct FramebufferTextureImage {
+            Image2D image{};
+            VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        };
+        std::unordered_map<const Texture*, FramebufferTextureImage> framebufferTextureImages_;
+
         // Continuous-motion accumulation. Two ping-pong slots for the running
         // mean (.rgb) plus per-pixel frame count (.w packed via uintBitsToFloat),
         // and two ping-pong gbuf slots holding primary world hit (.xyz) plus
@@ -788,6 +805,9 @@ namespace threepp {
         // jittered primary ray; raygen sums them and the accumulator
         // advances FC by `spp` so the running mean stays correctly weighted.
         uint32_t samplesPerPixel_ = 1;
+        // Effective default-framebuffer raster MSAA sample count selected from
+        // Canvas::samples() and the physical device color/depth limits.
+        VkSampleCountFlagBits defaultFramebufferSamples_ = VK_SAMPLE_COUNT_1_BIT;
         // # of extra primary rays fired at detected silhouette pixels
         // (gbufIds-mismatch / depth-gradient / diagonal neighbour).
         // 0 disables silhouette MSAA entirely.
@@ -1317,6 +1337,8 @@ namespace threepp {
             // depth attachment so its depth test compares unjittered z
             // against unjittered z and doesn't shimmer between frames.
             Image2D       unjitDepth;   // d32_sfloat — UNJITTERED projection
+            Image2D       overlayMsaaColor;     // swapchain format, multisampled overlay target
+            Image2D       overlayResolvedColor; // swapchain format, single-sample transparent overlay
             VkFramebuffer framebuffer = VK_NULL_HANDLE;
             uint32_t      width = 0;
             uint32_t      height = 0;
@@ -1392,6 +1414,12 @@ namespace threepp {
         // Writes gl_PointSize from PointsMaterial::size, encoded in the
         // push constant's color.w slot for this pipeline only.
         VkPipeline       overlayPointListPipeline        = VK_NULL_HANDLE;
+        VkDescriptorSetLayout overlayCompositeDescSetLayout_ = VK_NULL_HANDLE;
+        VkPipelineLayout      overlayCompositePipelineLayout_ = VK_NULL_HANDLE;
+        VkPipeline            overlayCompositePipeline_       = VK_NULL_HANDLE;
+        VkDescriptorPool      overlayCompositeDescPool_       = VK_NULL_HANDLE;
+        std::array<VkDescriptorSet, kFramesInFlight> overlayCompositeDescSets_{};
+        VkSampler overlayCompositeSampler_ = VK_NULL_HANDLE;
         // Depth prepass that fills rasterGbufs[f].unjitDepth using the
         // unjittered VP. Reuses the raster pipeline's descriptor set + push
         // constants (same camera UBO, same model matrix push). Runs after
@@ -1665,6 +1693,41 @@ namespace threepp {
             return r.width != s.width || r.height != s.height;
         }
 
+        static uint32_t sampleCountValue(VkSampleCountFlagBits samples) {
+            switch (samples) {
+                case VK_SAMPLE_COUNT_64_BIT: return 64;
+                case VK_SAMPLE_COUNT_32_BIT: return 32;
+                case VK_SAMPLE_COUNT_16_BIT: return 16;
+                case VK_SAMPLE_COUNT_8_BIT: return 8;
+                case VK_SAMPLE_COUNT_4_BIT: return 4;
+                case VK_SAMPLE_COUNT_2_BIT: return 2;
+                default: return 1;
+            }
+        }
+
+        VkSampleCountFlagBits chooseDefaultFramebufferSamples(int requested) const {
+            if (requested <= 1) return VK_SAMPLE_COUNT_1_BIT;
+
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(ctx->physicalDevice(), &props);
+            const VkSampleCountFlags supported =
+                    props.limits.framebufferColorSampleCounts &
+                    props.limits.framebufferDepthSampleCounts;
+
+            const std::array<std::pair<int, VkSampleCountFlagBits>, 6> candidates{{
+                    {64, VK_SAMPLE_COUNT_64_BIT},
+                    {32, VK_SAMPLE_COUNT_32_BIT},
+                    {16, VK_SAMPLE_COUNT_16_BIT},
+                    {8, VK_SAMPLE_COUNT_8_BIT},
+                    {4, VK_SAMPLE_COUNT_4_BIT},
+                    {2, VK_SAMPLE_COUNT_2_BIT},
+            }};
+            for (const auto& [value, flag] : candidates) {
+                if (requested >= value && (supported & flag)) return flag;
+            }
+            return VK_SAMPLE_COUNT_1_BIT;
+        }
+
         // ── Per-frame timing instrumentation ─────────────────────────────
         // Managed by vulkan/GpuTimings.{hpp,cpp}. Owns one VkQueryPool per
         // frame-in-flight; exposes begin/end brackets per TimingPass plus CPU
@@ -1853,6 +1916,9 @@ namespace threepp {
                     static_cast<GLFWwindow*>(canvas.windowPtr()),
                     /*enableRayTracing*/ true,
                     /*vsync*/ canvas.vsync());
+            defaultFramebufferSamples_ = chooseDefaultFramebufferSamples(canvas.samples());
+            viewport.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
+            scissor.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
 
             // The scene-dependent AS build runs lazily on the first render()
             // call. Everything below is scene-independent and safe at ctor time.
@@ -1935,6 +2001,9 @@ namespace threepp {
                            const char* name) {
                         return createSampledImage2D(w, h, fmt, pix, sz,
                                                    filter, addrU, addrV, name);
+                    },
+                    [this](const Texture* texture) -> const Image2D* {
+                        return framebufferTextureImage(texture);
                     });
         }
 
@@ -2168,6 +2237,11 @@ namespace threepp {
             if (overlayLineListColoredPipeline)   vkDestroyPipeline(d, overlayLineListColoredPipeline, nullptr);
             if (overlayLineStripColoredPipeline)  vkDestroyPipeline(d, overlayLineStripColoredPipeline, nullptr);
             if (overlayPointListPipeline)         vkDestroyPipeline(d, overlayPointListPipeline, nullptr);
+            if (overlayCompositePipeline_)        vkDestroyPipeline(d, overlayCompositePipeline_, nullptr);
+            if (overlayCompositePipelineLayout_)  vkDestroyPipelineLayout(d, overlayCompositePipelineLayout_, nullptr);
+            if (overlayCompositeDescPool_)        vkDestroyDescriptorPool(d, overlayCompositeDescPool_, nullptr);
+            if (overlayCompositeDescSetLayout_)   vkDestroyDescriptorSetLayout(d, overlayCompositeDescSetLayout_, nullptr);
+            if (overlayCompositeSampler_)         vkDestroySampler(d, overlayCompositeSampler_, nullptr);
             if (overlayDepthPrepassPipeline)      vkDestroyPipeline(d, overlayDepthPrepassPipeline, nullptr);
             if (overlayPipelineLayout)      vkDestroyPipelineLayout(d, overlayPipelineLayout, nullptr);
             // Particle billboard pass resources.
@@ -2203,6 +2277,10 @@ namespace threepp {
             }
             lineGeomCache_.clear();
             overlayPass_.reset();// destroy sprite/line pipelines + caches while device is alive
+            for (auto& [_, rec] : framebufferTextureImages_) {
+                destroyImage2D(ctx->allocator(), d, rec.image);
+            }
+            framebufferTextureImages_.clear();
             if (gbufSampler_)           vkDestroySampler(d, gbufSampler_, nullptr);
             destroyBuffer(ctx->allocator(), dummyUvBuffer_);
 
@@ -2294,6 +2372,231 @@ namespace threepp {
                 check(wr, (std::string("wait one-shot (") + label + ")").c_str());
             }
             vkFreeCommandBuffers(ctx->device(), cmdPool, 1, &cb);
+        }
+
+        [[nodiscard]] VkClearColorValue encodedClearColorValue() const {
+            Color cc;
+            cc.copy(clearColor);
+            ColorManagement::workingToColorSpace(cc, SRGBColorSpace);
+            VkClearColorValue out{};
+            out.float32[0] = cc.r;
+            out.float32[1] = cc.g;
+            out.float32[2] = cc.b;
+            out.float32[3] = clearAlpha;
+            return out;
+        }
+
+        [[nodiscard]] bool sceneBackgroundColor(Object3D& scene, Color& out) const {
+            auto* sc = dynamic_cast<Scene*>(&scene);
+            if (!sc || !sc->background.isColor()) return false;
+            out.copy(sc->background.color());
+            return true;
+        }
+
+        [[nodiscard]] VkRect2D activeScissorRect(VkExtent2D ext) const {
+            if (!scissorTest || ext.width == 0 || ext.height == 0) {
+                return VkRect2D{{0, 0}, ext};
+            }
+
+            const int fbW = static_cast<int>(ext.width);
+            const int fbH = static_cast<int>(ext.height);
+            const int sx = std::clamp(static_cast<int>(std::floor(scissor.x)), 0, fbW);
+            const int syBottom = std::clamp(static_cast<int>(std::floor(scissor.y)), 0, fbH);
+            const int maxW = std::max(0, fbW - sx);
+            const int maxH = std::max(0, fbH - syBottom);
+            const int sw = std::clamp(static_cast<int>(std::ceil(scissor.z)), 0, maxW);
+            const int sh = std::clamp(static_cast<int>(std::ceil(scissor.w)), 0, maxH);
+            const int syTop = fbH - syBottom - sh;
+            return VkRect2D{{sx, syTop}, {static_cast<uint32_t>(sw), static_cast<uint32_t>(sh)}};
+        }
+
+        static bool coversFullExtent(const VkRect2D& rect, VkExtent2D ext) {
+            return rect.offset.x == 0 && rect.offset.y == 0 &&
+                   rect.extent.width == ext.width && rect.extent.height == ext.height;
+        }
+
+        void transitionImage(VkCommandBuffer cb, VkImage image,
+                             VkImageLayout oldLayout, VkImageLayout newLayout,
+                             VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
+                             VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
+                             VkImageAspectFlags aspectMask) const {
+            VkImageMemoryBarrier2 barrier{};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            barrier.srcStageMask = srcStage;
+            barrier.srcAccessMask = srcAccess;
+            barrier.dstStageMask = dstStage;
+            barrier.dstAccessMask = dstAccess;
+            barrier.oldLayout = oldLayout;
+            barrier.newLayout = newLayout;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = image;
+            barrier.subresourceRange.aspectMask = aspectMask;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.layerCount = 1;
+
+            VkDependencyInfo dep{};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.imageMemoryBarrierCount = 1;
+            dep.pImageMemoryBarriers = &barrier;
+            vkCmdPipelineBarrier2(cb, &dep);
+        }
+
+        void transitionDefaultFramebufferToGeneral(VkCommandBuffer cb, uint32_t imageIndex,
+                                                   VkImageLayout oldLayout,
+                                                   VkPipelineStageFlags2 srcStage,
+                                                   VkAccessFlags2 srcAccess) const {
+            transitionImage(cb, ctx->swapchainImages()[imageIndex],
+                            oldLayout, VK_IMAGE_LAYOUT_GENERAL,
+                            srcStage, srcAccess,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                    VK_ACCESS_2_TRANSFER_READ_BIT |
+                                    VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+        }
+
+        void recordDefaultColorClear(VkCommandBuffer cb, uint32_t imageIndex,
+                                     VkImageLayout oldLayout,
+                                     VkPipelineStageFlags2 srcStage,
+                                     VkAccessFlags2 srcAccess) {
+            const VkExtent2D ext = ctx->swapchainExtent();
+            const VkRect2D rect = activeScissorRect(ext);
+            if (rect.extent.width == 0 || rect.extent.height == 0) {
+                transitionDefaultFramebufferToGeneral(cb, imageIndex, oldLayout, srcStage, srcAccess);
+                return;
+            }
+
+            const VkImage image = ctx->swapchainImages()[imageIndex];
+            const VkClearColorValue clearValue = encodedClearColorValue();
+            if (coversFullExtent(rect, ext)) {
+                transitionImage(cb, image,
+                                oldLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                srcStage, srcAccess,
+                                VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT);
+                VkImageSubresourceRange range{};
+                range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                range.levelCount = 1;
+                range.layerCount = 1;
+                vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                     &clearValue, 1, &range);
+                transitionDefaultFramebufferToGeneral(cb, imageIndex,
+                                                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                                       VK_PIPELINE_STAGE_2_CLEAR_BIT,
+                                                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
+                return;
+            }
+
+            transitionImage(cb, image,
+                            oldLayout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                            srcStage, srcAccess,
+                            VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+
+            VkRenderingAttachmentInfo colorAtt{};
+            colorAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            colorAtt.imageView = ctx->swapchainImageViews()[imageIndex];
+            colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+            colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+            colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+
+            VkRenderingInfo ri{};
+            ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.offset = {0, 0};
+            ri.renderArea.extent = ext;
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 1;
+            ri.pColorAttachments = &colorAtt;
+            vkCmdBeginRendering(cb, &ri);
+
+            VkClearAttachment attachment{};
+            attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            attachment.colorAttachment = 0;
+            attachment.clearValue.color = clearValue;
+            VkClearRect clearRect{};
+            clearRect.rect = rect;
+            clearRect.layerCount = 1;
+            vkCmdClearAttachments(cb, 1, &attachment, 1, &clearRect);
+            vkCmdEndRendering(cb);
+
+            transitionDefaultFramebufferToGeneral(cb, imageIndex,
+                                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        }
+
+        void recordDefaultDepthClear(VkCommandBuffer cb) {
+            if (currentFrame >= rasterGbufs.size()) return;
+            auto& depth = rasterGbufs[currentFrame].unjitDepth;
+            if (depth.image == VK_NULL_HANDLE || depth.view == VK_NULL_HANDLE) return;
+
+            transitionImage(cb, depth.image,
+                            VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT);
+
+            VkRenderingAttachmentInfo depthAtt{};
+            depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            depthAtt.imageView = depth.view;
+            depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            depthAtt.clearValue.depthStencil = {0.0f, 0u};
+
+            const VkExtent2D ext = ctx->swapchainExtent();
+            VkRenderingInfo ri{};
+            ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            ri.renderArea.offset = {0, 0};
+            ri.renderArea.extent = ext;
+            ri.layerCount = 1;
+            ri.colorAttachmentCount = 0;
+            ri.pDepthAttachment = &depthAtt;
+            vkCmdBeginRendering(cb, &ri);
+            vkCmdEndRendering(cb);
+
+            transitionImage(cb, depth.image,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT);
+        }
+
+        void recordDefaultFramebufferClear(VkCommandBuffer cb, uint32_t imageIndex,
+                                           bool color, bool depth, bool,
+                                           VkImageLayout oldColorLayout,
+                                           VkPipelineStageFlags2 colorSrcStage,
+                                           VkAccessFlags2 colorSrcAccess) {
+            if (color) {
+                recordDefaultColorClear(cb, imageIndex, oldColorLayout, colorSrcStage, colorSrcAccess);
+            } else if (oldColorLayout != VK_IMAGE_LAYOUT_GENERAL) {
+                transitionDefaultFramebufferToGeneral(cb, imageIndex, oldColorLayout,
+                                                       colorSrcStage, colorSrcAccess);
+            }
+            if (depth && depthMask_) {
+                recordDefaultDepthClear(cb);
+            }
+        }
+
+        void consumePendingClearFlags() {
+            pendingClearColor_ = false;
+            pendingClearDepth_ = false;
+            pendingClearStencil_ = false;
         }
 
         static unsigned int geomVersionOf(const BufferGeometry& g) {
@@ -8303,6 +8606,167 @@ namespace threepp {
             return out;
         }
 
+        FramebufferTextureImage& ensureFramebufferTextureImage(Texture& texture) {
+            Image& img = texture.image();
+            const uint32_t w = img.width();
+            const uint32_t h = img.height();
+            if (w == 0 || h == 0) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: texture image has zero size");
+            }
+
+            auto& rec = framebufferTextureImages_[&texture];
+            const VkFormat format = ctx->swapchainFormat();
+            if (rec.image.image != VK_NULL_HANDLE &&
+                rec.image.width == w && rec.image.height == h && rec.image.format == format) {
+                return rec;
+            }
+
+            if (rec.image.image != VK_NULL_HANDLE) {
+                vkDeviceWaitIdle(ctx->device());
+                destroyImage2D(ctx->allocator(), ctx->device(), rec.image);
+                rec.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            }
+
+            Image2D out{};
+            out.width = w;
+            out.height = h;
+            out.format = format;
+            out.mipLevels = 1;
+
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = format;
+            ici.extent = {w, h, 1};
+            ici.mipLevels = 1;
+            ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO;
+            check(vmaCreateImage(ctx->allocator(), &ici, &aci, &out.image, &out.alloc, nullptr),
+                  "vmaCreateImage(framebuffer texture)");
+
+            VkImageViewCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = out.image;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = format;
+            vci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
+                              VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            check(vkCreateImageView(ctx->device(), &vci, nullptr, &out.view),
+                  "vkCreateImageView(framebuffer texture)");
+
+            VkSamplerCreateInfo sci{};
+            sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+            sci.magFilter = VK_FILTER_NEAREST;
+            sci.minFilter = VK_FILTER_NEAREST;
+            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sci.maxAnisotropy = 1.0f;
+            sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+            check(vkCreateSampler(ctx->device(), &sci, nullptr, &out.sampler),
+                  "vkCreateSampler(framebuffer texture)");
+
+            ctx->setObjectName(out.image, "framebufferTextureCopy");
+            ctx->setObjectName(out.view, "framebufferTextureCopy");
+
+            rec.image = out;
+            rec.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+            return rec;
+        }
+
+        const Image2D* framebufferTextureImage(const Texture* texture) const {
+            const auto it = framebufferTextureImages_.find(texture);
+            if (it == framebufferTextureImages_.end()) return nullptr;
+            if (it->second.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) return nullptr;
+            return &it->second.image;
+        }
+
+        void recordCopyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
+            if (level != 0) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: mip levels are not implemented yet");
+            }
+            if (currentRenderTarget_ != nullptr) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: render target copy is implemented in phase 2");
+            }
+            if (frameState_ == FrameState::Idle) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: no active default framebuffer frame");
+            }
+
+            auto& rec = ensureFramebufferTextureImage(texture);
+            const VkExtent2D ext = ctx->swapchainExtent();
+            const uint32_t copyW = std::min(rec.image.width, ext.width);
+            const uint32_t copyH = std::min(rec.image.height, ext.height);
+            const int32_t srcX = std::clamp(static_cast<int32_t>(std::lround(position.x)), 0,
+                                            std::max(0, static_cast<int32_t>(ext.width) - static_cast<int32_t>(copyW)));
+            const int32_t srcY = std::clamp(static_cast<int32_t>(std::lround(position.y)), 0,
+                                            std::max(0, static_cast<int32_t>(ext.height) - static_cast<int32_t>(copyH)));
+
+            VkCommandBuffer cb = cmdBuffers[currentFrame];
+            VkImage src = ctx->swapchainImages()[frameImageIndex_];
+
+            transitionImage(cb, src,
+                            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                    VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+
+            transitionImage(cb, rec.image.image,
+                            rec.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            rec.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                    : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                            rec.layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? 0
+                                    : VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+
+            VkImageCopy region{};
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.layerCount = 1;
+            region.srcOffset = {srcX, srcY, 0};
+            region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.dstSubresource.layerCount = 1;
+            region.extent = {copyW, copyH, 1};
+            vkCmdCopyImage(cb,
+                           src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           rec.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &region);
+
+            transitionImage(cb, rec.image.image,
+                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+            rec.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+            transitionDefaultFramebufferToGeneral(cb, frameImageIndex_,
+                                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                   VK_ACCESS_2_TRANSFER_READ_BIT);
+        }
+
         // ── ParticleSystem billboard resources ──────────────────────────────
 
         // Lazily build the 1×1 white texel bound for untextured particle
@@ -8365,7 +8829,7 @@ namespace threepp {
 
             // Same colorSpace→format rule as the sprite/bindless paths: only an
             // explicitly sRGB-tagged texture gets hardware sRGB decode on sample;
-            // particle.frag re-encodes the linear product for the UNORM swapchain.
+            // particle.frag keeps the sampled product in the renderer's linear path.
             const VkFormat fmt = (tex->colorSpace == ColorSpace::sRGB)
                                          ? VK_FORMAT_R8G8B8A8_SRGB
                                          : VK_FORMAT_R8G8B8A8_UNORM;
@@ -8752,7 +9216,8 @@ namespace threepp {
         Image2D createAttachmentImage2D(uint32_t w, uint32_t h, VkFormat format,
                                         VkImageUsageFlags usage,
                                         VkImageAspectFlags aspect,
-                                        const char* debugName = nullptr) {
+                                        const char* debugName = nullptr,
+                                        VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT) {
             Image2D out{};
             out.width  = w;
             out.height = h;
@@ -8765,7 +9230,7 @@ namespace threepp {
             ici.extent        = {w, h, 1};
             ici.mipLevels     = 1;
             ici.arrayLayers   = 1;
-            ici.samples       = VK_SAMPLE_COUNT_1_BIT;
+            ici.samples       = samples;
             ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
             ici.usage         = usage;
             ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
@@ -8815,6 +9280,8 @@ namespace threepp {
                 destroyImage2D(ctx->allocator(), d, g.reflAux);
                 destroyImage2D(ctx->allocator(), d, g.depth);
                 destroyImage2D(ctx->allocator(), d, g.unjitDepth);
+                destroyImage2D(ctx->allocator(), d, g.overlayMsaaColor);
+                destroyImage2D(ctx->allocator(), d, g.overlayResolvedColor);
                 g.width  = 0;
                 g.height = 0;
             }
@@ -8982,7 +9449,19 @@ namespace threepp {
                 g.unjitDepth = createAttachmentImage2D(swapExt.width, swapExt.height,
                                                        VK_FORMAT_D32_SFLOAT,
                                                        depthUsage, VK_IMAGE_ASPECT_DEPTH_BIT,
-                                                       N("unjitDepth"));
+                                                       N("unjitDepth"),
+                                                       defaultFramebufferSamples_);
+                if (defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT) {
+                    g.overlayMsaaColor = createAttachmentImage2D(
+                            swapExt.width, swapExt.height, ctx->swapchainFormat(),
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, N("overlayMsaaColor"),
+                            defaultFramebufferSamples_);
+                    g.overlayResolvedColor = createAttachmentImage2D(
+                            swapExt.width, swapExt.height, ctx->swapchainFormat(),
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT, N("overlayResolvedColor"));
+                }
 
                 VkImageView views[6] = {g.normal.view, g.motion.view, g.ids.view,
                                         g.uv.view, g.albedo.view, g.depth.view};
@@ -9014,8 +9493,10 @@ namespace threepp {
             // first frame regardless. Re-runs on resize (images are recreated).
             VkCommandBuffer initCb = beginOneShot();
             std::vector<VkImageMemoryBarrier> inits;
-            inits.reserve(rasterGbufs.size() * 6);
-            auto pushInit = [&](VkImage image, VkImageAspectFlags aspect, VkImageLayout layout) {
+            inits.reserve(rasterGbufs.size() * 14);
+            auto pushInit = [&](VkImage image, VkImageAspectFlags aspect, VkImageLayout layout,
+                                VkAccessFlags dstAccess = VK_ACCESS_SHADER_READ_BIT) {
+                if (image == VK_NULL_HANDLE) return;
                 VkImageMemoryBarrier b{};
                 b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
                 b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -9027,7 +9508,7 @@ namespace threepp {
                 b.subresourceRange.levelCount = 1;
                 b.subresourceRange.layerCount = 1;
                 b.srcAccessMask = 0;
-                b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                b.dstAccessMask = dstAccess;
                 inits.push_back(b);
             };
             for (auto& g : rasterGbufs) {
@@ -9043,6 +9524,11 @@ namespace threepp {
                 pushInit(g.reflect.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);// storage (compute r/w)
                 pushInit(g.reflAux.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);// storage (compute r/w)
                 pushInit(g.depth.image,  VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+                pushInit(g.overlayMsaaColor.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
+                pushInit(g.overlayResolvedColor.image, VK_IMAGE_ASPECT_COLOR_BIT,
+                         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
             }
             vkCmdPipelineBarrier(initCb,
                                  VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -9050,6 +9536,196 @@ namespace threepp {
                                  0, 0, nullptr, 0, nullptr,
                                  static_cast<uint32_t>(inits.size()), inits.data());
             endAndSubmitOneShot(initCb, "rasterGbuf init layouts");
+            rewriteOverlayCompositeDescriptors();
+        }
+
+        void rewriteOverlayCompositeDescriptors() {
+            if (defaultFramebufferSamples_ == VK_SAMPLE_COUNT_1_BIT ||
+                overlayCompositeDescSetLayout_ == VK_NULL_HANDLE ||
+                overlayCompositeSampler_ == VK_NULL_HANDLE) {
+                return;
+            }
+
+            for (uint32_t f = 0; f < kFramesInFlight; ++f) {
+                if (rasterGbufs[f].overlayResolvedColor.view == VK_NULL_HANDLE ||
+                    overlayCompositeDescSets_[f] == VK_NULL_HANDLE) {
+                    continue;
+                }
+                VkDescriptorImageInfo ii{};
+                ii.sampler     = overlayCompositeSampler_;
+                ii.imageView   = rasterGbufs[f].overlayResolvedColor.view;
+                ii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+                VkWriteDescriptorSet w{};
+                w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                w.dstSet          = overlayCompositeDescSets_[f];
+                w.dstBinding      = 0;
+                w.descriptorCount = 1;
+                w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                w.pImageInfo      = &ii;
+                vkUpdateDescriptorSets(ctx->device(), 1, &w, 0, nullptr);
+            }
+        }
+
+        void createOverlayCompositePipeline() {
+            if (defaultFramebufferSamples_ == VK_SAMPLE_COUNT_1_BIT ||
+                overlayCompositePipeline_ != VK_NULL_HANDLE) {
+                return;
+            }
+
+            if (overlayCompositeSampler_ == VK_NULL_HANDLE) {
+                VkSamplerCreateInfo sci{};
+                sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+                sci.magFilter    = VK_FILTER_NEAREST;
+                sci.minFilter    = VK_FILTER_NEAREST;
+                sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                sci.maxLod       = 0.f;
+                check(vkCreateSampler(ctx->device(), &sci, nullptr, &overlayCompositeSampler_),
+                      "vkCreateSampler(overlayComposite)");
+            }
+
+            VkDescriptorSetLayoutBinding b{};
+            b.binding         = 0;
+            b.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            b.descriptorCount = 1;
+            b.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo dlci{};
+            dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            dlci.bindingCount = 1;
+            dlci.pBindings    = &b;
+            check(vkCreateDescriptorSetLayout(ctx->device(), &dlci, nullptr,
+                                              &overlayCompositeDescSetLayout_),
+                  "vkCreateDescriptorSetLayout(overlayComposite)");
+
+            VkPipelineLayoutCreateInfo plci{};
+            plci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            plci.setLayoutCount = 1;
+            plci.pSetLayouts    = &overlayCompositeDescSetLayout_;
+            check(vkCreatePipelineLayout(ctx->device(), &plci, nullptr,
+                                         &overlayCompositePipelineLayout_),
+                  "vkCreatePipelineLayout(overlayComposite)");
+
+            VkDescriptorPoolSize ps{};
+            ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            ps.descriptorCount = kFramesInFlight;
+            VkDescriptorPoolCreateInfo dpci{};
+            dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            dpci.maxSets       = kFramesInFlight;
+            dpci.poolSizeCount = 1;
+            dpci.pPoolSizes    = &ps;
+            check(vkCreateDescriptorPool(ctx->device(), &dpci, nullptr,
+                                         &overlayCompositeDescPool_),
+                  "vkCreateDescriptorPool(overlayComposite)");
+
+            std::array<VkDescriptorSetLayout, kFramesInFlight> layouts{};
+            layouts.fill(overlayCompositeDescSetLayout_);
+            VkDescriptorSetAllocateInfo ai{};
+            ai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            ai.descriptorPool     = overlayCompositeDescPool_;
+            ai.descriptorSetCount = kFramesInFlight;
+            ai.pSetLayouts        = layouts.data();
+            check(vkAllocateDescriptorSets(ctx->device(), &ai, overlayCompositeDescSets_.data()),
+                  "vkAllocateDescriptorSets(overlayComposite)");
+
+            VkShaderModuleCreateInfo vsmci{};
+            vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vsmci.codeSize = sizeof(kOverlayCompositeVertSpv);
+            vsmci.pCode    = kOverlayCompositeVertSpv;
+            VkShaderModule vert = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &vsmci, nullptr, &vert),
+                  "vkCreateShaderModule(overlay_composite.vert)");
+
+            VkShaderModuleCreateInfo fsmci{};
+            fsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fsmci.codeSize = sizeof(kOverlayCompositeFragSpv);
+            fsmci.pCode    = kOverlayCompositeFragSpv;
+            VkShaderModule frag = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &fsmci, nullptr, &frag),
+                  "vkCreateShaderModule(overlay_composite.frag)");
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vert;
+            stages[0].pName  = "main";
+            stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = frag;
+            stages[1].pName  = "main";
+
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount  = 1;
+
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode    = VK_CULL_MODE_NONE;
+            rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth   = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkPipelineColorBlendAttachmentState cbas{};
+            cbas.blendEnable         = VK_TRUE;
+            cbas.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            cbas.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cbas.colorBlendOp        = VK_BLEND_OP_ADD;
+            cbas.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+            cbas.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+            cbas.alphaBlendOp        = VK_BLEND_OP_ADD;
+            cbas.colorWriteMask      = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                       VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb{};
+            cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.attachmentCount = 1;
+            cb.pAttachments    = &cbas;
+
+            VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dyn{};
+            dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dyn.dynamicStateCount = 2;
+            dyn.pDynamicStates    = dynStates;
+
+            const VkFormat colorFmt = ctx->swapchainFormat();
+            VkPipelineRenderingCreateInfo prci{};
+            prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            prci.colorAttachmentCount    = 1;
+            prci.pColorAttachmentFormats = &colorFmt;
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.pNext               = &prci;
+            gpci.stageCount          = 2;
+            gpci.pStages             = stages;
+            gpci.pVertexInputState   = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState      = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState   = &ms;
+            gpci.pColorBlendState    = &cb;
+            gpci.pDynamicState       = &dyn;
+            gpci.layout              = overlayCompositePipelineLayout_;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
+                                            &overlayCompositePipeline_),
+                  "vkCreateGraphicsPipelines(overlayComposite)");
+
+            vkDestroyShaderModule(ctx->device(), vert, nullptr);
+            vkDestroyShaderModule(ctx->device(), frag, nullptr);
+            rewriteOverlayCompositeDescriptors();
         }
 
         void createRasterCameraUbos() {
@@ -9467,7 +10143,7 @@ namespace threepp {
 
             VkPipelineMultisampleStateCreateInfo ms{};
             ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.rasterizationSamples = defaultFramebufferSamples_;
 
             // Depth test re-enabled. Compares against rasterGbufs[f].unjitDepth
             // (filled by the overlay_depth prepass with the SAME unjittered
@@ -9814,7 +10490,7 @@ namespace threepp {
 
                 VkPipelineMultisampleStateCreateInfo dms{};
                 dms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-                dms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+                dms.rasterizationSamples = defaultFramebufferSamples_;
 
                 VkPipelineDepthStencilStateCreateInfo dds{};
                 dds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -9971,7 +10647,7 @@ namespace threepp {
 
             VkPipelineMultisampleStateCreateInfo ms{};
             ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.rasterizationSamples = defaultFramebufferSamples_;
 
             VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
             VkPipelineDynamicStateCreateInfo dyn{};
@@ -10146,7 +10822,7 @@ namespace threepp {
 
             VkPipelineMultisampleStateCreateInfo ms{};
             ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.rasterizationSamples = defaultFramebufferSamples_;
 
             // Depth-tested (occluded by scene), depth-write off (transparent).
             VkPipelineDepthStencilStateCreateInfo ds{};
@@ -10598,6 +11274,10 @@ namespace threepp {
             if (particlePipelineNormal_ == VK_NULL_HANDLE) {
                 createParticlePipeline();
             }
+            if (defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT &&
+                overlayCompositePipeline_ == VK_NULL_HANDLE) {
+                createOverlayCompositePipeline();
+            }
             // Raster G-buffer matches the PT render extent — in hybrid mode
             // raygen reads it 1:1 by launch coord, so it must launch at the
             // same resolution the gbuffer rasterized at.
@@ -10611,16 +11291,17 @@ namespace threepp {
         // Replaced with the real scene environment by uploadEnvFromTexture()
         // the first time render() sees a non-empty scene.environment / .background.
         void createDefaultEnvImage() {
-            const float pixels[4] = {0.f, 0.f, 0.f, 1.f};
+            const float pixels[4] = {clearColor.r, clearColor.g, clearColor.b, 1.f};
             envImage = createSampledImage2D(
                     1, 1, VK_FORMAT_R32G32B32A32_SFLOAT,
                     pixels, sizeof(pixels),
                     VK_FILTER_NEAREST,
                     VK_SAMPLER_ADDRESS_MODE_REPEAT,
                     VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-                    "envImage(default 1x1 black)");
+                    "envImage(default clear color)");
             envIsDefault = true;
             envIsBgColor = false;
+            envDefaultClearColor.copy(clearColor);
             envTextureIdUploaded = 0xFFFFFFFFu;
         }
 
@@ -11325,7 +12006,12 @@ namespace threepp {
                     rebuildDefaultEnvCdfImages();// no importance sampling on solid colors
                     return true;
                 }
-                if (envIsDefault) return false;
+                if (envIsDefault &&
+                    envDefaultClearColor.r == clearColor.r &&
+                    envDefaultClearColor.g == clearColor.g &&
+                    envDefaultClearColor.b == clearColor.b) {
+                    return false;
+                }
                 vkDeviceWaitIdle(ctx->device());
                 destroyImage2D(ctx->allocator(), ctx->device(), envImage);
                 createDefaultEnvImage();
@@ -13015,11 +13701,9 @@ namespace threepp {
         void recordCommandBuffer(VkCommandBuffer cb, uint32_t imageIndex) {
 
             // ── Split-screen pane region ───────────────────────────────────
-            // When scissorTest is on, clip the PT pane to the scissor sub-rect:
-            // render region-sized at the image origin (gbuf/raygen/denoise/bloom
-            // all read the members below), and offset only the final TAA write
-            // to the scissor position. Defaults to the full frame (byte-identical
-            // single-scene path) when scissorTest is off.
+            // When scissorTest is on, clip only the final swapchain write to
+            // the scissor sub-rect. The scene still renders with the full-frame
+            // viewport/projection, just like GL scissor.
             {
                 const VkExtent2D fullSwap   = ctx->swapchainExtent();
                 const VkExtent2D fullRender = renderExtent();
@@ -13041,11 +13725,6 @@ namespace threepp {
                     // GL scissor y is from the bottom; the swapchain image is
                     // top-left origin → flip. Full-height panes map to 0.
                     regionDstY_    = static_cast<int>(fullSwap.height) - (syB + sh);
-                    regionRenderExt_ = {
-                            std::max(1u, static_cast<uint32_t>(std::lround(
-                                                 static_cast<double>(sw) * fullRender.width / fullSwap.width))),
-                            std::max(1u, static_cast<uint32_t>(std::lround(
-                                                 static_cast<double>(sh) * fullRender.height / fullSwap.height)))};
                 }
             }
 
@@ -13414,14 +14093,8 @@ namespace threepp {
                     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                             rasterPipelineLayout, 0, 1,
                                             &rasterDescSets[currentFrame], 0, nullptr);
-                    // Split-screen: clip the overlay depth prepass to the pane
-                    // region. unjitDepth is full-res but the PT pane lands at
-                    // regionDst (size regionSwapExt) after the TAA write, so the
-                    // overlay's occluder depth must be laid down at the same
-                    // place the color pass reads it. Both default to the full
-                    // frame when scissorTest is off (byte-identical single-scene).
-                    VkViewport dvp{float(regionDstX_), float(regionDstY_),
-                                   float(regionSwapExt_.width), float(regionSwapExt_.height), 0.f, 1.f};
+                    // GL scissor clips output but does not change projection.
+                    VkViewport dvp{0.f, 0.f, float(dext.width), float(dext.height), 0.f, 1.f};
                     vkCmdSetViewport(cb, 0, 1, &dvp);
                     VkRect2D dsc{{regionDstX_, regionDstY_}, regionSwapExt_};
                     vkCmdSetScissor(cb, 0, 1, &dsc);
@@ -13668,45 +14341,21 @@ namespace threepp {
             dep.pImageMemoryBarriers = preBarriers.data();
             vkCmdPipelineBarrier2(cb, &dep);
 
-            // Split-screen: clear the whole frame to clearColor once so the area
-            // outside the PT pane's scissor shows the clear colour. Gated on
-            // scissorTest so the default full-screen path is byte-identical (the
-            // TAA write covers the whole frame there anyway).
-            if (autoClear_ && scissorTest) {
-                Color cc;
-                cc.copy(clearColor);
-                ColorManagement::workingToColorSpace(cc, SRGBColorSpace);
-                VkClearColorValue cv{};
-                cv.float32[0] = cc.r;
-                cv.float32[1] = cc.g;
-                cv.float32[2] = cc.b;
-                cv.float32[3] = clearAlpha;
-                VkImageSubresourceRange clrRange{};
-                clrRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                clrRange.levelCount = 1;
-                clrRange.layerCount = 1;
-                vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_GENERAL, &cv, 1, &clrRange);
-                // Clear (transfer write) → the TAA swapchain store (compute write).
-                VkImageMemoryBarrier2 clrBar{};
-                clrBar.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                clrBar.srcStageMask  = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-                clrBar.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                clrBar.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
-                clrBar.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                       VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
-                clrBar.oldLayout            = VK_IMAGE_LAYOUT_GENERAL;
-                clrBar.newLayout            = VK_IMAGE_LAYOUT_GENERAL;
-                clrBar.srcQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
-                clrBar.dstQueueFamilyIndex  = VK_QUEUE_FAMILY_IGNORED;
-                clrBar.image                = img;
-                clrBar.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                clrBar.subresourceRange.levelCount = 1;
-                clrBar.subresourceRange.layerCount = 1;
-                VkDependencyInfo clrDep{};
-                clrDep.sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                clrDep.imageMemoryBarrierCount = 1;
-                clrDep.pImageMemoryBarriers    = &clrBar;
-                vkCmdPipelineBarrier2(cb, &clrDep);
+            const bool shouldClearColor = pendingClearColor_ ||
+                                          (autoClear_ && autoClearColor_ && scissorTest);
+            // Default depth has no separate attachment in this path; unjitDepth
+            // is already populated for the frame-end overlay occlusion pass.
+            const bool shouldClearDepth = false;
+            const bool shouldClearStencil = false;
+            consumePendingClearFlags();
+            if (shouldClearColor || shouldClearDepth || shouldClearStencil) {
+                recordDefaultFramebufferClear(cb, imageIndex,
+                                               shouldClearColor, shouldClearDepth, shouldClearStencil,
+                                               VK_IMAGE_LAYOUT_GENERAL,
+                                               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                       VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                               VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                                       VK_ACCESS_2_TRANSFER_WRITE_BIT);
             }
 
             // descriptorSets index is shared by photon and primary RT pipelines.
@@ -14035,40 +14684,83 @@ namespace threepp {
 
                 if (hasOverlay) {
                     gpuTimings_->begin(cb, TP_OverlayDraw, currentFrame);
-                    // Swapchain GENERAL → COLOR_ATTACHMENT_OPTIMAL. The
-                    // overlay always composites onto the full-resolution
-                    // swapchain — TAA wrote it directly (upscaling there if
-                    // renderScale < 1), so there is no render-extent target
-                    // here even in scaled mode.
-                    VkImageMemoryBarrier2 toColor{};
-                    toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                    toColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                            VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-                    toColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                            VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                    toColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-                    toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-                                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                    toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                    toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toColor.image = img;
-                    toColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    toColor.subresourceRange.levelCount = 1;
-                    toColor.subresourceRange.layerCount = 1;
-                    VkDependencyInfo dOv{};
-                    dOv.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                    dOv.imageMemoryBarrierCount = 1;
-                    dOv.pImageMemoryBarriers = &toColor;
-                    vkCmdPipelineBarrier2(cb, &dOv);
+                    const bool useOverlayMsaa = defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT;
+                    if (useOverlayMsaa) {
+                        if (rasterGbufs[currentFrame].overlayMsaaColor.view == VK_NULL_HANDLE ||
+                            rasterGbufs[currentFrame].overlayResolvedColor.view == VK_NULL_HANDLE ||
+                            overlayCompositePipeline_ == VK_NULL_HANDLE ||
+                            overlayCompositeDescSets_[currentFrame] == VK_NULL_HANDLE) {
+                            throw std::runtime_error("[VulkanRenderer] overlay MSAA resources are not initialized");
+                        }
+
+                        VkImageMemoryBarrier2 toOverlayColor{};
+                        toOverlayColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                        toOverlayColor.srcStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                        toOverlayColor.srcAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+                        toOverlayColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        toOverlayColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                        toOverlayColor.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        toOverlayColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        toOverlayColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        toOverlayColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        toOverlayColor.image = rasterGbufs[currentFrame].overlayResolvedColor.image;
+                        toOverlayColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        toOverlayColor.subresourceRange.levelCount = 1;
+                        toOverlayColor.subresourceRange.layerCount = 1;
+                        VkDependencyInfo dOverlayColor{};
+                        dOverlayColor.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                        dOverlayColor.imageMemoryBarrierCount = 1;
+                        dOverlayColor.pImageMemoryBarriers = &toOverlayColor;
+                        vkCmdPipelineBarrier2(cb, &dOverlayColor);
+                    } else {
+                        // Swapchain GENERAL → COLOR_ATTACHMENT_OPTIMAL. The
+                        // overlay always composites onto the full-resolution
+                        // swapchain — TAA wrote it directly (upscaling there if
+                        // renderScale < 1), so there is no render-extent target
+                        // here even in scaled mode.
+                        VkImageMemoryBarrier2 toColor{};
+                        toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                        toColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                        toColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                                VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        toColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                        toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        toColor.image = img;
+                        toColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        toColor.subresourceRange.levelCount = 1;
+                        toColor.subresourceRange.layerCount = 1;
+                        VkDependencyInfo dOv{};
+                        dOv.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                        dOv.imageMemoryBarrierCount = 1;
+                        dOv.pImageMemoryBarriers = &toColor;
+                        vkCmdPipelineBarrier2(cb, &dOv);
+                    }
 
                     VkRenderingAttachmentInfo colorAtt{};
                     colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                    colorAtt.imageView   = ctx->swapchainImageViews()[imageIndex];
+                    colorAtt.imageView   = useOverlayMsaa
+                            ? rasterGbufs[currentFrame].overlayMsaaColor.view
+                            : ctx->swapchainImageViews()[imageIndex];
                     colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                    colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
-                    colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+                    colorAtt.loadOp      = useOverlayMsaa ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                          : VK_ATTACHMENT_LOAD_OP_LOAD;
+                    colorAtt.storeOp     = useOverlayMsaa ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                                           : VK_ATTACHMENT_STORE_OP_STORE;
+                    if (useOverlayMsaa) {
+                        colorAtt.resolveMode        = VK_RESOLVE_MODE_AVERAGE_BIT;
+                        colorAtt.resolveImageView   = rasterGbufs[currentFrame].overlayResolvedColor.view;
+                        colorAtt.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        colorAtt.clearValue.color.float32[0] = 0.f;
+                        colorAtt.clearValue.color.float32[1] = 0.f;
+                        colorAtt.clearValue.color.float32[2] = 0.f;
+                        colorAtt.clearValue.color.float32[3] = 0.f;
+                    }
 
                     // Read-only depth from the overlay depth prepass. Was
                     // transitioned to DEPTH_STENCIL_READ_ONLY_OPTIMAL at the
@@ -14094,13 +14786,10 @@ namespace threepp {
 
                     // Pipeline is selected per-draw based on material.wireframe.
                     // Set viewport/scissor once — they're dynamic state shared
-                    // across the wireframe + basic pipelines. Split-screen: clip
-                    // to the pane region (same as the depth prepass above) so the
-                    // scene overlays — live point cloud, wireframes, lines — land
-                    // in the PT pane instead of spanning the whole window.
-                    // regionSwapExt_ == full extent when scissorTest is off.
-                    VkViewport vpDyn{float(regionDstX_), float(regionDstY_),
-                                     float(regionSwapExt_.width), float(regionSwapExt_.height), 0.f, 1.f};
+                    // across the wireframe + basic pipelines. Scissor clips the
+                    // overlay to the target region; viewport stays full-frame so
+                    // projection matches the base render.
+                    VkViewport vpDyn{0.f, 0.f, float(ext.width), float(ext.height), 0.f, 1.f};
                     vkCmdSetViewport(cb, 0, 1, &vpDyn);
                     VkRect2D scDyn{{regionDstX_, regionDstY_}, regionSwapExt_};
                     vkCmdSetScissor(cb, 0, 1, &scDyn);
@@ -14493,6 +15182,75 @@ namespace threepp {
                     }
 
                     vkCmdEndRendering(cb);
+
+                    if (useOverlayMsaa) {
+                        VkImageMemoryBarrier2 overlayToSample{};
+                        overlayToSample.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                        overlayToSample.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        overlayToSample.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                        overlayToSample.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+                        overlayToSample.dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT;
+                        overlayToSample.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        overlayToSample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        overlayToSample.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        overlayToSample.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        overlayToSample.image = rasterGbufs[currentFrame].overlayResolvedColor.image;
+                        overlayToSample.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        overlayToSample.subresourceRange.levelCount = 1;
+                        overlayToSample.subresourceRange.layerCount = 1;
+
+                        VkImageMemoryBarrier2 swapToColor{};
+                        swapToColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                        swapToColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                        swapToColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                                    VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        swapToColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        swapToColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                        swapToColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        swapToColor.image = img;
+                        swapToColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                        swapToColor.subresourceRange.levelCount = 1;
+                        swapToColor.subresourceRange.layerCount = 1;
+
+                        std::array<VkImageMemoryBarrier2, 2> compositeBars{overlayToSample, swapToColor};
+                        VkDependencyInfo compositeDep{};
+                        compositeDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                        compositeDep.imageMemoryBarrierCount = static_cast<uint32_t>(compositeBars.size());
+                        compositeDep.pImageMemoryBarriers = compositeBars.data();
+                        vkCmdPipelineBarrier2(cb, &compositeDep);
+
+                        VkRenderingAttachmentInfo compositeColor{};
+                        compositeColor.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                        compositeColor.imageView   = ctx->swapchainImageViews()[imageIndex];
+                        compositeColor.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        compositeColor.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
+                        compositeColor.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+                        VkRenderingInfo compositeRi{};
+                        compositeRi.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                        compositeRi.renderArea.offset = {0, 0};
+                        compositeRi.renderArea.extent = ext;
+                        compositeRi.layerCount = 1;
+                        compositeRi.colorAttachmentCount = 1;
+                        compositeRi.pColorAttachments = &compositeColor;
+                        vkCmdBeginRendering(cb, &compositeRi);
+
+                        VkViewport fullVp{0.f, 0.f, float(ext.width), float(ext.height), 0.f, 1.f};
+                        VkRect2D fullSc{{0, 0}, ext};
+                        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, overlayCompositePipeline_);
+                        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                overlayCompositePipelineLayout_, 0, 1,
+                                                &overlayCompositeDescSets_[currentFrame], 0, nullptr);
+                        vkCmdSetViewport(cb, 0, 1, &fullVp);
+                        vkCmdSetScissor(cb, 0, 1, &fullSc);
+                        vkCmdDraw(cb, 3, 1, 0, 0);
+                        vkCmdEndRendering(cb);
+                    }
 
                     // Swapchain back to GENERAL so the downstream blocks
                     // (ImGui overlay or the direct present-src transition)
@@ -15153,71 +15911,14 @@ namespace threepp {
             VkCommandBuffer cb = cmdBuffers[currentFrame];
             beginCommandRecording(cb);
 
-            // UNDEFINED → TRANSFER_DST, vkCmdClearColorImage, TRANSFER_DST → GENERAL.
-            const VkImage img = ctx->swapchainImages()[imageIndex];
-            VkImageSubresourceRange range{};
-            range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            range.levelCount = 1;
-            range.layerCount = 1;
-            {
-                VkImageMemoryBarrier2 b{};
-                b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                b.srcStageMask  = VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT;
-                b.srcAccessMask = 0;
-                b.dstStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-                b.dstAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                b.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-                b.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.image = img;
-                b.subresourceRange = range;
-                VkDependencyInfo dep{};
-                dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                dep.imageMemoryBarrierCount = 1;
-                dep.pImageMemoryBarriers = &b;
-                vkCmdPipelineBarrier2(cb, &dep);
-            }
-            // Encode into the swapchain's display (sRGB) space. The swapchain is a
-            // plain UNORM image and this clear bypasses the shader's linearToSRGB,
-            // so a color-managed (linear) clear color must be encoded here to match
-            // shaded pixels. No-op when ColorManagement is disabled (legacy raw).
-            Color cc;
-            cc.copy(clearColor);
-            ColorManagement::workingToColorSpace(cc, SRGBColorSpace);
-            VkClearColorValue cv{};
-            cv.float32[0] = cc.r;
-            cv.float32[1] = cc.g;
-            cv.float32[2] = cc.b;
-            cv.float32[3] = clearAlpha;
-            vkCmdClearColorImage(cb, img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                 &cv, 1, &range);
-            {
-                VkImageMemoryBarrier2 b{};
-                b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                b.srcStageMask  = VK_PIPELINE_STAGE_2_CLEAR_BIT;
-                b.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                b.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                  VK_PIPELINE_STAGE_2_TRANSFER_BIT |
-                                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-                b.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                                  VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                  VK_ACCESS_2_TRANSFER_READ_BIT |
-                                  VK_ACCESS_2_TRANSFER_WRITE_BIT |
-                                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-                                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                b.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-                b.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                b.image = img;
-                b.subresourceRange = range;
-                VkDependencyInfo dep{};
-                dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                dep.imageMemoryBarrierCount = 1;
-                dep.pImageMemoryBarriers = &b;
-                vkCmdPipelineBarrier2(cb, &dep);
-            }
+            const bool shouldClearColor = pendingClearColor_ || (autoClear_ && autoClearColor_);
+            const bool shouldClearDepth = pendingClearDepth_ || (autoClear_ && autoClearDepth_);
+            const bool shouldClearStencil = pendingClearStencil_ || (autoClear_ && autoClearStencil_);
+            consumePendingClearFlags();
+            recordDefaultFramebufferClear(cb, imageIndex,
+                                           shouldClearColor, shouldClearDepth, shouldClearStencil,
+                                           VK_IMAGE_LAYOUT_UNDEFINED,
+                                           VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0);
             return true;
         }
 
@@ -15338,6 +16039,26 @@ namespace threepp {
                     const uint32_t rh = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(full.height)));
                     const int      syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(full.height) - static_cast<int>(rh));
                     const uint32_t ry = static_cast<uint32_t>(static_cast<int>(full.height) - (syB + static_cast<int>(rh)));
+                    if (autoClear_ && (autoClearColor_ || autoClearDepth_ || autoClearStencil_)) {
+                        const Color savedClearColor = clearColor;
+                        const float savedClearAlpha = clearAlpha;
+                        Color bg;
+                        if (autoClearColor_ && sceneBackgroundColor(scene, bg)) {
+                            clearColor.copy(bg);
+                            clearAlpha = 1.f;
+                        }
+                        recordDefaultFramebufferClear(cmdBuffers[currentFrame], frameImageIndex_,
+                                                       autoClearColor_, false, autoClearStencil_,
+                                                       VK_IMAGE_LAYOUT_GENERAL,
+                                                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                               VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                                               VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                                       VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                                               VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                                               VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                        clearColor.copy(savedClearColor);
+                        clearAlpha = savedClearAlpha;
+                    }
                     overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
                                          scene, camera, /*screenSpaceOnly=*/false, rx, ry, rw, rh);
                     return;
@@ -15354,6 +16075,40 @@ namespace threepp {
             // present still completes from endFrame().
             overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
                                  scene, camera, /*screenSpaceOnly=*/false);
+        }
+
+        void clearDefaultFramebuffer(bool color, bool depth, bool stencil) {
+            if (!color && !depth && !stencil) return;
+            if (currentRenderTarget_ != nullptr) {
+                throw std::runtime_error("VulkanRenderer::clear: render target clearing is not implemented yet");
+            }
+            if (frameState_ == FrameState::Idle) {
+                pendingClearColor_ |= color;
+                pendingClearDepth_ |= depth;
+                pendingClearStencil_ |= stencil;
+                return;
+            }
+            // During an open default-framebuffer frame, unjitDepth is the
+            // occluder buffer consumed by the frame-end world-space overlay
+            // pass. A GL-style clearDepth() between main scene and HUD must not
+            // erase that occluder data before Line/Grid overlays depth-test.
+            depth = false;
+            stencil = false;
+            recordDefaultFramebufferClear(cmdBuffers[currentFrame], frameImageIndex_,
+                                           color, depth, stencil,
+                                           VK_IMAGE_LAYOUT_GENERAL,
+                                           VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                                   VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                                   VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        }
+
+        bool willAppendPerspectiveOverlayOnly(const Camera& camera) const {
+            return !camera.is<OrthographicCamera>() &&
+                   frameState_ != FrameState::Idle &&
+                   scissorTest && scissor.z >= 1.f && scissor.w >= 1.f;
         }
     };
 
@@ -15385,6 +16140,9 @@ namespace threepp {
         pimpl_->toneMapping_         = toneMapping;
         pimpl_->toneMappingExposure_ = toneMappingExposure;
         pimpl_->autoClear_           = autoClear;
+        pimpl_->autoClearColor_      = autoClearColor;
+        pimpl_->autoClearDepth_      = autoClearDepth;
+        pimpl_->autoClearStencil_    = autoClearStencil;
         // Only the PT-bound (perspective-camera) render() call needs the
         // scene-build pass — it populates lastVisibleEntries_, the BLAS
         // cache, motion bits and the per-mesh fingerprint state the PT
@@ -15393,7 +16151,8 @@ namespace threepp {
         // motionThisFrame_ / meshMovedBits_ / lastVisibleEntries_ and the
         // next PT frame cold-starts (visibly drops to ~1-spp quality).
         // The ortho overlay record path walks the HUD scene directly instead.
-        if (!camera.is<OrthographicCamera>()) {
+        const bool skipSceneBuildForOverlayOnly = pimpl_->willAppendPerspectiveOverlayOnly(camera);
+        if (!camera.is<OrthographicCamera>() && !skipSceneBuildForOverlayOnly) {
             const auto sceneStart = std::chrono::high_resolution_clock::now();
             pimpl_->ensureSceneBuilt(scene);
             // World-space Sprites (screenSpace == false) are drawn by the overlay
@@ -15438,6 +16197,8 @@ namespace threepp {
 
     void VulkanRenderer::setSize(const std::pair<int, int>& s) {
         pimpl_->size = WindowSize{s.first, s.second};
+        pimpl_->viewport.set(0.f, 0.f, static_cast<float>(s.first), static_cast<float>(s.second));
+        pimpl_->scissor.set(0.f, 0.f, static_cast<float>(s.first), static_cast<float>(s.second));
         pimpl_->needsResize = true;
     }
 
@@ -15465,10 +16226,23 @@ namespace threepp {
     float VulkanRenderer::getClearAlpha() const { return pimpl_->clearAlpha; }
     void VulkanRenderer::setClearAlpha(float a) { pimpl_->clearAlpha = a; }
 
-    void VulkanRenderer::clear(bool, bool, bool) {}
+    void VulkanRenderer::clear(bool color, bool depth, bool stencil) {
+        pimpl_->clearDefaultFramebuffer(color, depth, stencil);
+    }
 
-    RenderTarget* VulkanRenderer::getRenderTarget() { return nullptr; }
-    void VulkanRenderer::setRenderTarget(RenderTarget*, int, int) {}
+    RenderTarget* VulkanRenderer::getRenderTarget() { return pimpl_->currentRenderTarget_; }
+    void VulkanRenderer::setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel) {
+        if (renderTarget != nullptr) {
+            throw std::runtime_error("VulkanRenderer::setRenderTarget: offscreen render targets are implemented in phase 2");
+        }
+        pimpl_->currentRenderTarget_ = nullptr;
+        pimpl_->activeCubeFace_ = activeCubeFace;
+        pimpl_->activeMipmapLevel_ = activeMipmapLevel;
+    }
+
+    void VulkanRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
+        pimpl_->recordCopyFramebufferToTexture(position, texture, level);
+    }
 
     void VulkanRenderer::writeFramebuffer(const std::filesystem::path& filename) {
         auto ext = filename.extension().string();
@@ -15786,6 +16560,10 @@ namespace threepp {
         return {impl.eventCam_->width(), impl.eventCam_->height()};
     }
 
+    void VulkanRenderer::setDepthMask(bool flag) {
+        pimpl_->depthMask_ = flag;
+    }
+
     void VulkanRenderer::dispose() { pimpl_.reset(); }
 
     void* VulkanRenderer::nativeInstance() const {
@@ -15808,6 +16586,9 @@ namespace threepp {
     }
     uint32_t VulkanRenderer::imageCount() const {
         return static_cast<uint32_t>(pimpl_->ctx->swapchainImages().size());
+    }
+    uint32_t VulkanRenderer::defaultFramebufferSampleCount() const {
+        return Impl::sampleCountValue(pimpl_->defaultFramebufferSamples_);
     }
 
     void VulkanRenderer::setOverlayCallback(std::function<void(void*)> callback) {

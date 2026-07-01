@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <utility>
 
 namespace threepp::vulkan {
 
@@ -35,8 +36,12 @@ namespace threepp::vulkan {
 // ─────────────────────────────────────────────────────────────────────────────
 
 OverlayPass::OverlayPass(VulkanContext& ctx, uint32_t framesInFlight,
-                         SampledImageCreator uploadFn)
-    : ctx_(ctx), framesInFlight_(framesInFlight), uploadFn_(std::move(uploadFn)) {
+                         SampledImageCreator uploadFn,
+                         ExternalImageResolver externalImageFn)
+    : ctx_(ctx),
+      framesInFlight_(framesInFlight),
+      uploadFn_(std::move(uploadFn)),
+      externalImageFn_(std::move(externalImageFn)) {
     spriteDescPools_.resize(framesInFlight_, VK_NULL_HANDLE);
 }
 
@@ -48,6 +53,7 @@ OverlayPass::~OverlayPass() {
     if (orthoLineStripPipeline_)    vkDestroyPipeline(d, orthoLineStripPipeline_, nullptr);
     if (orthoMeshPipeline_)         vkDestroyPipeline(d, orthoMeshPipeline_, nullptr);
     if (orthoMeshTransparentPipeline_) vkDestroyPipeline(d, orthoMeshTransparentPipeline_, nullptr);
+    if (orthoMeshWireframePipeline_) vkDestroyPipeline(d, orthoMeshWireframePipeline_, nullptr);
     if (orthoPointListPipeline_)    vkDestroyPipeline(d, orthoPointListPipeline_, nullptr);
     if (orthoLinePipelineLayout_)   vkDestroyPipelineLayout(d, orthoLinePipelineLayout_, nullptr);
     if (spriteDescSetLayout_)       vkDestroyDescriptorSetLayout(d, spriteDescSetLayout_, nullptr);
@@ -55,6 +61,7 @@ OverlayPass::~OverlayPass() {
         if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
     }
     for (auto& [t, rec] : spriteAtlasCache_) {
+        if (!rec.ownsImage) continue;
         destroyImage2D(ctx_.allocator(), d, rec.image);
     }
     spriteAtlasCache_.clear();
@@ -215,6 +222,14 @@ void OverlayPass::createOrthoLinePipelines() {
     check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMesh, nullptr,
                                     &orthoMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoMesh)");
+
+    VkPipelineRasterizationStateCreateInfo rsWire = rs;
+    rsWire.polygonMode = VK_POLYGON_MODE_LINE;
+    VkGraphicsPipelineCreateInfo gpciMeshWire = gpciMesh;
+    gpciMeshWire.pRasterizationState = &rsWire;
+    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshWire, nullptr,
+                                    &orthoMeshWireframePipeline_),
+          "vkCreateGraphicsPipelines(orthoMeshWireframe)");
 
     VkPipelineColorBlendAttachmentState cbasT = cbas;
     cbasT.blendEnable         = VK_TRUE;
@@ -533,6 +548,36 @@ OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
     const uint32_t h = img.height();
     if (w == 0 || h == 0) return nullptr;
 
+    if (externalImageFn_) {
+        if (const Image2D* external = externalImageFn_(tex)) {
+            auto it = spriteAtlasCache_.find(tex);
+            if (it != spriteAtlasCache_.end()) {
+                SpriteAtlasRec& rec = it->second;
+                if (rec.ownsImage) {
+                    vkDeviceWaitIdle(ctx_.device());
+                    destroyImage2D(ctx_.allocator(), ctx_.device(), rec.image);
+                }
+                rec.image = *external;
+                rec.textureVersion = tex->version();
+                rec.width = external->width;
+                rec.height = external->height;
+                rec.liveCheck = std::weak_ptr<Texture>(texSp);
+                rec.ownsImage = false;
+                return &rec;
+            }
+
+            SpriteAtlasRec rec{};
+            rec.image = *external;
+            rec.textureVersion = tex->version();
+            rec.width = external->width;
+            rec.height = external->height;
+            rec.liveCheck = std::weak_ptr<Texture>(texSp);
+            rec.ownsImage = false;
+            auto [ins, _] = spriteAtlasCache_.emplace(tex, rec);
+            return &ins->second;
+        }
+    }
+
     const unsigned int curVersion = tex->version();
     auto it = spriteAtlasCache_.find(tex);
     if (it != spriteAtlasCache_.end()) {
@@ -540,11 +585,14 @@ OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
         const bool stale = rec.liveCheck.expired() ||
                            rec.liveCheck.lock().get() != tex ||
                            rec.textureVersion != curVersion ||
-                           rec.width != w || rec.height != h;
+                           rec.width != w || rec.height != h ||
+                           !rec.ownsImage;
         if (!stale) return &rec;
         // Stale — destroy and re-upload.
-        vkDeviceWaitIdle(ctx_.device());
-        destroyImage2D(ctx_.allocator(), ctx_.device(), rec.image);
+        if (rec.ownsImage) {
+            vkDeviceWaitIdle(ctx_.device());
+            destroyImage2D(ctx_.allocator(), ctx_.device(), rec.image);
+        }
         spriteAtlasCache_.erase(it);
     }
 
@@ -577,10 +625,9 @@ OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
     // == sRGB`): ONLY an explicitly sRGB-tagged texture gets hardware
     // sRGB decode on sample. Linear AND NoColorSpace are sampled raw.
     // The TextSprite glyph atlas is NoColorSpace but Font::rasterize
-    // bakes LINEAR bytes (color.r*255) into it — so it must be sampled
-    // raw (UNORM), and overlay_sprite.frag applies the linear→sRGB
-    // output encode for the UNORM swapchain. (Was: NoColorSpace fell
-    // to SRGB here → double sRGB decode → dark non-white text.)
+    // bakes LINEAR bytes (color.r*255) into it, so it must be sampled
+    // raw (UNORM). (Was: NoColorSpace fell to SRGB here → double
+    // sRGB decode → dark non-white text.)
     const VkFormat fmt = (tex->colorSpace == ColorSpace::sRGB)
                                  ? VK_FORMAT_R8G8B8A8_SRGB
                                  : VK_FORMAT_R8G8B8A8_UNORM;
@@ -958,6 +1005,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         Color   color{1.f, 1.f, 1.f};
         float   opacity = 1.f;
         bool    transparent = false;
+        bool    wireframe = false;
     };
     std::vector<OrthoMeshDraw> meshDraws;
     if (!screenSpaceOnly) {
@@ -972,6 +1020,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             md.mesh = m;
             std::memcpy(md.world.elements.data(), m->matrixWorld->elements.data(), 64);
             if (auto* mc = dynamic_cast<MaterialWithColor*>(mat.get())) md.color = mc->color;
+            if (auto* mw = dynamic_cast<MaterialWithWireframe*>(mat.get())) md.wireframe = mw->wireframe;
             md.opacity     = mat->opacity;
             md.transparent = mat->transparent;
             meshDraws.push_back(md);
@@ -1065,13 +1114,14 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     ri.pColorAttachments = &colorAtt;
     vkCmdBeginRendering(cb, &ri);
 
-    // Split-screen: clip to the region sub-rect (regionW == 0 → full frame).
+    // GL scissor semantics: viewport remains full-frame; the optional region
+    // only clips which swapchain pixels are written.
     const bool   regionActive = regionW > 0u && regionH > 0u;
     const float  rgx = regionActive ? float(regionX) : 0.f;
     const float  rgy = regionActive ? float(regionY) : 0.f;
     const float  rgw = regionActive ? float(regionW) : float(ext.width);
     const float  rgh = regionActive ? float(regionH) : float(ext.height);
-    VkViewport vp{rgx, rgy, rgw, rgh, 0.f, 1.f};
+    VkViewport vp{0.f, 0.f, float(ext.width), float(ext.height), 0.f, 1.f};
     vkCmdSetViewport(cb, 0, 1, &vp);
     VkRect2D sc{{int32_t(rgx), int32_t(rgy)}, {uint32_t(rgw), uint32_t(rgh)}};
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -1101,7 +1151,10 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             const LineRec* rec = ensureLineGeometryUploaded(md.mesh->geometry().get());
             if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
-            VkPipeline want = md.transparent ? orthoMeshTransparentPipeline_ : orthoMeshPipeline_;
+            VkPipeline want;
+            if (md.wireframe)       want = orthoMeshWireframePipeline_;
+            else if (md.transparent) want = orthoMeshTransparentPipeline_;
+            else                    want = orthoMeshPipeline_;
             if (want != curMesh) {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
                 curMesh = want;

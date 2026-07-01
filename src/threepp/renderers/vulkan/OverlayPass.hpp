@@ -51,8 +51,10 @@ namespace threepp::vulkan {
                 VkSamplerAddressMode addrU,
                 VkSamplerAddressMode addrV,
                 const char* debugName)>;
+        using ExternalImageResolver = std::function<const Image2D*(const Texture*)>;
 
-        OverlayPass(VulkanContext& ctx, uint32_t framesInFlight, SampledImageCreator uploadFn);
+        OverlayPass(VulkanContext& ctx, uint32_t framesInFlight, SampledImageCreator uploadFn,
+                    ExternalImageResolver externalImageFn = {});
         ~OverlayPass();
         OverlayPass(const OverlayPass&)            = delete;
         OverlayPass& operator=(const OverlayPass&) = delete;
@@ -65,9 +67,9 @@ namespace threepp::vulkan {
         // screenSpaceOnly — when true, only sprites with Sprite::screenSpace=true
         //                   are drawn (used for the automatic screen-space sprite
         //                   compositing after the PT body).
-        // regionW == 0 → full frame. Otherwise the overlay is clipped to the
-        // swapchain sub-rect (regionX, regionY, regionW, regionH) — used for
-        // split-screen secondary panes (overlay-only, drawn beside a PT pane).
+        // regionW == 0 → full frame. Otherwise only the swapchain write is
+        // clipped to (regionX, regionY, regionW, regionH); projection remains
+        // full-frame to match GL scissor semantics.
         void record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
                     Object3D& scene, Camera& camera, bool screenSpaceOnly,
                     uint32_t regionX = 0, uint32_t regionY = 0,
@@ -83,6 +85,7 @@ namespace threepp::vulkan {
             uint32_t     width          = 0;
             uint32_t     height         = 0;
             std::weak_ptr<Texture> liveCheck;
+            bool         ownsImage      = true;
         };
 
         // Per-BufferGeometry vertex/index upload for Sprite quads.
@@ -106,6 +109,7 @@ namespace threepp::vulkan {
         VulkanContext&      ctx_;
         uint32_t            framesInFlight_;
         SampledImageCreator uploadFn_;
+        ExternalImageResolver externalImageFn_;
 
         static constexpr uint32_t kMaxSpritesPerFrame = 64;
 
@@ -120,6 +124,7 @@ namespace threepp::vulkan {
         VkPipeline       orthoLineStripPipeline_       = VK_NULL_HANDLE;
         VkPipeline       orthoMeshPipeline_            = VK_NULL_HANDLE;
         VkPipeline       orthoMeshTransparentPipeline_ = VK_NULL_HANDLE;
+        VkPipeline       orthoMeshWireframePipeline_   = VK_NULL_HANDLE;
 
         // Ortho point pipeline (overlay_point.vert/frag, POINT_LIST, pos+color
         // vertex bindings, depth-off). Reuses orthoLinePipelineLayout_.

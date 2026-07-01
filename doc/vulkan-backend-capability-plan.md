@@ -14,6 +14,11 @@
 
 - 不新增 example。
 - 阶段验收只使用已经存在、且能通过 `createRenderer(canvas)` 菜单选择 Vulkan 后端的 examples，或已经存在的 Vulkan 专用 examples。
+- 用于通用 Vulkan 阶段验收的 example 必须同时支持 GL 后端选择；不能在 GL 后端稳定运行的通用 example 不能作为 Vulkan parity 验收依据，只能记录为环境或 example 覆盖缺口。
+- 通用 example 的 Vulkan 验收必须与同一 example 的 GL 截图进行对比。GL 与 Vulkan 截图应使用相同构建 preset、窗口尺寸、初始场景状态、相机状态、随机种子和固定帧数；优先使用 example 已有的 `--shot`/`--frames` 参数或 renderer readback 测试生成截图，没有自动截图入口时才使用窗口截图并在验收记录中说明。
+- 截图对比目标是验证 Vulkan 与 GL 的可见内容、布局、颜色空间、纹理方向、viewport/scissor、透明和 UI 覆盖关系保持一致；不得要求 path tracing 噪声、阴影采样或后端特有抗锯齿与 GL 逐像素完全一致。若只能做人工视觉对比，验收记录必须包含 GL/Vulkan 截图路径和已检查的差异点。
+- `Canvas` 的 `aa`/`antialiasing` 参数属于通用 renderer 契约；阶段 1 必须支持默认 framebuffer 的 Vulkan MSAA/resolve。GL 与 Vulkan 不要求逐像素一致，但不能因为 Vulkan 忽略 MSAA 导致网格线、普通线段或几何边缘出现明显偏粗、锯齿或遮挡错误。
+- 颜色空间转换必须通过输入纹理 format、RenderTarget/default framebuffer 输出 format 等 Vulkan format 语义完成；默认 shader 计算保持在线性空间，不能为了通过 GL/Vulkan 截图对比而在单个 fragment shader 中临时手工做 linear→sRGB。
 - 阶段验收和重验证统一使用 CMake preset `dev-mswin`；正式验收不得使用手写临时 `build-vulkan-*` 目录作为依据。`dev-mswin` 是 Visual Studio x64 Debug preset，运行路径为 `build/dev-mswin/bin/Debug/<target>.exe`。
 - 通用 example 的 Vulkan 运行方式统一为：
 
@@ -21,6 +26,15 @@
 cmake --build --preset dev-mswin --target <example_target>
 "4" | & .\build\dev-mswin\bin\Debug\<example_target>.exe
 ```
+
+- 通用 example 的 GL 基线运行方式统一为：
+
+```powershell
+cmake --build --preset dev-mswin --target <example_target>
+"<gl_menu_index>" | & .\build\dev-mswin\bin\Debug\<example_target>.exe
+```
+
+- `<gl_menu_index>` 必须以当前 example 的 `createRenderer(canvas)` 菜单输出为准，不得假设固定编号。
 
 - Vulkan 专用 example 直接运行：
 
@@ -98,27 +112,27 @@ cmake --build build --config Debug --target vulkan_showcase vulkan_gallery vulka
 
 **实施步骤：**
 
-- [ ] 在 `VulkanRenderer::Impl` 中集中记录当前 framebuffer 状态：默认 surface、当前 target、viewport、scissor、scissorTest、clear color/alpha、clear depth/stencil、depth mask。
-- [ ] 将 `clear(color, depth, stencil)` 接到实际 Vulkan command recording，默认 framebuffer 和 offscreen target 共用同一套状态入口。
-- [ ] 将 `clearDepth()` 映射到 depth attachment clear，不改变 color attachment。
-- [ ] 确认 `autoClear` 在 `render()` 开始时只清当前输出目标。
-- [ ] 确认 `setViewport`、`setScissor`、`setScissorTest` 对 swapchain 和后续 offscreen target 使用同一坐标约定。
-- [ ] 保持 `readRGBPixels()` 和 `writeFramebuffer()` 对默认 framebuffer 的现有行为。
+- [x] 在 `VulkanRenderer::Impl` 中集中记录当前 framebuffer 状态：默认 surface、当前 target、viewport、scissor、scissorTest、clear color/alpha、clear depth/stencil、depth mask。
+- [x] 将 `clear(color, depth, stencil)` 接到实际 Vulkan command recording，默认 framebuffer 和 offscreen target 共用同一套状态入口。
+- [x] 将 `clearDepth()` 映射到 depth attachment clear，不改变 color attachment。
+- [x] 确认 `autoClear` 在 `render()` 开始时只清当前输出目标。
+- [x] 确认 `setViewport`、`setScissor`、`setScissorTest` 对 swapchain 和后续 offscreen target 使用同一坐标约定。
+- [x] 支持默认 framebuffer 的 MSAA：读取 `Canvas::samples()`，为 Vulkan swapchain 路径创建 multisampled color/depth attachments，并在提交到 swapchain、TAA 输入或 framebuffer copy/readback 前完成 resolve。该阶段只要求默认 framebuffer 的 raster/overlay 路径达标，RenderTarget MSAA 仍归阶段 8。
+- [x] 保持 `readRGBPixels()` 和 `writeFramebuffer()` 对默认 framebuffer 的现有行为。
 
 **验收 examples：**
 
 ```powershell
-cmake --build build --config Debug --target multiple_scenes data_texture Shooter
-"4" | & .\build\bin\multiple_scenes.exe
-"4" | & .\build\bin\data_texture.exe
-"4" | & .\build\bin\Shooter.exe --shot vulkan_stage1.png --frames 120
+cmake --build --preset dev-mswin --target multiple_scenes data_texture
+"4" | & .\build\dev-mswin\bin\data_texture.exe
+"4" | & .\build\dev-mswin\bin\multiple_scenes.exe
 ```
 
 **通过标准：**
 
 - `multiple_scenes` 左右 scissor 区域都可见，拖动分割线不出现清屏错误。
-- `data_texture` 中主场景和左上角 framebuffer sprite 同时可见，`clearDepth` 不破坏 color。
-- `Shooter --shot` 生成图片，UI 二次渲染不被深度遮挡。
+- `data_texture` 中主场景和左上角 framebuffer sprite 同时可见，`clearDepth` 不破坏 color；该 example 使用 `Canvas("Data texture", {{"aa", 4}})`，Vulkan 截图必须与 GL 截图对比，确认箱子和足球遮挡网格线，且 GridHelper/线段的可见粗细和边缘抗锯齿没有明显偏离 GL。
+- 当前 `dev-mswin` preset 未生成 `Shooter` 目标；若后续 preset 启用该 target，需要补跑 `Shooter --shot`，确认 UI 二次渲染不被深度遮挡。
 
 ## 阶段 2：RenderTarget、depthTexture、copy 与离屏渲染
 
@@ -510,6 +524,7 @@ cmake --build build --config Debug --target vulkan_showcase vulkan_gallery vulka
 - 对非法参数抛出清晰异常，不静默跳过 draw。
 - GPU 资源在 resize、dispose、帧延迟释放中没有 use-after-free。
 - 对应阶段列出的 existing examples 能通过 Vulkan 后端选择运行。
+- 对应阶段列出的通用 examples 同时能通过 GL 后端运行，并已将 Vulkan 截图与 GL 截图完成对比；Vulkan 专用 examples 不适用 GL 截图对比，但必须保留原有 Vulkan 专用验收。
 - 没有 existing example 覆盖的能力，在文档中明确标记，并由测试或后续用户批准的 example 改造补充验收。
 
 ## 建议执行顺序

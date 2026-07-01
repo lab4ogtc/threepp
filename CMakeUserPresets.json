@@ -47,6 +47,8 @@
         "windows"
       ],
       "cacheVariables": {
+        "CMAKE_C_FLAGS": "/utf-8 /DNOMINMAX /DWIN32_LEAN_AND_MEAN",
+        "CMAKE_CXX_FLAGS": "/utf-8 /DNOMINMAX /DWIN32_LEAN_AND_MEAN",
         "THREEPP_BUILD_EXAMPLES": "ON",
         "THREEPP_BUILD_EXAMPLE_PROJECTS": "ON",
         "THREEPP_BUILD_TESTS": "ON",

@@ -77,12 +77,9 @@ namespace threepp::vulkan {
         // clamped [1, 6] by the caller; 1 at high fps). The shader scales its
         // per-frame temporal constants (deviation-streak ramp, soft-clip rate)
         // by it so ghost decay is constant in wall-clock time, not frames.
-        // Split-screen: the pane content is rendered region-sized AT THE IMAGE
-        // ORIGIN of the (full-size) input/history textures. inWidth/inHeight and
-        // outWidth/outHeight are the PANE (region) sizes; physInW/H and
-        // physOutW/H are the full texture sizes (for UV normalisation); dstX/dstY
-        // offset the swapchain write to the pane's screen position. Defaults
-        // (phys = 0, dst = 0) reproduce the full-frame 1:1 behaviour exactly.
+        // Scissored writes: outWidth/outHeight are the dispatch/write region,
+        // dstX/dstY are the swapchain/history offset, and physIn/physOut are
+        // the full texture sizes used for full-frame UV normalisation.
         void recordResolve(VkCommandBuffer cb,
                            uint32_t frame,
                            uint32_t imageIndex,

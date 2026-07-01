@@ -53,7 +53,7 @@ layout(set = 0, binding = 6) uniform usampler2D gbufIdsPrevTex;
 
 layout(push_constant) uniform Pc {
     float blendAlpha;// base new-sample weight (0.1 = strong AA, slow ghost decay)
-    uint  width;     // PANE (scissor region) output size — dispatch + writes
+    uint  width;     // scissor-region output size — dispatch bounds
     uint  height;
     uint  inWidth;   // PANE (scissor region) input size (path-trace render extent)
     uint  inHeight;
@@ -69,19 +69,17 @@ layout(push_constant) uniform Pc {
                      // only one step — leaving one discrete stale band per
                      // ramp frame ("double/triple edge ghosts" behind moving
                      // objects at capped fps).
-    // Split-screen: packed swapchain write offset (dstX | dstY<<16). The pane is
-    // rendered region-sized at the texture ORIGIN; only the swapchain store is
-    // offset to the pane's screen position. 0 = full-frame (no offset). Occupies
-    // the former std430 pad at offset 28, so the mat4 still aligns to offset 32.
+    // Packed swapchain write offset (dstX | dstY<<16). Scissor rendering keeps
+    // full-frame projection; this offset converts local dispatch pixels to
+    // physical swapchain/history coordinates.
     uint  dstOffset;
     // prevVPunjit · currVPunjit⁻¹ — maps current CLIP at the far plane
     // (reversed-Z: z = 0) to previous clip. Supplies SKY pixels their true
     // rotation-induced motion. std430: mat4 aligns to offset 32.
     mat4  skyReproj;
-    // Split-screen: full (physical) texture sizes for UV normalisation. The pane
-    // content lives in [0..inWidth]/[0..width] of these full-size textures, so a
-    // region-UV in [0,1] must be scaled by region/phys before sampling. Default
-    // (phys == region) → scale 1 → identical to the full-frame path.
+    // Full physical texture sizes for UV normalisation. For full-frame rendering
+    // these match width/height and inWidth/inHeight; for scissored writes they
+    // keep sampling in full-frame coordinates.
     uint  physInW;
     uint  physInH;
     uint  physOutW;
@@ -188,15 +186,10 @@ void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.width) || px.y >= int(pc.height)) return;
 
-    const vec2 sz = vec2(float(pc.width), float(pc.height));
-    const vec2 uv = (vec2(px) + 0.5) / sz;
-
-    // Split-screen: the pane content occupies [0..inWidth]/[0..width] of the
-    // full-size textures, so map the region-UV into that sub-rect for sampling.
-    // (At full-frame, region == phys → scale 1 → unchanged.)
-    const vec2 inScale  = vec2(float(pc.inWidth), float(pc.inHeight)) / vec2(float(pc.physInW), float(pc.physInH));
-    const vec2 outScale = vec2(float(pc.width),   float(pc.height))   / vec2(float(pc.physOutW), float(pc.physOutH));
-    const vec2 uvIn = uv * inScale;// render-extent textures (input, motion, ids)
+    const ivec2 dstBase = ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u));
+    const ivec2 dstPx = px + dstBase;
+    const vec2 uv = (vec2(dstPx) + 0.5) / vec2(float(pc.physOutW), float(pc.physOutH));
+    const vec2 uvIn = uv;// normalized full-frame coords for input, motion, ids
 
     // Current sample — raw (jittered) input. Temporal accumulation over the
     // Halton jitter sequence is the anti-aliasing now (TSR), not FXAA.
@@ -230,7 +223,7 @@ void main() {
     //   ids.z = flags  (bit 0 is_water, bit 3 is_skinned)
     const uvec4 currIds = texture(gbufIdsCurrTex, uvIn);
     const uvec4 prevIds = reprojValid
-            ? texture(gbufIdsPrevTex, prevUv * inScale)
+            ? texture(gbufIdsPrevTex, prevUv)
             : uvec4(0u);
     const bool isSkinned = (currIds.z & 8u) != 0u;
     // NO hard mesh-ID disocclusion reject. Under jitter a silhouette pixel's
@@ -270,7 +263,7 @@ void main() {
 
     // Motion in pixels — used by the clip-rate gate below AND the velocity
     // alpha. NDC motion is in [-2, 2] across the screen.
-    const vec2 motionPx = motionGL * 0.5 * vec2(pc.width, pc.height);
+    const vec2 motionPx = motionGL * 0.5 * vec2(pc.physOutW, pc.physOutH);
     const float motionLen = length(motionPx);
 
     // DILATED motion: max |motion| over the 3×3 input neighbourhood. A pixel
@@ -286,7 +279,7 @@ void main() {
             for (int dx = -1; dx <= 1; ++dx) {
                 const vec2 mv = texture(gbufMotionTex, uvIn + vec2(dx, dy) * inTexel).rg;
                 dilatedMotionPx = max(dilatedMotionPx,
-                                      length(mv * 0.5 * vec2(pc.width, pc.height)));
+                                      length(mv * 0.5 * vec2(pc.physOutW, pc.physOutH)));
             }
     }
 
@@ -295,7 +288,7 @@ void main() {
     if (reprojValid && cnt > 0.5) {
         // Catmull-Rom 5-tap (sharper than single bilinear — kills the
         // "everything smears on camera translation" compounding blur).
-        const vec3 histRGB = sampleHistoryCR(prevUv * outScale);
+        const vec3 histRGB = sampleHistoryCR(prevUv);
         // Variance clip in YCoCg. γ widens/tightens the allowed history box:
         // ~1 is a good flicker/ghost balance.
         const vec3  mu    = m1 / cnt;
@@ -336,7 +329,7 @@ void main() {
         // constant wall-clock time: at 30 fps one real frame advances it 3
         // reference frames and the backstop fires immediately, instead of
         // leaving 3 frames × N px of discrete stale bands behind the edge.
-        devStreak = (devK > 2.0) ? min(texture(taaHistoryReadTex, prevUv * outScale).a + pc.dtFrames, 8.0) : 0.0;
+        devStreak = (devK > 2.0) ? min(texture(taaHistoryReadTex, prevUv).a + pc.dtFrames, 8.0) : 0.0;
         // Instant σ-term, gated on DILATED motion: during continuous camera
         // motion the streak's 3-frame ramp re-arms on every freshly-vacated
         // pixel, leaving a steady-state stale rim trailing edges across the
@@ -406,9 +399,6 @@ void main() {
     // still write history (RCAS reads the resolved frame from the history slot).
     // When a downstream RCAS pass owns the swapchain write, skip it here but
     // still write history (RCAS reads the resolved frame from the history slot).
-    // Swapchain write is offset to the pane's screen position; history stays at
-    // the texture origin (region-local), so next frame reprojects consistently.
-    const ivec2 dstPx = px + ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u));
     if (pc.writeSwap != 0u) imageStore(taaSwapImage, dstPx, vec4(result, 1.0));
-    imageStore(taaHistoryWriteImg,  px, vec4(result, devStreak));// .a = deviation streak
+    imageStore(taaHistoryWriteImg,  dstPx, vec4(result, devStreak));// .a = deviation streak
 }

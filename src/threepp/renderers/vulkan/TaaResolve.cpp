@@ -442,7 +442,7 @@ namespace threepp::vulkan {
                                    uint32_t physInH,
                                    uint32_t physOutW,
                                    uint32_t physOutH) {
-        // Physical (full texture) sizes default to the region sizes → scale 1.
+        // Physical (full texture) sizes default to the dispatch sizes.
         if (physInW == 0)  physInW  = inWidth;
         if (physInH == 0)  physInH  = inHeight;
         if (physOutW == 0) physOutW = outWidth;
@@ -488,7 +488,7 @@ namespace threepp::vulkan {
         const float alpha = historyValid_ ? blendAlpha : 1.0f;
         uint32_t alphaBits;
         std::memcpy(&alphaBits, &alpha, sizeof(alphaBits));
-        // Layout: blendAlpha, output w/h (history + dispatch + writes),
+        // Layout: blendAlpha, output w/h (dispatch + writes),
         // input w/h (the render extent the samples were traced at).
         // Layout mirrors the shader's std430 push block: 7 scalars, 4 bytes
         // of pad, then the column-major mat4 at offset 32.

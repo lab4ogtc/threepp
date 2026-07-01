@@ -68,6 +68,7 @@ namespace threepp {
         void setRenderTarget(RenderTarget* renderTarget, int activeCubeFace = 0, int activeMipmapLevel = 0) override;
 
         [[nodiscard]] std::vector<unsigned char> readRGBPixels() override;
+        void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0) override;
 
         // Save the last presented frame to disk (.png / .jpg / .jpeg / .bmp),
         // creating parent directories as needed — same convenience GLRenderer
@@ -182,6 +183,8 @@ namespace threepp {
         void setEventsOnlyMode(bool enabled);
         [[nodiscard]] bool eventsOnlyMode() const;
 
+        void setDepthMask(bool flag) override;
+
         void dispose() override;
 
         // ImGui integration handles. All Vulkan types are erased to void* /
@@ -193,6 +196,7 @@ namespace threepp {
         [[nodiscard]] uint32_t graphicsQueueFamily() const;
         [[nodiscard]] uint32_t nativeSwapchainFormat() const;// cast to VkFormat
         [[nodiscard]] uint32_t imageCount() const;            // swapchain image count
+        [[nodiscard]] uint32_t defaultFramebufferSampleCount() const;
 
         // Callback invoked once per frame inside the present render pass,
         // after the path tracer has written the image. The argument is a
