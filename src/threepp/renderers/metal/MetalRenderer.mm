@@ -3849,12 +3849,12 @@ void MetalRenderer::Impl::render(Scene& scene, Camera& camera, bool autoClear) {
         if (hasPreviousRender) {
             const auto elapsed = std::chrono::duration<float, std::milli>(now - lastRenderTime).count();
             const auto isOrderedScissorContinuation = scissorTest && (scissor.x > lastScissor.x || scissor.y > lastScissor.y);
-            if (!renderTarget && elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation && screenCommandsEncoded) {
+            if (!window.isInsideAnimateLoop() && !renderTarget && elapsed > frameBoundaryThresholdMs && !isOrderedScissorContinuation && screenCommandsEncoded) {
                 commitPendingFrame();
             }
         }
 
-        if (currentCommandBuffer && !explicitFrameInProgress && screenCommandsEncoded) {
+        if (currentCommandBuffer && !window.isInsideAnimateLoop() && !explicitFrameInProgress && screenCommandsEncoded) {
             bool isNewFrame = false;
             if (scissorTest) {
                 if (scissor.x < lastScissor.x || scissor.y < lastScissor.y) {
