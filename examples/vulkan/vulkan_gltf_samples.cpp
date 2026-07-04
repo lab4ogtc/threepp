@@ -23,8 +23,18 @@ struct ModelEntry {
 
 static std::vector<ModelEntry> scanModels(const fs::path& root) {
     std::vector<ModelEntry> entries;
+    auto addModelFile = [&](const fs::path& path, const std::string& fallbackName = {}) {
+        const auto ext = path.extension().string();
+        if (ext != ".gltf" && ext != ".glb") return false;
+        entries.push_back({fallbackName.empty() ? path.stem().string() : fallbackName, path});
+        return true;
+    };
     for (auto& dir : fs::directory_iterator(root)) {
         try {
+            if (dir.is_regular_file()) {
+                addModelFile(dir.path());
+                continue;
+            }
             if (!dir.is_directory()) continue;
             auto name = dir.path().filename().string();
 
@@ -39,8 +49,7 @@ static std::vector<ModelEntry> scanModels(const fs::path& root) {
                 continue;
             }
             for (auto& f : fs::directory_iterator(dir.path())) {
-                if (f.path().extension() == ".gltf") {
-                    entries.push_back({name, f.path()});
+                if (addModelFile(f.path(), name)) {
                     break;
                 }
             }

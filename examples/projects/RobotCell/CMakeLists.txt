@@ -1,4 +1,8 @@
-add_example(NAME "robot_cell" SOURCES main.cpp LINK_PHYSX)
+if (TARGET unofficial::omniverse-physx-sdk::sdk)
+    add_example(NAME "robot_cell" SOURCES main.cpp LINK_PHYSX)
+else ()
+    add_example(NAME "robot_cell" SOURCES depthprobe.cpp)
+endif ()
 
 # On Vulkan builds the perception sensor can be ray-traced through the
 # renderer's TLAS (PathTracedLidarSensor camera mode) instead of rasterised.

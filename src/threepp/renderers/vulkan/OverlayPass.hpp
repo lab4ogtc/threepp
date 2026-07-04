@@ -67,13 +67,15 @@ namespace threepp::vulkan {
         // screenSpaceOnly — when true, only sprites with Sprite::screenSpace=true
         //                   are drawn (used for the automatic screen-space sprite
         //                   compositing after the PT body).
-        // regionW == 0 → full frame. Otherwise only the swapchain write is
-        // clipped to (regionX, regionY, regionW, regionH); projection remains
-        // full-frame to match GL scissor semantics.
+        // regionW == 0 表示整帧。否则将 swapchain 写入裁剪到
+        // (regionX, regionY, regionW, regionH)。regionAsViewport 为 true 时，
+        // Vulkan 动态 viewport 也使用同一区域；否则投影保持整帧，
+        // 用于匹配 GL scissor 语义。
         void record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
                     Object3D& scene, Camera& camera, bool screenSpaceOnly,
                     uint32_t regionX = 0, uint32_t regionY = 0,
-                    uint32_t regionW = 0, uint32_t regionH = 0);
+                    uint32_t regionW = 0, uint32_t regionH = 0,
+                    bool regionAsViewport = false);
 
     private:
         // Cached uploaded sprite atlas. Keyed on Texture*; liveCheck detects
@@ -96,15 +98,30 @@ namespace threepp::vulkan {
             std::weak_ptr<BufferGeometry> liveCheck;
         };
 
+        // 正交贴图 Mesh 使用普通 BufferGeometry：position 与 uv 分开上传。
+        struct TexturedMeshGeomRec {
+            Buffer   position;
+            Buffer   uv;
+            Buffer   index;
+            uint32_t vertexCount = 0;
+            uint32_t indexCount = 0;
+            uint32_t geomId = 0;
+            unsigned int positionVersion = 0;
+            unsigned int uvVersion = 0;
+            unsigned int indexVersion = 0;
+        };
+
         // Lazy pipeline setup — called from record() on first use.
         void createSpriteOverlayPipeline();
         void createOrthoLinePipelines();
         void createOrthoPointPipeline();
+        void createTexturedMeshPipeline();
 
         // Cache helpers — called from record() on each draw.
         const SpriteAtlasRec* ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp);
         const SpriteGeomRec*  ensureSpriteGeometryUploaded(const BufferGeometry* geom);
-        const LineRec*        ensureLineGeometryUploaded(const BufferGeometry* geom);
+        const TexturedMeshGeomRec* ensureTexturedMeshGeometryUploaded(const BufferGeometry* geom);
+        LineRec*              ensureLineGeometryUploaded(const BufferGeometry* geom);
 
         VulkanContext&      ctx_;
         uint32_t            framesInFlight_;
@@ -122,9 +139,15 @@ namespace threepp::vulkan {
         VkPipelineLayout orthoLinePipelineLayout_      = VK_NULL_HANDLE;
         VkPipeline       orthoLineListPipeline_        = VK_NULL_HANDLE;
         VkPipeline       orthoLineStripPipeline_       = VK_NULL_HANDLE;
+        VkPipeline       orthoLineDashedListPipeline_  = VK_NULL_HANDLE;
+        VkPipeline       orthoLineDashedStripPipeline_ = VK_NULL_HANDLE;
+        VkPipeline       orthoLineColoredListPipeline_ = VK_NULL_HANDLE;
+        VkPipeline       orthoLineColoredStripPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoMeshPipeline_            = VK_NULL_HANDLE;
         VkPipeline       orthoMeshTransparentPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoMeshWireframePipeline_   = VK_NULL_HANDLE;
+        VkPipeline       orthoTexturedMeshPipeline_    = VK_NULL_HANDLE;
+        VkPipeline       orthoDepthTextureMeshPipeline_ = VK_NULL_HANDLE;
 
         // Ortho point pipeline (overlay_point.vert/frag, POINT_LIST, pos+color
         // vertex bindings, depth-off). Reuses orthoLinePipelineLayout_.
@@ -136,6 +159,7 @@ namespace threepp::vulkan {
         // Texture + geometry caches
         std::unordered_map<const Texture*,        SpriteAtlasRec> spriteAtlasCache_;
         std::unordered_map<const BufferGeometry*, SpriteGeomRec>  spriteGeomCache_;
+        std::unordered_map<const BufferGeometry*, TexturedMeshGeomRec> texturedMeshGeomCache_;
         std::unordered_map<const BufferGeometry*, LineRec> lineGeomCache_;
         uint64_t overlayFrameCounter_ = 0;
     };

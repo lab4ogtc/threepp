@@ -1,5 +1,10 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : enable
+
+#include "vulkan_shared.h"
+
+const int kMaxRasterClipPlanes = 4;
 
 // Hybrid raster G-buffer prepass. Produces depth, world-space normal,
 // screen-space motion vector and per-pixel instance/flags so the PT raygen
@@ -32,6 +37,10 @@ layout(set = 0, binding = 0) uniform CameraUbo {
 layout(set = 0, binding = 1, scalar) readonly buffer MotionMatBuf {
     mat4 motionMat[];
 };
+layout(set = 0, binding = 2, scalar) readonly buffer GbufMatBuf {
+    MaterialDesc gbufMats[];
+};
+layout(set = 0, binding = 3) uniform sampler2D gbufAlbedoMaps[kMaxMaterialTextures];
 
 layout(push_constant) uniform PC {
     mat4 model;
@@ -49,6 +58,7 @@ layout(location = 2) in vec2 inUv;// passthrough for raygen texture sampling
 // binds rec->vertex here so inPrevPos == inPos and motion reduces to the
 // rigid-body case via motionMat[i] alone (same as before this change).
 layout(location = 3) in vec3 inPrevPos;
+layout(location = 4) in vec2 inUv2;
 
 layout(location = 0) out vec3 vWorldNormal;
 layout(location = 1) out vec4 vCurrClipUnjit;// motion-vec source — must not include jitter
@@ -60,9 +70,26 @@ layout(location = 6) out vec3 vWorldPos;// for fragment-shader TBN via dFdx/dFdy
 layout(location = 7) out vec3 vColor;// per-vertex color; this fixed-input path has no
                                      // color binding, so always white (the indirect
                                      // path — gbuffer_indirect.vert — does real vertex colors)
+layout(location = 8) flat out vec4 vLocalClipPlanes[kMaxRasterClipPlanes];
+layout(location = 12) flat out uint vLocalClipPlaneCount;
+layout(location = 13) flat out uint vLocalClipIntersection;
+layout(location = 14) flat out uint vMeshIdx;
+layout(location = 15) out vec2 vUv2;
+
+float displacementAmount(MaterialDesc m, vec2 uv) {
+    if (m.displacementTexIndex < 0) return 0.0;
+    const int ti = clamp(m.displacementTexIndex, 0, int(kMaxMaterialTextures) - 1);
+    const vec2 duv = (m.uvTransformDisplacement * vec3(uv, 1.0)).xy;
+    return textureLod(gbufAlbedoMaps[ti], duv, 0.0).r * m.displacementScale + m.displacementBias;
+}
 
 void main() {
-    vec4 worldPos     = pc.model * vec4(inPos, 1.0);
+    const MaterialDesc m = gbufMats[pc.instanceCustomIndex];
+    const float disp = displacementAmount(m, inUv);
+    const vec3 displacedPos = inPos + normalize(inNormal) * disp;
+    const vec3 displacedPrevPos = inPrevPos + normalize(inNormal) * disp;
+
+    vec4 worldPos     = pc.model * vec4(displacedPos, 1.0);
     // prev_world = (motionMat * curr_model) * prev_local_pos = prev_model * inPrevPos.
     //   Static meshes:    inPrevPos == inPos     → equivalent to motionMat * worldPos.
     //   Skinned/displaced: inPrevPos = prev pose → captures the per-vertex
@@ -70,7 +97,7 @@ void main() {
     //                                              (identity for these meshes since
     //                                              the rigid world matrix doesn't
     //                                              change) would miss.
-    vec4 prevWorldPos = motionMat[pc.instanceCustomIndex] * pc.model * vec4(inPrevPos, 1.0);
+    vec4 prevWorldPos = motionMat[pc.instanceCustomIndex] * pc.model * vec4(displacedPrevPos, 1.0);
 
     // mat3(model) is correct for normals only under uniform/no-shear scale.
     // threepp's scene graphs are typically uniform-scaled; non-uniform
@@ -80,10 +107,17 @@ void main() {
     vCurrClipUnjit = cam.currVPunjittered * worldPos;
     vPrevClip      = cam.prevVP           * prevWorldPos;
     vInstanceIdx   = pc.instanceCustomIndex;
+    vMeshIdx       = pc.instanceCustomIndex;
     vFlags         = pc.flags;
     vUv            = inUv;
+    vUv2           = inUv2;
     vWorldPos      = worldPos.xyz;
     vColor         = vec3(1.0);// no color binding on this path
+    for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
+        vLocalClipPlanes[i] = vec4(0.0, 0.0, 0.0, 1.0e20);
+    }
+    vLocalClipPlaneCount = 0u;
+    vLocalClipIntersection = 0u;
 
     // threepp's projection matrix follows the GL convention (Y up in NDC).
     // Vulkan NDC has Y pointing down, so we negate Y at the gl_Position

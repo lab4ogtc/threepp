@@ -409,20 +409,20 @@ namespace threepp::vulkan {
 
     void DeferredShade::recordDispatch(VkCommandBuffer cb, uint32_t frame,
                                        uint32_t width, uint32_t height, uint32_t envMipCount,
-                                       bool shadows, bool ao, uint32_t frameCounter,
+                                       bool visibilityShadows, bool ao, uint32_t frameCounter,
                                        uint32_t emissiveCount, float emissiveTotalPower,
                                        float fireflyClamp,
                                        float oceanFineTileSize, float oceanFoamTileSize,
-                                       bool denoise, bool restirDI,
-                                       float volDensity, float volAniso,
-                                       float starIntensity,
-                                       float camDeltaLen, float camRotAngle,
-                                       float timeSec) {
+                                        bool denoise, bool restirDI,
+                                        float volDensity, float volAniso,
+                                        float starIntensity,
+                                        float camDeltaLen, float camRotAngle,
+                                        float timeSec) {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeLayout_, 0, 1, &sets_[frame], 0, nullptr);
-        const uint32_t flags = (shadows ? 1u : 0u) | (ao ? 2u : 0u) | (denoise ? 4u : 0u)
-                             | (restirDI ? 8u : 0u);
+        const uint32_t flags = (visibilityShadows ? 1u : 0u) | (ao ? 2u : 0u) |
+                               (denoise ? 4u : 0u) | (restirDI ? 8u : 0u);
         uint32_t emPowerBits, fireflyBits, oceanFineBits, oceanFoamBits, volDensBits, volAnisoBits, starBits,
                 camDeltaBits, camRotBits, timeBits;
         std::memcpy(&emPowerBits,   &emissiveTotalPower, sizeof(emPowerBits));

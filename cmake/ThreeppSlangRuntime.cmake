@@ -1,7 +1,13 @@
 function(threepp_configure_slang_runtime target)
-    if (APPLE AND THREEPP_WITH_SLANG)
-        set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "@executable_path")
+    if (NOT THREEPP_WITH_SLANG)
+        return()
+    endif ()
 
+    if (APPLE)
+        set_property(TARGET ${target} APPEND PROPERTY BUILD_RPATH "@executable_path")
+    endif ()
+
+    if (APPLE OR WIN32)
         foreach (slang_target
                 slang::slang
                 slang::slang-glslang

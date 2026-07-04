@@ -32,17 +32,23 @@ struct GeometryDesc {
     uint64_t normalAddress;
     uint64_t indexAddress;
     uint64_t uvAddress;
+    uint64_t uv2Address;// unused here, kept for layout match with closest_hit.rchit
     uint64_t foamAddress;// unused here, kept for layout match with closest_hit.rchit
     uint64_t prevVertexAddress;// unused here, kept for layout match
     uint64_t colorAddress;// unused here, kept for layout match with closest_hit.rchit
     uint     indexed;
     uint     _pad;
+    uint64_t materialGroupAddress;
+    uint     materialGroupCount;
+    uint     _materialGroupPad;
 };
 
+layout(buffer_reference, scalar) readonly buffer MaterialGroupBuf { MaterialGroupDesc groups[]; };
+
 // MaterialDesc + kMaxMaterialTextures come from vulkan_shared.h. This shader
-// only reads albedoTexIndex, alphaCutoff, transmission, and uvTransform, but
-// having the full struct visible removes the hand-padded prefix-mirror trick
-// that needed manual updates whenever the host struct grew.
+// only reads alpha texture/cutoff/transmission fields, but having the full
+// struct visible removes the hand-padded prefix-mirror trick that needed manual
+// updates whenever the host struct grew.
 
 layout(set = 0, binding = 3, scalar) readonly buffer GeomDescBuf {
     GeometryDesc geoms[];
@@ -62,6 +68,21 @@ layout(push_constant) uniform Pc {
 
 hitAttributeEXT vec2 attribs;
 
+uint resolveMaterialIndex(GeometryDesc gdesc, uint instanceIndex, uint primitiveIndex) {
+    if (gdesc.materialGroupAddress == 0ul || gdesc.materialGroupCount == 0u) {
+        return instanceIndex;
+    }
+    MaterialGroupBuf groupBuf = MaterialGroupBuf(gdesc.materialGroupAddress);
+    for (uint i = 0u; i < gdesc.materialGroupCount; ++i) {
+        const MaterialGroupDesc group = groupBuf.groups[i];
+        if (primitiveIndex >= group.startPrimitive &&
+            primitiveIndex < group.startPrimitive + group.primitiveCount) {
+            return group.materialIndex;
+        }
+    }
+    return instanceIndex;
+}
+
 // Stable hash for the stochastic alpha-blend coin. Inputs must be invariant
 // across multiple any-hit invocations of the same triangle within one ray
 // (BVH may invoke any-hit on each candidate during traversal), so the seed
@@ -78,7 +99,9 @@ float blendHash(uvec3 launch, uint sampleIndex, uint inst, uint prim) {
 }
 
 void main() {
-    const MaterialDesc mdesc = mats[gl_InstanceCustomIndexEXT];
+    const uint instIdx = uint(gl_InstanceCustomIndexEXT);
+    const GeometryDesc gdesc = geoms[instIdx];
+    const MaterialDesc mdesc = mats[resolveMaterialIndex(gdesc, instIdx, uint(gl_PrimitiveID))];
     const bool isShadowRay = (gl_IncomingRayFlagsEXT & gl_RayFlagsTerminateOnFirstHitEXT) != 0u;
     const bool isBlend  = mdesc.alphaCutoff < 0.0;
     const bool isCutout = mdesc.alphaCutoff > 0.0;
@@ -97,9 +120,8 @@ void main() {
     // Both blend and cutout need a texture to sample alpha from. Without one,
     // BLEND with no map = fully opaque (accept), cutout with no map = nothing
     // to test (also accept).
-    if (mdesc.albedoTexIndex < 0) return;
+    if (mdesc.albedoTexIndex < 0 && mdesc.alphaTexIndex < 0) return;
 
-    const GeometryDesc gdesc = geoms[gl_InstanceCustomIndexEXT];
     if (gdesc.uvAddress == 0ul) return;// no UV → cannot alpha-test
 
     uvec3 idx;
@@ -120,14 +142,21 @@ void main() {
     const vec2 uv2 = vec2(ub.u[idx.z * 2 + 0], ub.u[idx.z * 2 + 1]);
     const float w = 1.0 - attribs.x - attribs.y;
     const vec2 rawUv = w * uv0 + attribs.x * uv1 + attribs.y * uv2;
-    // Apply the SAME UV transform closest_hit uses for the albedo sample.
-    // Without this, foliage atlases (KHR_texture_transform on baseColor) test
-    // alpha at the wrong texel — the leaf cutout silhouette stops matching
-    // the visible color and the supporting plane rectangle shows through.
-    const vec2 uv = (mdesc.uvTransform * vec3(rawUv, 1.0)).xy;
-
-    const int idxClamped = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
-    const float alpha = texture(albedoMaps[idxClamped], uv).a;
+    float alpha = 1.0;
+    if (mdesc.albedoTexIndex >= 0) {
+        // Apply the SAME UV transform closest_hit uses for the albedo sample.
+        // Without this, foliage atlases (KHR_texture_transform on baseColor) test
+        // alpha at the wrong texel — the leaf cutout silhouette stops matching
+        // the visible color and the supporting plane rectangle shows through.
+        const vec2 uv = (mdesc.uvTransform * vec3(rawUv, 1.0)).xy;
+        const int idxClamped = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        alpha *= texture(albedoMaps[idxClamped], uv).a;
+    }
+    if (mdesc.alphaTexIndex >= 0) {
+        const vec2 uv = (mdesc.uvTransformAlpha * vec3(rawUv, 1.0)).xy;
+        const int idxClamped = clamp(mdesc.alphaTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        alpha *= texture(albedoMaps[idxClamped], uv).g;
+    }
 
     if (isBlend) {
         // Stochastic alpha-blend: ignore with probability (1 - alpha) so the

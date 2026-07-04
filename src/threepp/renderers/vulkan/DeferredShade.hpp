@@ -102,7 +102,7 @@ namespace threepp::vulkan {
         // foam-noise drift so its speed doesn't scale with fps.
         void recordDispatch(VkCommandBuffer cb, uint32_t frame,
                             uint32_t width, uint32_t height, uint32_t envMipCount,
-                            bool shadows, bool ao, uint32_t frameCounter,
+                            bool visibilityShadows, bool ao, uint32_t frameCounter,
                             uint32_t emissiveCount, float emissiveTotalPower,
                             float fireflyClamp,
                             float oceanFineTileSize, float oceanFoamTileSize,

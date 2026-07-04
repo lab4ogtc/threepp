@@ -56,22 +56,30 @@ struct GeometryDesc {
     uint64_t normalAddress;
     uint64_t indexAddress;
     uint64_t uvAddress;// 0 == no UV attribute
+    uint64_t uv2Address;// 0 == no UV2 attribute
     uint64_t foamAddress;// 0/1 flag (not an address): 1 == FFT-displaced ocean surface (world-space foam + thin-shell water)
     uint64_t prevVertexAddress;// previous frame deformed positions (skinned/displaced); == vertexAddress for static
     uint64_t colorAddress;// 0 == no per-vertex color (material.vertexColors off or geometry has no "color")
     uint     indexed;
     uint     _pad;
+    uint64_t materialGroupAddress;
+    uint     materialGroupCount;
+    uint     _materialGroupPad;
 };
+
+layout(buffer_reference, scalar) readonly buffer MaterialGroupBuf { MaterialGroupDesc groups[]; };
 
 struct DirLight {
     vec3 direction;
     vec3 color;
+    uint castShadow;
 };
 struct PointLight {
     vec3  position;
     float range;  // 0 = infinite
     vec3  color;
     float decay;
+    uint  castShadow;
 };
 struct SpotLight {
     vec3  position;
@@ -81,6 +89,7 @@ struct SpotLight {
     vec3  direction;      // toward target (emission direction)
     float cosAngleOuter;  // cos(angle)          — hard cutoff
     float cosAngleInner;  // cos(angle*(1-pen))  — full-brightness edge
+    uint  castShadow;
 };
 struct RectLight {
     vec3 position;
@@ -133,6 +142,22 @@ layout(set = 0, binding = 5, scalar) uniform LightsUbo {
     SpotLight  spotLights[8];
     RectLight  rectLights[4];
 } lights;
+
+uint resolveMaterialIndex(GeometryDesc gdesc, uint instanceIndex, uint primitiveIndex) {
+    if (gdesc.materialGroupAddress == 0ul || gdesc.materialGroupCount == 0u) {
+        return instanceIndex;
+    }
+    MaterialGroupBuf groupBuf = MaterialGroupBuf(gdesc.materialGroupAddress);
+    for (uint i = 0u; i < gdesc.materialGroupCount; ++i) {
+        const MaterialGroupDesc group = groupBuf.groups[i];
+        if (primitiveIndex >= group.startPrimitive &&
+            primitiveIndex < group.startPrimitive + group.primitiveCount) {
+            return group.materialIndex;
+        }
+    }
+    return instanceIndex;
+}
+
 layout(set = 0, binding = 6) uniform sampler2D envTex;
 // Env luminance CDF (Phase A: importance-sample bright env features). Bound
 // as a 1×1 dummy with envCdfTotalSum=0 when env is solid color or default.
@@ -281,7 +306,7 @@ layout(push_constant) uniform Pc {
     uint envMipCount;
     uint _pad1;
     uint _pad2;
-    uint motionFlags;       // bit 2 = scene has any glass material (gates caustic gather)
+    uint motionFlags;       // bit 2 = glass scene, bit 3 = shadowMap enabled
     uint emissiveCount;     // # of EmTri entries
     float emissiveTotalPower;// total CDF power (last entry's cumPower)
     uint _padSpp;           // raygen spp (unused here)
@@ -315,6 +340,38 @@ layout(location = 2) rayPayloadEXT Payload giSubPayload;
 // Must come AFTER the binding declarations (envTex, fog, photonCounts /
 // photonData) that some of the helpers reference.
 #include "shade_common.glsl"
+
+vec3 sampleMaterialEquirectColor(MaterialDesc m, vec3 dir) {
+    const float u = 0.5 + atan(dir.z, dir.x) / TWO_PI;
+    const float v = 0.5 + asin(clamp(dir.y, -1.0, 1.0)) / PI;
+    const int ti = clamp(m.envTexIndex, 0, int(kMaxMaterialTextures) - 1);
+    return texture(albedoMaps[ti], vec2(u, v)).rgb;
+}
+vec3 sampleMaterialEquirect(MaterialDesc m, vec3 dir) {
+    if (m.envTexIndex < 0) return sampleEquirect(dir);
+    return sampleMaterialEquirectColor(m, dir) * m.envMapIntensity;
+}
+bool hasLegacyEnvMap(MaterialDesc m) {
+    return m.envTexIndex >= 0 && m.envMapCombine >= 0;
+}
+vec3 applyLegacyEnvMap(MaterialDesc m, vec3 lit, vec3 dir, float specularStrength) {
+    const vec3 envColor = sampleMaterialEquirectColor(m, dir);
+    const float strength = specularStrength * m.envMapIntensity;
+    if (m.envMapCombine == 1) {
+        return mix(lit, envColor, strength);
+    }
+    if (m.envMapCombine == 2) {
+        return lit + envColor * strength;
+    }
+    return mix(lit, lit * envColor, strength);
+}
+
+vec3 sampleToonBand(MaterialDesc m, float nDotL) {
+    if (m.roughnessTexIndex < 0) return vec3(nDotL);
+    const int ti = clamp(m.roughnessTexIndex, 0, int(kMaxMaterialTextures) - 1);
+    const vec2 uvToon = (m.uvTransformRoughMetal * vec3(clamp(nDotL, 0.0, 1.0), 0.0, 1.0)).xy;
+    return texture(albedoMaps[ti], uvToon).rgb;
+}
 
 // ───── ReSTIR DI — Stage 1a (init RIS) ─────
 // One reservoir per primary-shading invocation, built in registers via RIS.
@@ -414,9 +471,9 @@ void finalizeGiReservoir(inout GiReservoir r) {
 // at NEIGHBOUR samples (temporal reproject / spatial neighbour taps) uses
 // THIS pixel's BRDF rather than the storing pixel's — that's the whole point
 // of ReSTIR target re-eval. Pass `Lo = vec3(0)` to get just BRDF·NdotL.
-vec3 evalGiTarget(vec3 V, vec3 L, vec3 N, vec3 F0, vec3 albedo,
+vec3 evalGiTarget(vec3 V, vec3 L, vec3 N, vec3 clearcoatN, vec3 F0, vec3 albedo,
                   float roughness, float metalness, float alpha,
-                  float ccProb,    float ccWeight,  float ccRough,
+                  float ccProb,    float ccWeight,  float ccRough, float ccNdotV,
                   float baseScale, vec3 Lo) {
     const float NdotL = dot(N, L);
     if (NdotL <= 0.0) return vec3(0.0);
@@ -431,14 +488,9 @@ vec3 evalGiTarget(vec3 V, vec3 L, vec3 N, vec3 F0, vec3 albedo,
     const vec3  spec  = (D_e * G_e * F_e) / max(4.0 * NdotV * NdotL, 1e-4) * kcSpec(F0, NdotV, roughness);
     const vec3  kd    = (vec3(1.0) - F_e) * (1.0 - metalness);
     const vec3  diff  = kd * albedo / PI + kcDiff(albedo, metalness, F0, NdotV, alpha);
-    vec3 brdf = (diff + spec) * baseScale;
-    if (ccWeight > 0.0) {
-        const float k_cc = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-        const float D_cc = distGGX(NdotH, ccRough);
-        const float G_cc = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotL, k_cc);
-        brdf += vec3((D_cc * G_cc) / max(4.0 * NdotV * NdotL, 1e-4) * ccWeight);
-    }
-    return brdf * NdotL * Lo;
+    vec3 brdfCos = (diff + spec) * baseScale * NdotL;
+    brdfCos += clearcoatBrdfCos(V, L, clearcoatN, ccNdotV, ccWeight, ccRough);
+    return brdfCos * Lo;
 }
 
 // Reconstruct (dir, maxDist, Le_unclamped) from a stored reservoir sample.
@@ -539,8 +591,10 @@ LightInfo evalLightInfoForReservoir(int typeCode, vec3 lightPos, vec3 hitPos) {
 void main() {
     const float w = 1.0 - attribs.x - attribs.y;
 
-    const GeometryDesc gdesc = geoms[gl_InstanceCustomIndexEXT];
-    const MaterialDesc mdesc = mats [gl_InstanceCustomIndexEXT];
+    const uint instIdx = uint(gl_InstanceCustomIndexEXT);
+    const GeometryDesc gdesc = geoms[instIdx];
+    const MaterialDesc mdesc = mats[resolveMaterialIndex(gdesc, instIdx, uint(gl_PrimitiveID))];
+    const bool legacyEnvMap = hasLegacyEnvMap(mdesc);
 
     uvec3 idx;
     if (gdesc.indexed != 0u) {
@@ -624,65 +678,18 @@ void main() {
         return;
     }
 
-    // MeshBasicMaterial: unlit early-out. Sentinel `roughness < 0` set on the
-    // host (VulkanRenderer.cpp materialFromMesh). Emit base color as direct
-    // radiance and terminate the path — no lighting, NEE, or bounce. Mirrors
-    // WGPU's `shininess == -1` unlit gate.
-    if (mdesc.roughness < 0.0) {
-        vec2 unlitUv = vec2(0.0);
-        if (gdesc.uvAddress != 0ul) {
-            UvBuf ub = UvBuf(gdesc.uvAddress);
-            const vec2 uv0 = vec2(ub.u[idx.x * 2 + 0], ub.u[idx.x * 2 + 1]);
-            const vec2 uv1 = vec2(ub.u[idx.y * 2 + 0], ub.u[idx.y * 2 + 1]);
-            const vec2 uv2 = vec2(ub.u[idx.z * 2 + 0], ub.u[idx.z * 2 + 1]);
-            unlitUv = w * uv0 + attribs.x * uv1 + attribs.y * uv2;
-        }
-        vec3 albedoSample = vec3(1.0);
-        if (mdesc.albedoTexIndex >= 0) {
-            const int idxClamped = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
-            const vec2 uvA = (mdesc.uvTransform * vec3(unlitUv, 1.0)).xy;
-            albedoSample = texture(albedoMaps[idxClamped], uvA).rgb;
-        }
-        // Per-vertex color (material.vertexColors) — MeshBasicMaterial honours
-        // it in three.js too. Same linear-space multiply as the lit path.
-        vec3 unlitVtxCol = vec3(1.0);
-        if (gdesc.colorAddress != 0ul) {
-            ColorBuf cb = ColorBuf(gdesc.colorAddress);
-            const vec3 c0 = vec3(cb.c[idx.x * 3 + 0], cb.c[idx.x * 3 + 1], cb.c[idx.x * 3 + 2]);
-            const vec3 c1 = vec3(cb.c[idx.y * 3 + 0], cb.c[idx.y * 3 + 1], cb.c[idx.y * 3 + 2]);
-            const vec3 c2 = vec3(cb.c[idx.z * 3 + 0], cb.c[idx.z * 3 + 1], cb.c[idx.z * 3 + 2]);
-            unlitVtxCol = w * c0 + attribs.x * c1 + attribs.y * c2;
-        }
-        const vec3 hitPosUnlit = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
-        // Unlit: emit base color as direct radiance. Route to diff channel
-        // (unlit is view-independent by definition).
-        payload.radianceDiff  = mdesc.albedo * albedoSample * unlitVtxCol;
-        payload.radianceSpec  = vec3(0.0);
-        payload.brdfWeight    = vec3(0.0);
-        payload.nextOrigin    = vec3(0.0);
-        payload.nextDir       = vec3(0.0);
-        payload.flags         = 1u;// terminate
-        payload.hitWorldPos     = hitPosUnlit;
-        payload.prevWorldPos    = hitPosUnlit;// unlit terminates path, no reproject benefit
-        payload.hitInstanceId   = uint(gl_InstanceCustomIndexEXT) + 1u;
-        payload.hitRoughness    = 1.0;
-        payload.hitMetalness    = 0.0;
-        payload.hitTransmission = 0.0;
-        payload.hitSpecFrac     = 0.0;// unlit: no view-dep concern
-        payload.hitNormal       = N;
-        return;
-    }
-
-    // UV interpolation (only when the geometry has a uv attribute). The
-    // outer fallback is vec2(0) — harmless for materials without an albedo
-    // texture; the slot-0 white default would just sample (0,0) anyway.
+    // UV interpolation (only when the geometry has a uv attribute). Keep this
+    // before the unlit sentinels so MeshMatcap/MeshNormal can use the same
+    // normal/bump perturbation as lit materials before their early-out.
     vec2 rawUv = vec2(0.0);
+    vec2 rawUv2 = vec2(0.0);
     if (gdesc.uvAddress != 0ul) {
         UvBuf ub = UvBuf(gdesc.uvAddress);
         const vec2 uv0 = vec2(ub.u[idx.x * 2 + 0], ub.u[idx.x * 2 + 1]);
         const vec2 uv1 = vec2(ub.u[idx.y * 2 + 0], ub.u[idx.y * 2 + 1]);
         const vec2 uv2 = vec2(ub.u[idx.z * 2 + 0], ub.u[idx.z * 2 + 1]);
         rawUv = w * uv0 + attribs.x * uv1 + attribs.y * uv2;
+        rawUv2 = rawUv;
 
         // Tangent-space normal map (glTF convention). The TBN frame is
         // derived per-pixel from triangle position + UV deltas, so we don't
@@ -714,13 +721,155 @@ void main() {
                     const vec3 T = Tworld / Tlen;
                     const vec3 B = cross(N, T);
                     const int nidx = clamp(mdesc.normalTexIndex, 0, int(kMaxMaterialTextures) - 1);
-                    vec3 ns = texture(albedoMaps[nidx], (mdesc.uvTransformNormal * vec3(rawUv, 1.0)).xy).rgb * 2.0 - 1.0;
-                    ns.xy *= mdesc.normalScale;
-                    ns.z = sqrt(max(0.0, 1.0 - dot(ns.xy, ns.xy)));
-                    N = normalize(T * ns.x + B * ns.y + N * ns.z);
+                    const vec2 uvN = (mdesc.uvTransformNormal * vec3(rawUv, 1.0)).xy;
+                    if (mdesc.normalMapMode == 1) {
+                        const vec2 texel = 1.0 / max(vec2(textureSize(albedoMaps[nidx], 0)), vec2(1.0));
+                        const float h0 = texture(albedoMaps[nidx], uvN).r;
+                        const float hx = texture(albedoMaps[nidx], uvN + vec2(texel.x, 0.0)).r;
+                        const float hy = texture(albedoMaps[nidx], uvN + vec2(0.0, texel.y)).r;
+                        const vec3 ns = normalize(vec3(
+                                -(hx - h0) * mdesc.normalScale.x,
+                                -(hy - h0) * mdesc.normalScale.y,
+                                1.0));
+                        N = normalize(T * ns.x + B * ns.y + N * ns.z);
+                    } else {
+                        vec3 ns = texture(albedoMaps[nidx], uvN).rgb * 2.0 - 1.0;
+                        ns.xy *= mdesc.normalScale;
+                        ns.z = sqrt(max(0.0, 1.0 - dot(ns.xy, ns.xy)));
+                        N = normalize(T * ns.x + B * ns.y + N * ns.z);
+                    }
                 }
             }
         }
+    }
+    if (gdesc.uv2Address != 0ul) {
+        UvBuf ub2 = UvBuf(gdesc.uv2Address);
+        const vec2 uv20 = vec2(ub2.u[idx.x * 2 + 0], ub2.u[idx.x * 2 + 1]);
+        const vec2 uv21 = vec2(ub2.u[idx.y * 2 + 0], ub2.u[idx.y * 2 + 1]);
+        const vec2 uv22 = vec2(ub2.u[idx.z * 2 + 0], ub2.u[idx.z * 2 + 1]);
+        rawUv2 = w * uv20 + attribs.x * uv21 + attribs.y * uv22;
+    }
+
+    // MeshBasicMaterial: unlit early-out. Sentinel `roughness < 0` set on the
+    // host (VulkanRenderer.cpp materialFromMesh). Emit base color as direct
+    // radiance and terminate the path — no lighting, NEE, or bounce. Mirrors
+    // WGPU's `shininess == -1` unlit gate.
+    if (mdesc.roughness < 0.0) {
+        if (mdesc.roughness < -3.5) {
+            vec3 baseSample = vec3(1.0);
+            if (mdesc.albedoTexIndex >= 0) {
+                const int baseIdx = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
+                const vec2 uvBase = (mdesc.uvTransform * vec3(rawUv, 1.0)).xy;
+                baseSample = texture(albedoMaps[baseIdx], uvBase).rgb;
+            }
+            vec3 matcapSample = vec3(1.0);
+            if (mdesc.roughnessTexIndex >= 0) {
+                const int idxClamped = clamp(mdesc.roughnessTexIndex, 0, int(kMaxMaterialTextures) - 1);
+                const vec3 viewDir = normalize(gl_WorldRayDirectionEXT);
+                vec3 xAxis = vec3(viewDir.z, 0.0, -viewDir.x);
+                xAxis = dot(xAxis, xAxis) > 1e-8 ? normalize(xAxis) : vec3(1.0, 0.0, 0.0);
+                const vec3 yAxis = normalize(cross(viewDir, xAxis));
+                const vec2 matcapUv = clamp(vec2(dot(xAxis, normalize(N)), dot(yAxis, normalize(N))) * 0.495 + vec2(0.5),
+                                            vec2(0.0), vec2(1.0));
+                matcapSample = texture(albedoMaps[idxClamped], matcapUv).rgb;
+            }
+            const vec3 hitPosMatcap = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+            payload.radianceDiff  = mdesc.albedo * baseSample * matcapSample;
+            payload.radianceSpec  = vec3(0.0);
+            payload.brdfWeight    = vec3(0.0);
+            payload.nextOrigin    = vec3(0.0);
+            payload.nextDir       = vec3(0.0);
+            payload.flags         = 1u;
+            payload.hitWorldPos   = hitPosMatcap;
+            payload.prevWorldPos  = hitPosMatcap;
+            payload.hitInstanceId = uint(gl_InstanceCustomIndexEXT) + 1u;
+            payload.hitRoughness  = 1.0;
+            payload.hitMetalness  = 0.0;
+            payload.hitTransmission = 0.0;
+            payload.hitSpecFrac   = 0.0;
+            payload.hitNormal     = N;
+            return;
+        }
+        if (mdesc.roughness < -2.5 && mdesc.roughness > -3.5) {
+            const float depthShade = clamp(1.0 - gl_HitTEXT / 10.0, 0.0, 1.0);
+            const vec3 hitPosDepth = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+            payload.radianceDiff  = vec3(depthShade);
+            payload.radianceSpec  = vec3(0.0);
+            payload.brdfWeight    = vec3(0.0);
+            payload.nextOrigin    = vec3(0.0);
+            payload.nextDir       = vec3(0.0);
+            payload.flags         = 1u;
+            payload.hitWorldPos   = hitPosDepth;
+            payload.prevWorldPos  = hitPosDepth;
+            payload.hitInstanceId = uint(gl_InstanceCustomIndexEXT) + 1u;
+            payload.hitRoughness  = 1.0;
+            payload.hitMetalness  = 0.0;
+            payload.hitTransmission = 0.0;
+            payload.hitSpecFrac   = 0.0;
+            payload.hitNormal     = N;
+            return;
+        }
+        if (mdesc.roughness < -1.5 && mdesc.roughness > -2.5) {
+            const vec3 hitPosNormal = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+            payload.radianceDiff  = normalize(N) * 0.5 + vec3(0.5);
+            payload.radianceSpec  = vec3(0.0);
+            payload.brdfWeight    = vec3(0.0);
+            payload.nextOrigin    = vec3(0.0);
+            payload.nextDir       = vec3(0.0);
+            payload.flags         = 1u;
+            payload.hitWorldPos   = hitPosNormal;
+            payload.prevWorldPos  = hitPosNormal;
+            payload.hitInstanceId = uint(gl_InstanceCustomIndexEXT) + 1u;
+            payload.hitRoughness  = 1.0;
+            payload.hitMetalness  = 0.0;
+            payload.hitTransmission = 0.0;
+            payload.hitSpecFrac   = 0.0;
+            payload.hitNormal     = N;
+            return;
+        }
+        vec3 albedoSample = vec3(1.0);
+        if (mdesc.albedoTexIndex >= 0) {
+            const int idxClamped = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
+            const vec2 uvA = (mdesc.uvTransform * vec3(rawUv, 1.0)).xy;
+            albedoSample = texture(albedoMaps[idxClamped], uvA).rgb;
+        }
+        // Per-vertex color (material.vertexColors) — MeshBasicMaterial honours
+        // it in three.js too. Same linear-space multiply as the lit path.
+        vec3 unlitVtxCol = vec3(1.0);
+        if (gdesc.colorAddress != 0ul) {
+            ColorBuf cb = ColorBuf(gdesc.colorAddress);
+            const vec3 c0 = vec3(cb.c[idx.x * 3 + 0], cb.c[idx.x * 3 + 1], cb.c[idx.x * 3 + 2]);
+            const vec3 c1 = vec3(cb.c[idx.y * 3 + 0], cb.c[idx.y * 3 + 1], cb.c[idx.y * 3 + 2]);
+            const vec3 c2 = vec3(cb.c[idx.z * 3 + 0], cb.c[idx.z * 3 + 1], cb.c[idx.z * 3 + 2]);
+            unlitVtxCol = w * c0 + attribs.x * c1 + attribs.y * c2;
+        }
+        const vec3 hitPosUnlit = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+        vec3 unlitRadiance = mdesc.albedo * albedoSample * unlitVtxCol;
+        if (mdesc.lightTexIndex >= 0 && mdesc.roughness > -1.5) {
+            const int li = clamp(mdesc.lightTexIndex, 0, int(kMaxMaterialTextures) - 1);
+            const vec2 uvL = (mdesc.uvTransformLight * vec3(rawUv2, 1.0)).xy;
+            unlitRadiance *= texture(albedoMaps[li], uvL).rgb * mdesc.lightMapIntensity;
+        }
+        if (legacyEnvMap) {
+            unlitRadiance = applyLegacyEnvMap(mdesc, unlitRadiance, reflect(-V, N), 1.0);
+        }
+        // Unlit: emit base color as direct radiance. Route to diff channel
+        // (unlit is view-independent by definition).
+        payload.radianceDiff  = unlitRadiance;
+        payload.radianceSpec  = vec3(0.0);
+        payload.brdfWeight    = vec3(0.0);
+        payload.nextOrigin    = vec3(0.0);
+        payload.nextDir       = vec3(0.0);
+        payload.flags         = 1u;// terminate
+        payload.hitWorldPos     = hitPosUnlit;
+        payload.prevWorldPos    = hitPosUnlit;// unlit terminates path, no reproject benefit
+        payload.hitInstanceId   = uint(gl_InstanceCustomIndexEXT) + 1u;
+        payload.hitRoughness    = 1.0;
+        payload.hitMetalness    = 0.0;
+        payload.hitTransmission = 0.0;
+        payload.hitSpecFrac     = 0.0;// unlit: no view-dep concern
+        payload.hitNormal       = N;
+        return;
     }
 
     // FFT fine-cascade normal perturbation. Adds sub-mesh-resolution wave
@@ -755,16 +904,52 @@ void main() {
         const float strength = 0.5;
         N = normalize(N + strength * vec3(-grad.x, 0.0, -grad.y));
     }
+    vec3 clearcoatN = N;
+    if (mdesc.clearcoatNormalTexIndex >= 0 && gdesc.uvAddress != 0ul && gdesc.vertexAddress != 0ul) {
+        UvBuf ubCc = UvBuf(gdesc.uvAddress);
+        const vec2 uv0Cc = vec2(ubCc.u[idx.x * 2 + 0], ubCc.u[idx.x * 2 + 1]);
+        const vec2 uv1Cc = vec2(ubCc.u[idx.y * 2 + 0], ubCc.u[idx.y * 2 + 1]);
+        const vec2 uv2Cc = vec2(ubCc.u[idx.z * 2 + 0], ubCc.u[idx.z * 2 + 1]);
+        VertexBuf vbCc = VertexBuf(gdesc.vertexAddress);
+        const vec3 p0Cc = vec3(vbCc.p[idx.x * 3 + 0], vbCc.p[idx.x * 3 + 1], vbCc.p[idx.x * 3 + 2]);
+        const vec3 p1Cc = vec3(vbCc.p[idx.y * 3 + 0], vbCc.p[idx.y * 3 + 1], vbCc.p[idx.y * 3 + 2]);
+        const vec3 p2Cc = vec3(vbCc.p[idx.z * 3 + 0], vbCc.p[idx.z * 3 + 1], vbCc.p[idx.z * 3 + 2]);
+        const vec3 e1Cc = p1Cc - p0Cc;
+        const vec3 e2Cc = p2Cc - p0Cc;
+        const vec2 duv1Cc = uv1Cc - uv0Cc;
+        const vec2 duv2Cc = uv2Cc - uv0Cc;
+        const float detCc = duv1Cc.x * duv2Cc.y - duv2Cc.x * duv1Cc.y;
+        if (abs(detCc) > 1e-8) {
+            const float invCc = 1.0 / detCc;
+            const vec3 TobjCc = invCc * (e1Cc * duv2Cc.y - e2Cc * duv1Cc.y);
+            vec3 TworldCc = mat3(gl_ObjectToWorldEXT) * TobjCc;
+            TworldCc = TworldCc - dot(TworldCc, clearcoatN) * clearcoatN;
+            const float TlenCc = length(TworldCc);
+            if (TlenCc > 1e-6) {
+                const vec3 T = TworldCc / TlenCc;
+                const vec3 B = cross(clearcoatN, T);
+                const int nidx = clamp(mdesc.clearcoatNormalTexIndex, 0, int(kMaxMaterialTextures) - 1);
+                vec3 ns = texture(albedoMaps[nidx], (mdesc.uvTransformClearcoatNormal * vec3(rawUv, 1.0)).xy).rgb * 2.0 - 1.0;
+                ns.xy *= mdesc.clearcoatNormalScale;
+                ns.z = sqrt(max(0.0, 1.0 - dot(ns.xy, ns.xy)));
+                clearcoatN = normalize(T * ns.x + B * ns.y + clearcoatN * ns.z);
+            }
+        }
+    }
     // Per-channel transformed UVs — applied to rawUv with each texture's own matrix.
     const vec2 uvAlbedo         = (mdesc.uvTransform            * vec3(rawUv, 1.0)).xy;
     const vec2 uvRoughMetal     = (mdesc.uvTransformRoughMetal  * vec3(rawUv, 1.0)).xy;
     const vec2 uvEmissive       = (mdesc.uvTransformEmissive    * vec3(rawUv, 1.0)).xy;
-    const vec2 uvOcclusion      = (mdesc.uvTransformOcclusion   * vec3(rawUv, 1.0)).xy;
+    const vec2 uvOcclusion      = (mdesc.uvTransformOcclusion   * vec3(rawUv2, 1.0)).xy;
+    const vec2 uvLight          = (mdesc.uvTransformLight       * vec3(rawUv2, 1.0)).xy;
+    const vec2 uvSpecular       = (mdesc.uvTransformSpecular    * vec3(rawUv, 1.0)).xy;
     const vec2 uvClearcoat      = (mdesc.uvTransformClearcoat   * vec3(rawUv, 1.0)).xy;
     const vec2 uvClearcoatRough = (mdesc.uvTransformClearcoatRough * vec3(rawUv, 1.0)).xy;
     const vec2 uvTransmission   = (mdesc.uvTransformTransmission * vec3(rawUv, 1.0)).xy;
+    const vec2 uvThickness      = (mdesc.uvTransformThickness * vec3(rawUv, 1.0)).xy;
 
     const float NdotV = max(dot(N, V), 0.0);
+    const float ccNdotV = max(dot(clearcoatN, V), 1e-4);
 
     // Albedo: scalar PBR colour modulated by the bound albedo map (sRGB
     // decode is hardware-side via the VK_FORMAT_R8G8B8A8_SRGB view).
@@ -789,12 +974,137 @@ void main() {
         albedo *= w * c0 + attribs.x * c1 + attribs.y * c2;
     }
 
+    if (mdesc.alphaCutoff == -3.0) {
+        const vec3 hitPosShadow = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+        const vec3 shadowOrig = hitPosShadow + N * rtSelfEps(hitPosShadow);
+        const bool shadowMapEnabled = (pc.motionFlags & 8u) != 0u;
+        float shadow = 0.0;
+        if (shadowMapEnabled) {
+            for (uint i = 0u; i < lights.dirCount; ++i) {
+                if ((lights.dirLights[i].castShadow & 1u) == 0u) continue;
+                const vec3 L = normalize(lights.dirLights[i].direction);
+                if (dot(N, L) <= 0.0) continue;
+                shadowVisibility = 1.0;
+                traceRayEXT(topAS,
+                            gl_RayFlagsTerminateOnFirstHitEXT |
+                            gl_RayFlagsSkipClosestHitShaderEXT |
+                            gl_RayFlagsNoOpaqueEXT,
+                            kRayMaskShadow, 1, 0, 1,
+                            shadowOrig, 0.0, L, 1e30, 1);
+                shadow = max(shadow, 1.0 - shadowVisibility);
+            }
+            for (uint i = 0u; i < lights.pointCount; ++i) {
+                if ((lights.pointLights[i].castShadow & 1u) == 0u) continue;
+                vec3 toL = lights.pointLights[i].position - hitPosShadow;
+                const float dist = length(toL);
+                if (dist <= 1e-4) continue;
+                toL /= dist;
+                if (dot(N, toL) <= 0.0) continue;
+                shadowVisibility = 1.0;
+                traceRayEXT(topAS,
+                            gl_RayFlagsTerminateOnFirstHitEXT |
+                            gl_RayFlagsSkipClosestHitShaderEXT |
+                            gl_RayFlagsNoOpaqueEXT,
+                            kRayMaskShadow, 1, 0, 1,
+                            shadowOrig, 0.0, toL, dist - 1e-2, 1);
+                shadow = max(shadow, 1.0 - shadowVisibility);
+            }
+            for (uint i = 0u; i < lights.spotCount; ++i) {
+                if ((lights.spotLights[i].castShadow & 1u) == 0u) continue;
+                vec3 toL = lights.spotLights[i].position - hitPosShadow;
+                const float dist = length(toL);
+                if (dist <= 1e-4) continue;
+                toL /= dist;
+                const float spotCos = dot(-toL, lights.spotLights[i].direction);
+                const float spotAtten = smoothstep(lights.spotLights[i].cosAngleOuter,
+                                                   lights.spotLights[i].cosAngleInner, spotCos);
+                if (spotAtten <= 0.0 || dot(N, toL) <= 0.0) continue;
+                shadowVisibility = 1.0;
+                traceRayEXT(topAS,
+                            gl_RayFlagsTerminateOnFirstHitEXT |
+                            gl_RayFlagsSkipClosestHitShaderEXT |
+                            gl_RayFlagsNoOpaqueEXT,
+                            kRayMaskShadow, 1, 0, 1,
+                            shadowOrig, 0.0, toL, dist - 1e-2, 1);
+                shadow = max(shadow, (1.0 - shadowVisibility) * spotAtten);
+            }
+        }
+        const float shadowOpacity = shadow * clamp(mdesc.transmission, 0.0, 1.0);
+        payload.radianceDiff  = albedo * shadowOpacity;
+        payload.radianceSpec  = vec3(0.0);
+        payload.brdfWeight    = vec3(1.0 - shadowOpacity);
+        payload.nextOrigin    = hitPosShadow;
+        payload.nextDir       = gl_WorldRayDirectionEXT;
+        payload.flags         = shadowOpacity > 0.999 ? 1u : 4u;
+        payload.hitWorldPos   = hitPosShadow;
+        payload.prevWorldPos  = hitPosShadow;
+        payload.hitInstanceId = uint(gl_InstanceCustomIndexEXT) + 1u;
+        payload.hitRoughness  = 1.0;
+        payload.hitMetalness  = 0.0;
+        payload.hitTransmission = 1.0 - shadowOpacity;
+        payload.hitSpecFrac   = 0.0;
+        payload.hitNormal     = N;
+        payload.primaryAlbedo = vec4(albedo, 1.0);
+        return;
+    }
+
+    if (mdesc.sheenRoughness < -0.5 && mdesc.sheenRoughness > -1.5) {
+        vec3 toonEmissive = mdesc.emissive * mdesc.emissiveIntensity;
+        if (mdesc.emissiveTexIndex >= 0) {
+            const int ei = clamp(mdesc.emissiveTexIndex, 0, int(kMaxMaterialTextures) - 1);
+            toonEmissive *= texture(albedoMaps[ei], uvEmissive).rgb;
+        }
+        float toonAmbientOcclusion = 1.0;
+        if (mdesc.occlusionTexIndex >= 0) {
+            const int oi = clamp(mdesc.occlusionTexIndex, 0, int(kMaxMaterialTextures) - 1);
+            toonAmbientOcclusion = mix(1.0, texture(albedoMaps[oi], uvOcclusion).r, mdesc.aoMapIntensity);
+        }
+        vec3 toonLightMap = vec3(0.0);
+        if (mdesc.lightTexIndex >= 0) {
+            const int li = clamp(mdesc.lightTexIndex, 0, int(kMaxMaterialTextures) - 1);
+            toonLightMap = texture(albedoMaps[li], uvLight).rgb * mdesc.lightMapIntensity;
+        }
+        vec3 toonLit = toonEmissive + albedo * (lights.ambient + toonLightMap) * toonAmbientOcclusion;
+        const vec3 hitPosToon = gl_WorldRayOriginEXT + gl_WorldRayDirectionEXT * gl_HitTEXT;
+        for (uint i = 0u; i < lights.dirCount; ++i) {
+            const float nDotL = max(dot(N, normalize(lights.dirLights[i].direction)), 0.0);
+            toonLit += albedo * sampleToonBand(mdesc, nDotL) * lights.dirLights[i].color;
+        }
+        for (uint i = 0u; i < lights.pointCount; ++i) {
+            const LightInfo li = evalLightInfoForReservoir(int(8u + i), lights.pointLights[i].position, hitPosToon);
+            if (li.maxDist <= 0.0) continue;
+            const float nDotL = max(dot(N, li.dir), 0.0);
+            toonLit += albedo * sampleToonBand(mdesc, nDotL) * li.Le;
+        }
+        for (uint i = 0u; i < lights.spotCount; ++i) {
+            const LightInfo li = evalLightInfoForReservoir(int(16u + i), lights.spotLights[i].position, hitPosToon);
+            if (li.maxDist <= 0.0) continue;
+            const float nDotL = max(dot(N, li.dir), 0.0);
+            toonLit += albedo * sampleToonBand(mdesc, nDotL) * li.Le;
+        }
+        payload.radianceDiff  = toonLit;
+        payload.radianceSpec  = vec3(0.0);
+        payload.brdfWeight    = vec3(0.0);
+        payload.nextOrigin    = vec3(0.0);
+        payload.nextDir       = vec3(0.0);
+        payload.flags         = 1u;
+        payload.hitWorldPos   = hitPosToon;
+        payload.prevWorldPos  = hitPosToon;
+        payload.hitInstanceId = uint(gl_InstanceCustomIndexEXT) + 1u;
+        payload.hitRoughness  = 1.0;
+        payload.hitMetalness  = 0.0;
+        payload.hitTransmission = 0.0;
+        payload.hitSpecFrac   = 0.0;
+        payload.hitNormal     = N;
+        return;
+    }
+
     // glTF packs roughness in .g and metalness in .b; threepp's metalnessMap /
     // roughnessMap typically point at the same packed texture, so the bindless
     // cache dedupes to a single slot. Multiplicative — matches three.js.
     float roughness = mdesc.roughness;
     float metalness = mdesc.metalness;
-    if (mdesc.roughnessTexIndex >= 0) {
+    if (mdesc.roughnessTexIndex >= 0 && mdesc.sheenRoughness >= 0.0) {
         const int i = clamp(mdesc.roughnessTexIndex, 0, int(kMaxMaterialTextures) - 1);
         roughness *= texture(albedoMaps[i], uvRoughMetal).g;
     }
@@ -804,6 +1114,11 @@ void main() {
     }
     roughness = clamp(roughness, 0.04, 1.0);
     metalness = clamp(metalness, 0.0,  1.0);
+    float specularIntensity = mdesc.specularIntensity;
+    if (mdesc.specularTexIndex >= 0) {
+        const int i = clamp(mdesc.specularTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        specularIntensity *= texture(albedoMaps[i], uvSpecular).r;
+    }
 
     // Foam application: folded-surface vertices (foamCoverage > 0, set by
     // water_displace.comp via the Tessendorf Jacobian) bleach the albedo
@@ -884,7 +1199,7 @@ void main() {
         roughness = mix(roughness, foamRough, foamMask);
     }
 
-    vec3 F0 = mix(vec3(0.04) * mdesc.specularIntensity * mdesc.specularColor, albedo, metalness);
+    vec3 F0 = mix(vec3(0.04) * specularIntensity * mdesc.specularColor, albedo, metalness);
     // Thin-film iridescence layer (KHR_materials_iridescence). Modulates F0
     // with wavelength-dependent interference; lobe shape (GGX) is unchanged,
     // only the Fresnel base shifts per channel. Skipped when factor == 0
@@ -914,8 +1229,6 @@ void main() {
     // lobe in eval/sampling. ccProb floors the cc sampling rate at 0.15·cc so
     // face-on viewing (where ccFresnel ≈ 0.04) doesn't starve the cc lobe of
     // samples. Mutually exclusive with transmission via the early-return below.
-    // Out of scope for v1: separate clearcoatNormalMap — clearcoat uses the
-    // shading normal (post base normal-map), matching three.js raster.
     // Spec-constant gate: clearcoat-free scene → ccScalar/ccRough collapse
     // to the no-clearcoat constants, propagating through ccWeight → ccProb
     // → baseScale below. Downstream `if (ccWeight > 0.0)` / `if (ccProb > 0.0)`
@@ -940,7 +1253,7 @@ void main() {
     ccScalar = clamp(ccScalar, 0.0, 1.0);
     ccRough  = clamp(ccRough,  0.04, 1.0);
     const float ccF0       = 0.04;
-    const float ccFresnel  = ccF0 + (1.0 - ccF0) * pow(1.0 - NdotV, 5.0);
+    const float ccFresnel  = ccF0 + (1.0 - ccF0) * pow(1.0 - ccNdotV, 5.0);
     const float ccWeight   = ccScalar * ccFresnel;
     const float ccAlpha    = ccRough * ccRough;
     const float ccProb     = max(ccWeight, 0.15 * ccScalar);
@@ -978,6 +1291,11 @@ void main() {
     if (mdesc.transmissionTexIndex >= 0) {
         const int i = clamp(mdesc.transmissionTexIndex, 0, int(kMaxMaterialTextures) - 1);
         transmission *= texture(albedoMaps[i], uvTransmission).r;
+    }
+    float materialThickness = mdesc.thickness;
+    if (mdesc.thicknessTexIndex >= 0) {
+        const int i = clamp(mdesc.thicknessTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        materialThickness *= texture(albedoMaps[i], uvThickness).g;
     }
     // Foam suppresses transmission so whitecaps read as opaque whitewater
     // rather than tinted glass. Keyed off foamMask (the speckled visible
@@ -1088,10 +1406,10 @@ void main() {
         vec3 glassTint = tintBase * G1out;
         if (mdesc.attenuationDistance > 0.0) {
             if (isThinShell) {
-                // Thin-shell proxy — use the user-supplied `thickness` as
+                // Thin-shell proxy — use the material thickness as
                 // in-medium distance. Applied at every entry crossing.
                 glassTint *= pow(max(mdesc.attenuationColor, vec3(1e-6)),
-                                 vec3(mdesc.thickness / mdesc.attenuationDistance));
+                                 vec3(materialThickness / mdesc.attenuationDistance));
             } else if (!isEntering) {
                 // Closed-mesh actual ray distance through the medium —
                 // matches the original (pre-branch) behaviour. An earlier
@@ -1715,7 +2033,7 @@ void main() {
                             const float dist2    = dist * dist;
                             const float pickPdf  = tChosen.v2.w / pc.emissiveTotalPower;
                             const float pdfOmega = pickPdf * dist2 / (tChosen.v0.w * cosLight);
-                            const float pdfBsdfNee = brdfPdf3(V, lDir, N, roughness, metalness, ccProb, ccRough);
+                            const float pdfBsdfNee = brdfPdf3(V, lDir, N, clearcoatN, roughness, metalness, ccProb, ccRough);
                             const float wLight     = pdfOmega / max(pdfOmega + pdfBsdfNee, 1e-8);
                             contrib *= wLight;
                         }
@@ -1731,10 +2049,10 @@ void main() {
     // power-CDF-picked emissive triangle. See analyticNeeOpaque() in
     // shade_common.glsl — verbatim extraction of what lived inline here.
     // Future raygen gbuf-shade path calls the same fn.
-    lit += analyticNeeOpaque(V, N, hitPos,
+    lit += analyticNeeOpaque(V, N, clearcoatN, hitPos,
                              F0, albedo,
                              roughness, metalness, alpha,
-                             NdotV, k,
+                             NdotV, ccNdotV, k,
                              baseScale,
                              sheenScaling, hasSheen, mdesc.sheenColor, mdesc.sheenRoughness,
                              ccWeight, ccRough,
@@ -1742,31 +2060,45 @@ void main() {
     } // end useRISPrimary else (classic NEE branch)
 
 
+    float ao = 1.0;
+    if (mdesc.occlusionTexIndex >= 0) {
+        const int oi = clamp(mdesc.occlusionTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        ao = mix(1.0, texture(albedoMaps[oi], uvOcclusion).r, mdesc.aoMapIntensity);
+    }
+    vec3 lightMapIrradiance = vec3(0.0);
+    if (mdesc.lightTexIndex >= 0) {
+        const int li = clamp(mdesc.lightTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        lightMapIrradiance = texture(albedoMaps[li], uvLight).rgb * mdesc.lightMapIntensity;
+    }
+
     // === Env NEE + MIS ===
     //   • envCdfTotalSum > 0  → importance-sample the env by luminance.
     //   • envCdfTotalSum <= 0 → fallback to BSDF-sampled env NEE with 0.5 MIS.
     // Both branches with post-multiply firefly clamp. See envNeeOpaque() in
     // shade_common.glsl for details; it's a verbatim extraction of what used
     // to live inline here. Future raygen gbuf-shade path will call the same fn.
-    lit += envNeeOpaque(V, N, hitPos,
-                        F0, albedo,
-                        roughness, metalness, alpha,
-                        NdotV, k,
-                        baseScale, invBaseProb, pSpec,
-                        ccProb, ccRough, ccWeight, ccAlpha,
-                        seed);
+    if (mdesc.envTexIndex >= 0 && !legacyEnvMap) {
+        const vec3 diffEnv = albedo * (1.0 - metalness) * sampleMaterialEquirect(mdesc, N) * baseScale * ao;
+        const vec3 specEnv = sampleMaterialEquirect(mdesc, reflect(-V, N)) *
+                             (F0 * envBRDFApprox(NdotV, roughness).x +
+                              envBRDFApprox(NdotV, roughness).y) * baseScale;
+        lit += diffEnv + specEnv;
+    } else {
+        lit += envNeeOpaque(V, N, clearcoatN, hitPos,
+                            F0, albedo,
+                            roughness, metalness, alpha,
+                            NdotV, ccNdotV, k,
+                            baseScale, invBaseProb, pSpec,
+                            ccProb, ccRough, ccWeight, ccAlpha,
+                            seed);
+    }
 
     // Flat ambient irradiance — only the diffuse lobe receives it (metals
     // have no diffuse). No PI cancel under physical lights. Scaled by the
     // base-layer fraction so a 100%-clearcoat surface only shows the cc
     // contribution (which is dir-light + env NEE only — no flat ambient
     // term for clearcoat). Occlusion map (.r channel) scales ambient.
-    float ao = 1.0;
-    if (mdesc.occlusionTexIndex >= 0) {
-        const int oi = clamp(mdesc.occlusionTexIndex, 0, int(kMaxMaterialTextures) - 1);
-        ao = texture(albedoMaps[oi], uvOcclusion).r;
-    }
-    const vec3 ambient = albedo * (1.0 - metalness) * lights.ambient * baseScale * ao;
+    const vec3 ambient = albedo * (1.0 - metalness) * (lights.ambient + lightMapIrradiance) * baseScale * ao;
 
     // Probabilistic spec/diffuse lobe selection so polished
     // metals reflect nearby geometry, not just the env probe. p_spec mirrors
@@ -1784,7 +2116,7 @@ void main() {
     // Spherical-cap VNDF (Dupuy 2023) guarantees above-horizon wi; the
     // valid-flag check below is retained for numerical edge cases only.
     // Same sampler the env-NEE fallback uses, so pdfs match for MIS.
-    const BsdfSample bs = sampleBsdf(V, N, F0, albedo, alpha, ccAlpha,
+    const BsdfSample bs = sampleBsdf(V, N, clearcoatN, F0, albedo, alpha, ccAlpha,
                                      metalness, NdotV, pSpec, ccProb,
                                      ccWeight, baseScale, invBaseProb, seed);
     const vec3 bounceDir  = bs.dir;
@@ -1898,7 +2230,7 @@ void main() {
         giSubPayload.inFlags         = (8u | 16u) | ((pc.emissiveCount > 0u) ? 1u : 0u);
         giSubPayload.hitMetalness    = 0.0;
         giSubPayload.hitTransmission = 0.0;
-        giSubPayload.bsdfPdf         = brdfPdf3(V, bs.dir, N, roughness, metalness, ccProb, ccRough);
+        giSubPayload.bsdfPdf         = brdfPdf3(V, bs.dir, N, clearcoatN, roughness, metalness, ccProb, ccRough);
         giSubPayload.currentIor      = 1.0;
         giSubPayload.hitSpecFrac     = 0.0;
         giSubPayload.primaryAlbedo   = vec4(0.0);
@@ -2044,7 +2376,7 @@ void main() {
         giSubPayload.inFlags         = 8u | ((pc.emissiveCount > 0u) ? 1u : 0u);
         giSubPayload.hitMetalness    = 0.0;
         giSubPayload.hitTransmission = 0.0;
-        giSubPayload.bsdfPdf         = brdfPdf3(V, bs.dir, N, roughness, metalness, ccProb, ccRough);
+        giSubPayload.bsdfPdf         = brdfPdf3(V, bs.dir, N, clearcoatN, roughness, metalness, ccProb, ccRough);
         giSubPayload.currentIor      = 1.0;
         giSubPayload.hitSpecFrac     = 0.0;
         giSubPayload.primaryAlbedo   = vec4(0.0);
@@ -2163,8 +2495,8 @@ void main() {
         gi.W_sum = 0.0; gi.M = 0.0; gi.W = 0.0; gi.p_hat = 0.0;
 
         if (subHitSurface) {
-            const vec3 F_cand = evalGiTarget(V, bs.dir, N, F0, albedo, roughness, metalness,
-                                             alpha, ccProb, ccWeight, ccRough, baseScale, Lo_cand);
+            const vec3 F_cand = evalGiTarget(V, bs.dir, N, clearcoatN, F0, albedo, roughness, metalness,
+                                             alpha, ccProb, ccWeight, ccRough, ccNdotV, baseScale, Lo_cand);
             const float p_hat_cand = max(lum3(F_cand), 0.0);
             const float q_cand     = max(firstBsdfPdf, 1e-20);
             const float w_cand     = p_hat_cand / q_cand;
@@ -2224,9 +2556,9 @@ void main() {
                                     // Re-eval F + p_hat at OUR pixel using the
                                     // stored sample's xs / Lo. This is the
                                     // textbook ReSTIR target re-eval.
-                                    const vec3 F_prev = evalGiTarget(V, L_prev, N, F0, albedo,
+                                    const vec3 F_prev = evalGiTarget(V, L_prev, N, clearcoatN, F0, albedo,
                                                                        roughness, metalness, alpha,
-                                                                       ccProb, ccWeight, ccRough,
+                                                                       ccProb, ccWeight, ccRough, ccNdotV,
                                                                        baseScale, prevLoP);
                                     const float p_hat_prev = max(lum3(F_prev), 0.0);
                                     if (p_hat_prev > 0.0) {
@@ -2338,9 +2670,9 @@ void main() {
                     // Re-evaluate target at OUR pixel (BRDF + normal) for the
                     // neighbour's stored sample. This is what makes the merge
                     // unbiased — neighbour's BRDF / normal don't apply here.
-                    const vec3 F_sp = evalGiTarget(V, L_sp, N, F0, albedo,
+                    const vec3 F_sp = evalGiTarget(V, L_sp, N, clearcoatN, F0, albedo,
                                                     roughness, metalness, alpha,
-                                                    ccProb, ccWeight, ccRough,
+                                                    ccProb, ccWeight, ccRough, ccNdotV,
                                                     baseScale, spLoP);
                     const float p_hat_sp = max(lum3(F_sp), 0.0);
                     if (p_hat_sp > 0.0) {
@@ -2387,9 +2719,9 @@ void main() {
                 // ── Contribution at primary ──
                 // Standard RIS estimator: F · W at the chosen sample, F
                 // evaluated at OUR pixel's BRDF.
-                const vec3 F_chosen = evalGiTarget(V, omegaI_chosen, N, F0, albedo,
+                const vec3 F_chosen = evalGiTarget(V, omegaI_chosen, N, clearcoatN, F0, albedo,
                                                     roughness, metalness, alpha,
-                                                    ccProb, ccWeight, ccRough, baseScale, gi.Lo);
+                                                    ccProb, ccWeight, ccRough, ccNdotV, baseScale, gi.Lo);
                 vec3 contrib_raw = F_chosen * gi.W * vis;
                 if (pc.fireflyClamp < 1e20) {
                     const float giLum = lum3(contrib_raw);
@@ -2458,9 +2790,9 @@ void main() {
                             distChosen - 1e-2, 1);
                 const float vis = shadowVisibility;
                 if (vis > 0.0) {
-                    const vec3 F_chosen = evalGiTarget(V, omegaI_chosen, N, F0, albedo,
+                    const vec3 F_chosen = evalGiTarget(V, omegaI_chosen, N, clearcoatN, F0, albedo,
                                                         roughness, metalness, alpha,
-                                                        ccProb, ccWeight, ccRough, baseScale, gi.Lo);
+                                                        ccProb, ccWeight, ccRough, ccNdotV, baseScale, gi.Lo);
                     vec3 contrib_raw = F_chosen * gi.W * vis;
                     if (pc.fireflyClamp < 1e20) {
                         const float giLum = lum3(contrib_raw);
@@ -2480,6 +2812,14 @@ void main() {
     // All contributions currently route to the diff channel (spec=0). A
     // proper split would separate litDiff and litSpec at each NEE site; the
     // payload channels exist for it but the PT accumulator is single-channel.
+    vec3 surfaceRadiance = emissiveOut + ambient + lit;
+    if (giConsumed) {
+        surfaceRadiance += giContrib;
+    }
+    if (legacyEnvMap) {
+        surfaceRadiance = applyLegacyEnvMap(mdesc, surfaceRadiance, reflect(-V, N), specularIntensity);
+    }
+
     if (giConsumed) {
         // GI absorbed bounce 1's contribution; raygen's step 1 trace continues
         // from xs at bounce 2. payload.flags bit 3 (=8u) is a documentation
@@ -2487,19 +2827,19 @@ void main() {
         // skipping FC adjustments for "free" GI bounces); the existing
         // bounce-loop maths is already correct without inspecting bit 3 since
         // the next-origin/dir + brdfWeight encode the post-bounce-1 state.
-        payload.radianceDiff = emissiveOut + ambient + lit + giContrib;
+        payload.radianceDiff = surfaceRadiance;
         payload.radianceSpec = vec3(0.0);
         payload.brdfWeight   = giTerminate ? vec3(0.0) : giThroughput;
         payload.nextOrigin   = giTerminate ? vec3(0.0) : giNextOrigin;
         payload.nextDir      = giTerminate ? vec3(0.0) : giNextDir;
         payload.flags        = giTerminate ? 1u : 8u;
     } else {
-        payload.radianceDiff = emissiveOut + ambient + lit;
+        payload.radianceDiff = surfaceRadiance;
         payload.radianceSpec = vec3(0.0);
-        payload.brdfWeight   = brdfWeight;
-        payload.nextOrigin   = hitPos + N * rtSelfEps(hitPos);
-        payload.nextDir      = bounceDir;
-        payload.flags        = pathFlags;
+        payload.brdfWeight   = (mdesc.envTexIndex >= 0) ? vec3(0.0) : brdfWeight;
+        payload.nextOrigin   = (mdesc.envTexIndex >= 0) ? vec3(0.0) : (hitPos + N * rtSelfEps(hitPos));
+        payload.nextDir      = (mdesc.envTexIndex >= 0) ? vec3(0.0) : bounceDir;
+        payload.flags        = (mdesc.envTexIndex >= 0) ? 1u : pathFlags;
     }
     // BSDF_ONLY override: zero the radiance fields so raygen's `radiance +=
     // throughput * (radianceDiff + radianceSpec)` at primary contributes
@@ -2563,7 +2903,7 @@ void main() {
     // Miss uses this for the BSDF→env MIS weight when env CDF is enabled. Must
     // match the actual sampler mixture above, otherwise MIS over/underweights
     // and adds noise on clearcoat.
-    payload.bsdfPdf = brdfPdf3(V, bounceDir, N, roughness, metalness, ccProb, ccRough);
+    payload.bsdfPdf = brdfPdf3(V, bounceDir, N, clearcoatN, roughness, metalness, ccProb, ccRough);
 
     // ── Primary-surface albedo for atrous demodulation (binding 35) ──
     // Gate: write a valid (.a=1) albedo ONLY at the primary hit on a

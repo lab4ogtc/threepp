@@ -15,7 +15,11 @@ option(THREEPP_TREAT_WARNINGS_AS_ERRORS "Treat warnings as errors" OFF)
 option(THREEPP_WITH_WGPU "Build with WebGPU backend (via wgpu-native)" OFF)
 option(THREEPP_WITH_VULKAN "Build with Vulkan backend (requires Vulkan SDK)" OFF)
 cmake_dependent_option(THREEPP_WITH_METAL "Build with Metal backend" ON "APPLE" OFF)
-cmake_dependent_option(THREEPP_WITH_SLANG "Build Slang shader compiler support" ON "APPLE" OFF)
+set(THREEPP_WITH_SLANG_DEFAULT OFF)
+if (APPLE)
+    set(THREEPP_WITH_SLANG_DEFAULT ON)
+endif ()
+option(THREEPP_WITH_SLANG "Build Slang shader compiler support" ${THREEPP_WITH_SLANG_DEFAULT})
 cmake_dependent_option(THREEPP_WGPU_GLSL_COMPAT
     "Enable GLSL->SPIR-V translation for ShaderMaterial on the Wgpu backend (requires glslang)"
     ON "THREEPP_WITH_WGPU" OFF)

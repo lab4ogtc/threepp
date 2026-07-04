@@ -66,9 +66,38 @@ namespace threepp {
 
         RenderTarget* getRenderTarget() override;
         void setRenderTarget(RenderTarget* renderTarget, int activeCubeFace = 0, int activeMipmapLevel = 0) override;
+        void setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) override;
 
         [[nodiscard]] std::vector<unsigned char> readRGBPixels() override;
         void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0) override;
+        void copyTextureToImage(Texture& texture) override;
+        std::future<void> copyTextureToImageAsync(Texture& texture) override;
+        void copyTexturesToImages(const std::vector<Texture*>& textures) override;
+        std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures) override;
+        [[nodiscard]] bool supportsAsyncPixelReadback() const noexcept override;
+        /**
+         * \brief 返回异步读回 staging buffer 从固定复用池命中的次数。
+         * \return 当前 renderer 生命周期内的复用命中计数。
+         */
+        [[nodiscard]] std::uint64_t asyncReadbackStagingReuseCount() const noexcept;
+        void readbackTextureAsync(
+                Texture& texture,
+                std::function<void(const ReadbackResult& result)> onComplete,
+                std::function<void(const std::string& error)> onError = nullptr) override;
+        std::future<PixelReadbackBuffer> readRenderTargetPixelsAsync(
+                const PixelReadbackRequest& request) override;
+        MaterialPrewarmStatus prewarmMaterial(RawShaderMaterial& material) override;
+        MaterialPrewarmStatus prewarmMaterial(const MaterialPrewarmRequest& request) override;
+        /**
+         * \brief 返回当前 Vulkan RenderTarget 主 texture 对应的原生 Image2D 指针。
+         * \return color target 返回 color Image2D，depth-only target 返回 depth Image2D；未绑定时返回 nullptr。
+         */
+        [[nodiscard]] void* nativeRenderTargetTexture() const;
+        /**
+         * \brief 返回当前 Vulkan RenderTarget 的 MSAA color Image2D 指针。
+         * \return 当前 RenderTarget 的 multisampled color attachment；未绑定或单采样时返回 nullptr。
+         */
+        [[nodiscard]] void* nativeRenderTargetMsaaTexture() const;
 
         // Save the last presented frame to disk (.png / .jpg / .jpeg / .bmp),
         // creating parent directories as needed — same convenience GLRenderer

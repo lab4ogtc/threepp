@@ -214,7 +214,7 @@ layout(set = 0, binding = 37, rgba8) uniform writeonly image2D primaryAlbedoSnap
 layout(set = 0, binding = 22) uniform sampler2D  gbufNormalTex;// world normal in n*0.5+0.5 encoding
 layout(set = 0, binding = 23) uniform sampler2D  gbufMotionTex;// rg = (prevNDC - currNDC) in GL convention
 layout(set = 0, binding = 24) uniform sampler2D  gbufDepthTex; // .r = depth (Vulkan NDC z, [0,1])
-layout(set = 0, binding = 25) uniform usampler2D gbufIdsTex;   // .x = instanceCustomIndex+1; 0 == sky/miss
+layout(set = 0, binding = 25) uniform usampler2D gbufIdsTex;   // .x = materialId+1, .y = instanceCustomIndex+1; 0 == sky/miss
 layout(set = 0, binding = 26) uniform sampler2D  gbufUvTex;    // .rg = material UV
 layout(set = 0, binding = 27) uniform sampler2D  blueNoiseTex; // 64×64 R8 void-and-cluster tile, sampled at (px+frame_offset, py+frame_offset) % 64
 
@@ -244,12 +244,14 @@ layout(set = 0, binding = 19) uniform sampler2D envMargTex;// marginal CDF
 struct DirLight {
     vec3 direction;
     vec3 color;
+    uint castShadow;
 };
 struct PointLight {
     vec3  position;
     float range;
     vec3  color;
     float decay;
+    uint  castShadow;
 };
 struct SpotLight {
     vec3  position;
@@ -259,6 +261,7 @@ struct SpotLight {
     vec3  direction;
     float cosAngleOuter;
     float cosAngleInner;
+    uint  castShadow;
 };
 struct RectLight {
     vec3 position;
@@ -1009,7 +1012,7 @@ void main() {
     if (hybridOn) {
         const ivec2 cpx = ivec2(gl_LaunchIDEXT.xy);
         const ivec2 csz = ivec2(gl_LaunchSizeEXT.xy);
-        const uint  idC = texelFetch(gbufIdsTex,   cpx, 0).x;
+        const uint  idC = texelFetch(gbufIdsTex,   cpx, 0).y;
         const float zC  = texelFetch(gbufDepthTex, cpx, 0).x;
         // Depth-crease tolerance under REVERSED-Z (z ≈ near/dist): relative
         // depth difference equals relative DISTANCE difference
@@ -1029,7 +1032,7 @@ void main() {
                 ivec2( 1,  1), ivec2(-1, -1), ivec2( 1, -1), ivec2(-1,  1));
         for (int k = 0; k < 8; ++k) {
             const ivec2 p   = clamp(cpx + off8[k], ivec2(0), csz - ivec2(1));
-            const uint  idN = texelFetch(gbufIdsTex,   p, 0).x;
+            const uint  idN = texelFetch(gbufIdsTex,   p, 0).y;
             if (idN != idC) {
                 isSilhouette = true;
                 break;

@@ -25,6 +25,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 
 using namespace threepp;
 
@@ -130,7 +132,13 @@ namespace {
 }// namespace
 
 
-int main() {
+int main(int argc, char** argv) {
+
+    bool selfcheck = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--selfcheck") == 0) selfcheck = true;
+    }
+    int exitCode = 0;
 
     Canvas canvas("Vulkan PT - physically correct LIDAR",
                   {{"vsync", true}, {"size", WindowSize{1600, 900}}});
@@ -287,6 +295,7 @@ int main() {
     std::vector<LidarReturn> returns;
     Clock clock;
     int  cachedModelIndex = currentModel;
+    int  selfcheckFrame = 0;
 
     canvas.animate([&] {
         const float dt = clock.getDelta();
@@ -405,5 +414,20 @@ int main() {
         }
 
         ui.render();
+
+        if (selfcheck) {
+            const bool pass = lastBeams > 0 &&
+                              lastReturns > 0 &&
+                              returns.size() >= static_cast<size_t>(lastBeams) &&
+                              std::isfinite(lastScanMs);
+            std::printf("[vulkan_lidar] selfcheck frame=%d beams=%d returns=%d scanMs=%.3f pass=%d\n",
+                        selfcheckFrame + 1, lastBeams, lastReturns,
+                        static_cast<double>(lastScanMs), pass ? 1 : 0);
+            if (++selfcheckFrame >= 2) {
+                exitCode = pass ? 0 : 1;
+                canvas.close();
+            }
+        }
     });
+    return exitCode;
 }

@@ -79,7 +79,11 @@ void RenderTarget::setSize(unsigned int width, unsigned int height, unsigned int
             this->texture = this->textures.front();
         }
 
+        // setSize 把 dispose 当作资源失效通知；resize 后 target 仍会继续使用，
+        // 后续 resize 或析构仍必须能再次通知 renderer 释放旧资源。
+        disposed = false;
         this->dispose();
+        disposed = false;
     }
 
     this->viewport.set(0, 0, static_cast<float>(width), static_cast<float>(height));

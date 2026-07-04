@@ -471,14 +471,16 @@ namespace threepp::vulkan {
         // before reading; both are required for correctness on discrete GPUs.
         VkBufferMemoryBarrier streamHostBarrier{};
         streamHostBarrier.sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-        streamHostBarrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+        streamHostBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT |
+                                          VK_ACCESS_SHADER_WRITE_BIT;
         streamHostBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
         streamHostBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         streamHostBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         streamHostBarrier.buffer = eventStreamRing_[writeSlot_].handle;
         streamHostBarrier.size   = VK_WHOLE_SIZE;
         vkCmdPipelineBarrier(cb,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                              VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               VK_PIPELINE_STAGE_HOST_BIT,
                               0, 0, nullptr, 1, &streamHostBarrier, 0, nullptr);
 

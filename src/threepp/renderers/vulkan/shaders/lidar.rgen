@@ -266,14 +266,16 @@ void main() {
             // segment start to the scatter point (fogSW), not the total
             // segment-relative distance (fogS) — air outside the medium
             // doesn't attenuate, only the water column does.
+            const float fogRange = totalRange + fogS;
+            const float atm = exp(-2.0 * max(0.0, pc.atmosphericExtinction) * fogRange);
             const float fogI = clamp(
                     pc.laserPower * throughput * fogAlbedo * pBack
-                    * exp(-sigmaT * fogSW) * pc.invReferenceIntensity,
+                    * atm * exp(-sigmaT * fogSW) * pc.invReferenceIntensity,
                     0.0, 1.0);
             if (fogI >= pc.detectorThreshold) {
                 LidarResult r;
                 r.position   = rayOrigin + rayDir * fogS;
-                r.distance   = totalRange + fogS;
+                r.distance   = fogRange;
                 r.normal     = -rayDir;       // back-toward-sensor convention
                 r.intensity  = fogI;
                 r.instanceId = -2;            // sentinel: fog return (not a surface)
@@ -300,7 +302,8 @@ void main() {
         // Compute the IN-MEDIUM path length from segment start to surface
         // hit. For the LIDAR medium path this clips to below mediumTop;
         // for the homogeneous fogUbo fallback this is the full distance.
-        // Beer-Lambert attenuation applies only over this path.
+        // Medium Beer-Lambert attenuation applies only over this path;
+        // atmospheric extinction applies over the full sensor-hit range.
         const vec2  surfWat = (sigmaT > 1.0e-6)
                 ? (useMedium
                         ? inMediumInterval(rayOrigin, rayDir, pl.distance, mediumTop)
@@ -308,7 +311,9 @@ void main() {
                 : vec2(0.0, 0.0);
         const float surfWaterPath = max(0.0, surfWat.y - surfWat.x);
 
-        const float scaledIntensity = pl.intensity * throughput * exp(-sigmaT * surfWaterPath);
+        const float surfaceRange = totalRange + pl.distance;
+        const float surfaceAtm = exp(-2.0 * max(0.0, pc.atmosphericExtinction) * surfaceRange);
+        const float scaledIntensity = pl.intensity * throughput * surfaceAtm * exp(-sigmaT * surfWaterPath);
         const bool detected =
                 scaledIntensity >= pc.detectorThreshold &&
                 pl.distance > 0.0 &&
@@ -317,7 +322,7 @@ void main() {
         if (detected) {
             LidarResult r;
             r.position   = pl.hitPos;
-            r.distance   = totalRange + pl.distance;
+            r.distance   = surfaceRange;
             r.normal     = pl.hitNormal;
             r.intensity  = clamp(scaledIntensity, 0.0, 1.0);
             r.instanceId = pl.instanceId;

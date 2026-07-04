@@ -11,7 +11,7 @@
 // Cook-Torrance microfacet BRDF evaluated at the back-scatter geometry
 // (sensor = transmitter = receiver, so L = V):
 //
-//     I = P_tx · f_back · cos θ · η(r) / r²
+//     I = P_tx · f_back · cos θ / r²
 //
 //     f_back = albedo·(1-metal)/π  +  F·D(N·N) / (4·cos θ)
 //
@@ -23,11 +23,12 @@
 //   F        = Schlick Fresnel at cos θ (metals use albedo as F0)
 //   cos θ    = beam · surface-normal (also N·H here, since H ≡ surface
 //              tangent of the back-scatter geometry)
-//   η(r)     = exp(-2σ_ext r)  Beer-Lambert round-trip atmospheric extinction
 //   r        = slant range from sensor to hit point
 //
 // Then divided by `invReferenceIntensity` so a perpendicular 1.0-albedo
 // surface at the reference range reads as 1.0 in the output.
+// Atmospheric extinction is applied in lidar.rgen, which knows the full
+// accumulated range for multi-return paths through transmissive surfaces.
 //
 // Why this matters for chrome:
 //   roughness 0.05 → α² ≈ 6e-6 → D peak ≈ 5e4 at θ=0 and crashes to
@@ -55,12 +56,18 @@ struct GeometryDesc {
     uint64_t normalAddress;
     uint64_t indexAddress;
     uint64_t uvAddress;
+    uint64_t uv2Address;
     uint64_t foamAddress;
     uint64_t prevVertexAddress;
     uint64_t colorAddress;// unused here, kept for layout match with closest_hit.rchit
     uint     indexed;
     uint     _pad;
+    uint64_t materialGroupAddress;
+    uint     materialGroupCount;
+    uint     _materialGroupPad;
 };
+
+layout(buffer_reference, scalar) readonly buffer MaterialGroupBuf { MaterialGroupDesc groups[]; };
 
 layout(buffer_reference, scalar) readonly buffer VertexBuf { float p[]; };
 layout(buffer_reference, scalar) readonly buffer IndexBuf  { uint  i[]; };
@@ -103,12 +110,27 @@ layout(location = 0) rayPayloadInEXT Payload pl;
 // barycentrics directly.
 hitAttributeEXT vec2 bary;
 
+uint resolveMaterialIndex(GeometryDesc geom, uint instanceIndex, uint primitiveIndex) {
+    if (geom.materialGroupAddress == 0ul || geom.materialGroupCount == 0u) {
+        return instanceIndex;
+    }
+    MaterialGroupBuf groupBuf = MaterialGroupBuf(geom.materialGroupAddress);
+    for (uint i = 0u; i < geom.materialGroupCount; ++i) {
+        const MaterialGroupDesc group = groupBuf.groups[i];
+        if (primitiveIndex >= group.startPrimitive &&
+            primitiveIndex < group.startPrimitive + group.primitiveCount) {
+            return group.materialIndex;
+        }
+    }
+    return instanceIndex;
+}
+
 void main() {
     const uint instId = uint(gl_InstanceCustomIndexEXT);
     const GeometryDesc geom = geoms[instId];
-    const MaterialDesc mat  = mats[instId];
 
     const uint primId = uint(gl_PrimitiveID);
+    const MaterialDesc mat  = mats[resolveMaterialIndex(geom, instId, primId)];
 
     // Resolve the three vertex indices of the hit triangle.
     uint i0, i1, i2;
@@ -221,13 +243,10 @@ void main() {
     // Near-IR LIDAR detectors don't resolve colour — use Rec. 709 luminance.
     const float rho      = 0.2126 * fBack.r + 0.7152 * fBack.g + 0.0722 * fBack.b;
 
-    // Beer-Lambert round-trip atmospheric extinction.
-    const float atm = exp(-2.0 * max(0.0, pc.atmosphericExtinction) * r);
-
     // LIDAR equation, normalised by the reference intensity. The cos θ
     // here is the projected-area term (irradiance on the surface); the
     // BRDF f_back already encodes the directional reflectance.
-    float I = pc.laserPower * rho * cosTheta * atm / max(r * r, 1e-6);
+    float I = pc.laserPower * rho * cosTheta / max(r * r, 1e-6);
     I *= pc.invReferenceIntensity;
     I = clamp(I, 0.0, 1.0);
 

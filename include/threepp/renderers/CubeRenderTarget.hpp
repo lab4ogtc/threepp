@@ -6,6 +6,9 @@
 #include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/textures/CubeTexture.hpp"
 
+#include <algorithm>
+#include <cstddef>
+
 namespace threepp {
 
     class CubeRenderTarget: public RenderTarget {
@@ -14,23 +17,31 @@ namespace threepp {
         explicit CubeRenderTarget(int size, const Options& options = {})
             : RenderTarget(static_cast<unsigned int>(size), static_cast<unsigned int>(size), options) {
 
-            texture = CubeTexture::create();
-            if (options.mapping) texture->mapping = *options.mapping;
-            if (options.wrapS) texture->wrapS = *options.wrapS;
-            if (options.wrapT) texture->wrapT = *options.wrapT;
-            if (options.magFilter) texture->magFilter = *options.magFilter;
-            if (options.format) texture->format = *options.format;
-            if (options.type) texture->type = *options.type;
-            if (options.anisotropy) texture->anisotropy = *options.anisotropy;
-            if (auto colorSpace = options.effectiveColorSpace()) {
-                texture->colorSpace = *colorSpace;
-            }
+            auto createCubeTexture = [&] {
+                auto cubeTexture = CubeTexture::create();
+                if (options.mapping) cubeTexture->mapping = *options.mapping;
+                if (options.wrapS) cubeTexture->wrapS = *options.wrapS;
+                if (options.wrapT) cubeTexture->wrapT = *options.wrapT;
+                if (options.magFilter) cubeTexture->magFilter = *options.magFilter;
+                if (options.format) cubeTexture->format = *options.format;
+                if (options.type) cubeTexture->type = *options.type;
+                if (options.anisotropy) cubeTexture->anisotropy = *options.anisotropy;
+                if (auto colorSpace = options.effectiveColorSpace()) {
+                    cubeTexture->colorSpace = *colorSpace;
+                }
 
-            texture->generateMipmaps = options.generateMipmaps;
-            texture->minFilter = options.minFilter.value_or(Filter::Linear);
+                cubeTexture->generateMipmaps = options.generateMipmaps;
+                cubeTexture->minFilter = options.minFilter.value_or(Filter::Linear);
+                return cubeTexture;
+            };
 
+            const auto textureCount = std::max(1, options.count);
             textures.clear();
-            textures.push_back(texture);
+            textures.reserve(static_cast<std::size_t>(textureCount));
+            for (int i = 0; i < textureCount; ++i) {
+                textures.push_back(createCubeTexture());
+            }
+            texture = textures.front();
         }
 
         static std::unique_ptr<CubeRenderTarget> create(int size, const Options& options = {}) {

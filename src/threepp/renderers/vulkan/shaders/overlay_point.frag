@@ -15,6 +15,7 @@ layout(location = 0) in vec3 vColor;
 layout(push_constant) uniform Pc {
     mat4 mvp;
     vec4 color;
+    vec4 point;
 } pc;
 
 layout(location = 0) out vec4 outColor;

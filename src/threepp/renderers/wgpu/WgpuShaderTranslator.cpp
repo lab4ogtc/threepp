@@ -190,7 +190,7 @@ namespace threepp::wgpu {
             out << "layout(std140, set=0, binding=2) uniform CustomUniforms {\n";
             for (auto& [t, n] : customFields) {
                 out << "    " << t << " " << n << ";\n";
-                if (t == "float" || t == "int") {
+                if (t == "float" || t == "int" || t == "bool") {
                     // 3 individual floats = 12 bytes; together with the field = 16 bytes.
                     out << "    float _p0" << n << "_, _p1" << n << "_, _p2" << n << "_;\n";
                 } else if (t == "vec3" || t == "ivec3") {
@@ -451,7 +451,7 @@ namespace threepp::wgpu {
         std::set<std::string> directlyDeclared;
         {
             static const std::regex dRex(
-                    R"(\buniform\s+(?:(?:lowp|mediump|highp)\s+)?(?:float|vec[234]|mat[234]|int|ivec[234])\s+(\w+)\s*;)");
+                    R"(\buniform\s+(?:(?:lowp|mediump|highp)\s+)?(?:float|vec[234]|mat[234]|int|bool|ivec[234])\s+(\w+)\s*;)");
             auto scan = [&](const std::string& src) {
                 std::sregex_iterator it(src.begin(), src.end(), dRex);
                 std::sregex_iterator end;
@@ -464,7 +464,6 @@ namespace threepp::wgpu {
         for (auto& n : uniformNames) {
             if (directlyDeclared.count(n)) filteredUniformNames.push_back(n);
         }
-        std::sort(filteredUniformNames.begin(), filteredUniformNames.end());
         result.customUniformNames = filteredUniformNames;
 
         // Build unified (type, name) field list by scanning BOTH expanded shaders.
@@ -473,7 +472,7 @@ namespace threepp::wgpu {
         std::map<std::string,std::string> uniformTypeMap;
         {
             static const std::regex typeRex(
-                    R"(\buniform\s+(?:(?:lowp|mediump|highp)\s+)?(float|vec[234]|mat[234]|int|ivec[234])\s+(\w+)\s*;)");
+                    R"(\buniform\s+(?:(?:lowp|mediump|highp)\s+)?(float|vec[234]|mat[234]|int|bool|ivec[234])\s+(\w+)\s*;)");
             auto scanTypes = [&](const std::string& src) {
                 std::sregex_iterator it(src.begin(), src.end(), typeRex);
                 std::sregex_iterator end;
@@ -483,7 +482,7 @@ namespace threepp::wgpu {
             scanTypes(expandedFrag);
         }
         std::vector<std::pair<std::string,std::string>> customFields; // (type, name), sorted
-        for (auto& n : filteredUniformNames) {  // already sorted alphabetically
+        for (auto& n : filteredUniformNames) {
             auto it = uniformTypeMap.find(n);
             if (it != uniformTypeMap.end()) customFields.push_back({it->second, n});
         }

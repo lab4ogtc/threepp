@@ -24,11 +24,13 @@
 #define VMA_IMPLEMENTATION
 #include "vulkan/VulkanContext.hpp"
 #include "vulkan/VulkanResources.hpp"
+#include "vulkan/VulkanRenderTargets.hpp"
 #include "vulkan/Denoiser.hpp"
 #include "vulkan/EnvPrefilter.hpp"
 #include "vulkan/EventCameraDetector.hpp"
 #include "vulkan/LidarScanner.hpp"
 #include "vulkan/PhotonCaustics.hpp"
+#include "vulkan/VulkanReadback.hpp"
 #include "vulkan/SkinningPipeline.hpp"
 #include "vulkan/TetSkinningPipeline.hpp"
 #include "vulkan/GpuTimings.hpp"
@@ -45,19 +47,29 @@
 
 #include "threepp/cameras/Camera.hpp"
 #include "threepp/cameras/OrthographicCamera.hpp"
+#include "threepp/cameras/PerspectiveCamera.hpp"
 #include "threepp/canvas/Canvas.hpp"
 #include "threepp/core/InterleavedBufferAttribute.hpp"
 #include "threepp/core/Object3D.hpp"
 #include "threepp/lights/AmbientLight.hpp"
 #include "threepp/lights/DirectionalLight.hpp"
+#include "threepp/lights/HemisphereLight.hpp"
 #include "threepp/lights/PointLight.hpp"
 #include "threepp/lights/RectAreaLight.hpp"
 #include "threepp/lights/SpotLight.hpp"
+#include "threepp/materials/LineDashedMaterial.hpp"
 #include "threepp/materials/Material.hpp"
 #include "threepp/materials/MeshBasicMaterial.hpp"
+#include "threepp/materials/MeshDepthMaterial.hpp"
+#include "threepp/materials/MeshMatcapMaterial.hpp"
+#include "threepp/materials/MeshNormalMaterial.hpp"
+#include "threepp/materials/MeshToonMaterial.hpp"
+#include "threepp/materials/ShadowMaterial.hpp"
 #include "threepp/materials/interfaces.hpp"
 #include "threepp/objects/Line.hpp"
+#include "threepp/objects/LineLoop.hpp"
 #include "threepp/objects/LineSegments.hpp"
+#include "threepp/objects/LOD.hpp"
 #include "threepp/objects/Points.hpp"
 #include "threepp/math/Box3.hpp"
 #include "threepp/math/Frustum.hpp"
@@ -73,10 +85,14 @@
 #include "threepp/objects/SkinnedMesh.hpp"
 #include "threepp/objects/Sprite.hpp"
 #include "threepp/materials/SpriteMaterial.hpp"
+#include "threepp/materials/RawShaderMaterial.hpp"
 #include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/renderers/VulkanRenderer.hpp"
+#include "threepp/renderers/shaders/SlangShaderCompiler.hpp"
+#include "threepp/renderers/vulkan/VulkanShaderMaterial.hpp"
 #include "threepp/renderers/vulkan/water/OceanFFT.hpp"
 #include "threepp/scenes/Scene.hpp"
+#include "threepp/textures/CubeTexture.hpp"
 #include "threepp/textures/Texture.hpp"
 
 // stb_image_write — implementation is already compiled in GLRenderer.cpp.
@@ -100,6 +116,8 @@
 // (taa_resolve.comp.spv moved into vulkan/TaaResolve.cpp)
 #include "threepp/renderers/vulkan/shaders/overlay.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_dashed.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_dashed.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_composite.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_composite.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_depth.vert.spv.h"
@@ -108,6 +126,7 @@
 #include "threepp/renderers/vulkan/shaders/overlay_color.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_point.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_point.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_point_textured.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/event_shade.comp.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.frag.spv.h"
@@ -120,18 +139,24 @@
 #include <GLFW/glfw3.h>
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
+#include <future>
+#include <mutex>
 #include <random>
 #include <cstring>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -205,6 +230,8 @@ namespace threepp {
         bool autoClearColor_ = true;
         bool autoClearDepth_ = true;
         bool autoClearStencil_ = true;
+        bool shadowMapEnabled_ = false;
+        ShadowMap shadowMapType_ = ShadowMap::PFC;
         bool pendingClearColor_ = false;
         bool pendingClearDepth_ = false;
         bool pendingClearStencil_ = false;
@@ -212,6 +239,7 @@ namespace threepp {
         RenderTarget* currentRenderTarget_ = nullptr;
         int activeCubeFace_ = 0;
         int activeMipmapLevel_ = 0;
+        int activeLayer_ = 0;
 
         // Scissor region for the final default-framebuffer write. Rendering
         // keeps the normal full-frame viewport/projection; scissor only clips
@@ -229,6 +257,7 @@ namespace threepp {
         float       toneMappingExposure_ = 1.f;
 
         std::unique_ptr<VulkanContext> ctx;
+        std::unique_ptr<vulkan::VulkanRenderTargets> renderTargets_;
 
         // Per-geometry BLAS + the buffers that back its build inputs. Vertex /
         // index / normal / uv buffers are kept alive past the build so the
@@ -243,6 +272,7 @@ namespace threepp {
             Buffer index;// .handle == VK_NULL_HANDLE for non-indexed geometry
             Buffer normal;
             Buffer uv;   // .handle == VK_NULL_HANDLE if geometry has no "uv"
+            Buffer uv2;  // .handle == VK_NULL_HANDLE if geometry has no "uv2"
             // Per-vertex RGB color (BufferGeometry "color" attribute, itemSize 3).
             // .handle == VK_NULL_HANDLE when the geometry has no usable "color".
             // Surfaced to the shaders via GeometryDesc::colorAddress / DrawInfo::
@@ -416,6 +446,28 @@ namespace threepp {
         };
         std::unordered_map<const Mesh*, std::unique_ptr<MorphedMeshState>> morphedMeshStates;
 
+        struct MaterialDisplacementStateKey {
+            std::shared_ptr<Texture> displacementMap;
+            unsigned int textureVersion = 0;
+            std::array<float, 9> uvTransform{};
+            TextureWrapping wrapS = TextureWrapping::ClampToEdge;
+            TextureWrapping wrapT = TextureWrapping::ClampToEdge;
+            Filter minFilter = Filter::Linear;
+            Filter magFilter = Filter::Linear;
+            float displacementScale = 1.0f;
+            float displacementBias = 0.0f;
+        };
+        struct MaterialDisplacedMeshState {
+            std::unique_ptr<BlasRecord> blas;
+            std::weak_ptr<BufferGeometry> liveCheck;
+            std::vector<MaterialDisplacementStateKey> materialKeys;
+            std::vector<GeometryGroup> materialGroups;
+            std::vector<GeometryGroup> referenceGroups;
+            DrawRange drawRange{};
+            unsigned int geomVersion = 0;
+        };
+        std::unordered_map<const Mesh*, std::unique_ptr<MaterialDisplacedMeshState>> materialDisplacedMeshStates;
+
         // Per-DisplacedMesh: BLAS (rebuilt-in-place each frame, same scheme as
         // SkinnedMesh) plus up to three FFT cascades (Phillips/Dynamic/IFFT
         // per cascade). The water_displace.comp pass reads the spatial-domain
@@ -564,6 +616,7 @@ namespace threepp {
             VkDeviceAddress normalAddress;
             VkDeviceAddress indexAddress;
             VkDeviceAddress uvAddress;// 0 == no UV attribute
+            VkDeviceAddress uv2Address;// 0 == no UV2 attribute
             VkDeviceAddress foamAddress;// 0 == no foam attribute (per-vertex float, written by water_displace.comp)
             // Previous-frame deformed vertex positions. For SkinnedMesh (or any
             // mesh that re-deforms per frame): a separate buffer holding the
@@ -579,13 +632,19 @@ namespace threepp {
             VkDeviceAddress colorAddress;
             uint32_t indexed;
             uint32_t _pad;
+            VkDeviceAddress materialGroupAddress;
+            uint32_t materialGroupCount;
+            uint32_t _materialGroupPad;
         };
+        static_assert(sizeof(GeometryDesc) == 88);
         // MaterialDesc layout lives in vulkan_shared.h (the same file the GLSL
         // path-tracer shaders pull in via #include). Bringing it into Impl scope
         // here keeps the existing `MaterialDesc md{};` call sites unchanged.
         using MaterialDesc = threepp::vulkan_pt::MaterialDesc;
+        using MaterialGroupDesc = threepp::vulkan_pt::MaterialGroupDesc;
 
         Buffer geometryDescsBuffer;
+        Buffer materialGroupDescsBuffer;
         // Per-frame-in-flight MaterialDesc storage. Was a single shared buffer
         // gated by vkDeviceWaitIdle on every animated-pbr update; now one buffer
         // per kFramesInFlight slot so the upload after a fence wait races
@@ -598,6 +657,11 @@ namespace threepp {
         std::array<Buffer, kFramesInFlight> materialDescsBuffers{};
         std::vector<MaterialDesc> matDescsCached_;
         std::array<bool, kFramesInFlight> matDescsDirty_{};
+        struct RasterGroupMaterialDescIndex {
+            uint32_t materialIndex = 0;
+            uint32_t descIndex = 0;
+        };
+        std::vector<std::vector<RasterGroupMaterialDescIndex>> rasterGroupMaterialDescIndices_;
 
         // Scene lights mirrored to a per-frame UBO. Scalar block layout means
         // the C++ structs map directly (no std140 vec3→vec4 padding).
@@ -609,10 +673,12 @@ namespace threepp {
         struct GpuDirLight {
             float direction[3];
             float color[3];
+            uint32_t castShadow;
         };
         struct GpuPointLight {
             float position[3]; float range;
             float color[3];    float decay;
+            uint32_t castShadow;
         };
         struct GpuSpotLight {
             float position[3];   float range;
@@ -620,6 +686,7 @@ namespace threepp {
             float direction[3];  // toward target (emission direction)
             float cosAngleOuter; // cos(angle)
             float cosAngleInner; // cos(angle * (1-penumbra))
+            uint32_t castShadow;
         };
         struct GpuRectLight {
             float position[3];
@@ -639,9 +706,9 @@ namespace threepp {
             GpuSpotLight  spotLights[kMaxSpotLights];
             GpuRectLight  rectLights[kMaxRectLights];
         };
-        static_assert(sizeof(GpuDirLight)   == 24);
-        static_assert(sizeof(GpuPointLight) == 32);
-        static_assert(sizeof(GpuSpotLight)  == 52);
+        static_assert(sizeof(GpuDirLight)   == 28);
+        static_assert(sizeof(GpuPointLight) == 36);
+        static_assert(sizeof(GpuSpotLight)  == 56);
         static_assert(sizeof(GpuRectLight)  == 60);
         std::array<Buffer, kFramesInFlight> lightsUbos{};
 
@@ -736,13 +803,14 @@ namespace threepp {
         // into it via mdesc.albedoTexIndex. Slot 0 is a 1×1 white default so
         // materials without an albedo map can still bind a valid descriptor.
         // Cache key is Texture* — the same Texture across multiple meshes only
-        // uploads once. All material textures share textureSampler_ (linear,
-        // repeat); per-texture filter/wrap is a v2 concern.
+        // uploads once. Each Image2D carries the sampler built from the source
+        // Texture's filter/wrap settings.
         // kMaxMaterialTextures, kPhotonGridBits, kPhotonGridSize, kPhotonsPerCell,
         // kPhotonEmitDim, and kGatherRadius all come from the shared header
         // (vulkan_shared.h, included near the top of this file). Editing any of
         // them there propagates to every shader on the next clean rebuild.
-        std::vector<Image2D> materialTextures;// owns image + view (sampler is shared)
+        std::vector<Image2D> materialTextures;// owns image + view + sampler
+        std::vector<bool> materialTextureOwned_;
         // Cache value: (weak_ptr liveness tag, bindless slot, uploaded version).
         // The weak_ptr lets ensureSceneBuilt prune entries when a Texture is
         // destroyed (so a future Texture* address-collision doesn't read stale
@@ -753,9 +821,11 @@ namespace threepp {
             std::weak_ptr<Texture> ref;
             uint32_t slot = 0;
             unsigned int version = 0;
+            bool ownsImage = true;
         };
         std::unordered_map<const Texture*, CachedTexture> textureCache;
         std::vector<uint32_t> freeTextureSlots;// slots reclaimed by prune
+        std::unordered_set<unsigned int> unsupportedCompressedFormatsWarned_;
         VkSampler textureSampler_ = VK_NULL_HANDLE;
 
         struct FramebufferTextureImage {
@@ -891,6 +961,7 @@ namespace threepp {
             bool     isGrass     = false;// GPU wind-deformed grass field
             bool     isMorphed   = false;
             bool     isTet       = false;
+            bool     isMaterialDisplaced = false;
             bool     isInstanced = false;// entry came from an InstancedMesh expansion
                                          // (the snapshot fast path recomputes its world
                                          // matrix as matrixWorld * getMatrixAt(i))
@@ -956,7 +1027,12 @@ namespace threepp {
         static constexpr uint32_t kSnapOverlay    = 32u;
         static constexpr uint32_t kSnapTet        = 64u;
         static constexpr uint32_t kSnapParticle   = 128u;
+        static constexpr uint32_t kSnapCastShadow = 256u;
+        static constexpr uint32_t kSnapReceiveShadow = 512u;
+        static constexpr uint32_t kSnapMaterialDisplaced = 1024u;
         std::vector<SnapNode> sceneSnapshot_;
+        Object3D* sceneSnapshotRoot_ = nullptr;
+        unsigned int sceneSnapshotRootId_ = 0;
 
         // Classification-routing flags for a mesh — shared by the snapshot
         // build and the replay walk so the two can't drift.
@@ -974,6 +1050,9 @@ namespace threepp {
             // marker (cheap: a length-mismatch reject for the empty-named common
             // case). Routed to the dedicated billboard pass and excluded from PT.
             if (auto mat = m.material(); mat && mat->name == kParticleMaterialName) fl |= kSnapParticle;
+            if (hasMaterialDisplacement(m)) fl |= kSnapMaterialDisplaced;
+            if (m.castShadow) fl |= kSnapCastShadow;
+            if (m.receiveShadow) fl |= kSnapReceiveShadow;
             return fl;
         }
 
@@ -982,6 +1061,7 @@ namespace threepp {
         // pointers are unchanged since the last full expansion.
         bool sceneSnapshotMatches(Object3D& scene) {
             if (!sceneBuilt_ || sceneSnapshot_.empty()) return false;
+            if (sceneSnapshotRoot_ != &scene || sceneSnapshotRootId_ != scene.id) return false;
             if (prevSceneFingerprint.size() != lastVisibleEntries_.size()) return false;
             size_t cur = 0;
             bool ok = true;
@@ -1022,10 +1102,16 @@ namespace threepp {
                                   o.layers.isEnabled(static_cast<unsigned>(overlayLayer_));
                 const bool tet = sn.mat && sn.mat->tetSkinning && sn.mat->tetTexture != nullptr;
                 const bool particle = sn.mat && sn.mat->name == kParticleMaterialName;
+                const bool materialDisplaced = hasMaterialDisplacement(*m);
+                const bool castShadow = m->castShadow;
+                const bool receiveShadow = m->receiveShadow;
                 if (wire != ((sn.flags & kSnapWire) != 0u) ||
                     over != ((sn.flags & kSnapOverlay) != 0u) ||
                     tet != ((sn.flags & kSnapTet) != 0u) ||
-                    particle != ((sn.flags & kSnapParticle) != 0u)) {
+                    particle != ((sn.flags & kSnapParticle) != 0u) ||
+                    materialDisplaced != ((sn.flags & kSnapMaterialDisplaced) != 0u) ||
+                    castShadow != ((sn.flags & kSnapCastShadow) != 0u) ||
+                    receiveShadow != ((sn.flags & kSnapReceiveShadow) != 0u)) {
                     ok = false;
                     return;
                 }
@@ -1147,18 +1233,26 @@ namespace threepp {
             std::shared_ptr<Texture> metalnessTex;         // covers metalnessMap swap
             std::shared_ptr<Texture> normalTex;            // covers normalMap swap
             std::shared_ptr<Texture> transmissionTex;      // covers transmissionMap swap
+            std::shared_ptr<Texture> thicknessTex;         // covers thicknessMap swap
             std::shared_ptr<Texture> clearcoatTex;         // covers clearcoatMap swap
             std::shared_ptr<Texture> clearcoatRoughnessTex;// covers clearcoatRoughnessMap swap
+            std::shared_ptr<Texture> clearcoatNormalTex;   // covers clearcoatNormalMap swap
             std::shared_ptr<Texture> emissiveTex;          // covers emissiveMap swap
+            std::shared_ptr<Texture> specularTex;          // covers specularMap swap
+            std::shared_ptr<Texture> alphaTex;             // covers alphaMap swap
+            std::shared_ptr<Texture> occlusionTex;         // covers aoMap swap
+            std::shared_ptr<Texture> lightTex;             // covers lightMap swap
+            std::shared_ptr<Texture> displacementTex;      // covers displacementMap swap
+            std::shared_ptr<Texture> envTex;               // covers envMap swap
             uint32_t instanceIndex;// 0 for non-instanced; distinguishes sub-instances
             unsigned int matVersion = 0;// Material::version() — bumped by needsUpdate(),
                                         // KHR_animation_pointer, etc. Lets us skip the
                                         // 8 texture-of dynamic_casts + materialFromMesh
                                         // (~21 dynamic_casts/mesh) when nothing on the
                                         // material has changed since last frame.
-            unsigned int geomVersion = 0;// composite BufferAttribute version (pos+norm+idx+uv)
+            unsigned int geomVersion = 0;// composite BufferAttribute version (pos+norm+idx+uv+uv2)
             std::array<float, 16> matrix{};
-            std::array<float, 15> pbr{};// + normalScale.xy + transmission/ior + clearcoat/roughness
+            std::array<float, 21> pbr{};// + normalScale.xy + transmission/ior + clearcoat/roughness + clearcoatNormalScale.xy + envMapIntensity/envMapCombine + aoMapIntensity/lightMapIntensity
             // TYPED views + attribute-pointer cache for the snapshot lean diff
             // (the void* fields above are compare-only). attrVersion gates the
             // cached attribute pointers: while BufferGeometry::
@@ -1172,6 +1266,7 @@ namespace threepp {
             const BufferAttribute* posAttr  = nullptr;
             const BufferAttribute* normAttr = nullptr;
             const BufferAttribute* uvAttr   = nullptr;
+            const BufferAttribute* uv2Attr  = nullptr;
             const BufferAttribute* idxAttr  = nullptr;
         };
         std::vector<MeshFingerprint> prevSceneFingerprint;
@@ -1330,13 +1425,16 @@ namespace threepp {
             Image2D       atrousB;      // rgba16f — SVGF multi-pass à-trous ping-pong (the other half)
             Image2D       reflect;      // rgba16f — sharp 1-mirror-ray reflection radiance (.rgb), demodulated; roughness-blurred by the reflection denoise. STORAGE
             Image2D       reflAux;      // rgba16f — reflection-denoiser auxiliary (ping-pong, mirrors `reflect`: STORAGE write + SAMPLED prev-frame read)
-            Image2D       depth;        // d32_sfloat — JITTERED projection (matches color attachments above; consumed by chit + TAA)
+            Image2D       depth;        // d32_sfloat_s8 — JITTERED projection (depth-only view is sampled by chit + TAA)
+            VkImageView   depthStencilView = VK_NULL_HANDLE;// framebuffer view with both depth and stencil aspects
             // Hybrid raster overlay's UNJITTERED depth attachment. Filled by
             // an extra depth-only prepass (overlay_depth.vert) right after
             // the main G-buffer pass. The wireframe overlay reads it as a
             // depth attachment so its depth test compares unjittered z
             // against unjittered z and doesn't shimmer between frames.
             Image2D       unjitDepth;   // d32_sfloat — UNJITTERED projection
+            Image2D       customShaderDepth; // d32_sfloat — ShaderMaterial pass local depth
+            Image2D       customShaderMsaaDepth; // d32_sfloat — MSAA ShaderMaterial pass local depth
             Image2D       overlayMsaaColor;     // swapchain format, multisampled overlay target
             Image2D       overlayResolvedColor; // swapchain format, single-sample transparent overlay
             VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -1352,10 +1450,18 @@ namespace threepp {
         // Indirect-drawing variant: uses gbuffer_indirect.vert with bindless
         // vertex pulling, declares zero vertex input bindings, consumes the
         // per-frame DrawInfo SSBO at binding 4. Selected by default for the
-        // gbuf pass since it collapses N draws into 1-4 vkCmdDrawIndirect
+        // gbuf pass since it collapses N draws into a few vkCmdDrawIndirect
         // calls — see recordRasterGbufPass.
         VkPipeline            rasterGbufIndirectPipeline = VK_NULL_HANDLE;
-        // Decal variant of the indirect pipeline (bucket [3], drawn last):
+        // Same indirect G-buffer shaders with depth test/write disabled for
+        // materials that set depthTest=false. This preserves unlit/basic
+        // visibility without growing MaterialDesc or shader layouts.
+        VkPipeline            rasterGbufNoDepthPipeline = VK_NULL_HANDLE;
+        // Same indirect shaders with depth test enabled but depth write disabled
+        // for materials that set depthWrite=false.
+        VkPipeline            rasterGbufNoDepthWritePipeline = VK_NULL_HANDLE;
+        std::unordered_map<uint64_t, VkPipeline> rasterGbufStencilPipelines_;
+        // Decal variant of the indirect pipeline (bucket [9], drawn last):
         // depth-write OFF, attachments 0-3 write-masked to zero, attachment 4
         // (albedo+metalness) alpha-blended with an RGB-only write mask — the
         // decal lerps its albedo over the receiver's, everything else (normal,
@@ -1400,6 +1506,8 @@ namespace threepp {
         // Mesh entries and walked in the overlay record loop.
         VkPipeline       overlayLineListPipeline    = VK_NULL_HANDLE;
         VkPipeline       overlayLineStripPipeline   = VK_NULL_HANDLE;
+        VkPipeline       overlayLineDashedListPipeline  = VK_NULL_HANDLE;
+        VkPipeline       overlayLineDashedStripPipeline = VK_NULL_HANDLE;
         // Per-vertex color counterparts. Use overlay_color.vert/.frag
         // (location 1 = inColor) and require a 2-binding vertex input.
         // Picked when the Line's geometry has a "color" attribute AND the
@@ -1414,6 +1522,11 @@ namespace threepp {
         // Writes gl_PointSize from PointsMaterial::size, encoded in the
         // push constant's color.w slot for this pipeline only.
         VkPipeline       overlayPointListPipeline        = VK_NULL_HANDLE;
+        VkDescriptorSetLayout overlayPointDescSetLayout_ = VK_NULL_HANDLE;
+        VkPipelineLayout      overlayPointPipelineLayout_ = VK_NULL_HANDLE;
+        VkPipeline            overlayPointListTexturedPipeline = VK_NULL_HANDLE;
+        std::array<VkDescriptorPool, kFramesInFlight> overlayPointDescPools_{};
+        static constexpr uint32_t kMaxPointTexturesPerFrame = 64;
         VkDescriptorSetLayout overlayCompositeDescSetLayout_ = VK_NULL_HANDLE;
         VkPipelineLayout      overlayCompositePipelineLayout_ = VK_NULL_HANDLE;
         VkPipeline            overlayCompositePipeline_       = VK_NULL_HANDLE;
@@ -1516,6 +1629,7 @@ namespace threepp {
             Points*  points;
             std::array<float, 16> worldMatrix;
             bool     isSegments; // true → LINE_LIST, false → LINE_STRIP (ignored when isPoints)
+            bool     isLoop;
             bool     isPoints;   // true → POINT_LIST topology, overrides the line topology
         };
         std::vector<LineEntry> lastVisibleLines_;
@@ -1531,6 +1645,9 @@ namespace threepp {
         // it pushes modelView = currViewUnjit_ · meshWorld and currProjUnjit_.
         std::array<float, 16> currViewUnjit_{};
         std::array<float, 16> currProjUnjit_{};
+        bool currCameraPerspective_ = false;
+
+        static constexpr uint32_t kMaxRasterClipPlanes = 4;
 
         // Per-frame raster camera data. currVPjittered drives gl_Position;
         // currVPunjittered + prevVP drive the motion-vector computation
@@ -1546,8 +1663,16 @@ namespace threepp {
                                       // reproject lands on the prev rasterized pixel rather
                                       // than its unjittered ideal — fixes per-frame wander
                                       // that manifests as shake on moving objects.
+            float    clipPlanes[kMaxRasterClipPlanes][4]; // world-space global clipping planes; .w = -Plane::constant
+            uint32_t clipPlaneCount = 0;
+            uint32_t clipIntersection = 0;
+            uint32_t clipPad[2]{};
         };
+        static_assert(sizeof(RasterCameraData) == 304,
+                      "RasterCameraData layout drifted from gbuffer.frag CameraUbo");
         std::array<Buffer, kFramesInFlight> rasterCameraUbos{};
+        std::vector<Plane> clippingPlanes_;
+        bool localClippingEnabled_ = false;
         bool  rasterPrevVPValid_ = false;
         float rasterPrevVP_[16]{};
         // prevVPunjit · currVPunjit⁻¹ for the TAA's sky-motion reconstruction
@@ -1582,6 +1707,24 @@ namespace threepp {
         // Lets the gbuffer pipeline keep a fixed 3-binding layout regardless
         // of per-mesh UV availability.
         Buffer dummyUvBuffer_{};
+
+        struct CustomShaderPipelineRecord {
+            vulkan::VulkanShaderMaterialKey key;
+            VkFormat colorFormat = VK_FORMAT_UNDEFINED;
+            uint32_t colorAttachmentCount = 1;
+            VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT;
+            vulkan::VulkanShaderMaterialLayout layout;
+            VkDescriptorSetLayout descriptorSetLayout = VK_NULL_HANDLE;
+            VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+            VkPipeline pipeline = VK_NULL_HANDLE;
+        };
+        std::unique_ptr<SlangShaderCompiler> customShaderSlangCompiler_;
+        std::unique_ptr<vulkan::VulkanShaderMaterialCompiler> customShaderCompiler_;
+        std::vector<CustomShaderPipelineRecord> customShaderPipelines_;
+        std::array<VkDescriptorPool, kFramesInFlight> customShaderDescriptorPools_{};
+        std::array<std::vector<Buffer>, kFramesInFlight> customShaderFrameBuffers_{};
+        std::array<std::vector<Image2D>, kFramesInFlight> customShaderFrameImages_{};
+        std::array<std::vector<VkImageView>, kFramesInFlight> customShaderFrameImageViews_{};
 
         // ── Raster TAA resolve ─────────────────────────────────────────────
         // Encapsulated in vulkan/TaaResolve.{hpp,cpp}. Owns its pipeline,
@@ -1742,6 +1885,7 @@ namespace threepp {
         // and consumed by gpuTimings_->readBack() on the next frame's fence
         // wait so the public getter sees the same frame's CPU + GPU numbers.
         float    pendingCpuEnsureSceneMs_ = 0.f;
+        bool     checkShaderErrors_ = false;
         // ReSTIR DI master toggle. When false, chit's primary RIS branch is
         // bypassed and the legacy per-light NEE classic loops run instead
         // (same pattern as bounces). Forwarded to chit via
@@ -1897,6 +2041,64 @@ namespace threepp {
         vulkan::Buffer   sceneCaptureBuf_{};
         uint32_t         sceneCaptureBufW_ = 0;
         uint32_t         sceneCaptureBufH_ = 0;
+        std::vector<std::future<void>> asyncReadbackWorkers_;
+        static constexpr std::size_t kAsyncReadbackStagingRingSize = 4;
+        std::mutex asyncReadbackStagingMutex_;
+        std::vector<vulkan::Buffer> asyncReadbackStagingRing_;
+        std::atomic<std::uint64_t> asyncReadbackStagingReuses_{0};
+
+        vulkan::Buffer acquireAsyncReadbackStaging(VkDeviceSize bytes) {
+            {
+                std::lock_guard lock(asyncReadbackStagingMutex_);
+                auto it = std::find_if(asyncReadbackStagingRing_.begin(), asyncReadbackStagingRing_.end(),
+                                       [bytes](const vulkan::Buffer& b) {
+                                           return b.handle != VK_NULL_HANDLE && b.size >= bytes;
+                                       });
+                if (it != asyncReadbackStagingRing_.end()) {
+                    auto staging = *it;
+                    asyncReadbackStagingRing_.erase(it);
+                    asyncReadbackStagingReuses_.fetch_add(1, std::memory_order_relaxed);
+                    return staging;
+                }
+            }
+            return vulkan::createBuffer(
+                    ctx->allocator(), ctx->device(), bytes,
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                            VMA_ALLOCATION_CREATE_MAPPED_BIT);
+        }
+
+        void releaseAsyncReadbackStaging(vulkan::Buffer& staging) {
+            if (staging.handle == VK_NULL_HANDLE) return;
+            std::lock_guard lock(asyncReadbackStagingMutex_);
+            if (asyncReadbackStagingRing_.size() < kAsyncReadbackStagingRingSize) {
+                asyncReadbackStagingRing_.push_back(staging);
+                staging = {};
+                return;
+            }
+            vulkan::destroyBuffer(ctx->allocator(), staging);
+        }
+
+        void destroyAsyncReadbackStagingRing() {
+            std::lock_guard lock(asyncReadbackStagingMutex_);
+            for (auto& staging : asyncReadbackStagingRing_) {
+                vulkan::destroyBuffer(ctx->allocator(), staging);
+            }
+            asyncReadbackStagingRing_.clear();
+        }
+
+        void reapAsyncReadbackWorkers() {
+            for (auto it = asyncReadbackWorkers_.begin(); it != asyncReadbackWorkers_.end();) {
+                if (it->valid() &&
+                    it->wait_for(std::chrono::milliseconds(0)) == std::future_status::ready) {
+                    it->get();
+                    it = asyncReadbackWorkers_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
 
         // Deferred-apply queue for setters that issue vkDeviceWaitIdle +
         // realloc descriptor/image resources. These collide with an open
@@ -1916,6 +2118,7 @@ namespace threepp {
                     static_cast<GLFWwindow*>(canvas.windowPtr()),
                     /*enableRayTracing*/ true,
                     /*vsync*/ canvas.vsync());
+            renderTargets_ = std::make_unique<vulkan::VulkanRenderTargets>(*ctx);
             defaultFramebufferSamples_ = chooseDefaultFramebufferSamples(canvas.samples());
             viewport.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
             scissor.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
@@ -2010,6 +2213,10 @@ namespace threepp {
         ~Impl() {
             if (!ctx) return;
             VkDevice d = ctx->device();
+            for (auto& worker : asyncReadbackWorkers_) {
+                if (worker.valid()) worker.wait();
+            }
+            asyncReadbackWorkers_.clear();
             // If a frame was mid-record when the renderer was destroyed (the
             // canvas frame-end callback never got to fire, or the user tore
             // down the renderer from inside the animate lambda), close the
@@ -2021,6 +2228,7 @@ namespace threepp {
                 frameState_ = FrameState::Idle;
             }
             vkDeviceWaitIdle(d);
+            destroyAsyncReadbackStagingRing();
 
             for (auto s : imageAvailable) if (s) vkDestroySemaphore(d, s, nullptr);
             destroyRenderFinishedSemaphores();
@@ -2049,6 +2257,7 @@ namespace threepp {
             for (auto& b : tlasInstancesBuffers) destroyBuffer(ctx->allocator(), b);
             destroyBuffer(ctx->allocator(), tlasRefitScratch_);
             destroyBuffer(ctx->allocator(), geometryDescsBuffer);
+            destroyBuffer(ctx->allocator(), materialGroupDescsBuffer);
             for (auto& b : materialDescsBuffers) destroyBuffer(ctx->allocator(), b);
             destroyBuffer(ctx->allocator(), sceneCaptureBuf_);
             destroyBuffer(ctx->allocator(), eventLumaBuf_);
@@ -2057,6 +2266,38 @@ namespace threepp {
             if (eventShadeDescPool_)       vkDestroyDescriptorPool(d, eventShadeDescPool_, nullptr);
             if (eventShadeDsLayout_)       vkDestroyDescriptorSetLayout(d, eventShadeDsLayout_, nullptr);
 
+            for (auto& frameBuffers : customShaderFrameBuffers_) {
+                for (auto& buffer : frameBuffers) {
+                    destroyBuffer(ctx->allocator(), buffer);
+                }
+                frameBuffers.clear();
+            }
+            for (auto& frameImages : customShaderFrameImages_) {
+                for (auto& image : frameImages) {
+                    destroyImage2D(ctx->allocator(), ctx->device(), image);
+                }
+                frameImages.clear();
+            }
+            for (auto& frameViews : customShaderFrameImageViews_) {
+                for (auto view : frameViews) {
+                    if (view != VK_NULL_HANDLE) vkDestroyImageView(d, view, nullptr);
+                }
+                frameViews.clear();
+            }
+            for (auto pool : customShaderDescriptorPools_) {
+                if (pool != VK_NULL_HANDLE) vkDestroyDescriptorPool(d, pool, nullptr);
+            }
+            for (auto& record : customShaderPipelines_) {
+                if (record.pipeline != VK_NULL_HANDLE) vkDestroyPipeline(d, record.pipeline, nullptr);
+                if (record.pipelineLayout != VK_NULL_HANDLE) vkDestroyPipelineLayout(d, record.pipelineLayout, nullptr);
+                if (record.descriptorSetLayout != VK_NULL_HANDLE) {
+                    vkDestroyDescriptorSetLayout(d, record.descriptorSetLayout, nullptr);
+                }
+            }
+            customShaderPipelines_.clear();
+            customShaderCompiler_.reset();
+            customShaderSlangCompiler_.reset();
+
             for (auto& [_, rec] : blasCache) {
                 if (rec->as) ctx->rt().destroyAccelerationStructure(d, rec->as, nullptr);
                 destroyBuffer(ctx->allocator(), rec->storage);
@@ -2064,6 +2305,7 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
+                destroyBuffer(ctx->allocator(), rec->uv2);
                 destroyBuffer(ctx->allocator(), rec->color);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
@@ -2087,6 +2329,7 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
+                destroyBuffer(ctx->allocator(), rec->uv2);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
@@ -2110,6 +2353,7 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
+                destroyBuffer(ctx->allocator(), rec->uv2);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
@@ -2124,6 +2368,7 @@ namespace threepp {
                     destroyBuffer(ctx->allocator(), rec->index);
                     destroyBuffer(ctx->allocator(), rec->normal);
                     destroyBuffer(ctx->allocator(), rec->uv);
+                    destroyBuffer(ctx->allocator(), rec->uv2);
                     destroyBuffer(ctx->allocator(), rec->prevVertex);
                     destroyBuffer(ctx->allocator(), rec->blasScratch);
                 }
@@ -2150,6 +2395,7 @@ namespace threepp {
                     destroyBuffer(ctx->allocator(), rec->index);
                     destroyBuffer(ctx->allocator(), rec->normal);
                     destroyBuffer(ctx->allocator(), rec->uv);
+                    destroyBuffer(ctx->allocator(), rec->uv2);
                     destroyBuffer(ctx->allocator(), rec->prevVertex);
                     destroyBuffer(ctx->allocator(), rec->blasScratch);
                 }
@@ -2167,10 +2413,16 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), rec->index);
                 destroyBuffer(ctx->allocator(), rec->normal);
                 destroyBuffer(ctx->allocator(), rec->uv);
+                destroyBuffer(ctx->allocator(), rec->uv2);
                 destroyBuffer(ctx->allocator(), rec->prevVertex);
                 destroyBuffer(ctx->allocator(), rec->blasScratch);
             }
             morphedMeshStates.clear();
+
+            for (auto& [_, st] : materialDisplacedMeshStates) {
+                if (st->blas) destroyBlasRecord(*st->blas);
+            }
+            materialDisplacedMeshStates.clear();
 
             for (auto& b : cameraUbos) destroyBuffer(ctx->allocator(), b);
             for (auto& b : prevCameraUbos) destroyBuffer(ctx->allocator(), b);
@@ -2193,8 +2445,14 @@ namespace threepp {
             for (auto& img : giResXsImagesPP) destroyImage2D(ctx->allocator(), d, img);
             for (auto& img : giResNsImagesPP) destroyImage2D(ctx->allocator(), d, img);
             for (auto& img : giResLoImagesPP) destroyImage2D(ctx->allocator(), d, img);
-            for (auto& img : materialTextures) destroyImage2D(ctx->allocator(), d, img);
+            for (size_t i = 0; i < materialTextures.size(); ++i) {
+                if (i >= materialTextureOwned_.size() || materialTextureOwned_[i]) {
+                    destroyImage2D(ctx->allocator(), d, materialTextures[i]);
+                }
+            }
             materialTextures.clear();
+            materialTextureOwned_.clear();
+            renderTargets_.reset();
             if (textureSampler_) vkDestroySampler(d, textureSampler_, nullptr);
 
             // EnvPrefilter owns its pipeline / layout / pool / sampler.
@@ -2224,6 +2482,12 @@ namespace threepp {
             for (auto& b : indirectCmdBuffers)  destroyBuffer(ctx->allocator(), b);
             if (rasterGbufPipeline)         vkDestroyPipeline(d, rasterGbufPipeline, nullptr);
             if (rasterGbufIndirectPipeline) vkDestroyPipeline(d, rasterGbufIndirectPipeline, nullptr);
+            if (rasterGbufNoDepthPipeline)  vkDestroyPipeline(d, rasterGbufNoDepthPipeline, nullptr);
+            if (rasterGbufNoDepthWritePipeline) vkDestroyPipeline(d, rasterGbufNoDepthWritePipeline, nullptr);
+            for (auto& [_, pipeline] : rasterGbufStencilPipelines_) {
+                if (pipeline) vkDestroyPipeline(d, pipeline, nullptr);
+            }
+            rasterGbufStencilPipelines_.clear();
             if (rasterGbufDecalPipeline)    vkDestroyPipeline(d, rasterGbufDecalPipeline, nullptr);
             if (rasterPipelineLayout)   vkDestroyPipelineLayout(d, rasterPipelineLayout, nullptr);
             if (rasterDsLayout)         vkDestroyDescriptorSetLayout(d, rasterDsLayout, nullptr);
@@ -2234,9 +2498,17 @@ namespace threepp {
             if (overlayBasicTransparentPipeline)  vkDestroyPipeline(d, overlayBasicTransparentPipeline, nullptr);
             if (overlayLineListPipeline)          vkDestroyPipeline(d, overlayLineListPipeline, nullptr);
             if (overlayLineStripPipeline)         vkDestroyPipeline(d, overlayLineStripPipeline, nullptr);
+            if (overlayLineDashedListPipeline)    vkDestroyPipeline(d, overlayLineDashedListPipeline, nullptr);
+            if (overlayLineDashedStripPipeline)   vkDestroyPipeline(d, overlayLineDashedStripPipeline, nullptr);
             if (overlayLineListColoredPipeline)   vkDestroyPipeline(d, overlayLineListColoredPipeline, nullptr);
             if (overlayLineStripColoredPipeline)  vkDestroyPipeline(d, overlayLineStripColoredPipeline, nullptr);
             if (overlayPointListPipeline)         vkDestroyPipeline(d, overlayPointListPipeline, nullptr);
+            if (overlayPointListTexturedPipeline) vkDestroyPipeline(d, overlayPointListTexturedPipeline, nullptr);
+            if (overlayPointPipelineLayout_)      vkDestroyPipelineLayout(d, overlayPointPipelineLayout_, nullptr);
+            if (overlayPointDescSetLayout_)       vkDestroyDescriptorSetLayout(d, overlayPointDescSetLayout_, nullptr);
+            for (auto& pool : overlayPointDescPools_) {
+                if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
+            }
             if (overlayCompositePipeline_)        vkDestroyPipeline(d, overlayCompositePipeline_, nullptr);
             if (overlayCompositePipelineLayout_)  vkDestroyPipelineLayout(d, overlayCompositePipelineLayout_, nullptr);
             if (overlayCompositeDescPool_)        vkDestroyDescriptorPool(d, overlayCompositeDescPool_, nullptr);
@@ -2273,7 +2545,9 @@ namespace threepp {
             for (auto& [g, rec] : lineGeomCache_) {
                 destroyBuffer(ctx->allocator(), rec.vertex);
                 if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.index);
+                destroyLineLoopRanges(rec.loopRanges);
                 if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.color);
+                if (rec.lineDistance.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.lineDistance);
             }
             lineGeomCache_.clear();
             overlayPass_.reset();// destroy sprite/line pipelines + caches while device is alive
@@ -2410,16 +2684,49 @@ namespace threepp {
             return VkRect2D{{sx, syTop}, {static_cast<uint32_t>(sw), static_cast<uint32_t>(sh)}};
         }
 
+        [[nodiscard]] VkRect2D activeViewportRect(VkExtent2D ext) const {
+            if (ext.width == 0 || ext.height == 0) {
+                return VkRect2D{{0, 0}, ext};
+            }
+
+            const int fbW = static_cast<int>(ext.width);
+            const int fbH = static_cast<int>(ext.height);
+            const int vx = std::clamp(static_cast<int>(std::floor(viewport.x)), 0, fbW);
+            const int vyBottom = std::clamp(static_cast<int>(std::floor(viewport.y)), 0, fbH);
+            const int maxW = std::max(0, fbW - vx);
+            const int maxH = std::max(0, fbH - vyBottom);
+            const int vw = std::clamp(static_cast<int>(std::ceil(viewport.z)), 0, maxW);
+            const int vh = std::clamp(static_cast<int>(std::ceil(viewport.w)), 0, maxH);
+            const int vyTop = fbH - vyBottom - vh;
+            return VkRect2D{{vx, vyTop}, {static_cast<uint32_t>(vw), static_cast<uint32_t>(vh)}};
+        }
+
         static bool coversFullExtent(const VkRect2D& rect, VkExtent2D ext) {
             return rect.offset.x == 0 && rect.offset.y == 0 &&
                    rect.extent.width == ext.width && rect.extent.height == ext.height;
+        }
+
+        static bool hasStencilAspect(VkFormat format) {
+            return format == VK_FORMAT_D16_UNORM_S8_UINT ||
+                   format == VK_FORMAT_D24_UNORM_S8_UINT ||
+                   format == VK_FORMAT_D32_SFLOAT_S8_UINT;
+        }
+
+        static VkImageAspectFlags depthBarrierAspect(VkFormat format) {
+            return hasStencilAspect(format)
+                    ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
+                    : VK_IMAGE_ASPECT_DEPTH_BIT;
         }
 
         void transitionImage(VkCommandBuffer cb, VkImage image,
                              VkImageLayout oldLayout, VkImageLayout newLayout,
                              VkPipelineStageFlags2 srcStage, VkAccessFlags2 srcAccess,
                              VkPipelineStageFlags2 dstStage, VkAccessFlags2 dstAccess,
-                             VkImageAspectFlags aspectMask) const {
+                             VkImageAspectFlags aspectMask,
+                             uint32_t baseMipLevel = 0,
+                             uint32_t levelCount = 1,
+                             uint32_t baseArrayLayer = 0,
+                             uint32_t layerCount = 1) const {
             VkImageMemoryBarrier2 barrier{};
             barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
             barrier.srcStageMask = srcStage;
@@ -2432,8 +2739,10 @@ namespace threepp {
             barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             barrier.image = image;
             barrier.subresourceRange.aspectMask = aspectMask;
-            barrier.subresourceRange.levelCount = 1;
-            barrier.subresourceRange.layerCount = 1;
+            barrier.subresourceRange.baseMipLevel = baseMipLevel;
+            barrier.subresourceRange.levelCount = levelCount;
+            barrier.subresourceRange.baseArrayLayer = baseArrayLayer;
+            barrier.subresourceRange.layerCount = layerCount;
 
             VkDependencyInfo dep{};
             dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
@@ -2605,19 +2914,38 @@ namespace threepp {
             if (auto* a = g.getAttribute<float>("normal"))   v += a->version;
             if (auto* idx = g.getIndex())                     v += idx->version;
             if (auto* a = g.getAttribute<float>("uv"))        v += a->version;
+            if (auto* a = g.getAttribute<float>("uv2"))       v += a->version;
             if (auto* a = g.getAttribute<float>("color"))     v += a->version;
             return v;
+        }
+
+        void destroyBlasRecord(BlasRecord& rec) {
+            if (rec.as) ctx->rt().destroyAccelerationStructure(ctx->device(), rec.as, nullptr);
+            destroyBuffer(ctx->allocator(), rec.storage);
+            destroyBuffer(ctx->allocator(), rec.vertex);
+            destroyBuffer(ctx->allocator(), rec.index);
+            destroyBuffer(ctx->allocator(), rec.normal);
+            destroyBuffer(ctx->allocator(), rec.uv);
+            destroyBuffer(ctx->allocator(), rec.uv2);
+            destroyBuffer(ctx->allocator(), rec.color);
+            destroyBuffer(ctx->allocator(), rec.prevVertex);
+            destroyBuffer(ctx->allocator(), rec.blasScratch);
+            rec = {};
         }
 
         // Build a single BLAS for the given geometry. Vertex / index buffers
         // are uploaded host-mapped, then the AS is built into freshly allocated
         // device storage. The temporary scratch buffer is destroyed on exit.
-        std::unique_ptr<BlasRecord> buildBlasFor(const BufferGeometry& geom) {
+        std::unique_ptr<BlasRecord> buildBlasFor(
+                const BufferGeometry& geom,
+                const std::vector<float>* positionOverride = nullptr) {
             auto* posAttr = geom.getAttribute<float>("position");
             if (!posAttr) return nullptr;
             auto* normAttr = geom.getAttribute<float>("normal");
             if (!normAttr) return nullptr;// the RT path requires per-vertex normals
             const auto& positions = posAttr->array();
+            const auto& uploadPositions = positionOverride ? *positionOverride : positions;
+            if (uploadPositions.size() != positions.size()) return nullptr;
             const auto& normals = normAttr->array();
             const uint32_t vertexCount = static_cast<uint32_t>(posAttr->count());
             if (vertexCount < 3) return nullptr;
@@ -2636,11 +2964,11 @@ namespace threepp {
             // before submission so a bad asset (typical of Assimp-loaded
             // URDF .dae meshes with degenerate triangles) is skipped with
             // a warning rather than killing the whole renderer.
-            for (size_t i = 0; i < positions.size(); ++i) {
-                if (!std::isfinite(positions[i])) {
+            for (size_t i = 0; i < uploadPositions.size(); ++i) {
+                if (!std::isfinite(uploadPositions[i])) {
                     std::cerr << "[VulkanRenderer] buildBlasFor: skipping geometry — "
                               << "position[" << i << "] is non-finite ("
-                              << positions[i] << "), vertexCount=" << vertexCount << '\n';
+                              << uploadPositions[i] << "), vertexCount=" << vertexCount << '\n';
                     return nullptr;
                 }
             }
@@ -2671,14 +2999,14 @@ namespace threepp {
 
             auto rec = std::make_unique<BlasRecord>();
 
-            const VkDeviceSize vbBytes = positions.size() * sizeof(float);
+            const VkDeviceSize vbBytes = uploadPositions.size() * sizeof(float);
             rec->vertex = createBuffer(
                     ctx->allocator(), ctx->device(), vbBytes,
                     geomUsage, VMA_MEMORY_USAGE_AUTO,
                     VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
             void* mapped = nullptr;
             vmaMapMemory(ctx->allocator(), rec->vertex.alloc, &mapped);
-            std::memcpy(mapped, positions.data(), vbBytes);
+            std::memcpy(mapped, uploadPositions.data(), vbBytes);
             vmaUnmapMemory(ctx->allocator(), rec->vertex.alloc);
 
             const VkDeviceSize nbBytes = normals.size() * sizeof(float);
@@ -2710,6 +3038,24 @@ namespace threepp {
                     vmaMapMemory(ctx->allocator(), rec->uv.alloc, &mapped);
                     std::memcpy(mapped, uvs.data(), uvBytes);
                     vmaUnmapMemory(ctx->allocator(), rec->uv.alloc);
+                }
+            }
+
+            if (auto* uv2Attr = geom.getAttribute<float>("uv2")) {
+                const auto& uvs = uv2Attr->array();
+                if (uv2Attr->count() == static_cast<int>(vertexCount) &&
+                    uvs.size() == vertexCount * 2) {
+                    const VkDeviceSize uvBytes = uvs.size() * sizeof(float);
+                    rec->uv2 = createBuffer(
+                            ctx->allocator(), ctx->device(), uvBytes,
+                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT |
+                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            VMA_MEMORY_USAGE_AUTO,
+                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                    vmaMapMemory(ctx->allocator(), rec->uv2.alloc, &mapped);
+                    std::memcpy(mapped, uvs.data(), uvBytes);
+                    vmaUnmapMemory(ctx->allocator(), rec->uv2.alloc);
                 }
             }
 
@@ -2866,6 +3212,26 @@ namespace threepp {
             rec->vbBytes     = vbBytes;// for the prevVertex re-sync copy
 
             return rec;
+        }
+
+        BlasRecord* ensureCachedStaticBlas(Mesh& mesh) {
+            const BufferGeometry* geomKey = mesh.geometry().get();
+            auto it = blasCache.find(geomKey);
+            if (it != blasCache.end()) {
+                const unsigned int curVer = geomVersionOf(*mesh.geometry());
+                if (it->second->geomVersion != curVer) {
+                    destroyBlasRecord(*it->second);
+                    blasCache.erase(it);
+                    it = blasCache.end();
+                }
+            }
+            if (it == blasCache.end()) {
+                auto rec = buildBlasFor(*mesh.geometry());
+                if (!rec) return nullptr;
+                rec->liveCheck = mesh.geometry();
+                it = blasCache.emplace(geomKey, std::move(rec)).first;
+            }
+            return it->second.get();
         }
 
         // CPU linear-blend skin → outPos/outNorm in the SkinnedMesh's local
@@ -3531,6 +3897,14 @@ namespace threepp {
                     vmaUnmapMemory(ctx->allocator(), rec.uv.alloc);
                 }
 
+                if (auto* uv2Attr = geom.getAttribute<float>("uv2");
+                    uv2Attr && rec.uv2.handle != VK_NULL_HANDLE) {
+                    vmaMapMemory(ctx->allocator(), rec.uv2.alloc, &mapped);
+                    std::memcpy(mapped, uv2Attr->array().data(),
+                                uv2Attr->array().size() * sizeof(float));
+                    vmaUnmapMemory(ctx->allocator(), rec.uv2.alloc);
+                }
+
                 if (auto* idxAttr = geom.getIndex();
                     idxAttr && rec.index.handle != VK_NULL_HANDLE) {
                     vmaMapMemory(ctx->allocator(), rec.index.alloc, &mapped);
@@ -3820,6 +4194,418 @@ namespace threepp {
 
             auto* morphObj = mesh.as<ObjectWithMorphTargetInfluences>();
             if (morphObj) st.prevInfluences = morphObj->morphTargetInfluences();
+        }
+
+        static const MaterialWithDisplacementMap* displacementOfMaterial(const std::shared_ptr<Material>& material) {
+            auto* disp = material ? dynamic_cast<MaterialWithDisplacementMap*>(material.get()) : nullptr;
+            return disp && disp->displacementMap ? disp : nullptr;
+        }
+
+        static const MaterialWithDisplacementMap* materialDisplacementOf(const Mesh& mesh) {
+            const auto& materials = mesh.materials();
+            if (materials.empty()) return nullptr;
+
+            const MaterialWithDisplacementMap* first = nullptr;
+            for (const auto& material : materials) {
+                auto* disp = displacementOfMaterial(material);
+                if (!disp) return nullptr;
+                if (!first) {
+                    first = disp;
+                    continue;
+                }
+                if (disp->displacementMap.get() != first->displacementMap.get() ||
+                    disp->displacementScale != first->displacementScale ||
+                    disp->displacementBias != first->displacementBias) {
+                    return nullptr;
+                }
+            }
+            return first;
+        }
+
+        static bool hasMaterialDisplacement(const Mesh& mesh) {
+            const auto& materials = mesh.materials();
+            if (materials.empty()) return false;
+            const auto geometry = mesh.geometry();
+            if (geometry && !geometry->groups.empty()) {
+                for (const auto& group : geometry->groups) {
+                    if (group.materialIndex < materials.size() &&
+                        displacementOfMaterial(materials[group.materialIndex])) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            return displacementOfMaterial(materials.front()) != nullptr;
+        }
+
+        static float wrapDisplacementUv(float x, TextureWrapping wrap) {
+            switch (wrap) {
+                case TextureWrapping::Repeat:
+                    return x - std::floor(x);
+                case TextureWrapping::MirroredRepeat: {
+                    float t = std::fmod(x, 2.0f);
+                    if (t < 0.0f) t += 2.0f;
+                    return t <= 1.0f ? t : 2.0f - t;
+                }
+                case TextureWrapping::ClampToEdge:
+                default:
+                    return std::clamp(x, 0.0f, 1.0f);
+            }
+        }
+
+        static bool isNearestDisplacementFilter(Filter filter) {
+            return filter == Filter::Nearest ||
+                   filter == Filter::NearestMipmapNearest ||
+                   filter == Filter::NearestMipmapLinear;
+        }
+
+        static float readDisplacementTexel(const Texture& texture, const Image& image, int x, int y) {
+            const int width = static_cast<int>(image.width());
+            const int height = static_cast<int>(image.height());
+            const int channels = image.channels();
+            if (width <= 0 || height <= 0 || channels <= 0) return 0.0f;
+
+            x = std::clamp(x, 0, width - 1);
+            y = std::clamp(y, 0, height - 1);
+            const size_t index = (static_cast<size_t>(y) * width + x) * channels;
+            if (image.isFloat()) {
+                const auto& data = image.data<float>();
+                return index < data.size() ? data[index] : 0.0f;
+            }
+            if (texture.type == Type::UnsignedByte || texture.type == Type::Byte) {
+                const auto& data = image.data<unsigned char>();
+                return index < data.size() ? static_cast<float>(data[index]) / 255.0f : 0.0f;
+            }
+            return 0.0f;
+        }
+
+        static float sampleDisplacementTexture(Texture& texture, float u, float v) {
+            if (texture.images().empty()) return 0.0f;
+            if (texture.matrixAutoUpdate) texture.updateMatrix();
+
+            const auto& e = texture.matrix.elements;
+            const float tu = e[0] * u + e[3] * v + e[6];
+            const float tv = e[1] * u + e[4] * v + e[7];
+            u = wrapDisplacementUv(tu, texture.wrapS);
+            v = wrapDisplacementUv(tv, texture.wrapT);
+
+            const auto& image = texture.image();
+            const int width = static_cast<int>(image.width());
+            const int height = static_cast<int>(image.height());
+            if (width <= 0 || height <= 0) return 0.0f;
+
+            if (isNearestDisplacementFilter(texture.magFilter)) {
+                const int x = std::min(width - 1, std::max(0, static_cast<int>(std::floor(u * width))));
+                const int y = std::min(height - 1, std::max(0, static_cast<int>(std::floor(v * height))));
+                return readDisplacementTexel(texture, image, x, y);
+            }
+
+            const float x = u * static_cast<float>(width - 1);
+            const float y = v * static_cast<float>(height - 1);
+            const int x0 = static_cast<int>(std::floor(x));
+            const int y0 = static_cast<int>(std::floor(y));
+            const int x1 = std::min(x0 + 1, width - 1);
+            const int y1 = std::min(y0 + 1, height - 1);
+            const float fx = x - static_cast<float>(x0);
+            const float fy = y - static_cast<float>(y0);
+
+            const float a = readDisplacementTexel(texture, image, x0, y0);
+            const float b = readDisplacementTexel(texture, image, x1, y0);
+            const float c = readDisplacementTexel(texture, image, x0, y1);
+            const float d = readDisplacementTexel(texture, image, x1, y1);
+            const float ab = a + (b - a) * fx;
+            const float cd = c + (d - c) * fx;
+            return ab + (cd - ab) * fy;
+        }
+
+        static std::array<float, 9> displacementUvTransform(Texture& texture) {
+            if (texture.matrixAutoUpdate) texture.updateMatrix();
+            return texture.matrix.elements;
+        }
+
+        static std::vector<MaterialDisplacementStateKey> materialDisplacementKeysOf(const Mesh& mesh) {
+            std::vector<MaterialDisplacementStateKey> keys;
+            const auto& materials = mesh.materials();
+            keys.reserve(materials.size());
+            for (const auto& material : materials) {
+                MaterialDisplacementStateKey key{};
+                if (auto* disp = displacementOfMaterial(material)) {
+                    Texture& texture = *disp->displacementMap;
+                    key.displacementMap = disp->displacementMap;
+                    key.textureVersion = texture.version();
+                    key.uvTransform = displacementUvTransform(texture);
+                    key.wrapS = texture.wrapS;
+                    key.wrapT = texture.wrapT;
+                    key.minFilter = texture.minFilter;
+                    key.magFilter = texture.magFilter;
+                    key.displacementScale = disp->displacementScale;
+                    key.displacementBias = disp->displacementBias;
+                }
+                keys.push_back(std::move(key));
+            }
+            return keys;
+        }
+
+        static bool displacementKeysEqual(
+                const std::vector<MaterialDisplacementStateKey>& a,
+                const std::vector<MaterialDisplacementStateKey>& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i].displacementMap.get() != b[i].displacementMap.get() ||
+                    a[i].textureVersion != b[i].textureVersion ||
+                    a[i].uvTransform != b[i].uvTransform ||
+                    a[i].wrapS != b[i].wrapS ||
+                    a[i].wrapT != b[i].wrapT ||
+                    a[i].minFilter != b[i].minFilter ||
+                    a[i].magFilter != b[i].magFilter ||
+                    a[i].displacementScale != b[i].displacementScale ||
+                    a[i].displacementBias != b[i].displacementBias) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static bool geometryGroupsEqual(
+                const std::vector<GeometryGroup>& a,
+                const std::vector<GeometryGroup>& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) {
+                if (a[i].start != b[i].start ||
+                    a[i].count != b[i].count ||
+                    a[i].materialIndex != b[i].materialIndex) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        static bool materialDisplacedStateMatches(
+                Mesh& mesh,
+                const MaterialDisplacedMeshState& state) {
+            if (!hasMaterialDisplacement(mesh)) return false;
+            const auto geometry = mesh.geometry();
+            if (!geometry) return false;
+            const auto groups = geometry->groups;
+            const DrawRange drawRange = geometry->drawRange;
+            return displacementKeysEqual(state.materialKeys, materialDisplacementKeysOf(mesh)) &&
+                   geometryGroupsEqual(state.materialGroups, groups) &&
+                   state.drawRange.start == drawRange.start &&
+                   state.drawRange.count == drawRange.count &&
+                   state.geomVersion == geomVersionOf(*geometry);
+        }
+
+        std::vector<float> buildMaterialDisplacedPositions(
+                Mesh& mesh,
+                const MaterialWithDisplacementMap& disp) {
+            const auto& geom = *mesh.geometry();
+            auto* posAttr = geom.getAttribute<float>("position");
+            auto* normAttr = geom.getAttribute<float>("normal");
+            if (!posAttr || !normAttr || !disp.displacementMap) return {};
+
+            const int vertexCount = posAttr->count();
+            if (normAttr->count() != vertexCount) return {};
+            const auto& base = posAttr->array();
+            const auto& normals = normAttr->array();
+            std::vector<float> out(base.begin(), base.end());
+
+            auto* uvAttr = geom.getAttribute<float>("uv");
+            if (!uvAttr || uvAttr->count() != vertexCount || uvAttr->array().size() != static_cast<size_t>(vertexCount) * 2u) {
+                return out;
+            }
+
+            auto& texture = *disp.displacementMap;
+            const auto& uvs = uvAttr->array();
+            for (int i = 0; i < vertexCount; ++i) {
+                const float h = sampleDisplacementTexture(texture, uvs[i * 2 + 0], uvs[i * 2 + 1]);
+                const float amount = h * disp.displacementScale + disp.displacementBias;
+                out[i * 3 + 0] += normals[i * 3 + 0] * amount;
+                out[i * 3 + 1] += normals[i * 3 + 1] * amount;
+                out[i * 3 + 2] += normals[i * 3 + 2] * amount;
+            }
+            return out;
+        }
+
+        std::shared_ptr<BufferGeometry> buildGroupedMaterialDisplacedGeometry(Mesh& mesh) {
+            const auto geometry = mesh.geometry();
+            if (!geometry || geometry->groups.empty()) return nullptr;
+            const auto& materials = mesh.materials();
+            if (materials.empty()) return nullptr;
+
+            auto* posAttr = geometry->getAttribute<float>("position");
+            auto* normAttr = geometry->getAttribute<float>("normal");
+            if (!posAttr || !normAttr) return nullptr;
+
+            const int vertexCount = posAttr->count();
+            if (vertexCount < 3 || normAttr->count() != vertexCount) return nullptr;
+
+            const auto& positions = posAttr->array();
+            const auto& normals = normAttr->array();
+            if (positions.size() != static_cast<size_t>(vertexCount) * 3u ||
+                normals.size() != static_cast<size_t>(vertexCount) * 3u) {
+                return nullptr;
+            }
+
+            auto* uvAttr = geometry->getAttribute<float>("uv");
+            const bool hasUv = uvAttr &&
+                               uvAttr->count() == vertexCount &&
+                               uvAttr->array().size() == static_cast<size_t>(vertexCount) * 2u;
+            auto* uv2Attr = geometry->getAttribute<float>("uv2");
+            const bool hasUv2 = uv2Attr &&
+                                uv2Attr->count() == vertexCount &&
+                                uv2Attr->array().size() == static_cast<size_t>(vertexCount) * 2u;
+            auto* colorAttr = geometry->getAttribute<float>("color");
+            const int colorItemSize = colorAttr ? colorAttr->itemSize() : 0;
+            const bool hasColor = colorAttr &&
+                                  colorAttr->count() == vertexCount &&
+                                  (colorItemSize == 3 || colorItemSize == 4);
+
+            const auto* idxAttr = geometry->getIndex();
+            const bool indexed = idxAttr != nullptr;
+            const uint32_t dataCount = indexed
+                    ? static_cast<uint32_t>(idxAttr->count())
+                    : static_cast<uint32_t>(vertexCount);
+
+            std::vector<float> outPos;
+            std::vector<float> outNorm;
+            std::vector<float> outUv;
+            std::vector<float> outUv2;
+            std::vector<float> outColor;
+            outPos.reserve(static_cast<size_t>(dataCount) * 3u);
+            outNorm.reserve(static_cast<size_t>(dataCount) * 3u);
+            if (hasUv) outUv.reserve(static_cast<size_t>(dataCount) * 2u);
+            if (hasUv2) outUv2.reserve(static_cast<size_t>(dataCount) * 2u);
+            if (hasColor) outColor.reserve(static_cast<size_t>(dataCount) * 3u);
+
+            const auto sourceIndex = [&](uint32_t dataIndex, uint32_t& src) -> bool {
+                if (indexed) {
+                    const auto& indices = idxAttr->array();
+                    if (dataIndex >= indices.size()) return false;
+                    src = indices[dataIndex];
+                } else {
+                    src = dataIndex;
+                }
+                return src < static_cast<uint32_t>(vertexCount);
+            };
+
+            const auto appendVertex = [&](uint32_t src, const std::shared_ptr<Material>& material) {
+                const auto* disp = displacementOfMaterial(material);
+                float amount = 0.0f;
+                if (disp && hasUv) {
+                    Texture& texture = *disp->displacementMap;
+                    const auto& uvs = uvAttr->array();
+                    const float h = sampleDisplacementTexture(texture, uvs[src * 2u + 0u], uvs[src * 2u + 1u]);
+                    amount = h * disp->displacementScale + disp->displacementBias;
+                }
+
+                outPos.push_back(positions[src * 3u + 0u] + normals[src * 3u + 0u] * amount);
+                outPos.push_back(positions[src * 3u + 1u] + normals[src * 3u + 1u] * amount);
+                outPos.push_back(positions[src * 3u + 2u] + normals[src * 3u + 2u] * amount);
+                outNorm.push_back(normals[src * 3u + 0u]);
+                outNorm.push_back(normals[src * 3u + 1u]);
+                outNorm.push_back(normals[src * 3u + 2u]);
+
+                if (hasUv) {
+                    const auto& uvs = uvAttr->array();
+                    outUv.push_back(uvs[src * 2u + 0u]);
+                    outUv.push_back(uvs[src * 2u + 1u]);
+                }
+                if (hasUv2) {
+                    const auto& uvs = uv2Attr->array();
+                    outUv2.push_back(uvs[src * 2u + 0u]);
+                    outUv2.push_back(uvs[src * 2u + 1u]);
+                }
+                if (hasColor) {
+                    const auto& colors = colorAttr->array();
+                    outColor.push_back(colors[src * colorItemSize + 0u]);
+                    outColor.push_back(colors[src * colorItemSize + 1u]);
+                    outColor.push_back(colors[src * colorItemSize + 2u]);
+                }
+            };
+
+            auto expanded = BufferGeometry::create();
+            for (const auto& group : geometry->groups) {
+                if (group.materialIndex >= materials.size()) continue;
+                const auto span = resolveVulkanDrawSpan(dataCount, geometry->drawRange, group);
+                const uint32_t count = (span.count / 3u) * 3u;
+                if (count == 0u) continue;
+
+                const uint32_t firstExpanded = static_cast<uint32_t>(outPos.size() / 3u);
+                for (uint32_t i = 0; i < count; ++i) {
+                    uint32_t src = 0;
+                    if (!sourceIndex(span.first + i, src)) return nullptr;
+                    appendVertex(src, materials[group.materialIndex]);
+                }
+                const uint32_t expandedCount = static_cast<uint32_t>(outPos.size() / 3u) - firstExpanded;
+                if (expandedCount > 0u) {
+                    expanded->addGroup(static_cast<int>(firstExpanded), static_cast<int>(expandedCount), group.materialIndex);
+                }
+            }
+
+            if (outPos.size() < 9u) return nullptr;
+            expanded->setAttribute("position", FloatBufferAttribute::create(outPos, 3));
+            expanded->setAttribute("normal", FloatBufferAttribute::create(outNorm, 3));
+            if (hasUv) expanded->setAttribute("uv", FloatBufferAttribute::create(outUv, 2));
+            if (hasUv2) expanded->setAttribute("uv2", FloatBufferAttribute::create(outUv2, 2));
+            if (hasColor) expanded->setAttribute("color", FloatBufferAttribute::create(outColor, 3));
+            return expanded;
+        }
+
+        MaterialDisplacedMeshState* ensureMaterialDisplacedBlas(Mesh& mesh) {
+            if (!hasMaterialDisplacement(mesh)) return nullptr;
+
+            auto it = materialDisplacedMeshStates.find(&mesh);
+            if (it != materialDisplacedMeshStates.end() &&
+                materialDisplacedStateMatches(mesh, *it->second)) {
+                return it->second.get();
+            }
+
+            if (it != materialDisplacedMeshStates.end()) {
+                if (it->second->blas) destroyBlasRecord(*it->second->blas);
+            } else {
+                it = materialDisplacedMeshStates.emplace(&mesh, std::make_unique<MaterialDisplacedMeshState>()).first;
+            }
+
+            const auto geometry = mesh.geometry();
+            if (!geometry) {
+                materialDisplacedMeshStates.erase(it);
+                return nullptr;
+            }
+
+            std::unique_ptr<BlasRecord> rec;
+            std::vector<GeometryGroup> referenceGroups;
+            if (!geometry->groups.empty() && mesh.materials().size() > 1) {
+                auto expanded = buildGroupedMaterialDisplacedGeometry(mesh);
+                if (!expanded) {
+                    materialDisplacedMeshStates.erase(it);
+                    return nullptr;
+                }
+                referenceGroups = expanded->groups;
+                rec = buildBlasFor(*expanded);
+            } else if (const auto* disp = materialDisplacementOf(mesh)) {
+                auto positions = buildMaterialDisplacedPositions(mesh, *disp);
+                if (positions.empty()) {
+                    materialDisplacedMeshStates.erase(it);
+                    return nullptr;
+                }
+                rec = buildBlasFor(*geometry, &positions);
+            }
+            if (!rec) {
+                materialDisplacedMeshStates.erase(it);
+                return nullptr;
+            }
+
+            rec->liveCheck = geometry;
+
+            auto& state = *it->second;
+            state.blas = std::move(rec);
+            state.liveCheck = geometry;
+            state.materialKeys = materialDisplacementKeysOf(mesh);
+            state.materialGroups = geometry->groups;
+            state.referenceGroups = std::move(referenceGroups);
+            state.drawRange = geometry->drawRange;
+            state.geomVersion = geomVersionOf(*geometry);
+            return &state;
         }
 
         // ── DisplacedMesh helpers ────────────────────────────────────────
@@ -4235,7 +5021,6 @@ namespace threepp {
                 water::OceanImage dsp = c.dyn->displacement();
                 ht.currentLayout  = VK_IMAGE_LAYOUT_GENERAL;
                 dsp.currentLayout = VK_IMAGE_LAYOUT_GENERAL;
-                st.scratchA.currentLayout = VK_IMAGE_LAYOUT_GENERAL;
                 c.ifft->recordApply(cb, ht,  st.scratchA);
                 c.ifft->recordApply(cb, dsp, st.scratchA);
 
@@ -4933,6 +5718,352 @@ namespace threepp {
             }
         }
 
+        vulkan::VulkanShaderMaterialCompiler& ensureCustomShaderCompiler() {
+            if (!customShaderCompiler_) {
+                customShaderSlangCompiler_ = std::make_unique<SlangShaderCompiler>();
+                customShaderCompiler_ = std::make_unique<vulkan::VulkanShaderMaterialCompiler>(
+                        *customShaderSlangCompiler_);
+            }
+            return *customShaderCompiler_;
+        }
+
+        void resetCustomShaderFrameResources(uint32_t frame) {
+            if (!ctx || frame >= customShaderFrameBuffers_.size()) return;
+            for (auto& buffer : customShaderFrameBuffers_[frame]) {
+                destroyBuffer(ctx->allocator(), buffer);
+            }
+            customShaderFrameBuffers_[frame].clear();
+            for (auto& image : customShaderFrameImages_[frame]) {
+                destroyImage2D(ctx->allocator(), ctx->device(), image);
+            }
+            customShaderFrameImages_[frame].clear();
+            for (auto view : customShaderFrameImageViews_[frame]) {
+                if (view != VK_NULL_HANDLE) vkDestroyImageView(ctx->device(), view, nullptr);
+            }
+            customShaderFrameImageViews_[frame].clear();
+            if (customShaderDescriptorPools_[frame] != VK_NULL_HANDLE) {
+                vkResetDescriptorPool(ctx->device(), customShaderDescriptorPools_[frame], 0);
+            }
+        }
+
+        VkDescriptorPool ensureCustomShaderDescriptorPool(uint32_t frame) {
+            if (customShaderDescriptorPools_[frame] != VK_NULL_HANDLE) {
+                return customShaderDescriptorPools_[frame];
+            }
+
+            std::array<VkDescriptorPoolSize, 4> sizes{};
+            sizes[0] = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 512};
+            sizes[1] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 128};
+            sizes[2] = {VK_DESCRIPTOR_TYPE_SAMPLER, 128};
+            sizes[3] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 128};
+
+            VkDescriptorPoolCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+            info.maxSets = 128;
+            info.poolSizeCount = static_cast<uint32_t>(sizes.size());
+            info.pPoolSizes = sizes.data();
+            check(vkCreateDescriptorPool(ctx->device(), &info, nullptr, &customShaderDescriptorPools_[frame]),
+                  "vkCreateDescriptorPool(custom shader)");
+            return customShaderDescriptorPools_[frame];
+        }
+
+        Buffer uploadCustomShaderFrameBuffer(
+                uint32_t frame,
+                VkDeviceSize size,
+                VkBufferUsageFlags usage,
+                const void* data) {
+            const VkDeviceSize bytes = std::max<VkDeviceSize>(size, 16);
+            auto buffer = createBuffer(
+                    ctx->allocator(),
+                    ctx->device(),
+                    bytes,
+                    usage,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            if (data && size > 0) {
+                void* mapped = nullptr;
+                vmaMapMemory(ctx->allocator(), buffer.alloc, &mapped);
+                std::memcpy(mapped, data, static_cast<size_t>(size));
+                vmaUnmapMemory(ctx->allocator(), buffer.alloc);
+            }
+            customShaderFrameBuffers_[frame].push_back(buffer);
+            return buffer;
+        }
+
+        uint32_t activeRenderTargetLayer(const vulkan::VulkanRenderTargets::Record& rt) const {
+            if (rt.key.cube) return static_cast<uint32_t>(std::max(0, activeCubeFace_));
+            return rt.color.arrayLayers > 1 ? static_cast<uint32_t>(std::max(0, activeLayer_)) : 0u;
+        }
+
+        VkExtent2D activeRenderTargetExtent(const RenderTarget& target) const {
+            const auto mip = static_cast<uint32_t>(std::max(0, activeMipmapLevel_));
+            return {std::max(1u, target.width >> mip),
+                    std::max(1u, target.height >> mip)};
+        }
+
+        VkImageView createCustomShaderFrameAttachmentView(
+                uint32_t frame,
+                const Image2D& image,
+                uint32_t baseMip,
+                uint32_t baseLayer) {
+            VkImageViewCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            info.image = image.image;
+            info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            info.format = image.format;
+            info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            info.subresourceRange.baseMipLevel = baseMip;
+            info.subresourceRange.levelCount = 1;
+            info.subresourceRange.baseArrayLayer = baseLayer;
+            info.subresourceRange.layerCount = 1;
+
+            VkImageView view = VK_NULL_HANDLE;
+            check(vkCreateImageView(ctx->device(), &info, nullptr, &view),
+                  "vkCreateImageView(custom shader attachment)");
+            customShaderFrameImageViews_[frame].push_back(view);
+            return view;
+        }
+
+        Image2D resolveCustomShaderFrameTexture(uint32_t frame, Texture& texture) {
+            if (auto* rtImage = renderTargets_ ? renderTargets_->findByTexture(texture) : nullptr) {
+                return *rtImage->image;
+            }
+
+            auto image = buildMaterialImage2D(&texture);
+            if (image.view == VK_NULL_HANDLE || image.sampler == VK_NULL_HANDLE) {
+                return {};
+            }
+            customShaderFrameImages_[frame].push_back(image);
+            return customShaderFrameImages_[frame].back();
+        }
+
+        static bool usesShaderInstancingVariant(const MeshEntry& entry) {
+            return dynamic_cast<InstancedMesh*>(entry.mesh) != nullptr;
+        }
+
+        struct VulkanDrawSpan {
+            uint32_t first = 0;
+            uint32_t count = 0;
+        };
+
+        static VulkanDrawSpan resolveVulkanDrawSpan(
+                uint32_t dataCount,
+                const DrawRange& drawRange,
+                const std::optional<GeometryGroup>& group = std::nullopt) {
+            const int64_t rangeStart = static_cast<int64_t>(drawRange.start);
+            const int64_t rangeCount = static_cast<int64_t>(drawRange.count);
+            const int64_t groupStart = group ? static_cast<int64_t>(group->start) : 0;
+            const int64_t groupCount = group ? static_cast<int64_t>(group->count)
+                                             : (std::numeric_limits<int64_t>::max)() / 2;
+            const int64_t drawStart = std::max<int64_t>(0, std::max(rangeStart, groupStart));
+            const int64_t drawEnd = std::min<int64_t>(
+                    static_cast<int64_t>(dataCount),
+                    std::min<int64_t>(rangeStart + rangeCount, groupStart + groupCount));
+            const int64_t drawCount = std::max<int64_t>(0, drawEnd - drawStart);
+            return {static_cast<uint32_t>(drawStart), static_cast<uint32_t>(drawCount)};
+        }
+
+        CustomShaderPipelineRecord& getOrCreateCustomShaderPipeline(ShaderMaterial& material,
+                                                                    bool instanced = false,
+                                                                    uint32_t colorAttachmentCount = 1,
+                                                                    VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT) {
+            auto& compiler = ensureCustomShaderCompiler();
+            const auto compiled = compiler.compile(material, instanced);
+            if (!compiled.success()) {
+                throw std::runtime_error("Vulkan ShaderMaterial compile failed:\n" + compiled.diagnostics);
+            }
+            const auto colorFormat = ctx->swapchainFormat();
+            for (auto& record : customShaderPipelines_) {
+                if (record.key == compiled.key &&
+                    record.colorFormat == colorFormat &&
+                    record.colorAttachmentCount == colorAttachmentCount &&
+                    record.sampleCount == sampleCount) {
+                    return record;
+                }
+            }
+
+            auto layout = vulkan::makeVulkanShaderMaterialLayout(material, instanced);
+
+            CustomShaderPipelineRecord record;
+            record.key = compiled.key;
+            record.colorFormat = colorFormat;
+            record.colorAttachmentCount = colorAttachmentCount;
+            record.sampleCount = sampleCount;
+            record.layout = std::move(layout);
+            try {
+                record.descriptorSetLayout = vulkan::createVulkanShaderMaterialDescriptorSetLayout(
+                        ctx->device(),
+                        record.layout);
+                record.pipelineLayout = vulkan::createVulkanShaderMaterialPipelineLayout(
+                        ctx->device(),
+                        record.descriptorSetLayout);
+                record.pipeline = vulkan::createVulkanShaderMaterialDynamicGraphicsPipeline(
+                        ctx->device(),
+                        compiled,
+                        record.pipelineLayout,
+                        colorFormat,
+                        VK_FORMAT_D32_SFLOAT,
+                        VK_NULL_HANDLE,
+                        colorAttachmentCount,
+                        sampleCount);
+            } catch (...) {
+                if (record.pipeline != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(ctx->device(), record.pipeline, nullptr);
+                }
+                if (record.pipelineLayout != VK_NULL_HANDLE) {
+                    vkDestroyPipelineLayout(ctx->device(), record.pipelineLayout, nullptr);
+                }
+                if (record.descriptorSetLayout != VK_NULL_HANDLE) {
+                    vkDestroyDescriptorSetLayout(ctx->device(), record.descriptorSetLayout, nullptr);
+                }
+                throw;
+            }
+            customShaderPipelines_.push_back(std::move(record));
+            return customShaderPipelines_.back();
+        }
+
+        std::array<float, 64> makeCustomShaderTransformData(
+                const MeshEntry& entry,
+                const Camera& camera,
+                bool instanced) const {
+            std::array<float, 64> data{};
+
+            Matrix4 modelMatrix;
+            if (instanced && entry.mesh && entry.mesh->matrixWorld) {
+                std::memcpy(modelMatrix.elements.data(), entry.mesh->matrixWorld->elements.data(), 64);
+            } else {
+                std::memcpy(modelMatrix.elements.data(), entry.worldMatrix.data(), 64);
+            }
+            std::memcpy(data.data(), modelMatrix.elements.data(), 64);
+            std::memcpy(data.data() + 16, currViewUnjit_.data(), 64);
+            std::memcpy(data.data() + 32, currProjUnjit_.data(), 64);
+
+            Matrix3 normalMatrix;
+            normalMatrix.setFromMatrix4(modelMatrix);
+            normalMatrix.invert();
+            normalMatrix.transpose();
+            const auto& ne = normalMatrix.elements;
+            data[48] = ne[0];
+            data[49] = ne[1];
+            data[50] = ne[2];
+            data[52] = ne[3];
+            data[53] = ne[4];
+            data[54] = ne[5];
+            data[56] = ne[6];
+            data[57] = ne[7];
+            data[58] = ne[8];
+
+            Vector3 camPos;
+            camPos.setFromMatrixPosition(*camera.matrixWorld);
+            data[60] = static_cast<float>(camPos.x);
+            data[61] = static_cast<float>(camPos.y);
+            data[62] = static_cast<float>(camPos.z);
+            return data;
+        }
+
+        static Texture* shaderMaterialTextureUniform(ShaderMaterial& material, const std::string& name) {
+            const auto it = material.uniforms.find(name);
+            if (it == material.uniforms.end() || !it->second.hasValue()) return nullptr;
+            auto& value = const_cast<Uniform&>(it->second).value();
+            if (auto** texture = std::get_if<Texture*>(&value)) {
+                return *texture;
+            }
+            return nullptr;
+        }
+
+        Buffer uploadCustomShaderInstanceBuffer(uint32_t frame, const MeshEntry& entry) {
+            Matrix4 instanceMatrix;
+            if (auto* instanced = dynamic_cast<InstancedMesh*>(entry.mesh)) {
+                instanced->getMatrixAt(entry.instanceIndex, instanceMatrix);
+            }
+            return uploadCustomShaderFrameBuffer(
+                    frame,
+                    instanceMatrix.elements.size() * sizeof(float),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    instanceMatrix.elements.data());
+        }
+
+        VkDescriptorSet updateCustomShaderDescriptorSet(
+                uint32_t frame,
+                ShaderMaterial& material,
+                const CustomShaderPipelineRecord& pipeline,
+                const MeshEntry& entry,
+                const Camera& camera,
+                bool instanced) {
+            const auto transformData = makeCustomShaderTransformData(entry, camera, instanced);
+            const auto transformBuffer = uploadCustomShaderFrameBuffer(
+                    frame,
+                    transformData.size() * sizeof(float),
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                    transformData.data());
+
+            const std::array<float, 4> lightData{};
+            const auto lightBuffer = uploadCustomShaderFrameBuffer(
+                    frame,
+                    lightData.size() * sizeof(float),
+                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                    lightData.data());
+
+            vulkan::VulkanShaderMaterialDescriptorResources resources;
+            resources.transformUniformBuffer = {transformBuffer.handle, 0, transformBuffer.size};
+            resources.lightUniformBuffer = {lightBuffer.handle, 0, lightBuffer.size};
+            if (instanced) {
+                const auto instanceBuffer = uploadCustomShaderInstanceBuffer(frame, entry);
+                resources.instanceStorageBuffer = {instanceBuffer.handle, 0, instanceBuffer.size};
+            }
+
+            if (pipeline.layout.hasCustomUniforms()) {
+                const auto uniformBytes = vulkan::packVulkanShaderMaterialUniforms(material, pipeline.layout);
+                const auto customBuffer = uploadCustomShaderFrameBuffer(
+                        frame,
+                        uniformBytes.size(),
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                        uniformBytes.data());
+                resources.customUniformBuffer = {customBuffer.handle, 0, customBuffer.size};
+            }
+
+            for (const auto& name : pipeline.layout.textures) {
+                const Image2D* image = nullptr;
+                Image2D resolvedImage{};
+                if (const auto it = material.customTextures.find(name); it != material.customTextures.end()) {
+                    image = static_cast<const Image2D*>(it->second);
+                    if (!image) {
+                        throw std::runtime_error("Missing Vulkan ShaderMaterial custom texture: " + name);
+                    }
+                } else {
+                    auto* texture = shaderMaterialTextureUniform(material, name);
+                    if (!texture) {
+                        throw std::runtime_error("Missing Vulkan ShaderMaterial texture uniform: " + name);
+                    }
+                    resolvedImage = resolveCustomShaderFrameTexture(frame, *texture);
+                    image = &resolvedImage;
+                }
+                if (image->view == VK_NULL_HANDLE || image->sampler == VK_NULL_HANDLE) {
+                    throw std::runtime_error("Incomplete Vulkan ShaderMaterial texture resource: " + name);
+                }
+
+                VkDescriptorImageInfo textureInfo{};
+                textureInfo.imageView = image->view;
+                textureInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                resources.textures.emplace(name, textureInfo);
+
+                VkDescriptorImageInfo samplerInfo{};
+                samplerInfo.sampler = image->sampler;
+                resources.samplers.emplace(name, samplerInfo);
+            }
+
+            const auto descriptorSet = vulkan::allocateVulkanShaderMaterialDescriptorSet(
+                    ctx->device(),
+                    ensureCustomShaderDescriptorPool(frame),
+                    pipeline.descriptorSetLayout);
+            const auto writes = vulkan::makeVulkanShaderMaterialDescriptorWrites(
+                    descriptorSet,
+                    pipeline.layout,
+                    resources);
+            vulkan::updateVulkanShaderMaterialDescriptorSet(ctx->device(), writes);
+            return descriptorSet;
+        }
+
         // Flush the cached host-side MaterialDescs into this frame's slot of
         // the per-frame ring. Called from renderFrame after the fence wait —
         // the in-flight signal guarantees the previous use of this slot has
@@ -4991,7 +6122,8 @@ namespace threepp {
                 // (skinned/displaced/morphed/tet) are here because their cached local
                 // AABB doesn't reflect the per-frame deformed extents, so frustum-
                 // culling them risks popping a still-on-screen body out of the gbuffer.
-                if (en.isOverlay || en.isSkinned || en.isDisplaced || en.isGrass || en.isMorphed || en.isTet) {
+                if (en.isOverlay || en.isSkinned || en.isDisplaced || en.isGrass ||
+                    en.isMorphed || en.isTet || en.isMaterialDisplaced) {
                     en.inFrustum = true;
                 } else {
                     auto geom = en.mesh->geometry();
@@ -5013,11 +6145,20 @@ namespace threepp {
             }
         }
 
+        static bool canRouteBumpMapThroughNormalSlot(const Material& mat) {
+            if (dynamic_cast<const MaterialWithSpecular*>(&mat)) return true;
+            if (dynamic_cast<const MaterialWithMatCap*>(&mat)) return true;
+            if (dynamic_cast<const MeshNormalMaterial*>(&mat)) return true;
+            if (dynamic_cast<const MeshToonMaterial*>(&mat)) return true;
+            return dynamic_cast<const MaterialWithRoughness*>(&mat) &&
+                   dynamic_cast<const MaterialWithMetalness*>(&mat);
+        }
+
         // Pull per-mesh PBR material params off the threepp Material chain.
         // Anything not satisfying the relevant interface gets a sensible
         // default so meshes lacking a material still render. albedoTexIndex
         // stays at -1 here — caller patches it after `ensureMaterialTexture`.
-        static MaterialDesc materialFromMesh(const Mesh& m) {
+        static MaterialDesc materialFromMaterial(const std::shared_ptr<Material>& mat) {
             MaterialDesc d{};
             d.albedo[0] = d.albedo[1] = d.albedo[2] = 0.8f;
             d.roughness = 0.5f;
@@ -5025,24 +6166,31 @@ namespace threepp {
             d.emissive[0] = d.emissive[1] = d.emissive[2] = 0.0f;
             d.emissiveIntensity = 1.0f;
             d.albedoTexIndex = -1;
+            d.alphaTexIndex = -1;
             d.roughnessTexIndex = -1;
             d.metalnessTexIndex = -1;
             d.normalTexIndex = -1;
+            d.normalMapMode = 0;
             d.normalScale[0] = 1.0f;
             d.normalScale[1] = 1.0f;
             d.alphaCutoff = 0.0f;// disabled by default; any-hit short-circuits on alphaCutoff <= 0
             d.transmission = 0.0f;// opaque by default
             d.ior          = 1.5f;// glass-typical default; only consulted when transmission > 0
             d.transmissionTexIndex = -1;
+            d.thicknessTexIndex = -1;
             d.clearcoat = 0.0f;// no coat by default; lobe is skipped when clearcoat == 0
             d.clearcoatRoughness = 0.0f;
             d.clearcoatTexIndex = -1;
             d.clearcoatRoughnessTexIndex = -1;
+            d.clearcoatNormalTexIndex = -1;
+            d.clearcoatNormalScale[0] = 1.0f;
+            d.clearcoatNormalScale[1] = 1.0f;
             d.attenuationColor[0] = d.attenuationColor[1] = d.attenuationColor[2] = 1.0f;
             d.attenuationDistance = 0.0f;
             d.emissiveTexIndex = -1;
             d.specularIntensity = 1.0f;
             d.specularColor[0] = d.specularColor[1] = d.specularColor[2] = 1.0f;
+            d.specularTexIndex = -1;
             d.sheenColor[0] = d.sheenColor[1] = d.sheenColor[2] = 0.0f;
             d.sheenRoughness = 0.0f;
             d.iridescence = 0.0f;             // off by default; lobe is skipped when iridescence == 0
@@ -5052,16 +6200,30 @@ namespace threepp {
             d.thickness = 0.0f;               // 0 = use back-face actual distance for Beer-Lambert (closed-mesh path)
             d.thinWalled = 0;                 // 0 = closed-mesh BSDF; 1 = thin-shell BSDF (set explicitly via MaterialWithThickness::thinWalled)
             d.occlusionTexIndex = -1;
+            d.lightTexIndex = -1;
+            d.envTexIndex = -1;
+            d.envMapIntensity = 1.0f;
+            d.envMapCombine = -1;
+            d.aoMapIntensity = 1.0f;
+            d.lightMapIntensity = 1.0f;
+            d.displacementTexIndex = -1;
+            d.displacementScale = 1.0f;
+            d.displacementBias = 0.0f;
             static constexpr float kIdent[9] = {1,0,0, 0,1,0, 0,0,1};
             std::copy(kIdent, kIdent+9, d.uvTransform);
+            std::copy(kIdent, kIdent+9, d.uvTransformAlpha);
             std::copy(kIdent, kIdent+9, d.uvTransformNormal);
             std::copy(kIdent, kIdent+9, d.uvTransformRoughMetal);
             std::copy(kIdent, kIdent+9, d.uvTransformEmissive);
             std::copy(kIdent, kIdent+9, d.uvTransformOcclusion);
+            std::copy(kIdent, kIdent+9, d.uvTransformLight);
+            std::copy(kIdent, kIdent+9, d.uvTransformSpecular);
             std::copy(kIdent, kIdent+9, d.uvTransformClearcoat);
             std::copy(kIdent, kIdent+9, d.uvTransformClearcoatRough);
+            std::copy(kIdent, kIdent+9, d.uvTransformClearcoatNormal);
             std::copy(kIdent, kIdent+9, d.uvTransformTransmission);
-            auto mat = m.material();
+            std::copy(kIdent, kIdent+9, d.uvTransformThickness);
+            std::copy(kIdent, kIdent+9, d.uvTransformDisplacement);
             if (!mat) return d;
             d.alphaCutoff = mat->alphaTest;
             if (auto* col = dynamic_cast<MaterialWithColor*>(mat.get())) {
@@ -5075,15 +6237,50 @@ namespace threepp {
             if (auto* mt = dynamic_cast<MaterialWithMetalness*>(mat.get())) {
                 d.metalness = mt->metalness;
             }
+            if (auto* sp = dynamic_cast<MaterialWithSpecular*>(mat.get())) {
+                d.specularColor[0] = sp->specular.r;
+                d.specularColor[1] = sp->specular.g;
+                d.specularColor[2] = sp->specular.b;
+                d.specularIntensity = 1.0f;
+                d.roughness = std::clamp(std::sqrt(2.0f / (std::max(0.0f, sp->shininess) + 2.0f)), 0.04f, 1.0f);
+            }
             if (auto* em = dynamic_cast<MaterialWithEmissive*>(mat.get())) {
                 d.emissive[0] = em->emissive.r;
                 d.emissive[1] = em->emissive.g;
                 d.emissive[2] = em->emissive.b;
                 d.emissiveIntensity = em->emissiveIntensity;
             }
+            if (auto* env = dynamic_cast<MaterialWithEnvMap*>(mat.get())) {
+                d.envMapIntensity = env->envMapIntensity;
+            }
+            if (auto* ao = dynamic_cast<MaterialWithAoMap*>(mat.get())) {
+                d.aoMapIntensity = ao->aoMapIntensity;
+            }
+            if (auto* light = dynamic_cast<MaterialWithLightMap*>(mat.get())) {
+                d.lightMapIntensity = light->lightMapIntensity;
+            }
+            if (auto* disp = dynamic_cast<MaterialWithDisplacementMap*>(mat.get())) {
+                d.displacementScale = disp->displacementScale;
+                d.displacementBias = disp->displacementBias;
+            }
+            if (auto* combine = dynamic_cast<MaterialWithCombine*>(mat.get())) {
+                d.envMapCombine = as_integer(combine->combine);
+                if (auto* reflectivity = dynamic_cast<MaterialWithReflectivity*>(mat.get())) {
+                    d.envMapIntensity = reflectivity->reflectivity;
+                }
+            }
             if (auto* nm = dynamic_cast<MaterialWithNormalMap*>(mat.get())) {
                 d.normalScale[0] = nm->normalScale.x;
                 d.normalScale[1] = nm->normalScale.y;
+            }
+            if (auto* bm = dynamic_cast<MaterialWithBumpMap*>(mat.get())) {
+                const auto* nm = dynamic_cast<MaterialWithNormalMap*>(mat.get());
+                if (bm->bumpMap && (!nm || !nm->normalMap) &&
+                    canRouteBumpMapThroughNormalSlot(*mat)) {
+                    d.normalMapMode = 1;
+                    d.normalScale[0] = bm->bumpScale;
+                    d.normalScale[1] = bm->bumpScale;
+                }
             }
             if (auto* tr = dynamic_cast<MaterialWithTransmission*>(mat.get())) {
                 d.transmission = tr->transmission;
@@ -5148,6 +6345,8 @@ namespace threepp {
             if (auto* cc = dynamic_cast<MaterialWithClearcoat*>(mat.get())) {
                 d.clearcoat = cc->clearcoat;
                 d.clearcoatRoughness = cc->clearcoatRoughness;
+                d.clearcoatNormalScale[0] = cc->clearcoatNormalScale.x;
+                d.clearcoatNormalScale[1] = cc->clearcoatNormalScale.y;
             }
             if (auto* att = dynamic_cast<MaterialWithAttenuation*>(mat.get())) {
                 d.attenuationColor[0] = att->attenuationColor.r;
@@ -5176,6 +6375,22 @@ namespace threepp {
                 d.iridescenceIOR         = std::max(1.0f, ir->iridescenceIOR);
                 d.iridescenceThicknessNm = std::max(0.0f, ir->iridescenceThicknessNm);
             }
+            if (dynamic_cast<ShadowMaterial*>(mat.get())) {
+                d.alphaCutoff = -3.0f;
+                d.transmission = std::clamp(mat->opacity, 0.0f, 1.0f);
+            }
+            if (dynamic_cast<MeshNormalMaterial*>(mat.get())) {
+                d.roughness = -2.0f;
+            }
+            if (dynamic_cast<MeshDepthMaterial*>(mat.get())) {
+                d.roughness = -3.0f;
+            }
+            if (dynamic_cast<MeshMatcapMaterial*>(mat.get())) {
+                d.roughness = -4.0f;
+            }
+            if (dynamic_cast<MeshToonMaterial*>(mat.get())) {
+                d.sheenRoughness = -1.0f;
+            }
             // sideMode mirrors threepp::Side {Front=0, Back=1, Double=2}.
             // Chit reads it for the wrong-side pass-through gate; the raster
             // gbuffer pass picks BACK / FRONT / NONE cull mode accordingly.
@@ -5188,6 +6403,56 @@ namespace threepp {
                 d.roughness = -1.0f;
             }
             return d;
+        }
+
+        static MaterialDesc materialFromMesh(const Mesh& m) {
+            return materialFromMaterial(m.material());
+        }
+
+        MaterialDesc materialDescForMaterial(const std::shared_ptr<Material>& material) const {
+            MaterialDesc d = materialFromMaterial(material);
+            auto appendPlane = [&](const Plane& p) {
+                if (d.clipPlaneCount >= kMaxRasterClipPlanes) return;
+                const uint32_t i = d.clipPlaneCount++;
+                d.clipPlanes[i][0] = p.normal.x;
+                d.clipPlanes[i][1] = p.normal.y;
+                d.clipPlanes[i][2] = p.normal.z;
+                d.clipPlanes[i][3] = -p.constant;
+            };
+
+            const uint32_t globalCount = std::min<uint32_t>(
+                    static_cast<uint32_t>(clippingPlanes_.size()), kMaxRasterClipPlanes);
+            for (uint32_t i = 0; i < globalCount; ++i) {
+                appendPlane(clippingPlanes_[i]);
+            }
+
+            const bool hasLocalPlanes = localClippingEnabled_ && material && !material->clippingPlanes.empty();
+            if (hasLocalPlanes) {
+                const uint32_t localStart = d.clipPlaneCount;
+                for (const auto& p : material->clippingPlanes) {
+                    appendPlane(p);
+                }
+                d.clipIntersection = material->clipIntersection ? 1u : 0u;
+                d._clipPad0 = localStart;
+            }
+            return d;
+        }
+
+        MaterialDesc materialDescForMesh(const Mesh& m) const {
+            return materialDescForMaterial(m.material());
+        }
+
+        static void applyInstanceColor(MaterialDesc& d, const MeshEntry& en) {
+            if (!en.isInstanced) return;
+            auto* inst = dynamic_cast<InstancedMesh*>(en.mesh);
+            auto* color = inst ? inst->instanceColor() : nullptr;
+            if (!color || en.instanceIndex >= static_cast<uint32_t>(color->count())) return;
+            const auto& values = color->array();
+            const auto base = static_cast<size_t>(en.instanceIndex) * 3u;
+            if (base + 2 >= values.size()) return;
+            d.albedo[0] *= values[base + 0];
+            d.albedo[1] *= values[base + 1];
+            d.albedo[2] *= values[base + 2];
         }
 
         static std::shared_ptr<Texture> emissiveTexOf(const Mesh& m) {
@@ -5204,6 +6469,51 @@ namespace threepp {
             if (!mat) return nullptr;
             if (auto* ao = dynamic_cast<MaterialWithAoMap*>(mat.get())) {
                 return ao->aoMap;
+            }
+            return nullptr;
+        }
+
+        static std::shared_ptr<Texture> lightTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* light = dynamic_cast<MaterialWithLightMap*>(mat.get())) {
+                return light->lightMap;
+            }
+            return nullptr;
+        }
+
+        static std::shared_ptr<Texture> displacementTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* disp = dynamic_cast<MaterialWithDisplacementMap*>(mat.get())) {
+                return disp->displacementMap;
+            }
+            return nullptr;
+        }
+
+        static std::shared_ptr<Texture> envTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* env = dynamic_cast<MaterialWithEnvMap*>(mat.get())) {
+                return env->envMap;
+            }
+            return nullptr;
+        }
+
+        static std::shared_ptr<Texture> specularTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* sp = dynamic_cast<MaterialWithSpecularMap*>(mat.get())) {
+                return sp->specularMap;
+            }
+            return nullptr;
+        }
+
+        static std::shared_ptr<Texture> alphaTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* am = dynamic_cast<MaterialWithAlphaMap*>(mat.get())) {
+                return am->alphaMap;
             }
             return nullptr;
         }
@@ -5228,6 +6538,14 @@ namespace threepp {
         static std::shared_ptr<Texture> roughnessTexOf(const Mesh& m) {
             auto mat = m.material();
             if (!mat) return nullptr;
+            if (auto* mc = dynamic_cast<MaterialWithMatCap*>(mat.get())) {
+                return mc->matcap;
+            }
+            if (dynamic_cast<MeshToonMaterial*>(mat.get())) {
+                if (auto* gm = dynamic_cast<MaterialWithGradientMap*>(mat.get())) {
+                    return gm->gradientMap;
+                }
+            }
             if (auto* r = dynamic_cast<MaterialWithRoughness*>(mat.get())) {
                 return r->roughnessMap;
             }
@@ -5247,7 +6565,12 @@ namespace threepp {
             auto mat = m.material();
             if (!mat) return nullptr;
             if (auto* nm = dynamic_cast<MaterialWithNormalMap*>(mat.get())) {
-                return nm->normalMap;
+                if (nm->normalMap) return nm->normalMap;
+            }
+            if (canRouteBumpMapThroughNormalSlot(*mat)) {
+                if (auto* bm = dynamic_cast<MaterialWithBumpMap*>(mat.get())) {
+                    return bm->bumpMap;
+                }
             }
             return nullptr;
         }
@@ -5257,6 +6580,15 @@ namespace threepp {
             if (!mat) return nullptr;
             if (auto* tr = dynamic_cast<MaterialWithTransmission*>(mat.get())) {
                 return tr->transmissionMap;
+            }
+            return nullptr;
+        }
+
+        static std::shared_ptr<Texture> thicknessTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* th = dynamic_cast<MaterialWithThickness*>(mat.get())) {
+                return th->thicknessMap;
             }
             return nullptr;
         }
@@ -5279,6 +6611,179 @@ namespace threepp {
             return nullptr;
         }
 
+        static std::shared_ptr<Texture> clearcoatNormalTexOf(const Mesh& m) {
+            auto mat = m.material();
+            if (!mat) return nullptr;
+            if (auto* cc = dynamic_cast<MaterialWithClearcoat*>(mat.get())) {
+                return cc->clearcoatNormalMap;
+            }
+            return nullptr;
+        }
+
+        void populateMaterialTextureSlots(MaterialDesc& md, const std::shared_ptr<Material>& mat) {
+            if (!mat) return;
+
+            auto setTexture = [&](std::shared_ptr<Texture> tex, int32_t& index, float (&transform)[9]) {
+                if (!tex) return;
+                index = ensureMaterialTexture(tex);
+                copyTexUvTransform(transform, tex);
+            };
+
+            if (auto* mm = dynamic_cast<MaterialWithMap*>(mat.get())) {
+                setTexture(mm->map, md.albedoTexIndex, md.uvTransform);
+            }
+            if (auto* mc = dynamic_cast<MaterialWithMatCap*>(mat.get())) {
+                setTexture(mc->matcap, md.roughnessTexIndex, md.uvTransformRoughMetal);
+            }
+            if (auto* am = dynamic_cast<MaterialWithAlphaMap*>(mat.get())) {
+                setTexture(am->alphaMap, md.alphaTexIndex, md.uvTransformAlpha);
+            }
+            if (dynamic_cast<MeshToonMaterial*>(mat.get())) {
+                if (auto* gm = dynamic_cast<MaterialWithGradientMap*>(mat.get())) {
+                    setTexture(gm->gradientMap, md.roughnessTexIndex, md.uvTransformRoughMetal);
+                }
+            } else if (auto* r = dynamic_cast<MaterialWithRoughness*>(mat.get())) {
+                setTexture(r->roughnessMap, md.roughnessTexIndex, md.uvTransformRoughMetal);
+            }
+            if (auto* mt = dynamic_cast<MaterialWithMetalness*>(mat.get())) {
+                if (mt->metalnessMap) {
+                    md.metalnessTexIndex = ensureMaterialTexture(mt->metalnessMap);
+                    if (md.roughnessTexIndex < 0) copyTexUvTransform(md.uvTransformRoughMetal, mt->metalnessMap);
+                }
+            }
+            if (auto* nm = dynamic_cast<MaterialWithNormalMap*>(mat.get()); nm && nm->normalMap) {
+                setTexture(nm->normalMap, md.normalTexIndex, md.uvTransformNormal);
+            } else if (canRouteBumpMapThroughNormalSlot(*mat)) {
+                if (auto* bm = dynamic_cast<MaterialWithBumpMap*>(mat.get())) {
+                    setTexture(bm->bumpMap, md.normalTexIndex, md.uvTransformNormal);
+                }
+            }
+            if (auto* tr = dynamic_cast<MaterialWithTransmission*>(mat.get())) {
+                setTexture(tr->transmissionMap, md.transmissionTexIndex, md.uvTransformTransmission);
+            }
+            if (auto* th = dynamic_cast<MaterialWithThickness*>(mat.get())) {
+                setTexture(th->thicknessMap, md.thicknessTexIndex, md.uvTransformThickness);
+            }
+            if (auto* cc = dynamic_cast<MaterialWithClearcoat*>(mat.get())) {
+                setTexture(cc->clearcoatMap, md.clearcoatTexIndex, md.uvTransformClearcoat);
+                setTexture(cc->clearcoatRoughnessMap, md.clearcoatRoughnessTexIndex, md.uvTransformClearcoatRough);
+                setTexture(cc->clearcoatNormalMap, md.clearcoatNormalTexIndex, md.uvTransformClearcoatNormal);
+            }
+            if (auto* em = dynamic_cast<MaterialWithEmissive*>(mat.get())) {
+                setTexture(em->emissiveMap, md.emissiveTexIndex, md.uvTransformEmissive);
+            }
+            if (auto* sp = dynamic_cast<MaterialWithSpecularMap*>(mat.get())) {
+                setTexture(sp->specularMap, md.specularTexIndex, md.uvTransformSpecular);
+            }
+            if (auto* ao = dynamic_cast<MaterialWithAoMap*>(mat.get())) {
+                setTexture(ao->aoMap, md.occlusionTexIndex, md.uvTransformOcclusion);
+            }
+            if (auto* light = dynamic_cast<MaterialWithLightMap*>(mat.get())) {
+                setTexture(light->lightMap, md.lightTexIndex, md.uvTransformLight);
+            }
+            if (auto* disp = dynamic_cast<MaterialWithDisplacementMap*>(mat.get())) {
+                setTexture(disp->displacementMap, md.displacementTexIndex, md.uvTransformDisplacement);
+            }
+            if (auto* env = dynamic_cast<MaterialWithEnvMap*>(mat.get()); env && env->envMap) {
+                md.envTexIndex = ensureMaterialTexture(env->envMap);
+            }
+        }
+
+        MaterialDesc buildMaterialDescForEntryMaterial(
+                const MeshEntry& entry,
+                const std::shared_ptr<Material>& material,
+                std::unordered_map<const Material*, uint32_t>& matAssetMap) {
+            MaterialDesc md = materialDescForMaterial(material);
+            applyInstanceColor(md, entry);
+            const Material* matKey = material.get();
+            auto [matIt, inserted] = matAssetMap.try_emplace(
+                    matKey, static_cast<uint32_t>(matAssetMap.size()));
+            md.materialAssetIdx = matIt->second;
+            populateMaterialTextureSlots(md, material);
+            return md;
+        }
+
+        static std::optional<uint32_t> findRasterGroupMaterialDescIndex(
+                const std::vector<RasterGroupMaterialDescIndex>& indices,
+                uint32_t materialIndex) {
+            for (const auto& entry : indices) {
+                if (entry.materialIndex == materialIndex) return entry.descIndex;
+            }
+            return std::nullopt;
+        }
+
+        void appendRasterGroupMaterialDescs(
+                uint32_t entryIndex,
+                const MeshEntry& entry,
+                std::vector<MaterialDesc>& matDescs,
+                std::unordered_map<const Material*, uint32_t>& matAssetMap) {
+            if (entryIndex >= rasterGroupMaterialDescIndices_.size() || !entry.mesh) return;
+            const auto geometry = entry.mesh->geometry();
+            const auto& materials = entry.mesh->materials();
+            if (!geometry || geometry->groups.empty() || materials.size() <= 1) return;
+
+            auto& groupIndices = rasterGroupMaterialDescIndices_[entryIndex];
+            for (const auto& group : geometry->groups) {
+                if (group.materialIndex >= materials.size()) continue;
+                const auto materialIndex = static_cast<uint32_t>(group.materialIndex);
+                if (findRasterGroupMaterialDescIndex(groupIndices, materialIndex)) continue;
+
+                uint32_t descIndex = entryIndex;
+                if (materialIndex != 0u) {
+                    descIndex = static_cast<uint32_t>(matDescs.size());
+                    matDescs.push_back(buildMaterialDescForEntryMaterial(
+                            entry, materials[materialIndex], matAssetMap));
+                }
+                groupIndices.push_back({materialIndex, descIndex});
+            }
+        }
+
+        void appendReferenceMaterialGroupDescs(
+                uint32_t entryIndex,
+                const MeshEntry& entry,
+                uint32_t dataCount,
+                std::vector<MaterialGroupDesc>& materialGroupDescs,
+                std::vector<uint32_t>& materialGroupOffsets,
+                std::vector<uint32_t>& materialGroupCounts,
+                const std::vector<GeometryGroup>* groupOverride = nullptr) const {
+            if (entryIndex >= rasterGroupMaterialDescIndices_.size() ||
+                entryIndex >= materialGroupOffsets.size() ||
+                entryIndex >= materialGroupCounts.size() ||
+                !entry.mesh) {
+                return;
+            }
+            const auto geometry = entry.mesh->geometry();
+            const auto& materials = entry.mesh->materials();
+            if (!geometry || materials.size() <= 1) return;
+            const auto& groups = groupOverride ? *groupOverride : geometry->groups;
+            if (groups.empty()) return;
+            const DrawRange fullDrawRange{0, std::numeric_limits<int>::max() / 2};
+            const DrawRange& activeDrawRange = groupOverride ? fullDrawRange : geometry->drawRange;
+
+            const uint32_t offset = static_cast<uint32_t>(materialGroupDescs.size());
+            const auto& groupIndices = rasterGroupMaterialDescIndices_[entryIndex];
+            for (const auto& group : groups) {
+                if (group.materialIndex >= materials.size()) continue;
+                const VulkanDrawSpan span = resolveVulkanDrawSpan(dataCount, activeDrawRange, group);
+                const uint32_t firstPrimitive = span.first / 3u;
+                const uint32_t endPrimitive = (span.first + span.count) / 3u;
+                if (endPrimitive <= firstPrimitive) continue;
+
+                const uint32_t materialIndex = static_cast<uint32_t>(group.materialIndex);
+                const uint32_t descIndex = findRasterGroupMaterialDescIndex(groupIndices, materialIndex)
+                                                   .value_or(entryIndex);
+                materialGroupDescs.push_back({
+                        firstPrimitive,
+                        endPrimitive - firstPrimitive,
+                        descIndex,
+                        0u});
+            }
+            const uint32_t count = static_cast<uint32_t>(materialGroupDescs.size()) - offset;
+            if (count == 0u) return;
+            materialGroupOffsets[entryIndex] = offset;
+            materialGroupCounts[entryIndex] = count;
+        }
+
         // Walk the scene each frame, fingerprint the meshes, and rebuild the
         // TLAS + per-instance desc tables when anything that affects ray
         // tracing changes (mesh added/removed, transform animated, material
@@ -5289,13 +6794,19 @@ namespace threepp {
         // compares. Cheap. The rare rebuild path waits the GPU idle, retires
         // the TLAS + scene desc buffers, and rewrites bindings 0/3/4 across
         // every descriptor set without re-allocating from the pool.
-        void ensureSceneBuilt(Object3D& scene) {
+        void ensureSceneBuilt(Object3D& scene, Camera& camera) {
             // force=false (matching GLRenderer/WgpuRenderer): with
             // updateMatrix()'s change-detection early-out, only subtrees whose
             // transforms actually moved pay the world-matrix multiplies — a
             // forced pass re-multiplied every node every frame (several
             // ms/frame on Bistro's node count, static or not).
             scene.updateMatrixWorld();
+            scene.traverseVisible([&](Object3D& object) {
+                auto* lod = dynamic_cast<LOD*>(&object);
+                if (lod && lod->autoUpdate && object.layers.test(camera.layers)) {
+                    lod->update(camera);
+                }
+            });
 
             // Honour live edits to already-uploaded material textures (e.g. a
             // DataTexture re-baked via setData + needsUpdate). Cheap version
@@ -5346,6 +6857,8 @@ namespace threepp {
             // Mirrors WGPU's expandMeshEntries (WgpuPathTracerAtlas.cpp:20).
             std::vector<MeshEntry> built;
             std::vector<LineEntry> builtLines;
+            sceneSnapshotRoot_ = &scene;
+            sceneSnapshotRootId_ = scene.id;
             sceneSnapshot_.clear();
             // traverseVisible (not traverse) so an invisible parent hides its
             // whole subtree — matches three.js / GLRenderer convention. Plain
@@ -5370,6 +6883,7 @@ namespace threepp {
                         le.line       = line;
                         le.points     = nullptr;
                         le.isSegments = (dynamic_cast<LineSegments*>(line) != nullptr);
+                        le.isLoop     = (dynamic_cast<LineLoop*>(line) != nullptr);
                         le.isPoints   = false;
                         std::memcpy(le.worldMatrix.data(),
                                     line->matrixWorld->elements.data(), 64);
@@ -5394,6 +6908,7 @@ namespace threepp {
                         le.line       = nullptr;
                         le.points     = pts;
                         le.isSegments = false;
+                        le.isLoop     = false;
                         le.isPoints   = true;
                         std::memcpy(le.worldMatrix.data(),
                                     pts->matrixWorld->elements.data(), 64);
@@ -5406,6 +6921,9 @@ namespace threepp {
                 if (!m || !m->visible) {
                     sceneSnapshot_.push_back(sn);// kind Other: pointer identity only
                     return;
+                }
+                if (auto geom = m->geometry(); geom && geom->hasAttribute("position") && !geom->hasAttribute("normal")) {
+                    geom->computeVertexNormals();
                 }
                 // Hybrid overlay (raster-only) classification. Wireframe-
                 // flagged materials and overlay-layer membership both route
@@ -5453,6 +6971,9 @@ namespace threepp {
                 const bool isTet = !isSkinned && !isDisplaced && !isGrass && !isMorphed &&
                                    m->material() && m->material()->tetSkinning &&
                                    m->material()->tetTexture != nullptr;
+                const bool isMaterialDisplaced = !isSkinned && !isDisplaced && !isGrass &&
+                                                  !isMorphed && !isTet &&
+                                                  hasMaterialDisplacement(*m);
                 if (inst && inst->count() > 0) {
                     Matrix4 instMat;
                     Matrix4 world;
@@ -5469,6 +6990,7 @@ namespace threepp {
                         e.isGrass      = isGrass;
                         e.isMorphed    = isMorphed;
                         e.isTet        = isTet;
+                        e.isMaterialDisplaced = isMaterialDisplaced;
                         e.isInstanced  = true;
                         std::memcpy(e.worldMatrix.data(), world.elements.data(), 64);
                         built.push_back(e);
@@ -5484,6 +7006,7 @@ namespace threepp {
                     e.isGrass      = isGrass;
                     e.isMorphed    = isMorphed;
                     e.isTet        = isTet;
+                    e.isMaterialDisplaced = isMaterialDisplaced;
                     std::memcpy(e.worldMatrix.data(), m->matrixWorld->elements.data(), 64);
                     built.push_back(e);
                 }
@@ -5503,6 +7026,7 @@ namespace threepp {
             bool tetDirtyAny = false;
             bool geomDirtyAny = false;
             bool morphDirtyAny = false;
+            bool materialDisplacedDirtyAny = false;
             std::vector<bool> entryGeomDirty(entries.size(), false);
             // Per-entry "material values bumped" bits — the ONLY entries whose
             // MaterialDesc must be re-derived in the material-values fast path
@@ -5542,22 +7066,36 @@ namespace threepp {
                             metalnessTexOf(*m) != fp.metalnessTex ||
                             normalTexOf(*m) != fp.normalTex ||
                             transmissionTexOf(*m) != fp.transmissionTex ||
+                            thicknessTexOf(*m) != fp.thicknessTex ||
                             clearcoatTexOf(*m) != fp.clearcoatTex ||
                             clearcoatRoughnessTexOf(*m) != fp.clearcoatRoughnessTex ||
-                            emissiveTexOf(*m) != fp.emissiveTex) {
+                            clearcoatNormalTexOf(*m) != fp.clearcoatNormalTex ||
+                            emissiveTexOf(*m) != fp.emissiveTex ||
+                            specularTexOf(*m) != fp.specularTex ||
+                            alphaTexOf(*m) != fp.alphaTex ||
+                            occlusionTexOf(*m) != fp.occlusionTex ||
+                            lightTexOf(*m) != fp.lightTex ||
+                            displacementTexOf(*m) != fp.displacementTex ||
+                            envTexOf(*m) != fp.envTex) {
                             leanOk = false;// texture swap = STRUCTURAL — full path decides
                             break;
                         }
                         matChanged = true;
                         fp.matVersion = matVer;
-                        const MaterialDesc md = materialFromMesh(*m);
+                        MaterialDesc md = materialDescForMesh(*m);
+                        applyInstanceColor(md, en);
                         fp.pbr = {md.albedo[0], md.albedo[1], md.albedo[2],
                                   md.roughness, md.metalness,
                                   md.emissive[0], md.emissive[1], md.emissive[2],
                                   md.emissiveIntensity,
                                   md.normalScale[0], md.normalScale[1],
                                   md.transmission, md.ior,
-                                  md.clearcoat, md.clearcoatRoughness};
+                                  md.clearcoat, md.clearcoatRoughness,
+                                  md.clearcoatNormalScale[0], md.clearcoatNormalScale[1],
+                                  md.envMapIntensity,
+                                  static_cast<float>(md.envMapCombine),
+                                  md.aoMapIntensity,
+                                  md.lightMapIntensity};
                     }
                     BufferGeometry* g = fp.geomTyped;
                     const unsigned int av = g->attributesVersion();
@@ -5566,6 +7104,7 @@ namespace threepp {
                         fp.posAttr  = g->getAttribute<float>("position");
                         fp.normAttr = g->getAttribute<float>("normal");
                         fp.uvAttr   = g->getAttribute<float>("uv");
+                        fp.uv2Attr  = g->getAttribute<float>("uv2");
                         fp.idxAttr  = g->getIndex();
                     }
                     unsigned int gv = 0;// must mirror geomVersionOf()
@@ -5573,6 +7112,7 @@ namespace threepp {
                     if (fp.normAttr) gv += fp.normAttr->version;
                     if (fp.idxAttr)  gv += fp.idxAttr->version;
                     if (fp.uvAttr)   gv += fp.uvAttr->version;
+                    if (fp.uv2Attr)  gv += fp.uv2Attr->version;
                     const bool geomChanged = (gv != fp.geomVersion);
                     if (geomChanged) {
                         fp.geomVersion = gv;
@@ -5659,25 +7199,40 @@ namespace threepp {
                     fp.posAttr  = fp.geomTyped->getAttribute<float>("position");
                     fp.normAttr = fp.geomTyped->getAttribute<float>("normal");
                     fp.uvAttr   = fp.geomTyped->getAttribute<float>("uv");
+                    fp.uv2Attr  = fp.geomTyped->getAttribute<float>("uv2");
                     fp.idxAttr  = fp.geomTyped->getIndex();
                     fp.albedoTex             = albedoTexOf(*m);
                     fp.roughnessTex          = roughnessTexOf(*m);
                     fp.metalnessTex          = metalnessTexOf(*m);
                     fp.normalTex             = normalTexOf(*m);
                     fp.transmissionTex       = transmissionTexOf(*m);
+                    fp.thicknessTex          = thicknessTexOf(*m);
                     fp.clearcoatTex          = clearcoatTexOf(*m);
                     fp.clearcoatRoughnessTex = clearcoatRoughnessTexOf(*m);
+                    fp.clearcoatNormalTex    = clearcoatNormalTexOf(*m);
                     fp.emissiveTex           = emissiveTexOf(*m);
+                    fp.specularTex           = specularTexOf(*m);
+                    fp.alphaTex              = alphaTexOf(*m);
+                    fp.occlusionTex          = occlusionTexOf(*m);
+                    fp.lightTex              = lightTexOf(*m);
+                    fp.displacementTex       = displacementTexOf(*m);
+                    fp.envTex                = envTexOf(*m);
                     fp.instanceIndex         = en.instanceIndex;
                     fp.matrix                = en.worldMatrix;
-                    const MaterialDesc md = materialFromMesh(*m);
+                    MaterialDesc md = materialDescForMesh(*m);
+                    applyInstanceColor(md, en);
                     fp.pbr = {md.albedo[0], md.albedo[1], md.albedo[2],
                               md.roughness, md.metalness,
                               md.emissive[0], md.emissive[1], md.emissive[2],
                               md.emissiveIntensity,
                               md.normalScale[0], md.normalScale[1],
                               md.transmission, md.ior,
-                              md.clearcoat, md.clearcoatRoughness};
+                              md.clearcoat, md.clearcoatRoughness,
+                              md.clearcoatNormalScale[0], md.clearcoatNormalScale[1],
+                              md.envMapIntensity,
+                              static_cast<float>(md.envMapCombine),
+                              md.aoMapIntensity,
+                              md.lightMapIntensity};
                 }
             }
             }// !leanOk (fingerprint re-derivation)
@@ -5748,6 +7303,17 @@ namespace threepp {
                 }
             }
 
+            std::vector<bool> entryMaterialDisplacedDirty(entries.size(), false);
+            for (size_t i = 0; i < entries.size(); ++i) {
+                if (!entries[i].isMaterialDisplaced) continue;
+                Mesh* m = entries[i].mesh;
+                auto stIt = materialDisplacedMeshStates.find(m);
+                if (stIt == materialDisplacedMeshStates.end() ||
+                    !materialDisplacedStateMatches(*m, *stIt->second)) {
+                    entryMaterialDisplacedDirty[i] = true;
+                }
+            }
+
             // LEAN path: the deformer dirty bits (bones / displaced / morph)
             // come from the scans above — fold them into the moved-bits mask
             // and the *DirtyAny flags exactly like the generic loop does.
@@ -5757,11 +7323,13 @@ namespace threepp {
                     const bool d = entryDisplacedDirty[i];
                     const bool gr = entryGrassDirty[i];
                     const bool mo = entryMorphDirty[i];
-                    if (!(b || d || gr || mo)) continue;
+                    const bool md = entryMaterialDisplacedDirty[i];
+                    if (!(b || d || gr || mo || md)) continue;
                     if (b) bonesDirtyAny = true;
                     if (d) displacedDirtyAny = true;
                     if (gr) grassDirtyAny = true;
                     if (mo) morphDirtyAny = true;
+                    if (md) materialDisplacedDirtyAny = true;
                     const size_t w = i >> 5;
                     if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
                     meshMovedBits_[w] |= (1u << (i & 31u));
@@ -5798,9 +7366,17 @@ namespace threepp {
                         a.albedoTex != b.albedoTex || a.roughnessTex != b.roughnessTex ||
                         a.metalnessTex != b.metalnessTex || a.normalTex != b.normalTex ||
                         a.transmissionTex != b.transmissionTex ||
+                        a.thicknessTex != b.thicknessTex ||
                         a.clearcoatTex != b.clearcoatTex ||
                         a.clearcoatRoughnessTex != b.clearcoatRoughnessTex ||
-                        a.emissiveTex != b.emissiveTex) {
+                        a.clearcoatNormalTex != b.clearcoatNormalTex ||
+                        a.emissiveTex != b.emissiveTex ||
+                        a.specularTex != b.specularTex ||
+                        a.alphaTex != b.alphaTex ||
+                        a.occlusionTex != b.occlusionTex ||
+                        a.lightTex != b.lightTex ||
+                        a.displacementTex != b.displacementTex ||
+                        a.envTex != b.envTex) {
                         structuralSame = false;
                         break;
                     }
@@ -5818,11 +7394,13 @@ namespace threepp {
                     const bool grassChanged = entryGrassDirty[i];
                     const bool geomChanged  = (a.geomVersion != b.geomVersion);
                     const bool morphChanged = entryMorphDirty[i];
+                    const bool matDispChanged = entryMaterialDisplacedDirty[i];
                     if (xfmChanged) matricesSame = false;
                     if (matChanged) { materialValuesSame = false; entryMatDirty[i] = true; }
                     if (bonesChanged) bonesDirtyAny = true;
                     if (dispChanged)  displacedDirtyAny = true;
                     if (grassChanged) grassDirtyAny = true;
+                    if (matDispChanged) materialDisplacedDirtyAny = true;
                     // Particle billboard meshes mutate attributes every frame but
                     // own no BLAS; never flag them geomDirty (would fire a per-
                     // frame vkDeviceWaitIdle for a refit that skips them). The
@@ -5847,14 +7425,20 @@ namespace threepp {
                     // share the same per-mesh bit. Reproject+halve FC for any
                     // of: matrix shift, pbr shift, pose deformation, ocean
                     // surface displacement, geometry data mutation, morph blend.
-                    if (xfmChanged || matChanged || bonesChanged || dispChanged || geomChanged || morphChanged) {
+                    if (xfmChanged || matChanged || bonesChanged || dispChanged ||
+                        geomChanged || morphChanged || matDispChanged) {
                         const size_t w = i >> 5;
                         if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
                         meshMovedBits_[w] |= (1u << (i & 31u));
                     }
                 }
+                if (materialDisplacedDirtyAny) {
+                    structuralSame = false;
+                }
                 if (structuralSame) {
-                    if (!matricesSame || !materialValuesSame || bonesDirtyAny || displacedDirtyAny || grassDirtyAny || geomDirtyAny || morphDirtyAny) {
+                    if (!matricesSame || !materialValuesSame || bonesDirtyAny ||
+                        displacedDirtyAny || grassDirtyAny || geomDirtyAny ||
+                        morphDirtyAny || materialDisplacedDirtyAny) {
                         motionThisFrame_ = true;
                     }
                     if (bonesDirtyAny) {
@@ -6037,7 +7621,9 @@ namespace threepp {
                         }
                     }
 
-                    if (!matricesSame || bonesDirtyAny || displacedDirtyAny || grassDirtyAny || tetDirtyAny || geomDirtyAny || morphDirtyAny) {
+                    if (!matricesSame || bonesDirtyAny || displacedDirtyAny ||
+                        grassDirtyAny || tetDirtyAny || geomDirtyAny ||
+                        morphDirtyAny || materialDisplacedDirtyAny) {
                         // TLAS refit: needed when instance transforms change
                         // (matricesSame=false) AND when any skinned BLAS was
                         // just rebuilt — the TLAS's per-instance wrapped AABB
@@ -6081,6 +7667,10 @@ namespace threepp {
                                 auto mIt = morphedMeshStates.find(en.mesh);
                                 if (mIt == morphedMeshStates.end()) continue;
                                 blasAddr = mIt->second->blas->address;
+                            } else if (en.isMaterialDisplaced) {
+                                auto mdIt = materialDisplacedMeshStates.find(en.mesh);
+                                if (mdIt == materialDisplacedMeshStates.end() || !mdIt->second->blas) continue;
+                                blasAddr = mdIt->second->blas->address;
                             } else {
                                 const BufferGeometry* geomKey = en.mesh->geometry().get();
                                 auto it = blasCache.find(geomKey);
@@ -6098,7 +7688,7 @@ namespace threepp {
                             // Same visibility-group rule as the full rebuild:
                             // blend/transmissive (non-water) → alpha mask so
                             // occlusion queries skip them.
-                            inst.mask = kRayMaskOpaque;
+                            inst.mask = kRayMaskOpaque | (en.mesh->castShadow ? kRayMaskShadow : 0u);
                             if (i < matDescsCached_.size() && !en.isDisplaced) {
                                 const auto& cmd = matDescsCached_[i];
                                 if (cmd.transmission > 0.0f || cmd.alphaCutoff < 0.0f)
@@ -6109,7 +7699,10 @@ namespace threepp {
                             inst.accelerationStructureReference = blasAddr;
                             instances.push_back(inst);
                         }
-                        const bool blasDeformed = bonesDirtyAny || displacedDirtyAny || grassDirtyAny || tetDirtyAny || morphDirtyAny || geomDirtyAny;
+                        const bool blasDeformed = bonesDirtyAny || displacedDirtyAny ||
+                                                   grassDirtyAny || tetDirtyAny ||
+                                                   morphDirtyAny || geomDirtyAny ||
+                                                   materialDisplacedDirtyAny;
                         // Stage the refit; recordCommandBuffer records it into the
                         // frame cb after the deformable BLAS rebuilds (no drain).
                         pendingTlasInstances_ = std::move(instances);
@@ -6148,7 +7741,7 @@ namespace threepp {
                         // to the full structural rebuild), so its dedup index stays
                         // valid. Full fallback only if the cache size somehow doesn't
                         // match (never on the fast path that reaches here).
-                        const bool patchMatDescs = matDescsCached_.size() == entries.size();
+                        const bool patchMatDescs = matDescsCached_.size() >= entries.size();
                         if (!patchMatDescs) matDescsCached_.assign(entries.size(), MaterialDesc{});
                         // Same dedup as the full-rebuild path below (consulted only on
                         // the full-rebuild fallback): entries order is identical
@@ -6160,7 +7753,8 @@ namespace threepp {
                             if (en.isOverlay) continue;// raster-overlay only — no MaterialDesc slot
                             if (patchMatDescs && !entryMatDirty[i]) continue;// unchanged → keep cached desc
                             Mesh* m = en.mesh;
-                            MaterialDesc md = materialFromMesh(*m);
+                            MaterialDesc md = materialDescForMesh(*m);
+                            applyInstanceColor(md, en);
                             if (patchMatDescs) {
                                 // Material* unchanged → its dedup index is stable.
                                 md.materialAssetIdx = matDescsCached_[i].materialAssetIdx;
@@ -6173,6 +7767,10 @@ namespace threepp {
                             if (auto tex = albedoTexOf(*m)) {
                                 md.albedoTexIndex = ensureMaterialTexture(tex);
                                 copyTexUvTransform(md.uvTransform, tex);
+                            }
+                            if (auto tex = alphaTexOf(*m)) {
+                                md.alphaTexIndex = ensureMaterialTexture(tex);
+                                copyTexUvTransform(md.uvTransformAlpha, tex);
                             }
                             if (auto tex = roughnessTexOf(*m)) {
                                 md.roughnessTexIndex = ensureMaterialTexture(tex);
@@ -6190,6 +7788,10 @@ namespace threepp {
                                 md.transmissionTexIndex = ensureMaterialTexture(tex);
                                 copyTexUvTransform(md.uvTransformTransmission, tex);
                             }
+                            if (auto tex = thicknessTexOf(*m)) {
+                                md.thicknessTexIndex = ensureMaterialTexture(tex);
+                                copyTexUvTransform(md.uvTransformThickness, tex);
+                            }
                             if (auto tex = clearcoatTexOf(*m)) {
                                 md.clearcoatTexIndex = ensureMaterialTexture(tex);
                                 copyTexUvTransform(md.uvTransformClearcoat, tex);
@@ -6198,15 +7800,48 @@ namespace threepp {
                                 md.clearcoatRoughnessTexIndex = ensureMaterialTexture(tex);
                                 copyTexUvTransform(md.uvTransformClearcoatRough, tex);
                             }
+                            if (auto tex = clearcoatNormalTexOf(*m)) {
+                                md.clearcoatNormalTexIndex = ensureMaterialTexture(tex);
+                                copyTexUvTransform(md.uvTransformClearcoatNormal, tex);
+                            }
                             if (auto tex = emissiveTexOf(*m)) {
                                 md.emissiveTexIndex = ensureMaterialTexture(tex);
                                 copyTexUvTransform(md.uvTransformEmissive, tex);
+                            }
+                            if (auto tex = specularTexOf(*m)) {
+                                md.specularTexIndex = ensureMaterialTexture(tex);
+                                copyTexUvTransform(md.uvTransformSpecular, tex);
                             }
                             if (auto tex = occlusionTexOf(*m)) {
                                 md.occlusionTexIndex = ensureMaterialTexture(tex);
                                 copyTexUvTransform(md.uvTransformOcclusion, tex);
                             }
+                            if (auto tex = lightTexOf(*m)) {
+                                md.lightTexIndex = ensureMaterialTexture(tex);
+                                copyTexUvTransform(md.uvTransformLight, tex);
+                            }
+                            if (auto tex = displacementTexOf(*m)) {
+                                md.displacementTexIndex = ensureMaterialTexture(tex);
+                                copyTexUvTransform(md.uvTransformDisplacement, tex);
+                            }
+                            if (auto tex = envTexOf(*m)) {
+                                md.envTexIndex = ensureMaterialTexture(tex);
+                            }
                             matDescsCached_[i] = md;
+                            if (patchMatDescs && i < rasterGroupMaterialDescIndices_.size()) {
+                                const auto& materials = m->materials();
+                                for (const auto& groupDesc : rasterGroupMaterialDescIndices_[i]) {
+                                    if (groupDesc.descIndex == i ||
+                                        groupDesc.descIndex >= matDescsCached_.size() ||
+                                        groupDesc.materialIndex >= materials.size()) {
+                                        continue;
+                                    }
+                                    MaterialDesc groupMd = buildMaterialDescForEntryMaterial(
+                                            en, materials[groupDesc.materialIndex], matAssetMap);
+                                    groupMd.materialAssetIdx = matDescsCached_[groupDesc.descIndex].materialAssetIdx;
+                                    matDescsCached_[groupDesc.descIndex] = groupMd;
+                                }
+                            }
                         }
                         for (auto& d : matDescsDirty_) d = true;
                         sceneHasGlass_ = false;
@@ -6261,12 +7896,14 @@ namespace threepp {
                 destroyBuffer(ctx->allocator(), tlasBuffer);
                 for (auto& b : tlasInstancesBuffers) { destroyBuffer(ctx->allocator(), b); b = {}; }
                 destroyBuffer(ctx->allocator(), geometryDescsBuffer);
+                destroyBuffer(ctx->allocator(), materialGroupDescsBuffer);
                 for (auto& b : materialDescsBuffers) {
                     destroyBuffer(ctx->allocator(), b);
                     b = {};
                 }
                 tlasBuffer = {};
                 geometryDescsBuffer = {};
+                materialGroupDescsBuffer = {};
 
                 // Prune stale cache entries whose underlying objects have been
                 // destroyed (typical on model swap). Keeping them risks an
@@ -6282,6 +7919,7 @@ namespace threepp {
                         destroyBuffer(ctx->allocator(), rec->index);
                         destroyBuffer(ctx->allocator(), rec->normal);
                         destroyBuffer(ctx->allocator(), rec->uv);
+                        destroyBuffer(ctx->allocator(), rec->uv2);
                         destroyBuffer(ctx->allocator(), rec->color);
                         destroyBuffer(ctx->allocator(), rec->prevVertex);
                         destroyBuffer(ctx->allocator(), rec->blasScratch);
@@ -6306,6 +7944,7 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
+                            destroyBuffer(ctx->allocator(), rec->uv2);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         // Return the skinning descriptor set to the pool, else
@@ -6340,6 +7979,7 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
+                            destroyBuffer(ctx->allocator(), rec->uv2);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         if (it->second->tetDescSet != VK_NULL_HANDLE) {
@@ -6362,6 +8002,7 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
+                            destroyBuffer(ctx->allocator(), rec->uv2);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         if (st->scratchA.view  != VK_NULL_HANDLE) vkDestroyImageView(ctx->device(), st->scratchA.view, nullptr);
@@ -6386,6 +8027,7 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
+                            destroyBuffer(ctx->allocator(), rec->uv2);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         destroyBuffer(ctx->allocator(), st->restPos);
@@ -6405,9 +8047,18 @@ namespace threepp {
                             destroyBuffer(ctx->allocator(), rec->index);
                             destroyBuffer(ctx->allocator(), rec->normal);
                             destroyBuffer(ctx->allocator(), rec->uv);
+                            destroyBuffer(ctx->allocator(), rec->uv2);
                             destroyBuffer(ctx->allocator(), rec->prevVertex);
                         }
                         it = morphedMeshStates.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+                for (auto it = materialDisplacedMeshStates.begin(); it != materialDisplacedMeshStates.end(); ) {
+                    if (it->second->liveCheck.expired()) {
+                        if (it->second->blas) destroyBlasRecord(*it->second->blas);
+                        it = materialDisplacedMeshStates.erase(it);
                     } else {
                         ++it;
                     }
@@ -6416,8 +8067,11 @@ namespace threepp {
                     if (it->second.ref.expired()) {
                         const uint32_t slot = it->second.slot;
                         if (slot < materialTextures.size()) {
-                            destroyImage2D(ctx->allocator(), ctx->device(), materialTextures[slot]);
+                            if (slot >= materialTextureOwned_.size() || materialTextureOwned_[slot]) {
+                                destroyImage2D(ctx->allocator(), ctx->device(), materialTextures[slot]);
+                            }
                             materialTextures[slot] = {};
+                            if (slot < materialTextureOwned_.size()) materialTextureOwned_[slot] = true;
                             freeTextureSlots.push_back(slot);
                         }
                         it = textureCache.erase(it);
@@ -6441,6 +8095,9 @@ namespace threepp {
             // instance and are not drawn in the gbuffer (both skip on isOverlay).
             std::vector<GeometryDesc> geomDescs(entries.size());
             std::vector<MaterialDesc> matDescs(entries.size());
+            std::vector<MaterialGroupDesc> materialGroupDescs;
+            std::vector<uint32_t> materialGroupOffsets(entries.size(), 0u);
+            std::vector<uint32_t> materialGroupCounts(entries.size(), 0u);
 
             // Material-asset dedup. Meshes sharing one Material C++ pointer
             // get the same matAssetIdx so raygen's bilinear reproject gate
@@ -6448,6 +8105,7 @@ namespace threepp {
             // grows by ~one entry per UNIQUE Material in the scene — well
             // below entries.size() in typical content.
             std::unordered_map<const Material*, uint32_t> matAssetMap;
+            rasterGroupMaterialDescIndices_.assign(entries.size(), {});
 
             for (size_t i = 0; i < entries.size(); ++i) {
                 const MeshEntry& en = entries[i];
@@ -6457,8 +8115,6 @@ namespace threepp {
                 // the TLAS. Skip before the geometry-keyed build so we don't
                 // allocate (or per-frame refit) an AS for them.
                 if (en.isParticle) continue;
-                const BufferGeometry* geomKey = m->geometry().get();
-
                 // Skinned meshes get a per-instance deformed BLAS rather than
                 // sharing the geometry-keyed cache. Two SkinnedMeshes loaded
                 // from the same glTF can share BufferGeometry but never share
@@ -6467,6 +8123,7 @@ namespace threepp {
                 // own FFT cascade and its own continuously-rewritten vertex
                 // buffer).
                 BlasRecord* recPtr = nullptr;
+                const std::vector<GeometryGroup>* referenceGroups = nullptr;
                 auto* sm = en.isSkinned ? static_cast<SkinnedMesh*>(m) : nullptr;
                 if (sm && sm->skeleton && !sm->skeleton->bones.empty()) {
                     auto* st = ensureSkinnedBlas(*sm);
@@ -6497,36 +8154,16 @@ namespace threepp {
                     if (!st) continue;
                     recPtr = st->blas.get();
                 } else {
-                    auto it = blasCache.find(geomKey);
-                    if (it != blasCache.end()) {
-                        const unsigned int curVer = geomVersionOf(*m->geometry());
-                        if (it->second->geomVersion != curVer) {
-                            auto& old = it->second;
-                            if (old->as) ctx->rt().destroyAccelerationStructure(ctx->device(), old->as, nullptr);
-                            destroyBuffer(ctx->allocator(), old->storage);
-                            destroyBuffer(ctx->allocator(), old->vertex);
-                            destroyBuffer(ctx->allocator(), old->index);
-                            destroyBuffer(ctx->allocator(), old->normal);
-                            destroyBuffer(ctx->allocator(), old->uv);
-                            destroyBuffer(ctx->allocator(), old->color);
-                            destroyBuffer(ctx->allocator(), old->prevVertex);
-                            destroyBuffer(ctx->allocator(), old->blasScratch);
-                            blasCache.erase(it);
-                            // erase() returns the next bucket entry, not end().
-                            // Force a fresh lookup so the "missing → build" branch
-                            // below fires; otherwise recPtr binds to a sibling
-                            // cache entry (different mesh's BLAS) and the TLAS
-                            // instance ends up referencing the wrong AS.
-                            it = blasCache.end();
-                        }
+                    BlasRecord* baseRec = ensureCachedStaticBlas(*m);
+                    if (!baseRec) continue;// degenerate / unsupported geometry
+                    if (en.isMaterialDisplaced) {
+                        auto* st = ensureMaterialDisplacedBlas(*m);
+                        if (!st || !st->blas) continue;
+                        recPtr = st->blas.get();
+                        if (!st->referenceGroups.empty()) referenceGroups = &st->referenceGroups;
+                    } else {
+                        recPtr = baseRec;
                     }
-                    if (it == blasCache.end()) {
-                        auto rec = buildBlasFor(*m->geometry());
-                        if (!rec) continue;// degenerate / unsupported geometry
-                        rec->liveCheck = m->geometry();
-                        it = blasCache.emplace(geomKey, std::move(rec)).first;
-                    }
-                    recPtr = it->second.get();
                 }
 
                 // Overlay meshes need a BlasRecord (vertex buffer for the
@@ -6556,6 +8193,7 @@ namespace threepp {
                 gdesc.normalAddress = recPtr->normal.address;
                 gdesc.indexAddress  = recPtr->index.address;
                 gdesc.uvAddress     = recPtr->uv.address;// 0 if no UV attribute
+                gdesc.uv2Address    = recPtr->uv2.handle != VK_NULL_HANDLE ? recPtr->uv2.address : recPtr->uv.address;
                 gdesc.foamAddress   = recPtr->isOceanSurface ? 1ull : 0ull;// 0/1 flag (not an address); 1 == FFT-displaced ocean surface
                 // prevVertexAddress: skinned + displaced meshes have a real
                 // prev-vertex buffer (different from current). Static meshes
@@ -6588,52 +8226,20 @@ namespace threepp {
                     gdesc.colorAddress = useVtxColor ? recPtr->color.address : 0;
                 }
                 gdesc._pad = 0;
+                gdesc.materialGroupAddress = 0;
+                gdesc.materialGroupCount = 0;
+                gdesc._materialGroupPad = 0;
                 geomDescs[i] = gdesc;
 
-                MaterialDesc md = materialFromMesh(*m);
-                {
-                    const Material* matKey = m->material().get();
-                    auto [matIt, inserted] = matAssetMap.try_emplace(
-                            matKey, static_cast<uint32_t>(matAssetMap.size()));
-                    md.materialAssetIdx = matIt->second;
-                }
-                if (auto tex = albedoTexOf(*m)) {
-                    md.albedoTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransform, tex);
-                }
-                if (auto tex = roughnessTexOf(*m)) {
-                    md.roughnessTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformRoughMetal, tex);
-                }
-                if (auto tex = metalnessTexOf(*m)) {
-                    md.metalnessTexIndex = ensureMaterialTexture(tex);
-                    if (md.roughnessTexIndex < 0) copyTexUvTransform(md.uvTransformRoughMetal, tex);
-                }
-                if (auto tex = normalTexOf(*m)) {
-                    md.normalTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformNormal, tex);
-                }
-                if (auto tex = transmissionTexOf(*m)) {
-                    md.transmissionTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformTransmission, tex);
-                }
-                if (auto tex = clearcoatTexOf(*m)) {
-                    md.clearcoatTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformClearcoat, tex);
-                }
-                if (auto tex = clearcoatRoughnessTexOf(*m)) {
-                    md.clearcoatRoughnessTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformClearcoatRough, tex);
-                }
-                if (auto tex = emissiveTexOf(*m)) {
-                    md.emissiveTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformEmissive, tex);
-                }
-                if (auto tex = occlusionTexOf(*m)) {
-                    md.occlusionTexIndex = ensureMaterialTexture(tex);
-                    copyTexUvTransform(md.uvTransformOcclusion, tex);
-                }
+                MaterialDesc md = buildMaterialDescForEntryMaterial(en, m->material(), matAssetMap);
                 matDescs[i] = md;
+                appendRasterGroupMaterialDescs(
+                        static_cast<uint32_t>(i), en, matDescs, matAssetMap);
+                appendReferenceMaterialGroupDescs(
+                        static_cast<uint32_t>(i), en,
+                        recPtr->index.handle != VK_NULL_HANDLE ? recPtr->indexCount : recPtr->vertexCount,
+                        materialGroupDescs, materialGroupOffsets, materialGroupCounts,
+                        referenceGroups);
                 // Visibility group (see vulkan_shared.h): blend/transmissive
                 // surfaces move to the alpha mask so pure-visibility occlusion
                 // queries (env gather, GI, emissive-NEE) cull them out — a text
@@ -6644,11 +8250,21 @@ namespace threepp {
                     instances.back().mask =
                             (!en.isDisplaced && (md.transmission > 0.0f || md.alphaCutoff < 0.0f))
                                     ? kRayMaskAlpha
-                                    : kRayMaskOpaque;
+                                    : (kRayMaskOpaque | (en.mesh->castShadow ? kRayMaskShadow : 0u));
                 }
             }
 
             buildTlas(instances);
+            if (!materialGroupDescs.empty()) {
+                uploadDescBuffer(materialGroupDescsBuffer, materialGroupDescs);
+                for (size_t i = 0; i < entries.size(); ++i) {
+                    if (materialGroupCounts[i] == 0u) continue;
+                    geomDescs[i].materialGroupAddress =
+                            materialGroupDescsBuffer.address +
+                            static_cast<VkDeviceAddress>(materialGroupOffsets[i]) * sizeof(MaterialGroupDesc);
+                    geomDescs[i].materialGroupCount = materialGroupCounts[i];
+                }
+            }
             uploadDescBuffer(geometryDescsBuffer, geomDescs);
             // Seed every per-frame slot with the fresh matDescs so the first
             // few frames don't try to flush against a half-initialised ring.
@@ -7500,6 +9116,7 @@ namespace threepp {
         // was reading on the previous use of `frame`).
         void uploadRasterCameraUbo(uint32_t frame, Camera& camera) {
             camera.updateMatrixWorld(true);
+            currCameraPerspective_ = camera.is<PerspectiveCamera>();
 
             // VP_unjittered = projection * view, view = matrixWorldInverse.
             Matrix4 view, proj;
@@ -7583,6 +9200,16 @@ namespace threepp {
             ubo.prevJitter[1] = rasterPrevJitterValid_ ? rasterPrevJitter_[1] : jClipY;
             ubo.prevJitter[2] = 0.f;
             ubo.prevJitter[3] = 0.f;
+            ubo.clipPlaneCount = std::min<uint32_t>(
+                    static_cast<uint32_t>(clippingPlanes_.size()), kMaxRasterClipPlanes);
+            ubo.clipIntersection = 0u;
+            for (uint32_t i = 0; i < ubo.clipPlaneCount; ++i) {
+                const auto& p = clippingPlanes_[i];
+                ubo.clipPlanes[i][0] = p.normal.x;
+                ubo.clipPlanes[i][1] = p.normal.y;
+                ubo.clipPlanes[i][2] = p.normal.z;
+                ubo.clipPlanes[i][3] = -p.constant;
+            }
 
             void* mapped = nullptr;
             vmaMapMemory(ctx->allocator(), rasterCameraUbos[frame].alloc, &mapped);
@@ -7700,36 +9327,42 @@ namespace threepp {
         }
 
         // Host mirror of gbuffer_indirect.vert's DrawInfo struct. Tight-
-        // packed (120 bytes, all members naturally aligned to ≤ 8) so it
+        // packed (224-byte stride, all members naturally aligned to <= 8) so it
         // matches the GLSL `scalar` block layout used in the shader.
         struct DrawInfoGpu {
             float    model[16];        // 64
             uint64_t posAddr;          // 8
             uint64_t nrmAddr;          // 8
             uint64_t uvAddr;           // 8
+            uint64_t uv2Addr;          // 8
             uint64_t prevPosAddr;      // 8
             uint64_t indexAddr;        // 8 (0 → non-indexed)
             uint64_t colorAddr;        // 8 (0 → no per-vertex color / vertexColors off)
             uint32_t instanceCustomIndex;
+            uint32_t materialIndex;
             uint32_t flags;
             uint32_t indexed;
             float    polygonOffset;    // clip-z depth bias (reverse-Z: + = toward near = on top)
+            float    clipPlanes[kMaxRasterClipPlanes][4]; // world-space local clipping planes; .w = threshold
+            uint32_t clipPlaneCount;
+            uint32_t clipIntersection;
+            uint32_t clipPad[2];
         };
-        static_assert(sizeof(DrawInfoGpu) == 128,
+        static_assert(sizeof(DrawInfoGpu) == 224,
                       "DrawInfoGpu layout drifted from gbuffer_indirect.vert");
 
-        // Per-cull-mode dispatch span into indirectCmdBuffers[frame].
+        // Per-cull/depth-mode dispatch span into indirectCmdBuffers[frame].
         struct DrawGroup {
             VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT;
             uint32_t        offset   = 0;// first cmd index (cmd-buffer-relative)
             uint32_t        count    = 0;
         };
-        // [0] Front (BACK cull), [1] Back (FRONT cull), [2] Double (NONE cull),
-        // [3] blend decals (NONE cull, drawn LAST with rasterGbufDecalPipeline
-        // so their albedo lerps over the already-rasterized receivers).
-        // The static order means recordRasterGbufPass can issue at most 4
+        // [0..2] depth-tested Front/Back/Double, [3..5] depthWrite=false,
+        // [6..8] depthTest=false, [9] blend decals (NONE cull, drawn LAST with
+        // rasterGbufDecalPipeline so their albedo lerps over receivers).
+        // The static order means recordRasterGbufPass can issue at most 10
         // vkCmdDrawIndirect calls and skip the empty ones.
-        std::array<DrawGroup, 4> indirectGroups_{};
+        std::array<DrawGroup, 10> indirectGroups_{};
         uint32_t indirectTotalDraws_ = 0;
 
         bool ensureDrawInfoCapacity(uint32_t frame, VkDeviceSize neededBytes) {
@@ -7768,12 +9401,12 @@ namespace threepp {
         // hybrid raster G-buffer pass. Called from renderFrame right after
         // cullEntriesAgainstFrustum (which sets MeshEntry::inFrustum) so we
         // can skip culled draws here. The actual GPU dispatch happens in
-        // recordRasterGbufPass via 1-4 vkCmdDrawIndirect calls partitioned
-        // by cull mode (+ a trailing blend-decal bucket).
+        // recordRasterGbufPass via a small fixed set of vkCmdDrawIndirect
+        // calls partitioned by cull/depth mode (+ a trailing blend-decal bucket).
         //
         // Draw partitioning: walk entries once, sort each visible draw
-        // into one of four buckets (Side::Front/Back/Double, then blend
-        // decals). Buckets are concatenated [Front | Back | Double | Decal]
+        // into one of ten buckets (Side::Front/Back/Double, depth-write-off,
+        // no-depth variants, then blend decals). Buckets are concatenated in that order
         // in the device buffers, and each VkDrawIndirectCommand's firstInstance carries the
         // global DrawInfo index — surfaced to the VS as gl_InstanceIndex
         // so the shader fetches `draws[gl_InstanceIndex]`. This trick
@@ -7785,9 +9418,14 @@ namespace threepp {
 
             if (lastVisibleEntries_.empty()) return;
 
-            // Four buckets: [BACK_cull, FRONT_cull, NONE_cull, decal] order.
-            std::array<std::vector<DrawInfoGpu>, 4>            draws;
-            std::array<std::vector<VkDrawIndirectCommand>, 4>  cmds;
+            const bool sceneHasShadowCaster = std::any_of(
+                    lastVisibleEntries_.begin(), lastVisibleEntries_.end(),
+                    [](const MeshEntry& en) {
+                        return !en.isOverlay && en.mesh && en.mesh->castShadow;
+                    });
+
+            std::array<std::vector<DrawInfoGpu>, 10>          draws;
+            std::array<std::vector<VkDrawIndirectCommand>, 10> cmds;
             auto bucketOf = [](VkCullModeFlags cm) -> int {
                 if (cm == VK_CULL_MODE_BACK_BIT)  return 0;
                 if (cm == VK_CULL_MODE_FRONT_BIT) return 1;
@@ -7806,83 +9444,142 @@ namespace threepp {
                 const uint32_t vcount = indexed ? rec->indexCount : rec->vertexCount;
                 if (vcount == 0u) continue;
 
-                const VkCullModeFlags wantCull =
-                        (i < lastVisibleCullMode_.size())
-                                ? lastVisibleCullMode_[i]
-                                : VK_CULL_MODE_BACK_BIT;
-                // Blend decals (alphaCutoff == -2 sentinel from materialFromMesh)
-                // go to bucket [3]: drawn last, with the albedo-blend pipeline.
-                // RasterFirst only — its shade reads the blended albedo
-                // attachment. ReferencePT's hybrid raygen re-samples material
-                // textures via the ids/UV attachments (which the decal pipeline
-                // write-masks), so there decals stay on the stochastic
-                // screen-door path that the PT accumulator converges.
-                const bool isDecal = renderMode_ == VulkanRenderer::RenderMode::RasterFirst &&
-                                     (i < matDescsCached_.size()) &&
-                                     (matDescsCached_[i].alphaCutoff == -2.0f);
-                const int b = isDecal ? 3 : bucketOf(wantCull);
+                const auto geometry = en.mesh->geometry();
+                auto cullModeForMaterial = [](const std::shared_ptr<Material>& material) {
+                    if (!material) return VK_CULL_MODE_BACK_BIT;
+                    switch (material->side) {
+                        case Side::Back:   return VK_CULL_MODE_FRONT_BIT;
+                        case Side::Double: return VK_CULL_MODE_NONE;
+                        default:           return VK_CULL_MODE_BACK_BIT;
+                    }
+                };
 
-                DrawInfoGpu di{};
-                std::memcpy(di.model, en.worldMatrix.data(), 64);
-                di.posAddr     = rec->vertex.address;
-                di.nrmAddr     = rec->normal.address;
-                di.uvAddr      = (rec->uv.handle != VK_NULL_HANDLE) ? rec->uv.address : 0ull;
-                // Warp-enabled DisplacedMesh: vertices reflow every frame, so
-                // prevVertex can't track a stable world point — point the
-                // motion-vector source at the current buffer so the ocean
-                // reprojects as world-static (see prevVertexAddress in the
-                // GeometryDesc build for the full rationale).
-                bool warpReproject = false;
-                if (en.isDisplaced) {
-                    warpReproject = static_cast<DisplacedMesh*>(en.mesh)->warp.halfRange > 0.0f;
-                }
-                di.prevPosAddr = (rec->prevVertex.handle != VK_NULL_HANDLE && !warpReproject)
-                                         ? rec->prevVertex.address
-                                         : rec->vertex.address;
-                di.indexAddr   = indexed ? rec->index.address : 0ull;
-                // Per-vertex color: only when the material opts in (vertexColors)
-                // and the geometry uploaded a color buffer — matches the
-                // GeometryDesc::colorAddress gate so RasterFirst and ReferencePT
-                // agree. gbuffer.frag multiplies albedo by the interpolated value.
-                {
-                    const auto dmat = en.mesh->material();
-                    di.colorAddr = (rec->color.handle != VK_NULL_HANDLE && dmat && dmat->vertexColors)
+                auto emitDraw = [&](const std::shared_ptr<Material>& material,
+                                    uint32_t materialDescIndex,
+                                    const std::optional<GeometryGroup>& group) {
+                    if (!material || material->stencilWrite) return;
+                    const VulkanDrawSpan span = resolveVulkanDrawSpan(
+                            vcount,
+                            geometry ? geometry->drawRange : DrawRange{0, static_cast<int>(vcount)},
+                            group);
+                    if (span.count == 0u) return;
+
+                    const VkCullModeFlags wantCull =
+                            (materialDescIndex < lastVisibleCullMode_.size())
+                                    ? lastVisibleCullMode_[materialDescIndex]
+                                    : cullModeForMaterial(material);
+                    // Blend decals (alphaCutoff == -2 sentinel from materialFromMaterial)
+                    // go to bucket [9]: drawn last, with the albedo-blend pipeline.
+                    // RasterFirst only — its shade reads the blended albedo
+                    // attachment. ReferencePT's hybrid raygen re-samples material
+                    // textures via the ids/UV attachments (which the decal pipeline
+                    // write-masks), so there decals stay on the stochastic
+                    // screen-door path that the PT accumulator converges.
+                    const bool isDecal = renderMode_ == VulkanRenderer::RenderMode::RasterFirst &&
+                                         (materialDescIndex < matDescsCached_.size()) &&
+                                         (matDescsCached_[materialDescIndex].alphaCutoff == -2.0f);
+                    const bool noDepthTest = !material->depthTest;
+                    const bool noDepthWrite = !material->depthWrite;
+                    const int baseBucket = noDepthTest ? 6 : (noDepthWrite ? 3 : 0);
+                    const int b = isDecal ? 9 : (baseBucket + bucketOf(wantCull));
+
+                    DrawInfoGpu di{};
+                    std::memcpy(di.model, en.worldMatrix.data(), 64);
+                    di.posAddr     = rec->vertex.address;
+                    di.nrmAddr     = rec->normal.address;
+                    di.uvAddr      = (rec->uv.handle != VK_NULL_HANDLE) ? rec->uv.address : 0ull;
+                    di.uv2Addr     = (rec->uv2.handle != VK_NULL_HANDLE)
+                                             ? rec->uv2.address
+                                             : di.uvAddr;
+                    // Warp-enabled DisplacedMesh: vertices reflow every frame, so
+                    // prevVertex can't track a stable world point — point the
+                    // motion-vector source at the current buffer so the ocean
+                    // reprojects as world-static (see prevVertexAddress in the
+                    // GeometryDesc build for the full rationale).
+                    bool warpReproject = false;
+                    if (en.isDisplaced) {
+                        warpReproject = static_cast<DisplacedMesh*>(en.mesh)->warp.halfRange > 0.0f;
+                    }
+                    di.prevPosAddr = (rec->prevVertex.handle != VK_NULL_HANDLE && !warpReproject)
+                                             ? rec->prevVertex.address
+                                             : rec->vertex.address;
+                    di.indexAddr   = indexed ? rec->index.address : 0ull;
+                    // Per-vertex color: only when this draw's material opts in
+                    // (vertexColors) and the geometry uploaded a color buffer.
+                    di.colorAddr = (rec->color.handle != VK_NULL_HANDLE && material->vertexColors)
                                            ? rec->color.address
                                            : 0ull;
-                }
-                di.instanceCustomIndex = static_cast<uint32_t>(i);
-                // Flag bits match the old gbuffer.vert push-constant layout:
-                //   bit 0 = is_water (DisplacedMesh), bit 3 = is_skinned.
-                uint32_t flags = 0u;
-                if (en.isDisplaced) flags |= 1u;
-                if (en.isSkinned)   flags |= 8u;
-                di.flags   = flags;
-                di.indexed = indexed ? 1u : 0u;
-                // polygonOffset → per-mesh clip-z depth bias (decals). Reverse-Z:
-                // a +clip-z bias pushes the surface toward NEAR so it renders on
-                // top of coplanar geometry (no z-fight). threepp/GL uses NEGATIVE
-                // polygonOffsetUnits for "on top", so flip the sign; units==0
-                // (bool only) → a small default that clears z-fight without
-                // floating. (The slope-scaled `factor` term isn't applied — flat
-                // decals don't need it; bias is uniform in NDC.)
-                float polyOff = 0.f;
-                if (auto pm = en.mesh->material(); pm && pm->polygonOffset) {
-                    // Honor BOTH factor + units (combined as a constant NDC bias —
-                    // the slope term can't be evaluated in the vertex shader; flat
-                    // decals don't need it). 0/0 (bool only) → a small default.
-                    const float uf = pm->polygonOffsetUnits + pm->polygonOffsetFactor;
-                    polyOff = (uf != 0.f) ? (-uf * 1.0e-6f) : 4.0e-6f;
-                }
-                di.polygonOffset = polyOff;
-                draws[b].push_back(di);
+                    di.instanceCustomIndex = static_cast<uint32_t>(i);
+                    di.materialIndex = materialDescIndex;
+                    // Flag bits match the G-buffer IDs attachment layout:
+                    //   bit 0 = is_water (DisplacedMesh), bit 3 = is_skinned,
+                    //   bit 4 = flatShading, bit 5 = receiveShadow, bit 6 = noDepthTest.
+                    uint32_t flags = 0u;
+                    if (en.isDisplaced) flags |= 1u;
+                    if (en.isSkinned)   flags |= 8u;
+                    if (auto* flat = dynamic_cast<MaterialWithFlatShading*>(material.get()); flat && flat->flatShading) {
+                        flags |= 16u;
+                    }
+                    if (shadowMapEnabled_ && (!sceneHasShadowCaster || en.mesh->receiveShadow)) flags |= 32u;
+                    if (noDepthTest) flags |= 64u;
+                    di.flags   = flags;
+                    di.indexed = indexed ? 1u : 0u;
+                    // polygonOffset → per-mesh clip-z depth bias (decals). Reverse-Z:
+                    // a +clip-z bias pushes the surface toward NEAR so it renders on
+                    // top of coplanar geometry (no z-fight). threepp/GL uses NEGATIVE
+                    // polygonOffsetUnits for "on top", so flip the sign; units==0
+                    // (bool only) → a small default that clears z-fight without
+                    // floating. (The slope-scaled `factor` term isn't applied — flat
+                    // decals don't need it; bias is uniform in NDC.)
+                    float polyOff = 0.f;
+                    if (material->polygonOffset) {
+                        // Honor BOTH factor + units (combined as a constant NDC bias —
+                        // the slope term can't be evaluated in the vertex shader; flat
+                        // decals don't need it). 0/0 (bool only) → a small default.
+                        const float uf = material->polygonOffsetUnits + material->polygonOffsetFactor;
+                        polyOff = (uf != 0.f) ? (-uf * 1.0e-6f) : 4.0e-6f;
+                    }
+                    di.polygonOffset = polyOff;
+                    if (localClippingEnabled_ && !material->clippingPlanes.empty()) {
+                        di.clipPlaneCount = std::min<uint32_t>(
+                                static_cast<uint32_t>(material->clippingPlanes.size()), kMaxRasterClipPlanes);
+                        di.clipIntersection = material->clipIntersection ? 1u : 0u;
+                        for (uint32_t clipIndex = 0; clipIndex < di.clipPlaneCount; ++clipIndex) {
+                            const auto& p = material->clippingPlanes[clipIndex];
+                            di.clipPlanes[clipIndex][0] = p.normal.x;
+                            di.clipPlanes[clipIndex][1] = p.normal.y;
+                            di.clipPlanes[clipIndex][2] = p.normal.z;
+                            di.clipPlanes[clipIndex][3] = -p.constant;
+                        }
+                    }
+                    draws[b].push_back(di);
 
-                VkDrawIndirectCommand cmd{};
-                cmd.vertexCount   = vcount;
-                cmd.instanceCount = 1u;
-                cmd.firstVertex   = 0u;
-                cmd.firstInstance = 0u;// patched below to the final-position index
-                cmds[b].push_back(cmd);
-                ++globalIdx;
+                    VkDrawIndirectCommand cmd{};
+                    cmd.vertexCount   = span.count;
+                    cmd.instanceCount = 1u;
+                    cmd.firstVertex   = span.first;
+                    cmd.firstInstance = 0u;// patched below to the final-position index
+                    cmds[b].push_back(cmd);
+                    ++globalIdx;
+                };
+
+                const auto& materials = en.mesh->materials();
+                if (geometry && materials.size() > 1 && !geometry->groups.empty()) {
+                    const auto* groupIndices = i < rasterGroupMaterialDescIndices_.size()
+                                                       ? &rasterGroupMaterialDescIndices_[i]
+                                                       : nullptr;
+                    for (const auto& group : geometry->groups) {
+                        if (group.materialIndex >= materials.size()) continue;
+                        const uint32_t materialIndex = static_cast<uint32_t>(group.materialIndex);
+                        const uint32_t descIndex = groupIndices
+                                ? findRasterGroupMaterialDescIndex(*groupIndices, materialIndex)
+                                          .value_or(static_cast<uint32_t>(i))
+                                : static_cast<uint32_t>(i);
+                        emitDraw(materials[group.materialIndex], descIndex, group);
+                    }
+                } else {
+                    emitDraw(en.mesh->material(), static_cast<uint32_t>(i), std::nullopt);
+                }
             }
 
             indirectTotalDraws_ = globalIdx;
@@ -7902,11 +9599,13 @@ namespace threepp {
             uint8_t* dDst = static_cast<uint8_t*>(mappedDraws);
             uint8_t* cDst = static_cast<uint8_t*>(mappedCmds);
             uint32_t offset = 0;
-            const VkCullModeFlags cullForBucket[4] = {
+            const VkCullModeFlags cullForBucket[10] = {
+                    VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT, VK_CULL_MODE_NONE,
+                    VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT, VK_CULL_MODE_NONE,
                     VK_CULL_MODE_BACK_BIT, VK_CULL_MODE_FRONT_BIT, VK_CULL_MODE_NONE,
                     VK_CULL_MODE_NONE// decals: DecalGeometry wraps edges, don't cull
             };
-            for (int b = 0; b < 4; ++b) {
+            for (int b = 0; b < 10; ++b) {
                 const uint32_t n = static_cast<uint32_t>(draws[b].size());
                 indirectGroups_[b].cullMode = cullForBucket[b];
                 indirectGroups_[b].offset   = offset;
@@ -7951,9 +9650,301 @@ namespace threepp {
             }
         }
 
+        static VkStencilOp stencilOpToVk(StencilOp op) {
+            switch (op) {
+                case StencilOp::Zero: return VK_STENCIL_OP_ZERO;
+                case StencilOp::Keep: return VK_STENCIL_OP_KEEP;
+                case StencilOp::Replace: return VK_STENCIL_OP_REPLACE;
+                case StencilOp::Increment: return VK_STENCIL_OP_INCREMENT_AND_CLAMP;
+                case StencilOp::Decrement: return VK_STENCIL_OP_DECREMENT_AND_CLAMP;
+                case StencilOp::IncrementWrap: return VK_STENCIL_OP_INCREMENT_AND_WRAP;
+                case StencilOp::DecrementWrap: return VK_STENCIL_OP_DECREMENT_AND_WRAP;
+                case StencilOp::Invert: return VK_STENCIL_OP_INVERT;
+            }
+            return VK_STENCIL_OP_KEEP;
+        }
+
+        static VkCompareOp stencilFuncToVk(StencilFunc func) {
+            switch (func) {
+                case StencilFunc::Never: return VK_COMPARE_OP_NEVER;
+                case StencilFunc::Less: return VK_COMPARE_OP_LESS;
+                case StencilFunc::Equal: return VK_COMPARE_OP_EQUAL;
+                case StencilFunc::LessEqual: return VK_COMPARE_OP_LESS_OR_EQUAL;
+                case StencilFunc::Greater: return VK_COMPARE_OP_GREATER;
+                case StencilFunc::NotEqual: return VK_COMPARE_OP_NOT_EQUAL;
+                case StencilFunc::GreaterEqual: return VK_COMPARE_OP_GREATER_OR_EQUAL;
+                case StencilFunc::Always: return VK_COMPARE_OP_ALWAYS;
+            }
+            return VK_COMPARE_OP_ALWAYS;
+        }
+
+        static uint64_t stencilPipelineKey(const Material& material) {
+            const auto pack = [](auto value) {
+                return static_cast<uint64_t>(static_cast<uint16_t>(as_integer(value)));
+            };
+            auto func = pack(material.stencilFunc);
+            if (!material.depthTest) func |= 0x8000ull;
+            return func |
+                   (pack(material.stencilFail) << 16) |
+                   (pack(material.stencilZFail) << 32) |
+                   (pack(material.stencilZPass) << 48);
+        }
+
+        VkPipeline getOrCreateRasterGbufStencilPipeline(const Material& material) {
+            const auto key = stencilPipelineKey(material);
+            if (auto it = rasterGbufStencilPipelines_.find(key); it != rasterGbufStencilPipelines_.end()) {
+                return it->second;
+            }
+
+            VkShaderModuleCreateInfo vsmci{};
+            vsmci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vsmci.codeSize = sizeof(kGbufferVertSpv);
+            vsmci.pCode = kGbufferVertSpv;
+            VkShaderModule vertModule = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &vsmci, nullptr, &vertModule),
+                  "vkCreateShaderModule(gbuffer.vert stencil)");
+
+            VkShaderModuleCreateInfo fsmci{};
+            fsmci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fsmci.codeSize = sizeof(kGbufferFragSpv);
+            fsmci.pCode = kGbufferFragSpv;
+            VkShaderModule fragModule = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &fsmci, nullptr, &fragModule),
+                  "vkCreateShaderModule(gbuffer.frag stencil)");
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vertModule;
+            stages[0].pName = "main";
+            stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = fragModule;
+            stages[1].pName = "main";
+
+            VkVertexInputBindingDescription vibs[5]{};
+            vibs[0].binding = 0;
+            vibs[0].stride = 3 * sizeof(float);
+            vibs[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[1].binding = 1;
+            vibs[1].stride = 3 * sizeof(float);
+            vibs[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[2].binding = 2;
+            vibs[2].stride = 2 * sizeof(float);
+            vibs[2].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[3].binding = 3;
+            vibs[3].stride = 3 * sizeof(float);
+            vibs[3].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[4].binding = 4;
+            vibs[4].stride = 2 * sizeof(float);
+            vibs[4].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+            VkVertexInputAttributeDescription vias[5]{};
+            vias[0].location = 0;
+            vias[0].binding = 0;
+            vias[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+            vias[1].location = 1;
+            vias[1].binding = 1;
+            vias[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+            vias[2].location = 2;
+            vias[2].binding = 2;
+            vias[2].format = VK_FORMAT_R32G32_SFLOAT;
+            vias[3].location = 3;
+            vias[3].binding = 3;
+            vias[3].format = VK_FORMAT_R32G32B32_SFLOAT;
+            vias[4].location = 4;
+            vias[4].binding = 4;
+            vias[4].format = VK_FORMAT_R32G32_SFLOAT;
+
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vi.vertexBindingDescriptionCount = 5;
+            vi.pVertexBindingDescriptions = vibs;
+            vi.vertexAttributeDescriptionCount = 5;
+            vi.pVertexAttributeDescriptions = vias;
+
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount = 1;
+
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_BACK_BIT;
+            rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkPipelineDepthStencilStateCreateInfo ds{};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            ds.depthTestEnable = material.depthTest ? VK_TRUE : VK_FALSE;
+            ds.depthWriteEnable = VK_FALSE;
+            ds.depthCompareOp = VK_COMPARE_OP_GREATER;
+            ds.stencilTestEnable = VK_TRUE;
+            ds.front.failOp = stencilOpToVk(material.stencilFail);
+            ds.front.passOp = stencilOpToVk(material.stencilZPass);
+            ds.front.depthFailOp = stencilOpToVk(material.stencilZFail);
+            ds.front.compareOp = stencilFuncToVk(material.stencilFunc);
+            ds.front.compareMask = 0xff;
+            ds.front.writeMask = 0xff;
+            ds.front.reference = 0;
+            ds.back = ds.front;
+
+            VkPipelineColorBlendAttachmentState cbas[5]{};
+            for (auto& a : cbas) {
+                a.blendEnable = VK_FALSE;
+                a.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                   VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            }
+            VkPipelineColorBlendStateCreateInfo cbState{};
+            cbState.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cbState.attachmentCount = 5;
+            cbState.pAttachments = cbas;
+
+            VkDynamicState dynStates[6] = {
+                    VK_DYNAMIC_STATE_VIEWPORT,
+                    VK_DYNAMIC_STATE_SCISSOR,
+                    VK_DYNAMIC_STATE_CULL_MODE,
+                    VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK,
+                    VK_DYNAMIC_STATE_STENCIL_WRITE_MASK,
+                    VK_DYNAMIC_STATE_STENCIL_REFERENCE};
+            VkPipelineDynamicStateCreateInfo dyn{};
+            dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dyn.dynamicStateCount = static_cast<uint32_t>(sizeof(dynStates) / sizeof(dynStates[0]));
+            dyn.pDynamicStates = dynStates;
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.stageCount = 2;
+            gpci.pStages = stages;
+            gpci.pVertexInputState = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState = &ms;
+            gpci.pDepthStencilState = &ds;
+            gpci.pColorBlendState = &cbState;
+            gpci.pDynamicState = &dyn;
+            gpci.layout = rasterPipelineLayout;
+            gpci.renderPass = rasterGbufRenderPass;
+            gpci.subpass = 0;
+
+            VkPipeline pipeline = VK_NULL_HANDLE;
+            try {
+                check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr, &pipeline),
+                      "vkCreateGraphicsPipelines(rasterGbufStencil)");
+            } catch (...) {
+                vkDestroyShaderModule(ctx->device(), fragModule, nullptr);
+                vkDestroyShaderModule(ctx->device(), vertModule, nullptr);
+                throw;
+            }
+            vkDestroyShaderModule(ctx->device(), fragModule, nullptr);
+            vkDestroyShaderModule(ctx->device(), vertModule, nullptr);
+
+            rasterGbufStencilPipelines_.emplace(key, pipeline);
+            return pipeline;
+        }
+
+        void recordStencilGbufDraws(VkCommandBuffer cb, uint32_t frame) {
+
+            const bool sceneHasShadowCaster = std::any_of(
+                    lastVisibleEntries_.begin(), lastVisibleEntries_.end(),
+                    [](const MeshEntry& en) {
+                        return !en.isOverlay && en.mesh && en.mesh->castShadow;
+                    });
+
+            VkPipeline boundPipeline = VK_NULL_HANDLE;
+            for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
+                const auto& en = lastVisibleEntries_[i];
+                if (en.isOverlay) continue;
+                if (!en.mesh) continue;
+                const auto material = en.mesh->material();
+                if (!material || !material->stencilWrite) continue;
+
+                const BlasRecord* rec = resolveBlasForEntry(en);
+                if (!rec || rec->vertex.handle == VK_NULL_HANDLE ||
+                    rec->normal.handle == VK_NULL_HANDLE) {
+                    continue;
+                }
+
+                const uint32_t vertexCount = rec->index.handle != VK_NULL_HANDLE
+                        ? rec->indexCount
+                        : rec->vertexCount;
+                if (vertexCount == 0u) continue;
+
+                const VkPipeline pipeline = getOrCreateRasterGbufStencilPipeline(*material);
+                if (pipeline == VK_NULL_HANDLE) continue;
+                if (boundPipeline != pipeline) {
+                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+                    boundPipeline = pipeline;
+                }
+                if (boundPipeline == pipeline) {
+                    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                            rasterPipelineLayout, 0, 1,
+                                            &rasterDescSets[frame], 0, nullptr);
+                }
+
+                const VkCullModeFlags cullMode = (i < lastVisibleCullMode_.size())
+                        ? lastVisibleCullMode_[i]
+                        : VK_CULL_MODE_BACK_BIT;
+                vkCmdSetCullMode(cb, cullMode);
+                vkCmdSetStencilCompareMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                           static_cast<uint32_t>(material->stencilFuncMask));
+                vkCmdSetStencilWriteMask(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                         static_cast<uint32_t>(material->stencilWriteMask));
+                vkCmdSetStencilReference(cb, VK_STENCIL_FACE_FRONT_AND_BACK,
+                                         static_cast<uint32_t>(material->stencilRef));
+
+                struct PC {
+                    float    model[16];
+                    uint32_t instanceCustomIndex;
+                    uint32_t flags;
+                    uint32_t _pad0;
+                    uint32_t _pad1;
+                } pc{};
+                std::memcpy(pc.model, en.worldMatrix.data(), 64);
+                pc.instanceCustomIndex = static_cast<uint32_t>(i);
+                if (en.isDisplaced) pc.flags |= 1u;
+                if (en.isSkinned) pc.flags |= 8u;
+                if (auto* flat = dynamic_cast<MaterialWithFlatShading*>(material.get()); flat && flat->flatShading) {
+                    pc.flags |= 16u;
+                }
+                if (shadowMapEnabled_ && (!sceneHasShadowCaster || en.mesh->receiveShadow)) pc.flags |= 32u;
+                if (!material->depthTest) pc.flags |= 64u;
+                vkCmdPushConstants(cb, rasterPipelineLayout,
+                                   VK_SHADER_STAGE_VERTEX_BIT,
+                                   0, sizeof(pc), &pc);
+
+                VkBuffer vbufs[5] = {
+                        rec->vertex.handle,
+                        rec->normal.handle,
+                        rec->uv.handle != VK_NULL_HANDLE ? rec->uv.handle : dummyUvBuffer_.handle,
+                        rec->prevVertex.handle != VK_NULL_HANDLE ? rec->prevVertex.handle : rec->vertex.handle,
+                        rec->uv2.handle != VK_NULL_HANDLE
+                                ? rec->uv2.handle
+                                : (rec->uv.handle != VK_NULL_HANDLE ? rec->uv.handle : dummyUvBuffer_.handle)};
+                VkDeviceSize voffs[5] = {0, 0, 0, 0, 0};
+                vkCmdBindVertexBuffers(cb, 0, 5, vbufs, voffs);
+                if (rec->index.handle != VK_NULL_HANDLE) {
+                    vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                    vkCmdDrawIndexed(cb, vertexCount, 1, 0, 0, 0);
+                } else {
+                    vkCmdDraw(cb, vertexCount, 1, 0, 0);
+                }
+            }
+        }
+
         // Begin the raster G-buffer render pass and ship the prebuilt
-        // indirect-draw groups via 1-4 vkCmdDrawIndirect calls (one per
-        // active cull mode, plus a trailing blend-decal group on the
+        // indirect-draw groups via a fixed small number of vkCmdDrawIndirect
+            // calls (depth-tested/depth-write-off/no-depth buckets plus a trailing decal group) on the
         // albedo-blend pipeline). Replaces the prior per-mesh draw loop —
         // see buildIndirectDrawData above for how the GPU buffers are
         // populated.
@@ -8002,45 +9993,529 @@ namespace threepp {
             scissor.extent = gbufReg;
             vkCmdSetScissor(cb, 0, 1, &scissor);
 
-            if (indirectTotalDraws_ == 0u) {
-                vkCmdEndRenderPass(cb);
-                return;
-            }
-
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufIndirectPipeline);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                     rasterPipelineLayout, 0, 1,
                                     &rasterDescSets[frame], 0, nullptr);
 
-            // One vkCmdDrawIndirect per cull-mode group. Empty groups skip;
-            // a typical static scene fires one (BACK_cull); transmissive
-            // sets can fire two or three. cullMode flips between calls
-            // via the dynamic cullMode state — far cheaper than re-doing
-            // it per draw.
+            // One vkCmdDrawIndirect per cull/depth group. Empty groups skip;
+            // a typical static scene fires one (BACK_cull). cullMode flips
+            // between calls via dynamic state; depthWrite/depthTest material
+            // toggles use separate fixed-depth-state pipelines.
             constexpr VkDeviceSize cmdStride = sizeof(VkDrawIndirectCommand);
-            for (int b = 0; b < 3; ++b) {
-                const auto& g = indirectGroups_[b];
-                if (g.count == 0u) continue;
-                vkCmdSetCullMode(cb, g.cullMode);
-                vkCmdDrawIndirect(cb,
-                                  indirectCmdBuffers[frame].handle,
-                                  static_cast<VkDeviceSize>(g.offset) * cmdStride,
-                                  g.count,
-                                  static_cast<uint32_t>(cmdStride));
+            if (indirectTotalDraws_ > 0u) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufIndirectPipeline);
+                for (int b = 0; b < 3; ++b) {
+                    const auto& g = indirectGroups_[b];
+                    if (g.count == 0u) continue;
+                    vkCmdSetCullMode(cb, g.cullMode);
+                    vkCmdDrawIndirect(cb,
+                                      indirectCmdBuffers[frame].handle,
+                                      static_cast<VkDeviceSize>(g.offset) * cmdStride,
+                                      g.count,
+                                      static_cast<uint32_t>(cmdStride));
+                }
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufNoDepthWritePipeline);
+                for (int b = 3; b < 6; ++b) {
+                    const auto& g = indirectGroups_[b];
+                    if (g.count == 0u) continue;
+                    vkCmdSetCullMode(cb, g.cullMode);
+                    vkCmdDrawIndirect(cb,
+                                      indirectCmdBuffers[frame].handle,
+                                      static_cast<VkDeviceSize>(g.offset) * cmdStride,
+                                      g.count,
+                                      static_cast<uint32_t>(cmdStride));
+                }
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufNoDepthPipeline);
+                for (int b = 6; b < 9; ++b) {
+                    const auto& g = indirectGroups_[b];
+                    if (g.count == 0u) continue;
+                    vkCmdSetCullMode(cb, g.cullMode);
+                    vkCmdDrawIndirect(cb,
+                                      indirectCmdBuffers[frame].handle,
+                                      static_cast<VkDeviceSize>(g.offset) * cmdStride,
+                                      g.count,
+                                      static_cast<uint32_t>(cmdStride));
+                }
+                // Blend decals last: albedo-blend pipeline lerps over the receivers
+                // rasterized above (same layout/descriptors, no set rebind needed).
+                if (const auto& g = indirectGroups_[9]; g.count > 0u) {
+                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufDecalPipeline);
+                    vkCmdSetCullMode(cb, g.cullMode);
+                    vkCmdDrawIndirect(cb,
+                                      indirectCmdBuffers[frame].handle,
+                                      static_cast<VkDeviceSize>(g.offset) * cmdStride,
+                                      g.count,
+                                      static_cast<uint32_t>(cmdStride));
+                }
             }
-            // Blend decals last: albedo-blend pipeline lerps over the receivers
-            // rasterized above (same layout/descriptors, no set rebind needed).
-            if (const auto& g = indirectGroups_[3]; g.count > 0u) {
-                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufDecalPipeline);
-                vkCmdSetCullMode(cb, g.cullMode);
-                vkCmdDrawIndirect(cb,
-                                  indirectCmdBuffers[frame].handle,
-                                  static_cast<VkDeviceSize>(g.offset) * cmdStride,
-                                  g.count,
-                                  static_cast<uint32_t>(cmdStride));
-            }
+            recordStencilGbufDraws(cb, frame);
 
             vkCmdEndRenderPass(cb);
+        }
+
+        bool hasVisibleCustomShaderMaterials() const {
+            return std::any_of(lastVisibleEntries_.begin(), lastVisibleEntries_.end(), [](const MeshEntry& entry) {
+                if (!entry.mesh || entry.isOverlay || !entry.inFrustum) return false;
+                const auto geometry = entry.mesh->geometry();
+                const auto& materials = entry.mesh->materials();
+                const auto isVisibleCustomShader = [](const std::shared_ptr<Material>& material) {
+                    return material && material->visible &&
+                           material->name != kParticleMaterialName &&
+                           dynamic_cast<ShaderMaterial*>(material.get()) != nullptr;
+                };
+                if (materials.size() > 1 && geometry) {
+                    for (const auto& group : geometry->groups) {
+                        if (group.materialIndex < materials.size() &&
+                            isVisibleCustomShader(materials[group.materialIndex])) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                return !materials.empty() && isVisibleCustomShader(materials.front());
+            });
+        }
+
+        bool sceneHasVisibleCustomShaderMaterials(Object3D& scene) const {
+            bool found = false;
+            scene.traverseVisible([&](Object3D& object) {
+                if (found) return;
+                auto* mesh = dynamic_cast<Mesh*>(&object);
+                if (!mesh || !mesh->visible) return;
+                const auto isVisibleCustomShader = [](const std::shared_ptr<Material>& material) {
+                    return material && material->visible &&
+                           material->name != kParticleMaterialName &&
+                           dynamic_cast<ShaderMaterial*>(material.get()) != nullptr;
+                };
+                const auto& materials = mesh->materials();
+                found = std::any_of(materials.begin(), materials.end(), isVisibleCustomShader);
+            });
+            return found;
+        }
+
+        bool sceneCustomShaderMaterialsFitOrthoDepthOverlay(Object3D& scene) const {
+            bool any = false;
+            bool allFit = true;
+            scene.traverseVisible([&](Object3D& object) {
+                if (!allFit) return;
+                auto* mesh = dynamic_cast<Mesh*>(&object);
+                if (!mesh || !mesh->visible) return;
+                const auto isDepthTexturePost = [](const std::shared_ptr<Material>& material) {
+                    auto* shaderMaterial = material ? dynamic_cast<ShaderMaterial*>(material.get()) : nullptr;
+                    if (!shaderMaterial || !material->visible || material->name == kParticleMaterialName) {
+                        return std::optional<bool>{};
+                    }
+                    const auto it = shaderMaterial->uniforms.find("tDepth");
+                    if (it == shaderMaterial->uniforms.end() || !it->second.hasValue()) return std::optional<bool>{false};
+                    auto& value = const_cast<Uniform&>(it->second).value();
+                    return std::optional<bool>{std::get_if<Texture*>(&value) != nullptr};
+                };
+                const auto& materials = mesh->materials();
+                for (const auto& material : materials) {
+                    const auto depthPost = isDepthTexturePost(material);
+                    if (!depthPost.has_value()) continue;
+                    any = true;
+                    if (!*depthPost) {
+                        allFit = false;
+                        return;
+                    }
+                }
+            });
+            return any && allFit;
+        }
+
+        void recordCustomShaderMaterialPass(
+                VkCommandBuffer cb,
+                uint32_t imageIndex,
+                uint32_t frame,
+                const Camera& camera) {
+            if (!hasVisibleCustomShaderMaterials()) return;
+
+            const auto swapExtent = ctx->swapchainExtent();
+            const auto directExtent = currentRenderTarget_
+                    ? activeRenderTargetExtent(*currentRenderTarget_)
+                    : VkExtent2D{};
+            const bool directToRenderTarget = currentRenderTarget_ && renderTargets_ &&
+                                              currentRenderTarget_->texture &&
+                                              currentRenderTarget_->texture->format != Format::Depth &&
+                                              directExtent.width <= swapExtent.width &&
+                                              directExtent.height <= swapExtent.height;
+            vulkan::VulkanRenderTargets::Record* directRt = nullptr;
+            VkImageMemoryBarrier2 toColor{};
+            std::vector<VkRenderingAttachmentInfo> colorAttachments;
+
+            if (directToRenderTarget) {
+                directRt = &renderTargets_->getOrCreate(*currentRenderTarget_,
+                                                        activeCubeFace_,
+                                                        activeMipmapLevel_,
+                                                        defaultFramebufferSamples_,
+                                                        activeLayer_);
+                const auto activeMip = static_cast<uint32_t>(std::max(0, activeMipmapLevel_));
+                const auto activeLayer = activeRenderTargetLayer(*directRt);
+                const bool useMsaa = directRt->msaaColor.image != VK_NULL_HANDLE;
+                const auto transitionResolveAttachment = [&](Image2D& image, VkImageLayout& layout) {
+                    if ((activeMip > 0 || image.arrayLayers > 1) && layout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                        transitionImage(cb, image.image,
+                                        VK_IMAGE_LAYOUT_UNDEFINED,
+                                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                        0,
+                                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                        VK_ACCESS_2_SHADER_READ_BIT |
+                                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                        VK_IMAGE_ASPECT_COLOR_BIT,
+                                        0,
+                                        image.mipLevels,
+                                        0,
+                                        image.arrayLayers);
+                        layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                    }
+                    transitionImage(cb, image.image,
+                                    layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                            : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                                      VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? 0
+                                            : VK_ACCESS_2_SHADER_READ_BIT |
+                                                      VK_ACCESS_2_TRANSFER_READ_BIT |
+                                                      VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT,
+                                    activeMip,
+                                    1,
+                                    activeLayer);
+                    layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                };
+
+                const auto transitionMsaaAttachment = [&](Image2D& image, VkImageLayout& layout) {
+                    transitionImage(cb, image.image,
+                                    layout, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                            : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    layout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? 0
+                                            : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT);
+                    layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                };
+
+                const auto appendAttachment = [&](Image2D& image,
+                                                  VkImageLayout& layout,
+                                                  Image2D* msaaImage,
+                                                  VkImageLayout* msaaLayout) {
+                    transitionResolveAttachment(image, layout);
+                    const auto resolveView = createCustomShaderFrameAttachmentView(frame, image, activeMip, activeLayer);
+
+                    VkRenderingAttachmentInfo attachment{};
+                    attachment.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                    if (useMsaa && msaaImage && msaaLayout && msaaImage->image != VK_NULL_HANDLE) {
+                        transitionMsaaAttachment(*msaaImage, *msaaLayout);
+                        attachment.imageView = msaaImage->view;
+                        attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                        attachment.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                        attachment.clearValue.color = {{0.f, 0.f, 0.f, 0.f}};
+                        attachment.resolveMode = VK_RESOLVE_MODE_AVERAGE_BIT;
+                        attachment.resolveImageView = resolveView;
+                        attachment.resolveImageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                    } else {
+                        attachment.imageView = resolveView;
+                        attachment.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                        attachment.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                        attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                    }
+                    colorAttachments.push_back(attachment);
+                };
+
+                appendAttachment(directRt->color,
+                                 directRt->colorLayout,
+                                 &directRt->msaaColor,
+                                 &directRt->msaaColorLayout);
+                for (std::size_t i = 0; i < directRt->extraColors.size(); ++i) {
+                    Image2D* msaaImage = i < directRt->extraMsaaColors.size()
+                            ? &directRt->extraMsaaColors[i]
+                            : nullptr;
+                    VkImageLayout* msaaLayout = i < directRt->extraMsaaColorLayouts.size()
+                            ? &directRt->extraMsaaColorLayouts[i]
+                            : nullptr;
+                    appendAttachment(directRt->extraColors[i], directRt->extraColorLayouts[i],
+                                     msaaImage, msaaLayout);
+                }
+            } else {
+                VkImage image = ctx->swapchainImages()[imageIndex];
+                toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                toColor.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                       VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                toColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                        VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toColor.image = image;
+                toColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                toColor.subresourceRange.levelCount = 1;
+                toColor.subresourceRange.layerCount = 1;
+                VkDependencyInfo toColorDep{};
+                toColorDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                toColorDep.imageMemoryBarrierCount = 1;
+                toColorDep.pImageMemoryBarriers = &toColor;
+                vkCmdPipelineBarrier2(cb, &toColorDep);
+
+                VkRenderingAttachmentInfo color{};
+                color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                color.imageView = ctx->swapchainImageViews()[imageIndex];
+                color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+                color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                colorAttachments.push_back(color);
+            }
+
+            const bool customShaderMsaa = directRt && directRt->msaaColor.image != VK_NULL_HANDLE;
+            auto& depthImage = customShaderMsaa &&
+                                       rasterGbufs[frame].customShaderMsaaDepth.image != VK_NULL_HANDLE
+                    ? rasterGbufs[frame].customShaderMsaaDepth
+                    : rasterGbufs[frame].customShaderDepth;
+            VkImageMemoryBarrier2 toDepth{};
+            toDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+            toDepth.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            toDepth.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            toDepth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            toDepth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            toDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toDepth.image = depthImage.image;
+            toDepth.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            toDepth.subresourceRange.levelCount = 1;
+            toDepth.subresourceRange.layerCount = 1;
+            VkDependencyInfo toDepthDep{};
+            toDepthDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            toDepthDep.imageMemoryBarrierCount = 1;
+            toDepthDep.pImageMemoryBarriers = &toDepth;
+            vkCmdPipelineBarrier2(cb, &toDepthDep);
+
+            VkRenderingAttachmentInfo depth{};
+            depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            depth.imageView = depthImage.view;
+            depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depth.clearValue.depthStencil = {0.f, 0u};
+
+            VkRenderingInfo rendering{};
+            rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            rendering.renderArea.offset = {0, 0};
+            const VkExtent2D extent = directToRenderTarget ? directExtent : swapExtent;
+            rendering.renderArea.extent = extent;
+            rendering.layerCount = 1;
+            rendering.colorAttachmentCount = static_cast<uint32_t>(colorAttachments.size());
+            rendering.pColorAttachments = colorAttachments.data();
+            rendering.pDepthAttachment = &depth;
+            vkCmdBeginRendering(cb, &rendering);
+
+            VkViewport viewport{0.f, 0.f, float(extent.width), float(extent.height), 0.f, 1.f};
+            VkRect2D scissor{{0, 0}, extent};
+            vkCmdSetViewport(cb, 0, 1, &viewport);
+            vkCmdSetScissor(cb, 0, 1, &scissor);
+
+            struct CustomShaderDrawItem {
+                const MeshEntry* entry = nullptr;
+                ShaderMaterial* material = nullptr;
+                const BlasRecord* rec = nullptr;
+                std::optional<GeometryGroup> group;
+                DrawRange drawRange;
+                float z = 0.f;
+            };
+            std::vector<CustomShaderDrawItem> opaqueItems;
+            std::vector<CustomShaderDrawItem> transparentItems;
+            Vector3 cameraPosition;
+            cameraPosition.setFromMatrixPosition(*camera.matrixWorld);
+
+            for (const auto& entry : lastVisibleEntries_) {
+                if (!entry.mesh || entry.isOverlay || !entry.inFrustum) continue;
+                const auto geometry = entry.mesh->geometry();
+                if (!geometry) continue;
+
+                const BlasRecord* rec = resolveBlasForEntry(entry);
+                if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+
+                Matrix4 model;
+                std::memcpy(model.elements.data(), entry.worldMatrix.data(), 64);
+                Vector3 sortPosition;
+                sortPosition.setFromMatrixPosition(model);
+
+                const auto queueMaterial =
+                        [&](const std::shared_ptr<Material>& material,
+                            std::optional<GeometryGroup> group) {
+                            auto* shaderMaterial = material ? dynamic_cast<ShaderMaterial*>(material.get()) : nullptr;
+                            if (!shaderMaterial || !material->visible || material->name == kParticleMaterialName) return;
+                            const uint32_t dataCount = rec->index.handle != VK_NULL_HANDLE
+                                    ? rec->indexCount
+                                    : rec->vertexCount;
+                            if (resolveVulkanDrawSpan(dataCount, geometry->drawRange, group).count == 0u) {
+                                return;
+                            }
+                            CustomShaderDrawItem item{
+                                    &entry,
+                                    shaderMaterial,
+                                    rec,
+                                    group,
+                                    geometry->drawRange,
+                                    sortPosition.distanceToSquared(cameraPosition)};
+                            if (material->transparent) {
+                                transparentItems.push_back(item);
+                            } else {
+                                opaqueItems.push_back(item);
+                            }
+                        };
+
+                const auto& materials = entry.mesh->materials();
+                if (geometry && materials.size() > 1) {
+                    for (const auto& group : geometry->groups) {
+                        if (group.materialIndex < materials.size()) {
+                            queueMaterial(materials[group.materialIndex], group);
+                        }
+                    }
+                } else if (!materials.empty()) {
+                    queueMaterial(materials.front(), std::nullopt);
+                }
+            }
+
+            const auto opaqueLess = [](const CustomShaderDrawItem& a, const CustomShaderDrawItem& b) {
+                if (a.entry->mesh->renderOrder != b.entry->mesh->renderOrder) {
+                    return a.entry->mesh->renderOrder < b.entry->mesh->renderOrder;
+                }
+                if (a.z != b.z) return a.z < b.z;
+                return a.entry->mesh->id < b.entry->mesh->id;
+            };
+            const auto transparentLess = [](const CustomShaderDrawItem& a, const CustomShaderDrawItem& b) {
+                if (a.entry->mesh->renderOrder != b.entry->mesh->renderOrder) {
+                    return a.entry->mesh->renderOrder < b.entry->mesh->renderOrder;
+                }
+                if (a.z != b.z) return a.z > b.z;
+                return a.entry->mesh->id < b.entry->mesh->id;
+            };
+            std::stable_sort(opaqueItems.begin(), opaqueItems.end(), opaqueLess);
+            std::stable_sort(transparentItems.begin(), transparentItems.end(), transparentLess);
+
+            const auto drawItem = [&](const CustomShaderDrawItem& item) {
+                const auto& entry = *item.entry;
+                auto& shaderMaterial = *item.material;
+                const auto* rec = item.rec;
+                const bool instanced = usesShaderInstancingVariant(entry);
+                auto& pipeline = getOrCreateCustomShaderPipeline(
+                        shaderMaterial,
+                        instanced,
+                        rendering.colorAttachmentCount,
+                        customShaderMsaa ? directRt->key.samples : VK_SAMPLE_COUNT_1_BIT);
+                const auto descriptorSet = updateCustomShaderDescriptorSet(
+                        frame,
+                        shaderMaterial,
+                        pipeline,
+                        entry,
+                        camera,
+                        instanced);
+
+                const std::array<VkBuffer, 4> vertexBuffers{
+                        rec->vertex.handle,
+                        rec->normal.handle != VK_NULL_HANDLE ? rec->normal.handle : rec->vertex.handle,
+                        rec->uv.handle != VK_NULL_HANDLE ? rec->uv.handle : dummyUvBuffer_.handle,
+                        rec->color.handle != VK_NULL_HANDLE ? rec->color.handle : rec->vertex.handle};
+                const std::array<VkDeviceSize, 4> vertexOffsets{};
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.pipeline);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        pipeline.pipelineLayout, 0, 1, &descriptorSet, 0, nullptr);
+                vkCmdBindVertexBuffers(cb, 0, static_cast<uint32_t>(vertexBuffers.size()),
+                                       vertexBuffers.data(), vertexOffsets.data());
+                if (rec->index.handle != VK_NULL_HANDLE) {
+                    vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                    const auto span = resolveVulkanDrawSpan(rec->indexCount, item.drawRange, item.group);
+                    if (span.count > 0u) vkCmdDrawIndexed(cb, span.count, 1, span.first, 0, 0);
+                } else {
+                    const auto span = resolveVulkanDrawSpan(rec->vertexCount, item.drawRange, item.group);
+                    if (span.count > 0u) vkCmdDraw(cb, span.count, 1, span.first, 0);
+                }
+            };
+
+            for (const auto& item : opaqueItems) {
+                drawItem(item);
+            }
+            for (const auto& item : transparentItems) {
+                drawItem(item);
+            }
+
+            vkCmdEndRendering(cb);
+
+            if (directRt) {
+                const auto activeMip = static_cast<uint32_t>(std::max(0, activeMipmapLevel_));
+                const auto activeLayer = activeRenderTargetLayer(*directRt);
+                const auto transitionAttachmentForRead = [&](Image2D& image, VkImageLayout& layout) {
+                    transitionImage(cb, image.image,
+                                    VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    VK_ACCESS_2_SHADER_READ_BIT |
+                                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT,
+                                    activeMip,
+                                    1,
+                                    activeLayer);
+                    layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                };
+                transitionAttachmentForRead(directRt->color, directRt->colorLayout);
+                for (std::size_t i = 0; i < directRt->extraColors.size(); ++i) {
+                    transitionAttachmentForRead(directRt->extraColors[i], directRt->extraColorLayouts[i]);
+                }
+            } else {
+                VkImageMemoryBarrier2 toGeneral = toColor;
+                toGeneral.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                toGeneral.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                toGeneral.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                         VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
+                toGeneral.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                          VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                          VK_ACCESS_2_TRANSFER_READ_BIT |
+                                          VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                          VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                VkDependencyInfo toGeneralDep{};
+                toGeneralDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                toGeneralDep.imageMemoryBarrierCount = 1;
+                toGeneralDep.pImageMemoryBarriers = &toGeneral;
+                vkCmdPipelineBarrier2(cb, &toGeneralDep);
+            }
         }
 
         // Debug visualization: blit one of the G-buffer color attachments to
@@ -8210,6 +10685,13 @@ namespace threepp {
             scene.updateMatrixWorld();
 
             GpuLightsUbo ubo{};
+            const bool vsmShadows = shadowMapType_ == ShadowMap::VSM;
+            const auto shadowFlag = [&](bool castShadow, const std::shared_ptr<LightShadow>& shadow) -> uint32_t {
+                if (!castShadow) return 0u;
+                if (!vsmShadows || !shadow) return 1u;
+                const auto radius = std::max(0.f, std::min(255.f, shadow->radius));
+                return 1u | (static_cast<uint32_t>(radius * 16.f) << 8u);
+            };
 
             // traverseVisible so a hidden parent prunes its child lights too.
             scene.traverseVisible([&](Object3D& o) {
@@ -8217,6 +10699,10 @@ namespace threepp {
                     ubo.ambient[0] += a->color.r * a->intensity;
                     ubo.ambient[1] += a->color.g * a->intensity;
                     ubo.ambient[2] += a->color.b * a->intensity;
+                } else if (auto* h = dynamic_cast<HemisphereLight*>(&o)) {
+                    ubo.ambient[0] += 0.5f * (h->color.r + h->groundColor.r) * h->intensity;
+                    ubo.ambient[1] += 0.5f * (h->color.g + h->groundColor.g) * h->intensity;
+                    ubo.ambient[2] += 0.5f * (h->color.b + h->groundColor.b) * h->intensity;
                 } else if (auto* dl = dynamic_cast<DirectionalLight*>(&o)) {
                     if (ubo.dirCount >= kMaxDirLights) return;
                     Vector3 lp, tp;
@@ -8230,6 +10716,7 @@ namespace threepp {
                     g.color[0] = dl->color.r * dl->intensity;
                     g.color[1] = dl->color.g * dl->intensity;
                     g.color[2] = dl->color.b * dl->intensity;
+                    g.castShadow = shadowFlag(dl->castShadow, dl->shadow);
                 } else if (auto* pl = dynamic_cast<PointLight*>(&o)) {
                     if (ubo.pointCount >= kMaxPointLights) return;
                     Vector3 wp; pl->getWorldPosition(wp);
@@ -8240,6 +10727,7 @@ namespace threepp {
                     g.color[1] = pl->color.g * pl->intensity;
                     g.color[2] = pl->color.b * pl->intensity;
                     g.decay = pl->decay;
+                    g.castShadow = shadowFlag(pl->castShadow, pl->shadow);
                 } else if (auto* sl = dynamic_cast<SpotLight*>(&o)) {
                     if (ubo.spotCount >= kMaxSpotLights) return;
                     Vector3 lp, tp;
@@ -8258,6 +10746,7 @@ namespace threepp {
                     g.direction[0] = emDir.x; g.direction[1] = emDir.y; g.direction[2] = emDir.z;
                     g.cosAngleOuter = std::cos(sl->angle);
                     g.cosAngleInner = std::cos(sl->angle * (1.0f - sl->penumbra));
+                    g.castShadow = shadowFlag(sl->castShadow, sl->shadow);
                 } else if (auto* rl = dynamic_cast<RectAreaLight*>(&o)) {
                     if (ubo.rectCount >= kMaxRectLights) return;
                     Vector3 wp; rl->getWorldPosition(wp);
@@ -8400,8 +10889,9 @@ namespace threepp {
             ici.arrayLayers   = 1;
             ici.samples       = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling        = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage         = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT
-                              | (mipLevels > 1u ? VK_IMAGE_USAGE_TRANSFER_SRC_BIT : 0u);
+            ici.usage         = VK_IMAGE_USAGE_SAMPLED_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             ici.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -8420,6 +10910,8 @@ namespace threepp {
             void* mapped = nullptr;
             vmaMapMemory(ctx->allocator(), staging.alloc, &mapped);
             std::memcpy(mapped, pixels, byteSize);
+            check(vmaFlushAllocation(ctx->allocator(), staging.alloc, 0, byteSize),
+                  "vmaFlushAllocation(sampledImageStaging)");
             vmaUnmapMemory(ctx->allocator(), staging.alloc);
 
             VkCommandBuffer cb = beginOneShot();
@@ -8606,7 +11098,7 @@ namespace threepp {
             return out;
         }
 
-        FramebufferTextureImage& ensureFramebufferTextureImage(Texture& texture) {
+        FramebufferTextureImage& ensureFramebufferTextureImage(Texture& texture, uint32_t minMipLevels) {
             Image& img = texture.image();
             const uint32_t w = img.width();
             const uint32_t h = img.height();
@@ -8614,10 +11106,26 @@ namespace threepp {
                 throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: texture image has zero size");
             }
 
+            auto calcMipLevels = [](uint32_t width, uint32_t height) {
+                uint32_t maxDim = std::max(width, height);
+                uint32_t levels = 1;
+                while (maxDim > 1) {
+                    maxDim /= 2;
+                    ++levels;
+                }
+                return levels;
+            };
+            const auto maxMipLevels = calcMipLevels(w, h);
+            if (minMipLevels == 0 || minMipLevels > maxMipLevels) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: mip level is out of range");
+            }
+            const auto mipLevels = std::max(texture.generateMipmaps ? maxMipLevels : 1u, minMipLevels);
+
             auto& rec = framebufferTextureImages_[&texture];
             const VkFormat format = ctx->swapchainFormat();
             if (rec.image.image != VK_NULL_HANDLE &&
-                rec.image.width == w && rec.image.height == h && rec.image.format == format) {
+                rec.image.width == w && rec.image.height == h && rec.image.format == format &&
+                rec.image.mipLevels == mipLevels) {
                 return rec;
             }
 
@@ -8631,18 +11139,20 @@ namespace threepp {
             out.width = w;
             out.height = h;
             out.format = format;
-            out.mipLevels = 1;
+            out.mipLevels = mipLevels;
 
             VkImageCreateInfo ici{};
             ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             ici.imageType = VK_IMAGE_TYPE_2D;
             ici.format = format;
             ici.extent = {w, h, 1};
-            ici.mipLevels = 1;
+            ici.mipLevels = mipLevels;
             ici.arrayLayers = 1;
             ici.samples = VK_SAMPLE_COUNT_1_BIT;
             ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-            ici.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_SAMPLED_BIT;
             ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -8659,21 +11169,22 @@ namespace threepp {
             vci.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY,
                               VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
             vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.levelCount = mipLevels;
             vci.subresourceRange.layerCount = 1;
             check(vkCreateImageView(ctx->device(), &vci, nullptr, &out.view),
                   "vkCreateImageView(framebuffer texture)");
 
             VkSamplerCreateInfo sci{};
             sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
-            sci.magFilter = VK_FILTER_NEAREST;
-            sci.minFilter = VK_FILTER_NEAREST;
-            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-            sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-            sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sci.magFilter = filterToVk(texture.magFilter);
+            sci.minFilter = filterToVk(texture.minFilter);
+            sci.mipmapMode = mipmapModeToVk(texture.minFilter);
+            sci.addressModeU = wrapToVk(texture.wrapS);
+            sci.addressModeV = wrapToVk(texture.wrapT);
             sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
             sci.maxAnisotropy = 1.0f;
             sci.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
+            sci.maxLod = static_cast<float>(mipLevels > 0 ? mipLevels - 1 : 0);
             check(vkCreateSampler(ctx->device(), &sci, nullptr, &out.sampler),
                   "vkCreateSampler(framebuffer texture)");
 
@@ -8686,35 +11197,142 @@ namespace threepp {
         }
 
         const Image2D* framebufferTextureImage(const Texture* texture) const {
+            if (texture && renderTargets_) {
+                if (auto* rtImage = renderTargets_->findByTexture(*texture);
+                    rtImage && *rtImage->layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+                    return rtImage->image;
+                }
+            }
             const auto it = framebufferTextureImages_.find(texture);
             if (it == framebufferTextureImages_.end()) return nullptr;
             if (it->second.layout != VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) return nullptr;
             return &it->second.image;
         }
 
-        void recordCopyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
-            if (level != 0) {
-                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: mip levels are not implemented yet");
-            }
-            if (currentRenderTarget_ != nullptr) {
-                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: render target copy is implemented in phase 2");
-            }
-            if (frameState_ == FrameState::Idle) {
-                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: no active default framebuffer frame");
+        void recordCopyRenderTargetColorToExtras(VkCommandBuffer cb,
+                                                 vulkan::VulkanRenderTargets::Record& rt,
+                                                 uint32_t activeMip,
+                                                 uint32_t activeLayer) const {
+            if (rt.color.image == VK_NULL_HANDLE || rt.extraColors.empty()) return;
+
+            const uint32_t copyW = std::max(1u, rt.color.width >> activeMip);
+            const uint32_t copyH = std::max(1u, rt.color.height >> activeMip);
+            transitionImage(cb, rt.color.image,
+                            rt.colorLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            activeMip,
+                            1,
+                            activeLayer);
+
+            for (std::size_t i = 0; i < rt.extraColors.size(); ++i) {
+                auto& dst = rt.extraColors[i];
+                auto& dstLayout = rt.extraColorLayouts[i];
+                if (dst.image == VK_NULL_HANDLE) continue;
+
+                if ((activeMip > 0 || dst.arrayLayers > 1) &&
+                    dstLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                    transitionImage(cb, dst.image,
+                                    VK_IMAGE_LAYOUT_UNDEFINED,
+                                    VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                    0,
+                                    VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                    VK_ACCESS_2_SHADER_READ_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT,
+                                    0,
+                                    dst.mipLevels,
+                                    0,
+                                    dst.arrayLayers);
+                    dstLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                }
+
+                transitionImage(cb, dst.image,
+                                dstLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                dstLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                        ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                        : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                                  VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                dstLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                        ? 0
+                                        : VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                activeMip,
+                                1,
+                                activeLayer);
+
+                VkImageCopy region{};
+                region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.srcSubresource.mipLevel = activeMip;
+                region.srcSubresource.baseArrayLayer = activeLayer;
+                region.srcSubresource.layerCount = 1;
+                region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.dstSubresource.mipLevel = activeMip;
+                region.dstSubresource.baseArrayLayer = activeLayer;
+                region.dstSubresource.layerCount = 1;
+                region.extent = {std::min(copyW, std::max(1u, dst.width >> activeMip)),
+                                 std::min(copyH, std::max(1u, dst.height >> activeMip)),
+                                 1};
+                vkCmdCopyImage(cb,
+                               rt.color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               dst.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &region);
+
+                transitionImage(cb, dst.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                activeMip,
+                                1,
+                                activeLayer);
+                dstLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             }
 
-            auto& rec = ensureFramebufferTextureImage(texture);
+            transitionImage(cb, rt.color.image,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            activeMip,
+                            1,
+                            activeLayer);
+            rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
+        void recordCopyDefaultFramebufferToRenderTarget(VkCommandBuffer cb, RenderTarget& target) {
+            if (!renderTargets_) return;
+            auto& rt = renderTargets_->getOrCreate(target, activeCubeFace_, activeMipmapLevel_,
+                                                   defaultFramebufferSamples_, activeLayer_);
+            const bool hasColor = rt.color.image != VK_NULL_HANDLE;
+            if (hasColor) {
             const VkExtent2D ext = ctx->swapchainExtent();
-            const uint32_t copyW = std::min(rec.image.width, ext.width);
-            const uint32_t copyH = std::min(rec.image.height, ext.height);
-            const int32_t srcX = std::clamp(static_cast<int32_t>(std::lround(position.x)), 0,
-                                            std::max(0, static_cast<int32_t>(ext.width) - static_cast<int32_t>(copyW)));
-            const int32_t srcY = std::clamp(static_cast<int32_t>(std::lround(position.y)), 0,
-                                            std::max(0, static_cast<int32_t>(ext.height) - static_cast<int32_t>(copyH)));
+            const auto activeMip = static_cast<uint32_t>(std::max(0, activeMipmapLevel_));
+            const auto activeLayer = rt.key.cube
+                    ? static_cast<uint32_t>(std::max(0, activeCubeFace_))
+                    : static_cast<uint32_t>(std::max(0, activeLayer_));
+            const uint32_t srcW = std::min(rt.color.width, ext.width);
+            const uint32_t srcH = std::min(rt.color.height, ext.height);
+            const uint32_t dstW = std::max(1u, rt.color.width >> activeMip);
+            const uint32_t dstH = std::max(1u, rt.color.height >> activeMip);
+            if (srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) return;
 
-            VkCommandBuffer cb = cmdBuffers[currentFrame];
-            VkImage src = ctx->swapchainImages()[frameImageIndex_];
-
+            const VkImage src = ctx->swapchainImages()[frameImageIndex_];
             transitionImage(cb, src,
                             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
@@ -8727,6 +11345,391 @@ namespace threepp {
                             VK_ACCESS_2_TRANSFER_READ_BIT,
                             VK_IMAGE_ASPECT_COLOR_BIT);
 
+            if ((activeMip > 0 || rt.color.arrayLayers > 1) &&
+                rt.colorLayout == VK_IMAGE_LAYOUT_UNDEFINED) {
+                transitionImage(cb, rt.color.image,
+                                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                0,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                0,
+                                rt.color.mipLevels,
+                                0,
+                                rt.color.arrayLayers);
+                rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+
+            transitionImage(cb, rt.color.image,
+                            rt.colorLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                            rt.colorLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                    : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                              VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            rt.colorLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? 0
+                                    : VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            activeMip,
+                            1,
+                            activeLayer);
+
+            if (activeMip == 0) {
+                VkImageCopy region{};
+                region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.srcSubresource.layerCount = 1;
+                region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.dstSubresource.baseArrayLayer = activeLayer;
+                region.dstSubresource.layerCount = 1;
+                region.extent = {srcW, srcH, 1};
+                vkCmdCopyImage(cb,
+                               src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               rt.color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &region);
+            } else {
+                VkImageBlit blit{};
+                blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.srcSubresource.layerCount = 1;
+                blit.srcOffsets[1] = {static_cast<int32_t>(srcW), static_cast<int32_t>(srcH), 1};
+                blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                blit.dstSubresource.mipLevel = activeMip;
+                blit.dstSubresource.baseArrayLayer = activeLayer;
+                blit.dstSubresource.layerCount = 1;
+                blit.dstOffsets[1] = {static_cast<int32_t>(dstW), static_cast<int32_t>(dstH), 1};
+                vkCmdBlitImage(cb,
+                               src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               rt.color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &blit, VK_FILTER_LINEAR);
+            }
+
+            if (activeMip == 0 && rt.color.mipLevels > 1) {
+                transitionImage(cb, rt.color.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                0,
+                                1,
+                                activeLayer);
+
+                auto srcW = static_cast<int32_t>(rt.color.width);
+                auto srcH = static_cast<int32_t>(rt.color.height);
+                for (uint32_t level = 1; level < rt.color.mipLevels; ++level) {
+                    transitionImage(cb, rt.color.image,
+                                    rt.colorLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? VK_IMAGE_LAYOUT_UNDEFINED
+                                            : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    rt.colorLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                            : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                                      VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                    rt.colorLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                            ? 0
+                                            : VK_ACCESS_2_SHADER_READ_BIT,
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT,
+                                    level,
+                                    1,
+                                    activeLayer);
+
+                    const auto dstW = std::max(1, srcW / 2);
+                    const auto dstH = std::max(1, srcH / 2);
+                    VkImageBlit blit{};
+                    blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    blit.srcSubresource.mipLevel = level - 1;
+                    blit.srcSubresource.baseArrayLayer = activeLayer;
+                    blit.srcSubresource.layerCount = 1;
+                    blit.srcOffsets[1] = {srcW, srcH, 1};
+                    blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                    blit.dstSubresource.mipLevel = level;
+                    blit.dstSubresource.baseArrayLayer = activeLayer;
+                    blit.dstSubresource.layerCount = 1;
+                    blit.dstOffsets[1] = {dstW, dstH, 1};
+                    vkCmdBlitImage(cb,
+                                   rt.color.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   rt.color.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   1, &blit, VK_FILTER_LINEAR);
+
+                    transitionImage(cb, rt.color.image,
+                                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                    VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                    VK_ACCESS_2_TRANSFER_READ_BIT,
+                                    VK_IMAGE_ASPECT_COLOR_BIT,
+                                    level,
+                                    1,
+                                    activeLayer);
+                    srcW = dstW;
+                    srcH = dstH;
+                }
+
+                transitionImage(cb, rt.color.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                0,
+                                rt.color.mipLevels,
+                                activeLayer);
+            } else {
+                transitionImage(cb, rt.color.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                activeMip,
+                                1,
+                                activeLayer);
+            }
+            rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            recordCopyRenderTargetColorToExtras(cb, rt, activeMip, activeLayer);
+
+            transitionDefaultFramebufferToGeneral(cb, frameImageIndex_,
+                                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                   VK_ACCESS_2_TRANSFER_READ_BIT);
+            }
+
+            const bool wantsDepthCopy = target.depthTexture ||
+                                        (target.texture && target.texture->format == Format::Depth);
+            const bool wantsStencilCopy = target.stencilBuffer ||
+                                          (target.depthTexture &&
+                                           target.depthTexture->format == Format::DepthStencil);
+            if ((wantsDepthCopy || wantsStencilCopy) && rt.depth.image != VK_NULL_HANDLE &&
+                rasterGbufs[currentFrame].depth.image != VK_NULL_HANDLE) {
+                auto& srcDepth = rasterGbufs[currentFrame].depth;
+                const uint32_t depthW = std::min(rt.depth.width, srcDepth.width);
+                const uint32_t depthH = std::min(rt.depth.height, srcDepth.height);
+                if (depthW == 0 || depthH == 0) return;
+                const auto depthLayer = rt.depth.arrayLayers > 1
+                        ? (rt.key.cube
+                                  ? static_cast<uint32_t>(std::max(0, activeCubeFace_))
+                                  : static_cast<uint32_t>(std::max(0, activeLayer_)))
+                        : 0u;
+                const auto srcDepthAspect = depthBarrierAspect(srcDepth.format);
+                const auto dstDepthAspect = depthBarrierAspect(rt.depth.format);
+
+                transitionImage(cb, srcDepth.image,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                        VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                srcDepthAspect);
+                transitionImage(cb, rt.depth.image,
+                                rt.depthLayout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                rt.depthLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                        ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                        : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                rt.depthLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                        ? 0
+                                        : VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                dstDepthAspect,
+                                0,
+                                1,
+                                depthLayer);
+
+                if (wantsDepthCopy) {
+                    if (srcDepth.format != rt.depth.format) {
+                        const VkDeviceSize depthBytes = static_cast<VkDeviceSize>(depthW) * depthH * sizeof(float);
+                        if (rt.depthStencilCopyBuffer.handle == VK_NULL_HANDLE ||
+                            rt.depthStencilCopyBuffer.size < depthBytes) {
+                            if (rt.depthStencilCopyBuffer.handle != VK_NULL_HANDLE) {
+                                vulkan::destroyBuffer(ctx->allocator(), rt.depthStencilCopyBuffer);
+                            }
+                            rt.depthStencilCopyBuffer = vulkan::createBuffer(
+                                    ctx->allocator(), ctx->device(), depthBytes,
+                                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+                                    0);
+                        }
+
+                        VkBufferImageCopy toBuffer{};
+                        toBuffer.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                        toBuffer.imageSubresource.layerCount = 1;
+                        toBuffer.imageExtent = {depthW, depthH, 1};
+                        vkCmdCopyImageToBuffer(cb,
+                                               srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                               rt.depthStencilCopyBuffer.handle, 1, &toBuffer);
+
+                        VkBufferMemoryBarrier2 depthCopyBarrier{};
+                        depthCopyBarrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+                        depthCopyBarrier.srcStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                        depthCopyBarrier.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        depthCopyBarrier.dstStageMask = VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                        depthCopyBarrier.dstAccessMask = VK_ACCESS_2_TRANSFER_READ_BIT;
+                        depthCopyBarrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        depthCopyBarrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                        depthCopyBarrier.buffer = rt.depthStencilCopyBuffer.handle;
+                        depthCopyBarrier.offset = 0;
+                        depthCopyBarrier.size = depthBytes;
+                        VkDependencyInfo depthCopyDep{};
+                        depthCopyDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                        depthCopyDep.bufferMemoryBarrierCount = 1;
+                        depthCopyDep.pBufferMemoryBarriers = &depthCopyBarrier;
+                        vkCmdPipelineBarrier2(cb, &depthCopyDep);
+
+                        VkBufferImageCopy toDepth{};
+                        toDepth.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                        toDepth.imageSubresource.baseArrayLayer = depthLayer;
+                        toDepth.imageSubresource.layerCount = 1;
+                        toDepth.imageExtent = {depthW, depthH, 1};
+                        vkCmdCopyBufferToImage(cb,
+                                               rt.depthStencilCopyBuffer.handle,
+                                               rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                               1, &toDepth);
+                    } else {
+                        VkImageCopy depthRegion{};
+                        depthRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                        depthRegion.srcSubresource.layerCount = 1;
+                        depthRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                        depthRegion.dstSubresource.baseArrayLayer = depthLayer;
+                        depthRegion.dstSubresource.layerCount = 1;
+                        depthRegion.extent = {depthW, depthH, 1};
+                        vkCmdCopyImage(cb,
+                                       srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &depthRegion);
+                    }
+                }
+
+                if (wantsStencilCopy) {
+                    if (!hasStencilAspect(srcDepth.format) || !hasStencilAspect(rt.depth.format)) {
+                        throw std::runtime_error("VulkanRenderer::setRenderTarget: stencil readback requires stencil-capable depth images");
+                    }
+                    VkImageCopy stencilRegion{};
+                    stencilRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+                    stencilRegion.srcSubresource.layerCount = 1;
+                    stencilRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+                    stencilRegion.dstSubresource.baseArrayLayer = depthLayer;
+                    stencilRegion.dstSubresource.layerCount = 1;
+                    stencilRegion.extent = {depthW, depthH, 1};
+                    vkCmdCopyImage(cb,
+                                   srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                   1, &stencilRegion);
+                }
+
+                transitionImage(cb, srcDepth.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                srcDepthAspect);
+                transitionImage(cb, rt.depth.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                dstDepthAspect,
+                                0,
+                                1,
+                                depthLayer);
+                rt.depthLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+        }
+
+        void recordCopyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
+            if (level < 0) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: mip level must be non-negative");
+            }
+            if (frameState_ == FrameState::Idle) {
+                throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture: no active default framebuffer frame");
+            }
+
+            const auto mipLevel = static_cast<uint32_t>(level);
+            auto& rec = ensureFramebufferTextureImage(texture, mipLevel + 1u);
+            const VkExtent2D ext = currentRenderTarget_
+                    ? VkExtent2D{currentRenderTarget_->width, currentRenderTarget_->height}
+                    : ctx->swapchainExtent();
+            const uint32_t dstW = std::max(1u, rec.image.width >> mipLevel);
+            const uint32_t dstH = std::max(1u, rec.image.height >> mipLevel);
+            const uint32_t copyW = std::min(dstW, ext.width);
+            const uint32_t copyH = std::min(dstH, ext.height);
+            const int32_t srcX = std::clamp(static_cast<int32_t>(std::lround(position.x)), 0,
+                                            std::max(0, static_cast<int32_t>(ext.width) - static_cast<int32_t>(copyW)));
+            const int32_t srcY = std::clamp(static_cast<int32_t>(std::lround(position.y)), 0,
+                                            std::max(0, static_cast<int32_t>(ext.height) - static_cast<int32_t>(copyH)));
+
+            VkCommandBuffer cb = cmdBuffers[currentFrame];
+            VkImage src = ctx->swapchainImages()[frameImageIndex_];
+            VkImageLayout srcOldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            uint32_t srcLayer = 0;
+            if (currentRenderTarget_) {
+                auto& rt = renderTargets_->getOrCreate(*currentRenderTarget_, activeCubeFace_, activeMipmapLevel_,
+                                                       defaultFramebufferSamples_, activeLayer_);
+                if (rt.color.image == VK_NULL_HANDLE) {
+                    throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture requires a color render target");
+                }
+                src = rt.color.image;
+                srcOldLayout = rt.colorLayout;
+                srcLayer = rt.color.arrayLayers > 1
+                        ? (rt.key.cube
+                                  ? static_cast<uint32_t>(std::max(0, activeCubeFace_))
+                                  : static_cast<uint32_t>(std::max(0, activeLayer_)))
+                        : 0;
+            }
+
+            transitionImage(cb, src,
+                            srcOldLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                    VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                            VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            0,
+                            1,
+                            srcLayer);
+
+            if (rec.layout == VK_IMAGE_LAYOUT_UNDEFINED && rec.image.mipLevels > 1) {
+                transitionImage(cb, rec.image.image,
+                                VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                0,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                0,
+                                rec.image.mipLevels);
+                rec.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            }
+
             transitionImage(cb, rec.image.image,
                             rec.layout, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                             rec.layout == VK_IMAGE_LAYOUT_UNDEFINED
@@ -8737,13 +11740,16 @@ namespace threepp {
                                     : VK_ACCESS_2_SHADER_READ_BIT,
                             VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                             VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                            VK_IMAGE_ASPECT_COLOR_BIT);
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            mipLevel);
 
             VkImageCopy region{};
             region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.baseArrayLayer = srcLayer;
             region.srcSubresource.layerCount = 1;
             region.srcOffset = {srcX, srcY, 0};
             region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.dstSubresource.mipLevel = mipLevel;
             region.dstSubresource.layerCount = 1;
             region.extent = {copyW, copyH, 1};
             vkCmdCopyImage(cb,
@@ -8758,13 +11764,32 @@ namespace threepp {
                             VK_ACCESS_2_TRANSFER_WRITE_BIT,
                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                             VK_ACCESS_2_SHADER_READ_BIT,
-                            VK_IMAGE_ASPECT_COLOR_BIT);
+                            VK_IMAGE_ASPECT_COLOR_BIT,
+                            mipLevel);
             rec.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-            transitionDefaultFramebufferToGeneral(cb, frameImageIndex_,
-                                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                                                   VK_ACCESS_2_TRANSFER_READ_BIT);
+            if (currentRenderTarget_) {
+                auto& rt = renderTargets_->getOrCreate(*currentRenderTarget_, activeCubeFace_, activeMipmapLevel_,
+                                                       defaultFramebufferSamples_, activeLayer_);
+                transitionImage(cb, rt.color.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_READ_BIT,
+                                VK_IMAGE_ASPECT_COLOR_BIT,
+                                0,
+                                1,
+                                srcLayer);
+                rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            } else {
+                transitionDefaultFramebufferToGeneral(cb, frameImageIndex_,
+                                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                       VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                                       VK_ACCESS_2_TRANSFER_READ_BIT);
+            }
         }
 
         // ── ParticleSystem billboard resources ──────────────────────────────
@@ -8789,6 +11814,7 @@ namespace threepp {
         // OverlayPass::ensureSpriteAtlasTexture, minus the weak_ptr liveCheck.
         const Image2D* ensureParticleTexture(const Texture* tex) {
             if (!tex) return nullptr;
+            if (const Image2D* rtImage = framebufferTextureImage(tex)) return rtImage;
             Image& img = const_cast<Texture*>(tex)->image();
             const uint32_t w = img.width();
             const uint32_t h = img.height();
@@ -9095,6 +12121,7 @@ namespace threepp {
             accumWriteIdx_ = 0;
             prevCameraValid = false;
             prevWorldMats.clear();
+            if (taa_) taa_->invalidateHistory();
             if (frameState_ != FrameState::Idle) {
                 pendingAccumulationReset_ = true;
                 return;
@@ -9259,6 +12286,26 @@ namespace threepp {
             return out;
         }
 
+        VkImageView createAttachmentImageView(VkImage image, VkFormat format,
+                                              VkImageAspectFlags aspect,
+                                              const char* debugName = nullptr) {
+            VkImageView view = VK_NULL_HANDLE;
+            VkImageViewCreateInfo vci{};
+            vci.sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image    = image;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format   = format;
+            vci.subresourceRange.aspectMask = aspect;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            check(vkCreateImageView(ctx->device(), &vci, nullptr, &view),
+                  "vkCreateImageView(rasterGbuf attachment view)");
+            if (debugName) {
+                ctx->setObjectName(view, debugName);
+            }
+            return view;
+        }
+
         void destroyRasterGbufImages() {
             if (!ctx) return;
             VkDevice d = ctx->device();
@@ -9278,8 +12325,14 @@ namespace threepp {
                 destroyImage2D(ctx->allocator(), d, g.atrousB);
                 destroyImage2D(ctx->allocator(), d, g.reflect);
                 destroyImage2D(ctx->allocator(), d, g.reflAux);
+                if (g.depthStencilView) {
+                    vkDestroyImageView(d, g.depthStencilView, nullptr);
+                    g.depthStencilView = VK_NULL_HANDLE;
+                }
                 destroyImage2D(ctx->allocator(), d, g.depth);
                 destroyImage2D(ctx->allocator(), d, g.unjitDepth);
+                destroyImage2D(ctx->allocator(), d, g.customShaderDepth);
+                destroyImage2D(ctx->allocator(), d, g.customShaderMsaaDepth);
                 destroyImage2D(ctx->allocator(), d, g.overlayMsaaColor);
                 destroyImage2D(ctx->allocator(), d, g.overlayResolvedColor);
                 g.width  = 0;
@@ -9308,9 +12361,12 @@ namespace threepp {
             // 4: albedo + metalness (rgba8 unorm) — raster-first deferred input.
             attachments[4]        = attachments[0];
             attachments[4].format = VK_FORMAT_R8G8B8A8_UNORM;
-            // 5: depth (d32_sfloat).
+            // 5: depth/stencil. Depth is sampled through a depth-only view;
+            // stencil is used only inside this render pass for material stencil ops.
             attachments[5]              = attachments[0];
-            attachments[5].format       = VK_FORMAT_D32_SFLOAT;
+            attachments[5].format       = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            attachments[5].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            attachments[5].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
             attachments[5].finalLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
             VkAttachmentReference colorRefs[5]{};
@@ -9345,6 +12401,7 @@ namespace threepp {
             deps[1].srcSubpass    = 0;
             deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
             deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
             // Consumed by raygen (ReferencePT) AND the deferred shade compute
             // pass (RasterFirst) — make the attachments visible to both stages.
@@ -9373,7 +12430,8 @@ namespace threepp {
                     VK_IMAGE_USAGE_SAMPLED_BIT;
             const VkImageUsageFlags depthUsage =
                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
-                    VK_IMAGE_USAGE_SAMPLED_BIT;
+                    VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             for (size_t fi = 0; fi < rasterGbufs.size(); ++fi) {
                 auto& g = rasterGbufs[fi];
                 char nameBuf[64];
@@ -9434,9 +12492,13 @@ namespace threepp {
                 g.reflAux = createAttachmentImage2D(w, h, VK_FORMAT_R16G16B16A16_SFLOAT,
                                                     VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
                                                     VK_IMAGE_ASPECT_COLOR_BIT, N("reflAux"));
-                g.depth  = createAttachmentImage2D(w, h, VK_FORMAT_D32_SFLOAT,
+                g.depth  = createAttachmentImage2D(w, h, VK_FORMAT_D32_SFLOAT_S8_UINT,
                                                    depthUsage, VK_IMAGE_ASPECT_DEPTH_BIT,
                                                    N("depth"));
+                g.depthStencilView = createAttachmentImageView(
+                        g.depth.image, g.depth.format,
+                        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                        N("depthStencilView"));
                 // Unjittered depth, written by the overlay depth prepass and
                 // read by the post-TAA wireframe overlay's depth-test. Lives
                 // outside the main G-buffer render pass — bound only via
@@ -9451,7 +12513,17 @@ namespace threepp {
                                                        depthUsage, VK_IMAGE_ASPECT_DEPTH_BIT,
                                                        N("unjitDepth"),
                                                        defaultFramebufferSamples_);
+                g.customShaderDepth = createAttachmentImage2D(swapExt.width, swapExt.height,
+                                                              VK_FORMAT_D32_SFLOAT,
+                                                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                                              VK_IMAGE_ASPECT_DEPTH_BIT,
+                                                              N("customShaderDepth"));
                 if (defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT) {
+                    g.customShaderMsaaDepth = createAttachmentImage2D(
+                            swapExt.width, swapExt.height, VK_FORMAT_D32_SFLOAT,
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT, N("customShaderMsaaDepth"),
+                            defaultFramebufferSamples_);
                     g.overlayMsaaColor = createAttachmentImage2D(
                             swapExt.width, swapExt.height, ctx->swapchainFormat(),
                             VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
@@ -9464,7 +12536,7 @@ namespace threepp {
                 }
 
                 VkImageView views[6] = {g.normal.view, g.motion.view, g.ids.view,
-                                        g.uv.view, g.albedo.view, g.depth.view};
+                                        g.uv.view, g.albedo.view, g.depthStencilView};
                 VkFramebufferCreateInfo fci{};
                 fci.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
                 fci.renderPass      = rasterGbufRenderPass;
@@ -9523,7 +12595,8 @@ namespace threepp {
                 pushInit(g.atrousB.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);// storage (compute r/w)
                 pushInit(g.reflect.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);// storage (compute r/w)
                 pushInit(g.reflAux.image, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);// storage (compute r/w)
-                pushInit(g.depth.image,  VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+                pushInit(g.depth.image, depthBarrierAspect(g.depth.format),
+                         VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
                 pushInit(g.overlayMsaaColor.image, VK_IMAGE_ASPECT_COLOR_BIT,
                          VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
@@ -9744,8 +12817,8 @@ namespace threepp {
             // binding 0: per-frame CameraUbo (vertex + fragment — gbuffer.frag
             //            reads cam.jitter for the alpha-hash cutout discard)
             // binding 1: motionMat[] storage (vertex; same VkBuffer as raygen's binding 10)
-            // binding 2: mats[] storage (fragment; for normal-map index + uvTransformNormal)
-            // binding 3: albedoMaps[] bindless sampler array (fragment;
+            // binding 2: mats[] storage (vertex displacement + fragment material data)
+            // binding 3: albedoMaps[] bindless sampler array (vertex displacement + fragment;
             //            same VkImage handles as raygen's binding 8)
             // binding 4: DrawInfo[] storage (vertex; bindless vertex-pulling SSBO
             //            for the indirect-drawing gbuf pipeline). Re-pointed at
@@ -9763,11 +12836,11 @@ namespace threepp {
             bindings[2].binding         = 2;
             bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[2].descriptorCount = 1;
-            bindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[2].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             bindings[3].binding         = 3;
             bindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             bindings[3].descriptorCount = kMaxMaterialTextures;
-            bindings[3].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            bindings[3].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             bindings[4].binding         = 4;
             bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[4].descriptorCount = 1;
@@ -9835,12 +12908,12 @@ namespace threepp {
             stages[1].pName  = "main";
 
             // Vertex input mirrors the BLAS allocation layout: positions /
-            // normals / uvs / prev-positions packed (R32G32B32_SFLOAT for
-            // pos+normal+prevPos, R32G32_SFLOAT for uv). The BLAS allocations
+            // normals / uvs / uv2s / prev-positions packed (R32G32B32_SFLOAT for
+            // pos+normal+prevPos, R32G32_SFLOAT for uv/uv2). The BLAS allocations
             // have VERTEX_BUFFER_BIT so they bind directly. Meshes without
-            // a UV attribute bind dummyUvBuffer_ at binding 2; static meshes
+            // a UV attribute bind dummyUvBuffer_ at binding 2/4; static meshes
             // bind their own vertex buffer at binding 3 (prev == curr).
-            VkVertexInputBindingDescription vibs[4]{};
+            VkVertexInputBindingDescription vibs[5]{};
             vibs[0].binding   = 0;
             vibs[0].stride    = 3 * sizeof(float);
             vibs[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
@@ -9853,8 +12926,11 @@ namespace threepp {
             vibs[3].binding   = 3;
             vibs[3].stride    = 3 * sizeof(float);
             vibs[3].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            vibs[4].binding   = 4;
+            vibs[4].stride    = 2 * sizeof(float);
+            vibs[4].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
 
-            VkVertexInputAttributeDescription vias[4]{};
+            VkVertexInputAttributeDescription vias[5]{};
             vias[0].location = 0;
             vias[0].binding  = 0;
             vias[0].format   = VK_FORMAT_R32G32B32_SFLOAT;
@@ -9871,12 +12947,16 @@ namespace threepp {
             vias[3].binding  = 3;
             vias[3].format   = VK_FORMAT_R32G32B32_SFLOAT;
             vias[3].offset   = 0;
+            vias[4].location = 4;
+            vias[4].binding  = 4;
+            vias[4].format   = VK_FORMAT_R32G32_SFLOAT;
+            vias[4].offset   = 0;
 
             VkPipelineVertexInputStateCreateInfo vi{};
             vi.sType                           = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-            vi.vertexBindingDescriptionCount   = 4;
+            vi.vertexBindingDescriptionCount   = 5;
             vi.pVertexBindingDescriptions      = vibs;
-            vi.vertexAttributeDescriptionCount = 4;
+            vi.vertexAttributeDescriptionCount = 5;
             vi.pVertexAttributeDescriptions    = vias;
 
             VkPipelineInputAssemblyStateCreateInfo ia{};
@@ -10014,6 +13094,23 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciInd, nullptr,
                                             &rasterGbufIndirectPipeline),
                   "vkCreateGraphicsPipelines(rasterGbufIndirect)");
+
+            VkPipelineDepthStencilStateCreateInfo dsNoDepthWrite = ds;
+            dsNoDepthWrite.depthWriteEnable = VK_FALSE;
+            VkGraphicsPipelineCreateInfo gpciNoDepthWrite = gpciInd;
+            gpciNoDepthWrite.pDepthStencilState = &dsNoDepthWrite;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciNoDepthWrite, nullptr,
+                                            &rasterGbufNoDepthWritePipeline),
+                  "vkCreateGraphicsPipelines(rasterGbufNoDepthWrite)");
+
+            VkPipelineDepthStencilStateCreateInfo dsNoDepth = ds;
+            dsNoDepth.depthTestEnable = VK_FALSE;
+            dsNoDepth.depthWriteEnable = VK_FALSE;
+            VkGraphicsPipelineCreateInfo gpciNoDepth = gpciInd;
+            gpciNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciNoDepth, nullptr,
+                                            &rasterGbufNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(rasterGbufNoDepth)");
 
             // Decal variant (same shaders/layout/render pass): blend-decal
             // meshes (MaterialDesc.alphaCutoff == -2) draw AFTER the opaque
@@ -10175,13 +13272,10 @@ namespace threepp {
             dyn.dynamicStateCount = 2;
             dyn.pDynamicStates    = dynStates;
 
-            // mat4 mvp (64) + vec4 color (16) = 80 bytes, well under the
-            // 128B push-constant guarantee. Both vertex and fragment read
-            // the same block.
             VkPushConstantRange pcRange{};
             pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
             pcRange.offset     = 0;
-            pcRange.size       = 80;
+            pcRange.size       = 128;
 
             VkPipelineLayoutCreateInfo plci{};
             plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -10293,6 +13387,54 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStrip, nullptr,
                                             &overlayLineStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStrip)");
+
+            VkShaderModuleCreateInfo dvsmci{};
+            dvsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            dvsmci.codeSize = sizeof(kOverlayDashedVertSpv);
+            dvsmci.pCode    = kOverlayDashedVertSpv;
+            VkShaderModule dashedVert = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &dvsmci, nullptr, &dashedVert),
+                  "vkCreateShaderModule(overlay_dashed.vert)");
+
+            VkShaderModuleCreateInfo dfsmci{};
+            dfsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            dfsmci.codeSize = sizeof(kOverlayDashedFragSpv);
+            dfsmci.pCode    = kOverlayDashedFragSpv;
+            VkShaderModule dashedFrag = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &dfsmci, nullptr, &dashedFrag),
+                  "vkCreateShaderModule(overlay_dashed.frag)");
+
+            VkPipelineShaderStageCreateInfo dashedStages[2] = {stages[0], stages[1]};
+            dashedStages[0].module = dashedVert;
+            dashedStages[1].module = dashedFrag;
+            VkVertexInputBindingDescription dashedVibs[2]{};
+            dashedVibs[0] = vib;
+            dashedVibs[1].binding = 1;
+            dashedVibs[1].stride = sizeof(float);
+            dashedVibs[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            VkVertexInputAttributeDescription dashedVias[2]{};
+            dashedVias[0] = via;
+            dashedVias[1].location = 1;
+            dashedVias[1].binding = 1;
+            dashedVias[1].format = VK_FORMAT_R32_SFLOAT;
+            dashedVias[1].offset = 0;
+            VkPipelineVertexInputStateCreateInfo dashedVi = vi;
+            dashedVi.vertexBindingDescriptionCount = 2;
+            dashedVi.pVertexBindingDescriptions = dashedVibs;
+            dashedVi.vertexAttributeDescriptionCount = 2;
+            dashedVi.pVertexAttributeDescriptions = dashedVias;
+            VkGraphicsPipelineCreateInfo gpciDashedList = gpciLineList;
+            gpciDashedList.pStages = dashedStages;
+            gpciDashedList.pVertexInputState = &dashedVi;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedList, nullptr,
+                                            &overlayLineDashedListPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineDashedList)");
+            VkGraphicsPipelineCreateInfo gpciDashedStrip = gpciLineStrip;
+            gpciDashedStrip.pStages = dashedStages;
+            gpciDashedStrip.pVertexInputState = &dashedVi;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedStrip, nullptr,
+                                            &overlayLineDashedStripPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineDashedStrip)");
 
             // ── Colored line pipelines ──────────────────────────────────────
             // Different shader pair (overlay_color.vert/.frag) + 2 vertex
@@ -10408,12 +13550,75 @@ namespace threepp {
                                             &overlayPointListPipeline),
                   "vkCreateGraphicsPipelines(overlayPointList)");
 
+            VkDescriptorSetLayoutBinding pointBindings[2]{};
+            for (uint32_t i = 0; i < 2; ++i) {
+                pointBindings[i].binding         = i;
+                pointBindings[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                pointBindings[i].descriptorCount = 1;
+                pointBindings[i].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            }
+            VkDescriptorSetLayoutCreateInfo pointDslci{};
+            pointDslci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            pointDslci.bindingCount = 2;
+            pointDslci.pBindings    = pointBindings;
+            check(vkCreateDescriptorSetLayout(ctx->device(), &pointDslci, nullptr,
+                                              &overlayPointDescSetLayout_),
+                  "vkCreateDescriptorSetLayout(overlayPoint)");
+
+            VkPushConstantRange pointPcRange{};
+            pointPcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            pointPcRange.offset     = 0;
+            pointPcRange.size       = 96;
+            VkPipelineLayoutCreateInfo pointPlci{};
+            pointPlci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            pointPlci.setLayoutCount         = 1;
+            pointPlci.pSetLayouts            = &overlayPointDescSetLayout_;
+            pointPlci.pushConstantRangeCount = 1;
+            pointPlci.pPushConstantRanges    = &pointPcRange;
+            check(vkCreatePipelineLayout(ctx->device(), &pointPlci, nullptr,
+                                         &overlayPointPipelineLayout_),
+                  "vkCreatePipelineLayout(overlayPoint)");
+
+            for (uint32_t f = 0; f < kFramesInFlight; ++f) {
+                VkDescriptorPoolSize ps{};
+                ps.type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                ps.descriptorCount = kMaxPointTexturesPerFrame * 2;
+                VkDescriptorPoolCreateInfo dpci{};
+                dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
+                dpci.maxSets       = kMaxPointTexturesPerFrame;
+                dpci.poolSizeCount = 1;
+                dpci.pPoolSizes    = &ps;
+                check(vkCreateDescriptorPool(ctx->device(), &dpci, nullptr,
+                                             &overlayPointDescPools_[f]),
+                      "vkCreateDescriptorPool(overlayPoint)");
+            }
+
+            VkShaderModuleCreateInfo ptfsmci{};
+            ptfsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            ptfsmci.codeSize = sizeof(kOverlayPointTexturedFragSpv);
+            ptfsmci.pCode    = kOverlayPointTexturedFragSpv;
+            VkShaderModule pfragTextured = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &ptfsmci, nullptr, &pfragTextured),
+                  "vkCreateShaderModule(overlay_point_textured.frag)");
+            VkPipelineShaderStageCreateInfo ptStages[2] = {pStages[0], pStages[1]};
+            ptStages[1].module = pfragTextured;
+            VkGraphicsPipelineCreateInfo gpciPointTextured = gpciPointList;
+            gpciPointTextured.pStages = ptStages;
+            gpciPointTextured.layout  = overlayPointPipelineLayout_;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1,
+                                            &gpciPointTextured, nullptr,
+                                            &overlayPointListTexturedPipeline),
+                  "vkCreateGraphicsPipelines(overlayPointTextured)");
+
             vkDestroyShaderModule(ctx->device(), vertModule, nullptr);
             vkDestroyShaderModule(ctx->device(), fragModule, nullptr);
+            vkDestroyShaderModule(ctx->device(), dashedVert, nullptr);
+            vkDestroyShaderModule(ctx->device(), dashedFrag, nullptr);
             vkDestroyShaderModule(ctx->device(), cvert, nullptr);
             vkDestroyShaderModule(ctx->device(), cfrag, nullptr);
             vkDestroyShaderModule(ctx->device(), pvert, nullptr);
             vkDestroyShaderModule(ctx->device(), pfrag, nullptr);
+            vkDestroyShaderModule(ctx->device(), pfragTextured, nullptr);
 
             // ── Overlay depth prepass pipeline ──────────────────────────────
             // Renders all non-overlay scene geometry with the unjittered VP
@@ -10923,6 +14128,81 @@ namespace threepp {
         std::unordered_map<const BufferGeometry*, vulkan::LineRec> lineGeomCache_;
         uint64_t overlayFrameCounter_ = 0;// lastTouch reference for lineGeomCache_ entries
 
+        void destroyLineLoopRanges(std::vector<vulkan::LineRec::LoopRange>& ranges) {
+            for (auto& range : ranges) {
+                if (range.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), range.index);
+            }
+            ranges.clear();
+        }
+
+        void pruneLineLoopRanges(std::vector<vulkan::LineRec::LoopRange>& ranges, uint64_t cutoff) {
+            for (auto it = ranges.begin(); it != ranges.end();) {
+                if (it->lastTouch < cutoff) {
+                    if (it->index.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), it->index);
+                    it = ranges.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        vulkan::LineRec::LoopRange* ensureLineLoopRangeUploaded(
+                const BufferGeometry& geom,
+                vulkan::LineRec& rec,
+                const DrawRange& drawRange) {
+            const uint32_t sourceCount = (rec.index.handle != VK_NULL_HANDLE) ? rec.indexCount : rec.vertexCount;
+            const uint32_t start = static_cast<uint32_t>(std::max(0, drawRange.start));
+            const uint32_t cap = (sourceCount > start) ? (sourceCount - start) : 0u;
+            const uint32_t count = std::min(cap, static_cast<uint32_t>(std::max(0, drawRange.count)));
+            if (count < 2) return nullptr;
+
+            if (overlayFrameCounter_ > 8) {
+                pruneLineLoopRanges(rec.loopRanges, overlayFrameCounter_ - 8);
+            }
+
+            for (auto& range : rec.loopRanges) {
+                if (range.start == start && range.count == count) {
+                    range.lastTouch = overlayFrameCounter_;
+                    return &range;
+                }
+            }
+
+            std::vector<unsigned int> loopIndices;
+            loopIndices.reserve(static_cast<std::size_t>(count) * 2u);
+            if (auto* idxAttr = geom.getIndex()) {
+                const auto& indices = idxAttr->array();
+                for (uint32_t i = 0; i < count; ++i) {
+                    const auto a = indices[static_cast<std::size_t>(start + i)];
+                    const auto b = indices[static_cast<std::size_t>(start + ((i + 1u) % count))];
+                    loopIndices.push_back(a);
+                    loopIndices.push_back(b);
+                }
+            } else {
+                for (uint32_t i = 0; i < count; ++i) {
+                    loopIndices.push_back(start + i);
+                    loopIndices.push_back(start + ((i + 1u) % count));
+                }
+            }
+
+            vulkan::LineRec::LoopRange range{};
+            range.start = start;
+            range.count = count;
+            range.indexCount = static_cast<uint32_t>(loopIndices.size());
+            range.lastTouch = overlayFrameCounter_;
+            const VkDeviceSize bytes = loopIndices.size() * sizeof(unsigned int);
+            range.index = createBuffer(
+                    ctx->allocator(), ctx->device(), bytes,
+                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            void* mapped = nullptr;
+            vmaMapMemory(ctx->allocator(), range.index.alloc, &mapped);
+            std::memcpy(mapped, loopIndices.data(), bytes);
+            vmaUnmapMemory(ctx->allocator(), range.index.alloc);
+            rec.loopRanges.push_back(std::move(range));
+            return &rec.loopRanges.back();
+        }
+
         // Lazy-upload Line / LineSegments geometry into a host-visible
         // vertex (+ optional index) buffer pair. Returns nullptr if the
         // geometry has no usable position attribute. Cached by raw pointer
@@ -10933,7 +14213,7 @@ namespace threepp {
         // refreshSkinnedBlas pattern — a write-during-read race for that
         // one frame is benign because the per-pixel result blends sub-
         // pixel anyway).
-        const vulkan::LineRec* ensureLineGeometryUploaded(const BufferGeometry* geom) {
+        vulkan::LineRec* ensureLineGeometryUploaded(const BufferGeometry* geom) {
             if (!geom) return nullptr;
             auto posAttr = geom->getAttribute<float>("position");
             if (!posAttr || posAttr->count() == 0) return nullptr;
@@ -10942,10 +14222,14 @@ namespace threepp {
             const auto colAttr = geom->hasAttribute("color")
                                          ? geom->getAttribute<float>("color")
                                          : nullptr;
+            const auto distAttr = geom->hasAttribute("lineDistance")
+                                         ? geom->getAttribute<float>("lineDistance")
+                                         : nullptr;
 
             const uint32_t posVer = posAttr->version;
             const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : 0u;
             const uint32_t colVer = (colAttr && colAttr->count() > 0) ? colAttr->version : 0u;
+            const uint32_t distVer = (distAttr && distAttr->count() > 0) ? distAttr->version : 0u;
 
             auto it = lineGeomCache_.find(geom);
             if (it != lineGeomCache_.end() && it->second.geomId != geom->id) {
@@ -10954,7 +14238,9 @@ namespace threepp {
                 // (the version fields would otherwise alias — both at 0).
                 destroyBuffer(ctx->allocator(), it->second.vertex);
                 if (it->second.index.handle) destroyBuffer(ctx->allocator(), it->second.index);
+                destroyLineLoopRanges(it->second.loopRanges);
                 if (it->second.color.handle) destroyBuffer(ctx->allocator(), it->second.color);
+                if (it->second.lineDistance.handle) destroyBuffer(ctx->allocator(), it->second.lineDistance);
                 lineGeomCache_.erase(it);
                 it = lineGeomCache_.end();
             }
@@ -10963,10 +14249,12 @@ namespace threepp {
                 rec.lastTouch = overlayFrameCounter_;
                 if (rec.positionVersion == posVer &&
                     rec.indexVersion    == idxVer &&
-                    rec.colorVersion    == colVer) {
+                    rec.colorVersion    == colVer &&
+                    rec.lineDistanceVersion == distVer) {
                     return &rec;
                 }
                 // Re-upload paths.
+                destroyLineLoopRanges(rec.loopRanges);
                 const auto& posArr = posAttr->array();
                 const VkDeviceSize vbBytes = posArr.size() * sizeof(float);
                 if (vbBytes > rec.vertex.size) {
@@ -11006,7 +14294,6 @@ namespace threepp {
                     rec.indexCount   = 0;
                     rec.indexVersion = 0;
                 }
-
                 // Color buffer follows the same in-place / recreate logic.
                 if (colAttr && colAttr->count() > 0) {
                     const auto& colArr = colAttr->array();
@@ -11027,6 +14314,26 @@ namespace threepp {
                     destroyBuffer(ctx->allocator(), rec.color);
                     rec.color        = {};
                     rec.colorVersion = 0;
+                }
+                if (distAttr && distAttr->count() > 0) {
+                    const auto& distArr = distAttr->array();
+                    const VkDeviceSize dbBytes = distArr.size() * sizeof(float);
+                    if (rec.lineDistance.handle == VK_NULL_HANDLE || dbBytes > rec.lineDistance.size) {
+                        if (rec.lineDistance.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.lineDistance);
+                        rec.lineDistance = createBuffer(
+                                ctx->allocator(), ctx->device(), dbBytes,
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                VMA_MEMORY_USAGE_AUTO,
+                                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                    }
+                    vmaMapMemory(ctx->allocator(), rec.lineDistance.alloc, &mapped);
+                    std::memcpy(mapped, distArr.data(), dbBytes);
+                    vmaUnmapMemory(ctx->allocator(), rec.lineDistance.alloc);
+                    rec.lineDistanceVersion = distVer;
+                } else if (rec.lineDistance.handle != VK_NULL_HANDLE) {
+                    destroyBuffer(ctx->allocator(), rec.lineDistance);
+                    rec.lineDistance = {};
+                    rec.lineDistanceVersion = 0;
                 }
                 return &rec;
             }
@@ -11064,7 +14371,6 @@ namespace threepp {
                 std::memcpy(mapped, indices.data(), ibBytes);
                 vmaUnmapMemory(ctx->allocator(), rec.index.alloc);
             }
-
             if (colAttr && colAttr->count() > 0) {
                 const auto& colArr = colAttr->array();
                 rec.colorVersion = colVer;
@@ -11077,6 +14383,20 @@ namespace threepp {
                 vmaMapMemory(ctx->allocator(), rec.color.alloc, &mapped);
                 std::memcpy(mapped, colArr.data(), cbBytes);
                 vmaUnmapMemory(ctx->allocator(), rec.color.alloc);
+            }
+
+            if (distAttr && distAttr->count() > 0) {
+                const auto& distArr = distAttr->array();
+                rec.lineDistanceVersion = distVer;
+                const VkDeviceSize dbBytes = distArr.size() * sizeof(float);
+                rec.lineDistance = createBuffer(
+                        ctx->allocator(), ctx->device(), dbBytes,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                vmaMapMemory(ctx->allocator(), rec.lineDistance.alloc, &mapped);
+                std::memcpy(mapped, distArr.data(), dbBytes);
+                vmaUnmapMemory(ctx->allocator(), rec.lineDistance.alloc);
             }
 
             return &lineGeomCache_.emplace(geom, std::move(rec)).first->second;
@@ -11305,7 +14625,9 @@ namespace threepp {
             envTextureIdUploaded = 0xFFFFFFFFu;
         }
 
-        // Single shared sampler for every material texture in binding 8.
+        // Legacy shared material sampler. Kept for compatibility with older
+        // descriptor paths; current material texture descriptors bind each
+        // Image2D's own sampler.
         // Trilinear + 16× anisotropy: minified surfaces fetch from the proper
         // mip level (set by createSampledImage2D's blit-chain) and glancing
         // angles get aniso-filtered, both of which kill the per-frame texture
@@ -11347,9 +14669,8 @@ namespace threepp {
                     VK_SAMPLER_ADDRESS_MODE_REPEAT,
                     VK_SAMPLER_ADDRESS_MODE_REPEAT,
                     "materialTexture[0] (default white)");
-            // The Image2D's own sampler is unused (we share textureSampler_),
-            // but kept alive so destroyImage2D's clean-up still works.
             materialTextures.push_back(tex);
+            materialTextureOwned_.push_back(true);
         }
 
         // GPU skinning pipeline moved into vulkan/SkinningPipeline.{hpp,cpp}.
@@ -11371,12 +14692,38 @@ namespace threepp {
             }
         }
 
+        static VkFilter filterToVk(Filter f) {
+            switch (f) {
+                case Filter::Nearest:
+                case Filter::NearestMipmapNearest:
+                case Filter::NearestMipmapLinear:
+                    return VK_FILTER_NEAREST;
+                default:
+                    return VK_FILTER_LINEAR;
+            }
+        }
+
+        static VkSamplerMipmapMode mipmapModeToVk(Filter f) {
+            switch (f) {
+                case Filter::NearestMipmapNearest:
+                case Filter::LinearMipmapNearest:
+                    return VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                default:
+                    return VK_SAMPLER_MIPMAP_MODE_LINEAR;
+            }
+        }
+
         // Upload `tex` to the next bindless slot if not already cached. Returns
         // the slot index; -1 if upload fails or capacity is exhausted.
         int32_t ensureMaterialTexture(const std::shared_ptr<Texture>& texSp) {
             if (!texSp) return -1;
             const Texture* tex = texSp.get();
             if (auto it = textureCache.find(tex); it != textureCache.end()) {
+                if (!it->second.ownsImage) {
+                    if (auto* rtImage = renderTargets_ ? renderTargets_->findByTexture(*tex) : nullptr) {
+                        materialTextures[it->second.slot] = *rtImage->image;
+                    }
+                }
                 return static_cast<int32_t>(it->second.slot);
             }
             if (freeTextureSlots.empty() && materialTextures.size() >= kMaxMaterialTextures) {
@@ -11384,18 +14731,36 @@ namespace threepp {
                           << kMaxMaterialTextures << "); using -1 fallback\n";
                 return -1;
             }
+            auto allocateSlot = [&]() {
+                uint32_t slot;
+                if (!freeTextureSlots.empty()) {
+                    slot = freeTextureSlots.back();
+                    freeTextureSlots.pop_back();
+                } else {
+                    slot = static_cast<uint32_t>(materialTextures.size());
+                    materialTextures.push_back({});
+                    materialTextureOwned_.push_back(true);
+                }
+                if (slot >= materialTextureOwned_.size()) {
+                    materialTextureOwned_.resize(slot + 1, true);
+                }
+                return slot;
+            };
+
+            if (auto* rtImage = renderTargets_ ? renderTargets_->findByTexture(*tex) : nullptr) {
+                const uint32_t slot = allocateSlot();
+                materialTextures[slot] = *rtImage->image;
+                materialTextureOwned_[slot] = false;
+                textureCache.emplace(tex, CachedTexture{std::weak_ptr<Texture>(texSp), slot, tex->version(), false});
+                return static_cast<int32_t>(slot);
+            }
+
             Image2D out = buildMaterialImage2D(tex);
             if (!out.view) return -1;
-            uint32_t slot;
-            if (!freeTextureSlots.empty()) {
-                slot = freeTextureSlots.back();
-                freeTextureSlots.pop_back();
-                materialTextures[slot] = out;
-            } else {
-                slot = static_cast<uint32_t>(materialTextures.size());
-                materialTextures.push_back(out);
-            }
-            textureCache.emplace(tex, CachedTexture{std::weak_ptr<Texture>(texSp), slot, tex->version()});
+            const uint32_t slot = allocateSlot();
+            materialTextures[slot] = out;
+            materialTextureOwned_[slot] = true;
+            textureCache.emplace(tex, CachedTexture{std::weak_ptr<Texture>(texSp), slot, tex->version(), true});
             return static_cast<int32_t>(slot);
         }
 
@@ -11405,6 +14770,24 @@ namespace threepp {
         // initial upload (ensureMaterialTexture) and the in-place re-upload
         // (refreshDirtyMaterialTextures) share one code path.
         Image2D buildMaterialImage2D(const Texture* tex) {
+            if (auto* cube = dynamic_cast<const CubeTexture*>(tex)) {
+                std::vector<float> cubeEquirect;
+                uint32_t cubeW = 0;
+                uint32_t cubeH = 0;
+                if (!buildCubeEquirect(*cube, cubeEquirect, cubeW, cubeH)) return {};
+                char texName[96];
+                std::snprintf(texName, sizeof(texName),
+                              "materialCubeTextureEquirect (%ux%u, tex=%p)",
+                              cubeW, cubeH, static_cast<const void*>(tex));
+                return createSampledImage2D(
+                        cubeW, cubeH, VK_FORMAT_R32G32B32A32_SFLOAT,
+                        cubeEquirect.data(), cubeEquirect.size() * sizeof(float),
+                        VK_FILTER_LINEAR,
+                        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                        texName);
+            }
+
             Image& img = const_cast<Texture*>(tex)->image();
             const uint32_t w = img.width();
             const uint32_t h = img.height();
@@ -11428,9 +14811,12 @@ namespace threepp {
                         static_cast<int>(h),
                         *img.compressedFormat);
                 if (bcnRgba.empty()) {
-                    std::cerr << "[VulkanRenderer] unsupported compressed format 0x"
-                              << std::hex << *img.compressedFormat << std::dec
-                              << " for material tex (" << w << "x" << h << ")\n";
+                    if (unsupportedCompressedFormatsWarned_.insert(*img.compressedFormat).second) {
+                        std::cerr << "[VulkanRenderer] unsupported compressed format 0x"
+                                  << std::hex << *img.compressedFormat << std::dec
+                                  << " for material tex (" << w << "x" << h
+                                  << "); using material fallback\n";
+                    }
                     return {};
                 }
                 srcPtr = bcnRgba.data();
@@ -11473,16 +14859,62 @@ namespace threepp {
                         return {};
                     }
                     rgba.resize(pixels * 4);
+                    auto q = [](float v) {
+                        if (!(v == v)) v = 0.f;// NaN→0
+                        v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+                        return static_cast<unsigned char>(v * 255.f + 0.5f);
+                    };
                     for (size_t i = 0; i < pixels; ++i) {
-                        float r = srcF[i * fch + 0];
-                        float g = (fch >= 2) ? srcF[i * fch + 1] : r;
-                        float b = (fch >= 3) ? srcF[i * fch + 2] : ((fch == 1) ? r : 0.f);
-                        float a = (fch >= 4) ? srcF[i * fch + 3] : 1.f;
-                        auto q = [](float v) {
-                            if (!(v == v)) v = 0.f;// NaN→0
-                            v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
-                            return static_cast<unsigned char>(v * 255.f + 0.5f);
-                        };
+                        const auto base = i * static_cast<size_t>(fch);
+                        auto r = srcF[base + 0];
+                        auto g = (fch >= 2) ? srcF[base + 1] : r;
+                        auto b = (fch >= 3) ? srcF[base + 2] : ((fch == 1) ? r : 0.f);
+                        auto a = (fch >= 4) ? srcF[base + 3] : 1.f;
+                        switch (tex->format) {
+                            case Format::Alpha:
+                                r = g = b = 0.f;
+                                a = srcF[base + 0];
+                                break;
+                            case Format::Luminance:
+                                r = g = b = srcF[base + 0];
+                                a = 1.f;
+                                break;
+                            case Format::LuminanceAlpha:
+                                if (fch < 2) return {};
+                                r = g = b = srcF[base + 0];
+                                a = srcF[base + 1];
+                                break;
+                            case Format::Red:
+                            case Format::RedInteger:
+                                r = srcF[base + 0];
+                                g = b = 0.f;
+                                a = 1.f;
+                                break;
+                            case Format::RG:
+                            case Format::RGInteger:
+                                if (fch < 2) return {};
+                                r = srcF[base + 0];
+                                g = srcF[base + 1];
+                                b = 0.f;
+                                a = 1.f;
+                                break;
+                            case Format::BGR:
+                                if (fch < 3) return {};
+                                r = srcF[base + 2];
+                                g = srcF[base + 1];
+                                b = srcF[base + 0];
+                                a = 1.f;
+                                break;
+                            case Format::BGRA:
+                                if (fch < 4) return {};
+                                r = srcF[base + 2];
+                                g = srcF[base + 1];
+                                b = srcF[base + 0];
+                                a = srcF[base + 3];
+                                break;
+                            default:
+                                break;
+                        }
                         rgba[i * 4 + 0] = q(r);
                         rgba[i * 4 + 1] = q(g);
                         rgba[i * 4 + 2] = q(b);
@@ -11498,11 +14930,56 @@ namespace threepp {
                     std::memcpy(rgba.data(), srcPtr, pixels * 4);
                 } else {
                     for (size_t i = 0; i < pixels; ++i) {
-                        const unsigned char r = srcPtr[i * channels + 0];
-                        const unsigned char g = (channels >= 2) ? srcPtr[i * channels + 1] : r;
-                        const unsigned char b = (channels >= 3) ? srcPtr[i * channels + 2]
-                                                                : ((channels == 1) ? r : 0);
-                        const unsigned char a = (channels >= 4) ? srcPtr[i * channels + 3] : 255u;
+                        const auto base = i * static_cast<size_t>(channels);
+                        auto r = srcPtr[base + 0];
+                        auto g = (channels >= 2) ? srcPtr[base + 1] : r;
+                        auto b = (channels >= 3) ? srcPtr[base + 2] : ((channels == 1) ? r : 0);
+                        auto a = (channels >= 4) ? srcPtr[base + 3] : 255u;
+                        switch (tex->format) {
+                            case Format::Alpha:
+                                r = g = b = 0;
+                                a = srcPtr[base + 0];
+                                break;
+                            case Format::Luminance:
+                                r = g = b = srcPtr[base + 0];
+                                a = 255u;
+                                break;
+                            case Format::LuminanceAlpha:
+                                if (channels < 2) return {};
+                                r = g = b = srcPtr[base + 0];
+                                a = srcPtr[base + 1];
+                                break;
+                            case Format::Red:
+                            case Format::RedInteger:
+                                r = srcPtr[base + 0];
+                                g = b = 0;
+                                a = 255u;
+                                break;
+                            case Format::RG:
+                            case Format::RGInteger:
+                                if (channels < 2) return {};
+                                r = srcPtr[base + 0];
+                                g = srcPtr[base + 1];
+                                b = 0;
+                                a = 255u;
+                                break;
+                            case Format::BGR:
+                                if (channels < 3) return {};
+                                r = srcPtr[base + 2];
+                                g = srcPtr[base + 1];
+                                b = srcPtr[base + 0];
+                                a = 255u;
+                                break;
+                            case Format::BGRA:
+                                if (channels < 4) return {};
+                                r = srcPtr[base + 2];
+                                g = srcPtr[base + 1];
+                                b = srcPtr[base + 0];
+                                a = srcPtr[base + 3];
+                                break;
+                            default:
+                                break;
+                        }
                         rgba[i * 4 + 0] = r;
                         rgba[i * 4 + 1] = g;
                         rgba[i * 4 + 2] = b;
@@ -11524,7 +15001,7 @@ namespace threepp {
             return createSampledImage2D(
                     w, h, fmt,
                     rgba.data(), rgba.size(),
-                    VK_FILTER_LINEAR,
+                    filterToVk(tex->magFilter),
                     wrapToVk(tex->wrapS),
                     wrapToVk(tex->wrapT),
                     texName);
@@ -11539,6 +15016,7 @@ namespace threepp {
         void refreshDirtyMaterialTextures() {
             bool any = false;
             for (auto& kv : textureCache) {
+                if (!kv.second.ownsImage) continue;
                 const auto sp = kv.second.ref.lock();
                 if (sp && sp->version() != kv.second.version) { any = true; break; }
             }
@@ -11547,13 +15025,21 @@ namespace threepp {
             check(vkDeviceWaitIdle(ctx->device()), "vkDeviceWaitIdle (material texture refresh)");
             for (auto& kv : textureCache) {
                 const auto sp = kv.second.ref.lock();
-                if (!sp || sp->version() == kv.second.version) continue;
+                const auto currentVersion = sp ? sp->version() : kv.second.version;
+                if (currentVersion == kv.second.version) continue;
                 if (kv.second.slot >= materialTextures.size()) continue;
+                if (!kv.second.ownsImage) {
+                    if (auto* rtImage = renderTargets_ ? renderTargets_->findByTexture(*kv.first) : nullptr) {
+                        materialTextures[kv.second.slot] = *rtImage->image;
+                    }
+                    kv.second.version = currentVersion;
+                    continue;
+                }
                 Image2D rebuilt = buildMaterialImage2D(kv.first);
                 if (!rebuilt.view) continue;// keep the old image on failure
                 destroyImage2D(ctx->allocator(), ctx->device(), materialTextures[kv.second.slot]);
                 materialTextures[kv.second.slot] = rebuilt;// same slot index, new view
-                kv.second.version = sp->version();
+                kv.second.version = currentVersion;
             }
             // The bindless material array is referenced by three descriptor sets:
             // the PT set (binding 8) and deferred-compute set (binding 11) are
@@ -11915,6 +15401,7 @@ namespace threepp {
         // oceanFineHeightView/Sampler/TileSize values via the standard path.
         void rewriteOceanFineDescriptors_() {
             if (descriptorSets.empty()) return;
+            vkDeviceWaitIdle(ctx->device());
             const uint32_t totalSets = imageCount_ * kFramesInFlight;
             std::vector<VkDescriptorImageInfo> infos(totalSets);
             std::vector<VkWriteDescriptorSet>  writes(totalSets);
@@ -11941,6 +15428,7 @@ namespace threepp {
         // lifetime of that mesh, so per-frame writes aren't needed).
         void rewriteOceanFoamDescriptors_() {
             if (descriptorSets.empty()) return;
+            vkDeviceWaitIdle(ctx->device());
             const uint32_t totalSets = imageCount_ * kFramesInFlight;
             std::vector<VkDescriptorImageInfo> infos(totalSets);
             std::vector<VkWriteDescriptorSet>  writes(totalSets);
@@ -11970,6 +15458,106 @@ namespace threepp {
             dummy.marginal    = {1.0f};
             dummy.totalSum    = 0.0f;
             rebuildEnvCdfImages(dummy);
+        }
+
+        static float decodeCubeEnvChannel(float c, ColorSpace colorSpace) {
+            c = std::clamp(c, 0.0f, 1.0f);
+            if (colorSpace != ColorSpace::sRGB) return c;
+            return (c <= 0.04045f) ? (c / 12.92f)
+                                   : std::pow((c + 0.055f) / 1.055f, 2.4f);
+        }
+
+        bool buildCubeEquirect(const CubeTexture& cube, std::vector<float>& out,
+                               uint32_t& outW, uint32_t& outH) const {
+            const auto& faces = cube.images();
+            if (faces.size() < 6) {
+                std::cerr << "[VulkanRenderer] cube env texture has fewer than 6 faces; ignoring" << std::endl;
+                return false;
+            }
+
+            const uint32_t faceW = faces[0].width();
+            const uint32_t faceH = faces[0].height();
+            const int channels = faces[0].channels();
+            if (faceW == 0 || faceH == 0 || channels < 3) {
+                std::cerr << "[VulkanRenderer] cube env texture has unexpected face size; ignoring" << std::endl;
+                return false;
+            }
+            for (uint32_t i = 1; i < 6; ++i) {
+                if (faces[i].width() != faceW || faces[i].height() != faceH ||
+                    faces[i].channels() != channels || faces[i].isFloat() != faces[0].isFloat()) {
+                    std::cerr << "[VulkanRenderer] cube env texture faces differ in size or type; ignoring" << std::endl;
+                    return false;
+                }
+            }
+
+            outW = std::max(4u, faceW * 4u);
+            outH = std::max(2u, faceH * 2u);
+            out.assign(static_cast<size_t>(outW) * outH * 4u, 1.0f);
+
+            auto sampleFace = [&](uint32_t face, uint32_t x, uint32_t y, uint32_t c) -> float {
+                const auto& img = faces[face];
+                const auto index = (static_cast<size_t>(y) * faceW + x) * static_cast<size_t>(channels) + c;
+                if (img.isFloat()) {
+                    const auto& data = img.data<float>();
+                    return index < data.size() ? decodeCubeEnvChannel(data[index], cube.colorSpace) : 0.0f;
+                }
+                const auto& data = img.data<unsigned char>();
+                return index < data.size() ? decodeCubeEnvChannel(static_cast<float>(data[index]) / 255.0f, cube.colorSpace) : 0.0f;
+            };
+
+            auto sampleCube = [&](float dx, float dy, float dz, float* rgba) {
+                const float ax = std::abs(dx);
+                const float ay = std::abs(dy);
+                const float az = std::abs(dz);
+                uint32_t face = 0;
+                float sc = 0.0f;
+                float tc = 0.0f;
+                if (ax >= ay && ax >= az) {
+                    if (dx >= 0.0f) {
+                        face = 0; sc = -dz / ax; tc = -dy / ax;
+                    } else {
+                        face = 1; sc =  dz / ax; tc = -dy / ax;
+                    }
+                } else if (ay >= ax && ay >= az) {
+                    if (dy >= 0.0f) {
+                        face = 2; sc =  dx / ay; tc =  dz / ay;
+                    } else {
+                        face = 3; sc =  dx / ay; tc = -dz / ay;
+                    }
+                } else {
+                    if (dz >= 0.0f) {
+                        face = 4; sc =  dx / az; tc = -dy / az;
+                    } else {
+                        face = 5; sc = -dx / az; tc = -dy / az;
+                    }
+                }
+                const auto sx = static_cast<uint32_t>(std::clamp((sc * 0.5f + 0.5f) * float(faceW), 0.0f, float(faceW - 1u)));
+                const auto sy = static_cast<uint32_t>(std::clamp((tc * 0.5f + 0.5f) * float(faceH), 0.0f, float(faceH - 1u)));
+                rgba[0] = sampleFace(face, sx, sy, 0);
+                rgba[1] = sampleFace(face, sx, sy, 1);
+                rgba[2] = sampleFace(face, sx, sy, 2);
+                rgba[3] = channels > 3 ? sampleFace(face, sx, sy, 3) : 1.0f;
+            };
+
+            constexpr float pi = 3.14159265358979323846f;
+            constexpr float twoPi = 2.0f * pi;
+            for (uint32_t y = 0; y < outH; ++y) {
+                const float v = (static_cast<float>(y) + 0.5f) / static_cast<float>(outH);
+                const float lat = (v - 0.5f) * pi;
+                const float cosLat = std::cos(lat);
+                for (uint32_t x = 0; x < outW; ++x) {
+                    const float u = (static_cast<float>(x) + 0.5f) / static_cast<float>(outW);
+                    const float phi = (u - 0.5f) * twoPi;
+                    float rgba[4]{};
+                    sampleCube(std::cos(phi) * cosLat, std::sin(lat), std::sin(phi) * cosLat, rgba);
+                    const auto dst = (static_cast<size_t>(y) * outW + x) * 4u;
+                    out[dst + 0] = rgba[0];
+                    out[dst + 1] = rgba[1];
+                    out[dst + 2] = rgba[2];
+                    out[dst + 3] = rgba[3];
+                }
+            }
+            return true;
         }
 
         // Detect the active env texture (scene.environment, falling back to
@@ -12021,6 +15609,27 @@ namespace threepp {
             }
             envIsBgColor = false;
             if (!envIsDefault && tex->id == envTextureIdUploaded) return false;
+
+            if (auto* cube = dynamic_cast<CubeTexture*>(tex.get())) {
+                std::vector<float> cubeEquirect;
+                uint32_t cubeW = 0;
+                uint32_t cubeH = 0;
+                if (!buildCubeEquirect(*cube, cubeEquirect, cubeW, cubeH)) {
+                    return false;
+                }
+
+                vkDeviceWaitIdle(ctx->device());
+                destroyImage2D(ctx->allocator(), ctx->device(), envImage);
+                envImage = envPrefilter_->buildPmrem(
+                        cubeW, cubeH, cubeEquirect.data(), cubeEquirect.size() * sizeof(float));
+                envIsDefault = false;
+                envTextureIdUploaded = tex->id;
+
+                const auto cdf = wgpu_pt::buildEnvCdf<float>(
+                        cubeEquirect, static_cast<int>(cubeW), static_cast<int>(cubeH));
+                rebuildEnvCdfImages(cdf);
+                return true;
+            }
 
             // Only HDR float equirects (RGBELoader output) are supported.
             // LDR backgrounds are not handled — fall through to default.
@@ -12419,7 +16028,8 @@ namespace threepp {
             //   [3] exposure as float bits
             //   [4] motionFlags: bit 0 = any motion this frame (mesh or
             //       camera), bit 1 = camera viewProj changed, bit 2 = scene
-            //       has any glass material. Raygen takes a self-tap of
+            //       has any glass material, bit 3 = shadowMap enabled for
+            //       analytic-light shadows. Raygen takes a self-tap of
             //       accum/gbuf when bit 0 is clear, avoiding round-trip
             //       reproject precision drift on static scenes.
             //   [5]  emissiveCount       (closest_hit reads for NEE CDF)
@@ -14442,8 +18052,8 @@ namespace threepp {
             // [2] ToneMapping enum, [3] exposure as float bits,
             // [4] motionFlags (bit 0 = any motion, bit 1 = camera moved,
             //                  bit 2 = scene has any glass material,
-            //                  bit 3 = hybrid mode (gbuffer drives reproject
-            //                          + primary jitter is disabled),
+            //                  bit 3 = shadowMap enabled for analytic-light
+            //                          shadows,
             //                  bit 4 = ReSTIR DI enabled (RIS at primary;
             //                          chit falls back to classic NEE when off),
             //                  bit 5 = perSppJitter (hybrid sub-pixel jitter
@@ -14466,6 +18076,7 @@ namespace threepp {
                     (motionThisFrame_           ? 1u   : 0u) |
                     (cameraMovedThisFrame_      ? 2u   : 0u) |
                     (sceneHasGlass_             ? 4u   : 0u) |
+                    (shadowMapEnabled_          ? 8u   : 0u) |
                     (restirDIEnabled_           ? 16u  : 0u) |
                     (perSppJitterHybrid_        ? 32u  : 0u) |
                     (restirGIEnabled_           ? 64u  : 0u) |
@@ -14563,9 +18174,16 @@ namespace threepp {
                     vkCmdPipelineBarrier2(cb, &asdep);
                 }
                 gpuTimings_->begin(cb, TP_PathTrace, currentFrame);
+                // This flag gates ray-query visibility for more than analytic-light
+                // shadows: emissive NEE, ReSTIR DI and secondary GI all need scene
+                // occlusion even when no Directional/Point/Spot light casts shadows.
+                // Analytic-light shadows are further gated by the receiver bit,
+                // TLAS shadow mask, and the per-light castShadow flag.
+                const bool visibilityShadows = true;
                 deferredShade_->recordDispatch(cb, currentFrame,
                                                regionRenderExt_.width, regionRenderExt_.height,
-                                               envImage.mipLevels, /*shadows=*/true,
+                                               envImage.mipLevels,
+                                               visibilityShadows,
                                                /*ao=*/deferredAO_, sampleIndex,
                                                emissiveTriCountThisFrame_,
                                                emissiveTotalPowerThisFrame_,
@@ -14886,6 +18504,9 @@ namespace threepp {
                     // Points entries (isPoints == true) always use the
                     // POINT_LIST pipeline; the push constant's color.w slot
                     // carries PointsMaterial::size instead of opacity.
+                    if (overlayPointDescPools_[currentFrame] != VK_NULL_HANDLE) {
+                        vkResetDescriptorPool(ctx->device(), overlayPointDescPools_[currentFrame], 0);
+                    }
                     for (const auto& le : lastVisibleLines_) {
                         std::shared_ptr<BufferGeometry> geomPtr;
                         std::shared_ptr<Material>       matPtr;
@@ -14899,22 +18520,30 @@ namespace threepp {
                             matPtr  = le.line->material();
                         }
                         if (!geomPtr) continue;
-                        const vulkan::LineRec* lrec = ensureLineGeometryUploaded(geomPtr.get());
+                        vulkan::LineRec* lrec = ensureLineGeometryUploaded(geomPtr.get());
                         if (!lrec || lrec->vertex.handle == VK_NULL_HANDLE) continue;
 
                         Color color(1.f, 1.f, 1.f);
                         float pcW           = 1.0f;// opacity for lines, point-size for points
+                        bool pointSizeAttenuation = false;
+                        std::shared_ptr<Texture> pointMap;
+                        std::shared_ptr<Texture> pointAlphaMap;
                         bool useVertexColors = false;
+                        LineDashedMaterial* dashed = nullptr;
                         if (matPtr) {
                             if (auto* mc = dynamic_cast<MaterialWithColor*>(matPtr.get())) {
                                 color = mc->color;
                             }
+                            dashed = dynamic_cast<LineDashedMaterial*>(matPtr.get());
                             if (le.isPoints) {
                                 if (auto* ms = dynamic_cast<MaterialWithSize*>(matPtr.get())) {
                                     pcW = std::max(1.0f, ms->size);
+                                    pointSizeAttenuation = ms->sizeAttenuation && currCameraPerspective_;
                                 } else {
                                     pcW = 3.0f;// sensible default for sizeless materials
                                 }
+                                if (auto* mm = dynamic_cast<MaterialWithMap*>(matPtr.get())) pointMap = mm->map;
+                                if (auto* am = dynamic_cast<MaterialWithAlphaMap*>(matPtr.get())) pointAlphaMap = am->alphaMap;
                             } else {
                                 pcW = matPtr->opacity;
                             }
@@ -14922,18 +18551,33 @@ namespace threepp {
                                               lrec->color.handle != VK_NULL_HANDLE;
                         }
 
+                        const auto& drawRange = geomPtr->drawRange;
+                        vulkan::LineRec::LoopRange* loopRange = (!le.isPoints && le.isLoop)
+                                                                        ? ensureLineLoopRangeUploaded(*geomPtr, *lrec, drawRange)
+                                                                        : nullptr;
+                        const bool drawLoop = loopRange &&
+                                              loopRange->index.handle != VK_NULL_HANDLE &&
+                                              loopRange->indexCount > 0;
+                        const bool useDashed = !le.isPoints && !useVertexColors &&
+                                               dashed && lrec->lineDistance.handle != VK_NULL_HANDLE;
+                        const bool usePointTexture = le.isPoints && (pointMap || pointAlphaMap);
+                        const bool useListTopology = le.isSegments || drawLoop;
                         VkPipeline want;
                         if (le.isPoints) {
                             // Point pipeline always reads the color binding;
                             // skip the draw if the geometry has none.
                             if (lrec->color.handle == VK_NULL_HANDLE) continue;
-                            want = overlayPointListPipeline;
+                            want = usePointTexture ? overlayPointListTexturedPipeline
+                                                   : overlayPointListPipeline;
+                        } else if (useDashed) {
+                            want = useListTopology ? overlayLineDashedListPipeline
+                                                   : overlayLineDashedStripPipeline;
                         } else if (useVertexColors) {
-                            want = le.isSegments ? overlayLineListColoredPipeline
-                                                 : overlayLineStripColoredPipeline;
+                            want = useListTopology ? overlayLineListColoredPipeline
+                                                   : overlayLineStripColoredPipeline;
                         } else {
-                            want = le.isSegments ? overlayLineListPipeline
-                                                 : overlayLineStripPipeline;
+                            want = useListTopology ? overlayLineListPipeline
+                                                   : overlayLineStripPipeline;
                         }
                         if (want != curPipeline) {
                             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
@@ -14948,20 +18592,70 @@ namespace threepp {
                         struct OverlayPC {
                             float mvp[16];
                             float color[4];
+                            float dash[4];
                         } pcL{};
                         std::memcpy(pcL.mvp, mvpL.elements.data(), 64);
                         pcL.color[0] = color.r;
                         pcL.color[1] = color.g;
                         pcL.color[2] = color.b;
                         pcL.color[3] = pcW;
-                        vkCmdPushConstants(cb, overlayPipelineLayout,
+                        pcL.dash[0] = dashed ? dashed->dashSize : 0.f;
+                        pcL.dash[1] = dashed ? dashed->gapSize : 0.f;
+                        pcL.dash[2] = dashed ? dashed->scale : 1.f;
+                        if (le.isPoints) {
+                            pcL.dash[0] = pointSizeAttenuation ? 1.f : 0.f;
+                            pcL.dash[1] = 0.5f * static_cast<float>(ctx->swapchainExtent().height);
+                            pcL.dash[2] = pointMap ? 1.f : 0.f;
+                            pcL.dash[3] = pointAlphaMap ? 1.f : 0.f;
+                        }
+                        const VkPipelineLayout pcLayout = usePointTexture
+                                                                  ? overlayPointPipelineLayout_
+                                                                  : overlayPipelineLayout;
+                        vkCmdPushConstants(cb, pcLayout,
                                            VK_SHADER_STAGE_VERTEX_BIT |
                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
-                                           0, sizeof(pcL), &pcL);
+                                           0, (useDashed || le.isPoints) ? sizeof(pcL) : 80, &pcL);
+                        if (usePointTexture) {
+                            ensureParticleWhiteTexture();
+                            const Image2D* mapImg = pointMap ? ensureParticleTexture(pointMap.get()) : nullptr;
+                            const Image2D* alphaImg = pointAlphaMap ? ensureParticleTexture(pointAlphaMap.get()) : nullptr;
+                            if (!mapImg) mapImg = &particleWhiteTex_;
+                            if (!alphaImg) alphaImg = &particleWhiteTex_;
 
-                        const bool twoBindings = le.isPoints || useVertexColors;
+                            VkDescriptorSet ds = VK_NULL_HANDLE;
+                            VkDescriptorSetAllocateInfo asi{};
+                            asi.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                            asi.descriptorPool     = overlayPointDescPools_[currentFrame];
+                            asi.descriptorSetCount = 1;
+                            asi.pSetLayouts        = &overlayPointDescSetLayout_;
+                            check(vkAllocateDescriptorSets(ctx->device(), &asi, &ds),
+                                  "vkAllocateDescriptorSets(overlayPoint)");
+
+                            VkDescriptorImageInfo infos[2]{};
+                            infos[0].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                            infos[0].imageView   = mapImg->view;
+                            infos[0].sampler     = mapImg->sampler;
+                            infos[1].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                            infos[1].imageView   = alphaImg->view;
+                            infos[1].sampler     = alphaImg->sampler;
+                            VkWriteDescriptorSet writes[2]{};
+                            for (uint32_t i = 0; i < 2; ++i) {
+                                writes[i].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                                writes[i].dstSet          = ds;
+                                writes[i].dstBinding      = i;
+                                writes[i].descriptorCount = 1;
+                                writes[i].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                                writes[i].pImageInfo      = &infos[i];
+                            }
+                            vkUpdateDescriptorSets(ctx->device(), 2, writes, 0, nullptr);
+                            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                                    overlayPointPipelineLayout_, 0, 1, &ds, 0, nullptr);
+                        }
+
+                        const bool twoBindings = le.isPoints || useVertexColors || useDashed;
                         if (twoBindings) {
-                            VkBuffer     vbufsL[2] = {lrec->vertex.handle, lrec->color.handle};
+                            VkBuffer second = useDashed ? lrec->lineDistance.handle : lrec->color.handle;
+                            VkBuffer     vbufsL[2] = {lrec->vertex.handle, second};
                             VkDeviceSize voffsL[2] = {0, 0};
                             vkCmdBindVertexBuffers(cb, 0, 2, vbufsL, voffsL);
                         } else {
@@ -14972,8 +18666,10 @@ namespace threepp {
                         // Honour BufferGeometry::drawRange — the example
                         // sets it to limit how many of an over-allocated
                         // dynamic vertex buffer are actually rendered.
-                        const auto& drawRange = geomPtr->drawRange;
-                        if (lrec->index.handle != VK_NULL_HANDLE) {
+                        if (drawLoop) {
+                            vkCmdBindIndexBuffer(cb, loopRange->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                            vkCmdDrawIndexed(cb, loopRange->indexCount, 1, 0, 0, 0);
+                        } else if (lrec->index.handle != VK_NULL_HANDLE) {
                             vkCmdBindIndexBuffer(cb, lrec->index.handle, 0, VK_INDEX_TYPE_UINT32);
                             const uint32_t start = static_cast<uint32_t>(std::max(0, drawRange.start));
                             const uint32_t cap   = (lrec->indexCount > start) ? (lrec->indexCount - start) : 0u;
@@ -15610,9 +19306,11 @@ namespace threepp {
                 // TRANSFER bits defensively cover any transfer-stage write to
                 // the image. Cover both.
                 toColor.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                       VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                                       VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                       VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                 toColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                        VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                                        VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
                 toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                 toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
@@ -15670,9 +19368,11 @@ namespace threepp {
                 // TRANSFER bits defensively cover any transfer-stage write to
                 // the image. Cover both.
                 toPresent.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                         VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+                                         VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                 toPresent.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                          VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                                          VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                          VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
                 toPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
                 toPresent.dstAccessMask = 0;
                 toPresent.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
@@ -15713,6 +19413,7 @@ namespace threepp {
             // the pool and re-record. Result is stored in gpuTimings_ for
             // the public getter to read.
             gpuTimings_->readBack(currentFrame, pendingCpuEnsureSceneMs_);
+            resetCustomShaderFrameResources(currentFrame);
 
             // Apply any setter requests deferred from mid-frame. setRenderScale
             // / resetAccumulation issue vkDeviceWaitIdle + reallocate descriptor
@@ -15839,6 +19540,22 @@ namespace threepp {
             // Record the full PT body into the now-open cmd buffer. Leaves
             // the swapchain image in GENERAL.
             recordCommandBuffer(cmdBuffers[currentFrame], imageIndex);
+            const auto swapExtentForCustomRt = ctx->swapchainExtent();
+            const auto customRtExtent = currentRenderTarget_
+                    ? activeRenderTargetExtent(*currentRenderTarget_)
+                    : VkExtent2D{};
+            const bool directCustomToRenderTarget = currentRenderTarget_ && renderTargets_ &&
+                                                    currentRenderTarget_->texture &&
+                                                    currentRenderTarget_->texture->format != Format::Depth &&
+                                                    customRtExtent.width <= swapExtentForCustomRt.width &&
+                                                    customRtExtent.height <= swapExtentForCustomRt.height;
+            if (currentRenderTarget_ && directCustomToRenderTarget) {
+                recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
+            }
+            recordCustomShaderMaterialPass(cmdBuffers[currentFrame], imageIndex, currentFrame, camera);
+            if (currentRenderTarget_ && !directCustomToRenderTarget) {
+                recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
+            }
 
             // Scene-only swapchain capture. Runs BEFORE the sprite + ImGui
             // overlays composite — sensor pipelines that consume the
@@ -16005,9 +19722,18 @@ namespace threepp {
         // animateOnce().
         void renderFrame(Object3D& scene, Camera& camera) {
             const bool isOrtho = camera.is<OrthographicCamera>();
+            const bool orthoDepthOverlayToRenderTarget =
+                    isOrtho &&
+                    currentRenderTarget_ != nullptr &&
+                    sceneCustomShaderMaterialsFitOrthoDepthOverlay(scene);
+            const bool orthoNeedsFullFrame =
+                    isOrtho &&
+                    currentRenderTarget_ != nullptr &&
+                    !orthoDepthOverlayToRenderTarget &&
+                    sceneHasVisibleCustomShaderMaterials(scene);
 
             if (frameState_ == FrameState::Idle) {
-                if (isOrtho) {
+                if (isOrtho && !orthoNeedsFullFrame) {
                     if (!beginFrameOrthoOnly()) return;
                     frameState_ = FrameState::RecordingOrthoOnly;
                     // Standalone 2D render: draw the ortho overlay (Sprites +
@@ -16015,8 +19741,19 @@ namespace threepp {
                     // call produces output. The HUD pattern (a perspective render
                     // first, then ortho) instead reaches recordOrthoOverlay via the
                     // frame-already-in-flight path below.
-                    overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
-                                         scene, camera, /*screenSpaceOnly=*/false);
+                    const VkRect2D viewportRect = activeViewportRect(ctx->swapchainExtent());
+                    if (viewportRect.extent.width > 0 && viewportRect.extent.height > 0) {
+                        overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                             scene, camera, /*screenSpaceOnly=*/false,
+                                             static_cast<uint32_t>(viewportRect.offset.x),
+                                             static_cast<uint32_t>(viewportRect.offset.y),
+                                             viewportRect.extent.width,
+                                             viewportRect.extent.height,
+                                             /*regionAsViewport=*/true);
+                    }
+                    if (currentRenderTarget_) {
+                        recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
+                    }
                 } else {
                     if (!beginFrameForPT(scene, camera)) return;
                     frameState_ = FrameState::RecordingPostPT;
@@ -16073,15 +19810,23 @@ namespace threepp {
             // cmd buffer's swapchain image. Mesh / Line HUD overlays are
             // a follow-up — the no-op branch falls through to here so the
             // present still completes from endFrame().
-            overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
-                                 scene, camera, /*screenSpaceOnly=*/false);
+            const VkRect2D viewportRect = activeViewportRect(ctx->swapchainExtent());
+            if (viewportRect.extent.width > 0 && viewportRect.extent.height > 0) {
+                overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                     scene, camera, /*screenSpaceOnly=*/false,
+                                     static_cast<uint32_t>(viewportRect.offset.x),
+                                     static_cast<uint32_t>(viewportRect.offset.y),
+                                     viewportRect.extent.width,
+                                     viewportRect.extent.height,
+                                     /*regionAsViewport=*/true);
+            }
+            if (currentRenderTarget_) {
+                recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
+            }
         }
 
         void clearDefaultFramebuffer(bool color, bool depth, bool stencil) {
             if (!color && !depth && !stencil) return;
-            if (currentRenderTarget_ != nullptr) {
-                throw std::runtime_error("VulkanRenderer::clear: render target clearing is not implemented yet");
-            }
             if (frameState_ == FrameState::Idle) {
                 pendingClearColor_ |= color;
                 pendingClearDepth_ |= depth;
@@ -16143,18 +19888,73 @@ namespace threepp {
         pimpl_->autoClearColor_      = autoClearColor;
         pimpl_->autoClearDepth_      = autoClearDepth;
         pimpl_->autoClearStencil_    = autoClearStencil;
-        // Only the PT-bound (perspective-camera) render() call needs the
-        // scene-build pass — it populates lastVisibleEntries_, the BLAS
-        // cache, motion bits and the per-mesh fingerprint state the PT
-        // pipeline reads. The HUD pattern's second call (ortho camera over
-        // a separate HUD scene) must not touch any of that, or it clobbers
-        // motionThisFrame_ / meshMovedBits_ / lastVisibleEntries_ and the
-        // next PT frame cold-starts (visibly drops to ~1-spp quality).
-        // The ortho overlay record path walks the HUD scene directly instead.
+        pimpl_->checkShaderErrors_   = checkShaderErrors;
+        const bool shadowMapEnabled = shadowMap().enabled;
+        if (pimpl_->shadowMapEnabled_ != shadowMapEnabled) {
+            pimpl_->shadowMapEnabled_ = shadowMapEnabled;
+            if (pimpl_->taa_) pimpl_->taa_->invalidateHistory();
+            if (pimpl_->sceneBuilt_) pimpl_->resetAccumulation();
+        }
+        const auto shadowMapType = shadowMap().type;
+        if (pimpl_->shadowMapType_ != shadowMapType) {
+            pimpl_->shadowMapType_ = shadowMapType;
+            if (pimpl_->taa_) pimpl_->taa_->invalidateHistory();
+            if (pimpl_->sceneBuilt_) pimpl_->resetAccumulation();
+        }
+        if (pimpl_->clippingPlanes_ != clippingPlanes) {
+            pimpl_->clippingPlanes_ = clippingPlanes;
+            if (pimpl_->taa_) pimpl_->taa_->invalidateHistory();
+            if (pimpl_->sceneBuilt_) {
+                pimpl_->resetAccumulation();
+                pimpl_->sceneSnapshot_.clear();
+                pimpl_->prevSceneFingerprint.clear();
+            }
+        }
+        if (pimpl_->localClippingEnabled_ != localClippingEnabled) {
+            pimpl_->localClippingEnabled_ = localClippingEnabled;
+            if (pimpl_->taa_) pimpl_->taa_->invalidateHistory();
+            if (pimpl_->sceneBuilt_) {
+                pimpl_->resetAccumulation();
+                pimpl_->sceneSnapshot_.clear();
+                pimpl_->prevSceneFingerprint.clear();
+            }
+        }
+        // Scene build populates lastVisibleEntries_, BLAS cache, motion bits,
+        // and the per-mesh fingerprint state used by raster/custom material
+        // passes. Only the GL-style HUD pattern's second render() call may skip
+        // it: an orthographic camera appended to an already-open default-frame
+        // overlay walks its scene directly and must not clobber the main scene.
         const bool skipSceneBuildForOverlayOnly = pimpl_->willAppendPerspectiveOverlayOnly(camera);
-        if (!camera.is<OrthographicCamera>() && !skipSceneBuildForOverlayOnly) {
+        const bool orthoDepthOverlayToRenderTarget =
+                camera.is<OrthographicCamera>() &&
+                pimpl_->currentRenderTarget_ != nullptr &&
+                pimpl_->sceneCustomShaderMaterialsFitOrthoDepthOverlay(scene);
+        const bool orthoNeedsFullFrame =
+                camera.is<OrthographicCamera>() &&
+                pimpl_->currentRenderTarget_ != nullptr &&
+                !orthoDepthOverlayToRenderTarget &&
+                pimpl_->sceneHasVisibleCustomShaderMaterials(scene);
+        if (orthoDepthOverlayToRenderTarget && pimpl_->frameState_ != Impl::FrameState::Idle) {
+            pimpl_->endFrame();
+        }
+        const bool skipSceneBuildForOrthoHud =
+                camera.is<OrthographicCamera>() &&
+                !orthoNeedsFullFrame &&
+                pimpl_->frameState_ != Impl::FrameState::Idle &&
+                pimpl_->currentRenderTarget_ == nullptr;
+        const bool needsSceneBuild =
+                (!camera.is<OrthographicCamera>() || orthoNeedsFullFrame) &&
+                !skipSceneBuildForOverlayOnly &&
+                !skipSceneBuildForOrthoHud;
+        if (needsSceneBuild && pimpl_->frameState_ != Impl::FrameState::Idle) {
+            pimpl_->endFrame();
+        }
+        if (needsSceneBuild) {
+            if (!camera.parent) {
+                camera.updateMatrixWorld();
+            }
             const auto sceneStart = std::chrono::high_resolution_clock::now();
-            pimpl_->ensureSceneBuilt(scene);
+            pimpl_->ensureSceneBuilt(scene, camera);
             // World-space Sprites (screenSpace == false) are drawn by the overlay
             // billboard pass, not the PT/G-buffer path. Snapshot them each frame
             // with fresh world matrices (ensureSceneBuilt just ran
@@ -16232,16 +20032,44 @@ namespace threepp {
 
     RenderTarget* VulkanRenderer::getRenderTarget() { return pimpl_->currentRenderTarget_; }
     void VulkanRenderer::setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel) {
+        setRenderTarget(renderTarget, activeCubeFace, activeMipmapLevel, 0);
+    }
+
+    void VulkanRenderer::setRenderTarget(RenderTarget* renderTarget, int activeCubeFace, int activeMipmapLevel, int activeLayer) {
         if (renderTarget != nullptr) {
-            throw std::runtime_error("VulkanRenderer::setRenderTarget: offscreen render targets are implemented in phase 2");
+            pimpl_->renderTargets_->getOrCreate(*renderTarget, activeCubeFace, activeMipmapLevel,
+                                                pimpl_->defaultFramebufferSamples_, activeLayer);
         }
-        pimpl_->currentRenderTarget_ = nullptr;
+        pimpl_->currentRenderTarget_ = renderTarget;
         pimpl_->activeCubeFace_ = activeCubeFace;
         pimpl_->activeMipmapLevel_ = activeMipmapLevel;
+        pimpl_->activeLayer_ = activeLayer;
     }
 
     void VulkanRenderer::copyFramebufferToTexture(const Vector2& position, Texture& texture, int level) {
         pimpl_->recordCopyFramebufferToTexture(position, texture, level);
+    }
+
+    void* VulkanRenderer::nativeRenderTargetTexture() const {
+        if (!pimpl_->currentRenderTarget_ || !pimpl_->renderTargets_) return nullptr;
+        auto& rt = pimpl_->renderTargets_->getOrCreate(*pimpl_->currentRenderTarget_,
+                                                       pimpl_->activeCubeFace_,
+                                                       pimpl_->activeMipmapLevel_,
+                                                       pimpl_->defaultFramebufferSamples_,
+                                                       pimpl_->activeLayer_);
+        if (rt.color.image != VK_NULL_HANDLE) return static_cast<void*>(&rt.color);
+        if (rt.depth.image != VK_NULL_HANDLE) return static_cast<void*>(&rt.depth);
+        return nullptr;
+    }
+
+    void* VulkanRenderer::nativeRenderTargetMsaaTexture() const {
+        if (!pimpl_->currentRenderTarget_ || !pimpl_->renderTargets_) return nullptr;
+        auto& rt = pimpl_->renderTargets_->getOrCreate(*pimpl_->currentRenderTarget_,
+                                                       pimpl_->activeCubeFace_,
+                                                       pimpl_->activeMipmapLevel_,
+                                                       pimpl_->defaultFramebufferSamples_,
+                                                       pimpl_->activeLayer_);
+        return rt.msaaColor.image != VK_NULL_HANDLE ? static_cast<void*>(&rt.msaaColor) : nullptr;
     }
 
     void VulkanRenderer::writeFramebuffer(const std::filesystem::path& filename) {
@@ -16278,6 +20106,11 @@ namespace threepp {
         auto& impl = *pimpl_;
         auto* ctx  = impl.ctx.get();
         if (!ctx || ctx->swapchainImages().empty()) return {};
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+            ctx = impl.ctx.get();
+            if (!ctx || ctx->swapchainImages().empty()) return {};
+        }
 
         const VkExtent2D ext   = ctx->swapchainExtent();
         const auto       w     = ext.width;
@@ -16379,20 +20212,12 @@ namespace threepp {
         vulkan::check(vkWaitForFences(ctx->device(), 1, &fence, VK_TRUE, UINT64_MAX),
                       "vkWaitForFences(readRGBPixels)");
 
-        // Map staging, convert BGRA8_UNORM → RGB8 (Vulkan picks BGRA in
-        // VulkanContext::createSwapchain; the surface format is fixed).
-        std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
         void* mapped = nullptr;
         vmaInvalidateAllocation(ctx->allocator(), staging.alloc, 0, bytes);
         vulkan::check(vmaMapMemory(ctx->allocator(), staging.alloc, &mapped),
                       "vmaMapMemory(readRGBPixels)");
         const auto* bgra = static_cast<const unsigned char*>(mapped);
-        const size_t pixels = static_cast<size_t>(w) * h;
-        for (size_t i = 0; i < pixels; ++i) {
-            rgb[i * 3 + 0] = bgra[i * 4 + 2];// R ← B-channel of source
-            rgb[i * 3 + 1] = bgra[i * 4 + 1];// G ← G
-            rgb[i * 3 + 2] = bgra[i * 4 + 0];// B ← R
-        }
+        auto rgb = vulkan::readback::bgraToRgb(bgra, static_cast<size_t>(w) * h);
         vmaUnmapMemory(ctx->allocator(), staging.alloc);
 
         vkDestroyFence(ctx->device(), fence, nullptr);
@@ -16400,6 +20225,1015 @@ namespace threepp {
         vulkan::destroyBuffer(ctx->allocator(), staging);
 
         return rgb;
+    }
+
+    void VulkanRenderer::copyTextureToImage(Texture& texture) {
+        std::vector<Texture*> textures{&texture};
+        copyTexturesToImages(textures);
+    }
+
+    std::future<void> VulkanRenderer::copyTextureToImageAsync(Texture& texture) {
+        std::vector<Texture*> textures{&texture};
+        return copyTexturesToImagesAsync(textures);
+    }
+
+    bool VulkanRenderer::supportsAsyncPixelReadback() const noexcept {
+        return true;
+    }
+
+    std::uint64_t VulkanRenderer::asyncReadbackStagingReuseCount() const noexcept {
+        return pimpl_->asyncReadbackStagingReuses_.load(std::memory_order_relaxed);
+    }
+
+    void VulkanRenderer::copyTexturesToImages(const std::vector<Texture*>& textures) {
+        auto& impl = *pimpl_;
+        auto* ctx = impl.ctx.get();
+        if (!ctx) return;
+
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+        }
+
+        struct CopyOp {
+            Texture* texture = nullptr;
+            const vulkan::Image2D* srcImage = nullptr;
+            VkImageLayout* srcLayout = nullptr;
+            VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            VkImageAspectFlags barrierAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            VkImageLayout materialTextureLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkImageLayout restoreLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            bool depthAspect = false;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            uint32_t layers = 1;
+            VkDeviceSize bytes = 0;
+            vulkan::Buffer staging{};
+            vulkan::Image2D temporaryMaterialImage{};
+        };
+
+        std::vector<CopyOp> ops;
+        ops.reserve(textures.size());
+
+        for (auto* texture : textures) {
+            if (!texture) continue;
+
+            auto& op = ops.emplace_back();
+            op.texture = texture;
+
+            if (auto* rtImage = impl.renderTargets_ ? impl.renderTargets_->findByTexture(*texture) : nullptr) {
+                op.srcImage = rtImage->image;
+                op.srcLayout = rtImage->layout;
+                op.aspect = rtImage->aspect;
+                op.barrierAspect = op.aspect == VK_IMAGE_ASPECT_DEPTH_BIT
+                        ? Impl::depthBarrierAspect(op.srcImage->format)
+                        : op.aspect;
+            } else {
+                auto it = impl.framebufferTextureImages_.find(texture);
+                if (it != impl.framebufferTextureImages_.end()) {
+                    op.srcImage = &it->second.image;
+                    op.srcLayout = &it->second.layout;
+                } else if (auto texIt = impl.textureCache.find(texture);
+                           texIt != impl.textureCache.end() &&
+                           texIt->second.slot < impl.materialTextures.size()) {
+                    op.srcImage = &impl.materialTextures[texIt->second.slot];
+                    op.srcLayout = &op.materialTextureLayout;
+                } else {
+                    op.temporaryMaterialImage = impl.buildMaterialImage2D(texture);
+                    if (op.temporaryMaterialImage.image != VK_NULL_HANDLE) {
+                        op.srcImage = &op.temporaryMaterialImage;
+                        op.srcLayout = &op.materialTextureLayout;
+                    }
+                }
+            }
+
+            if (!op.srcImage || op.srcImage->image == VK_NULL_HANDLE || !op.srcLayout ||
+                (op.aspect != VK_IMAGE_ASPECT_COLOR_BIT && op.aspect != VK_IMAGE_ASPECT_DEPTH_BIT)) {
+                vulkan::destroyImage2D(ctx->allocator(), ctx->device(), op.temporaryMaterialImage);
+                ops.pop_back();
+                continue;
+            }
+
+            op.width = op.srcImage->width;
+            op.height = op.srcImage->height;
+            op.layers = std::max(1u, op.srcImage->arrayLayers);
+            if (op.width == 0 || op.height == 0) {
+                vulkan::destroyImage2D(ctx->allocator(), ctx->device(), op.temporaryMaterialImage);
+                ops.pop_back();
+                continue;
+            }
+
+            op.depthAspect = op.aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+            op.restoreLayout = *op.srcLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                    ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                    : *op.srcLayout;
+            op.bytes = static_cast<VkDeviceSize>(op.width) * op.height * op.layers *
+                       (op.depthAspect ? sizeof(float) : 4u);
+        }
+
+        if (ops.empty()) return;
+
+        VkCommandPool cpool = VK_NULL_HANDLE;
+        VkFence fence = VK_NULL_HANDLE;
+
+        const auto cleanup = [&] {
+            if (fence != VK_NULL_HANDLE) {
+                vkDestroyFence(ctx->device(), fence, nullptr);
+            }
+            if (cpool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(ctx->device(), cpool, nullptr);
+            }
+            for (auto& op : ops) {
+                if (op.staging.handle != VK_NULL_HANDLE) {
+                    vulkan::destroyBuffer(ctx->allocator(), op.staging);
+                }
+                if (op.temporaryMaterialImage.image != VK_NULL_HANDLE) {
+                    vulkan::destroyImage2D(ctx->allocator(), ctx->device(), op.temporaryMaterialImage);
+                }
+            }
+        };
+
+        try {
+            vkDeviceWaitIdle(ctx->device());
+
+            for (auto& op : ops) {
+                op.staging = vulkan::createBuffer(
+                        ctx->allocator(), ctx->device(), op.bytes,
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+            }
+
+            VkCommandPoolCreateInfo cpci{};
+            cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            cpci.queueFamilyIndex = ctx->queueFamilies().graphics;
+            vulkan::check(vkCreateCommandPool(ctx->device(), &cpci, nullptr, &cpool),
+                          "vkCreateCommandPool(copyTexturesToImages)");
+
+            VkCommandBufferAllocateInfo cbai{};
+            cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cbai.commandPool = cpool;
+            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbai.commandBufferCount = 1;
+            VkCommandBuffer cb = VK_NULL_HANDLE;
+            vulkan::check(vkAllocateCommandBuffers(ctx->device(), &cbai, &cb),
+                          "vkAllocateCommandBuffers(copyTexturesToImages)");
+
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vulkan::check(vkBeginCommandBuffer(cb, &bi),
+                          "vkBeginCommandBuffer(copyTexturesToImages)");
+
+            for (const auto& op : ops) {
+                VkImageMemoryBarrier toSrc{};
+                toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                toSrc.oldLayout = *op.srcLayout;
+                toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                toSrc.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                      VK_ACCESS_TRANSFER_WRITE_BIT |
+                                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toSrc.image = op.srcImage->image;
+                toSrc.subresourceRange.aspectMask = op.barrierAspect;
+                toSrc.subresourceRange.levelCount = 1;
+                toSrc.subresourceRange.layerCount = op.layers;
+                vkCmdPipelineBarrier(cb,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                             VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+                VkBufferImageCopy region{};
+                region.imageSubresource.aspectMask = op.aspect;
+                region.imageSubresource.layerCount = op.layers;
+                region.imageExtent = {op.width, op.height, 1};
+                vkCmdCopyImageToBuffer(cb, op.srcImage->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       op.staging.handle, 1, &region);
+
+                VkImageMemoryBarrier toRead = toSrc;
+                toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                toRead.newLayout = op.restoreLayout;
+                toRead.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+                vkCmdPipelineBarrier(cb,
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                     0, 0, nullptr, 0, nullptr, 1, &toRead);
+            }
+
+            vulkan::check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(copyTexturesToImages)");
+
+            VkFenceCreateInfo fci{};
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            vulkan::check(vkCreateFence(ctx->device(), &fci, nullptr, &fence),
+                          "vkCreateFence(copyTexturesToImages)");
+
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cb;
+            vulkan::check(vkQueueSubmit(ctx->graphicsQueue(), 1, &si, fence),
+                          "vkQueueSubmit(copyTexturesToImages)");
+            vulkan::check(vkWaitForFences(ctx->device(), 1, &fence, VK_TRUE, UINT64_MAX),
+                          "vkWaitForFences(copyTexturesToImages)");
+
+            for (auto& op : ops) {
+                *op.srcLayout = op.restoreLayout;
+
+                void* mapped = nullptr;
+                vmaInvalidateAllocation(ctx->allocator(), op.staging.alloc, 0, op.bytes);
+                vulkan::check(vmaMapMemory(ctx->allocator(), op.staging.alloc, &mapped),
+                              "vmaMapMemory(copyTexturesToImages)");
+                const size_t layerPixels = static_cast<size_t>(op.width) * op.height;
+                const size_t pixels = layerPixels * op.layers;
+                if (op.layers > 1 && dynamic_cast<CubeTexture*>(op.texture) && !op.depthAspect) {
+                    const uint32_t dstChannels = vulkan::VulkanRenderTargets::channelCount(op.texture->format);
+                    const auto* src = static_cast<const unsigned char*>(mapped);
+                    const bool bgra = op.srcImage->format == ctx->swapchainFormat() &&
+                                      ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                    auto& images = op.texture->images();
+                    images.clear();
+                    images.reserve(op.layers);
+                    for (uint32_t layer = 0; layer < op.layers; ++layer) {
+                        std::vector<unsigned char> dst;
+                        vulkan::readback::packColorBytes(src + layerPixels * 4u * layer,
+                                                         layerPixels, dstChannels, bgra, dst);
+                        images.emplace_back(std::move(dst), op.width, op.height);
+                    }
+                } else {
+                    auto& image = op.texture->image();
+                    image.setSize(op.width, op.height, op.layers > 1 ? op.layers : 0);
+                    if (op.depthAspect) {
+                        std::vector<float> depth(pixels);
+                        std::memcpy(depth.data(), mapped, static_cast<size_t>(op.bytes));
+                        image.setData(std::move(depth));
+                    } else {
+                        const uint32_t dstChannels = vulkan::VulkanRenderTargets::channelCount(op.texture->format);
+                        auto& dst = image.data<unsigned char>();
+                        const auto* src = static_cast<const unsigned char*>(mapped);
+                        const bool bgra = op.srcImage->format == ctx->swapchainFormat() &&
+                                          ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                        vulkan::readback::packColorBytes(src, pixels, dstChannels, bgra, dst);
+                    }
+                }
+                vmaUnmapMemory(ctx->allocator(), op.staging.alloc);
+            }
+
+            cleanup();
+        } catch (...) {
+            cleanup();
+            throw;
+        }
+    }
+
+    std::future<void> VulkanRenderer::copyTexturesToImagesAsync(const std::vector<Texture*>& textures) {
+        auto promise = std::make_shared<std::promise<void>>();
+        auto future = promise->get_future();
+        try {
+            auto& impl = *pimpl_;
+            auto* ctx = impl.ctx.get();
+            if (!ctx) {
+                promise->set_value();
+                return future;
+            }
+
+            if (impl.frameState_ != Impl::FrameState::Idle) {
+                impl.endFrame();
+            }
+            impl.reapAsyncReadbackWorkers();
+
+            struct CopyOp {
+                Texture* texture = nullptr;
+                const vulkan::Image2D* srcImage = nullptr;
+                VkImageLayout* srcLayout = nullptr;
+                VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+                VkImageAspectFlags barrierAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+                VkImageLayout materialTextureLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                VkImageLayout restoreLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                bool depthAspect = false;
+                uint32_t width = 0;
+                uint32_t height = 0;
+                uint32_t layers = 1;
+                VkFormat sourceFormat = VK_FORMAT_UNDEFINED;
+                VkDeviceSize bytes = 0;
+                vulkan::Buffer staging{};
+                vulkan::Image2D temporaryMaterialImage{};
+            };
+
+            std::vector<CopyOp> ops;
+            ops.reserve(textures.size());
+
+            for (auto* texture : textures) {
+                if (!texture) continue;
+
+                auto& op = ops.emplace_back();
+                op.texture = texture;
+
+                if (auto* rtImage = impl.renderTargets_ ? impl.renderTargets_->findByTexture(*texture) : nullptr) {
+                    op.srcImage = rtImage->image;
+                    op.srcLayout = rtImage->layout;
+                    op.aspect = rtImage->aspect;
+                    op.barrierAspect = op.aspect == VK_IMAGE_ASPECT_DEPTH_BIT
+                            ? Impl::depthBarrierAspect(op.srcImage->format)
+                            : op.aspect;
+                } else {
+                    auto it = impl.framebufferTextureImages_.find(texture);
+                    if (it != impl.framebufferTextureImages_.end()) {
+                        op.srcImage = &it->second.image;
+                        op.srcLayout = &it->second.layout;
+                    } else if (auto texIt = impl.textureCache.find(texture);
+                               texIt != impl.textureCache.end() &&
+                               texIt->second.slot < impl.materialTextures.size()) {
+                        op.srcImage = &impl.materialTextures[texIt->second.slot];
+                        op.srcLayout = &op.materialTextureLayout;
+                    } else {
+                        op.temporaryMaterialImage = impl.buildMaterialImage2D(texture);
+                        if (op.temporaryMaterialImage.image != VK_NULL_HANDLE) {
+                            op.srcImage = &op.temporaryMaterialImage;
+                            op.srcLayout = &op.materialTextureLayout;
+                        }
+                    }
+                }
+
+                if (!op.srcImage || op.srcImage->image == VK_NULL_HANDLE || !op.srcLayout ||
+                    (op.aspect != VK_IMAGE_ASPECT_COLOR_BIT && op.aspect != VK_IMAGE_ASPECT_DEPTH_BIT)) {
+                    vulkan::destroyImage2D(ctx->allocator(), ctx->device(), op.temporaryMaterialImage);
+                    ops.pop_back();
+                    continue;
+                }
+
+                op.width = op.srcImage->width;
+                op.height = op.srcImage->height;
+                op.layers = std::max(1u, op.srcImage->arrayLayers);
+                if (op.width == 0 || op.height == 0) {
+                    vulkan::destroyImage2D(ctx->allocator(), ctx->device(), op.temporaryMaterialImage);
+                    ops.pop_back();
+                    continue;
+                }
+
+                op.depthAspect = op.aspect == VK_IMAGE_ASPECT_DEPTH_BIT;
+                op.sourceFormat = op.srcImage->format;
+                op.restoreLayout = *op.srcLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                        ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                        : *op.srcLayout;
+                op.bytes = static_cast<VkDeviceSize>(op.width) * op.height * op.layers *
+                           (op.depthAspect ? sizeof(float) : 4u);
+            }
+
+            if (ops.empty()) {
+                promise->set_value();
+                return future;
+            }
+
+            VkCommandPool cpool = VK_NULL_HANDLE;
+            VkFence fence = VK_NULL_HANDLE;
+            bool submitted = false;
+
+            auto cleanupOps = [&impl](VulkanContext* opCtx,
+                                      std::vector<CopyOp>& copyOps,
+                                      VkCommandPool& pool,
+                                      VkFence& copyFence,
+                                      bool waitForFence) {
+                if (!opCtx) return;
+                if (waitForFence && copyFence != VK_NULL_HANDLE) {
+                    (void) vkWaitForFences(opCtx->device(), 1, &copyFence, VK_TRUE, UINT64_MAX);
+                }
+                if (copyFence != VK_NULL_HANDLE) {
+                    vkDestroyFence(opCtx->device(), copyFence, nullptr);
+                    copyFence = VK_NULL_HANDLE;
+                }
+                if (pool != VK_NULL_HANDLE) {
+                    vkDestroyCommandPool(opCtx->device(), pool, nullptr);
+                    pool = VK_NULL_HANDLE;
+                }
+                for (auto& op : copyOps) {
+                    if (op.staging.handle != VK_NULL_HANDLE) {
+                        impl.releaseAsyncReadbackStaging(op.staging);
+                    }
+                    if (op.temporaryMaterialImage.image != VK_NULL_HANDLE) {
+                        vulkan::destroyImage2D(opCtx->allocator(), opCtx->device(), op.temporaryMaterialImage);
+                        op.temporaryMaterialImage = {};
+                    }
+                }
+            };
+
+            try {
+                vkDeviceWaitIdle(ctx->device());
+
+                for (auto& op : ops) {
+                    op.staging = impl.acquireAsyncReadbackStaging(op.bytes);
+                }
+
+                VkCommandPoolCreateInfo cpci{};
+                cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+                cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+                cpci.queueFamilyIndex = ctx->queueFamilies().graphics;
+                vulkan::check(vkCreateCommandPool(ctx->device(), &cpci, nullptr, &cpool),
+                              "vkCreateCommandPool(copyTexturesToImagesAsync)");
+
+                VkCommandBufferAllocateInfo cbai{};
+                cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+                cbai.commandPool = cpool;
+                cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cbai.commandBufferCount = 1;
+                VkCommandBuffer cb = VK_NULL_HANDLE;
+                vulkan::check(vkAllocateCommandBuffers(ctx->device(), &cbai, &cb),
+                              "vkAllocateCommandBuffers(copyTexturesToImagesAsync)");
+
+                VkCommandBufferBeginInfo bi{};
+                bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                vulkan::check(vkBeginCommandBuffer(cb, &bi),
+                              "vkBeginCommandBuffer(copyTexturesToImagesAsync)");
+
+                for (const auto& op : ops) {
+                    VkImageMemoryBarrier toSrc{};
+                    toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                    toSrc.oldLayout = *op.srcLayout;
+                    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    toSrc.srcAccessMask = VK_ACCESS_SHADER_READ_BIT |
+                                          VK_ACCESS_TRANSFER_WRITE_BIT |
+                                          VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    toSrc.image = op.srcImage->image;
+                    toSrc.subresourceRange.aspectMask = op.barrierAspect;
+                    toSrc.subresourceRange.levelCount = 1;
+                    toSrc.subresourceRange.layerCount = op.layers;
+                    vkCmdPipelineBarrier(cb,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                                 VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+                    VkBufferImageCopy region{};
+                    region.imageSubresource.aspectMask = op.aspect;
+                    region.imageSubresource.layerCount = op.layers;
+                    region.imageExtent = {op.width, op.height, 1};
+                    vkCmdCopyImageToBuffer(cb, op.srcImage->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                           op.staging.handle, 1, &region);
+
+                    VkImageMemoryBarrier toRead = toSrc;
+                    toRead.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    toRead.newLayout = op.restoreLayout;
+                    toRead.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    toRead.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
+                    vkCmdPipelineBarrier(cb,
+                                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                                 VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                                         0, 0, nullptr, 0, nullptr, 1, &toRead);
+                }
+
+                vulkan::check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(copyTexturesToImagesAsync)");
+
+                VkFenceCreateInfo fci{};
+                fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+                vulkan::check(vkCreateFence(ctx->device(), &fci, nullptr, &fence),
+                              "vkCreateFence(copyTexturesToImagesAsync)");
+
+                VkSubmitInfo si{};
+                si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                si.commandBufferCount = 1;
+                si.pCommandBuffers = &cb;
+                vulkan::check(vkQueueSubmit(ctx->graphicsQueue(), 1, &si, fence),
+                              "vkQueueSubmit(copyTexturesToImagesAsync)");
+                submitted = true;
+
+                for (auto& op : ops) {
+                    *op.srcLayout = op.restoreLayout;
+                }
+
+                auto worker = std::async(
+                        std::launch::async,
+                        [ctx, ops = std::move(ops), cpool, fence, promise, cleanupOps]() mutable {
+                            try {
+                                vulkan::check(vkWaitForFences(ctx->device(), 1, &fence, VK_TRUE, UINT64_MAX),
+                                              "vkWaitForFences(copyTexturesToImagesAsync)");
+
+                                for (auto& op : ops) {
+                                    void* mapped = nullptr;
+                                    vmaInvalidateAllocation(ctx->allocator(), op.staging.alloc, 0, op.bytes);
+                                    vulkan::check(vmaMapMemory(ctx->allocator(), op.staging.alloc, &mapped),
+                                                  "vmaMapMemory(copyTexturesToImagesAsync)");
+                                    try {
+                                        const size_t layerPixels = static_cast<size_t>(op.width) * op.height;
+                                        const size_t pixels = layerPixels * op.layers;
+                                        if (op.layers > 1 && dynamic_cast<CubeTexture*>(op.texture) && !op.depthAspect) {
+                                            const uint32_t dstChannels = vulkan::VulkanRenderTargets::channelCount(op.texture->format);
+                                            const auto* src = static_cast<const unsigned char*>(mapped);
+                                            const bool bgra = op.sourceFormat == ctx->swapchainFormat() &&
+                                                              ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                                            auto& images = op.texture->images();
+                                            images.clear();
+                                            images.reserve(op.layers);
+                                            for (uint32_t layer = 0; layer < op.layers; ++layer) {
+                                                std::vector<unsigned char> dst;
+                                                vulkan::readback::packColorBytes(src + layerPixels * 4u * layer,
+                                                                                 layerPixels, dstChannels, bgra, dst);
+                                                images.emplace_back(std::move(dst), op.width, op.height);
+                                            }
+                                        } else {
+                                            auto& image = op.texture->image();
+                                            image.setSize(op.width, op.height, op.layers > 1 ? op.layers : 0);
+                                            if (op.depthAspect) {
+                                                std::vector<float> depth(pixels);
+                                                std::memcpy(depth.data(), mapped, static_cast<size_t>(op.bytes));
+                                                image.setData(std::move(depth));
+                                            } else {
+                                                const uint32_t dstChannels = vulkan::VulkanRenderTargets::channelCount(op.texture->format);
+                                                auto& dst = image.data<unsigned char>();
+                                                const auto* src = static_cast<const unsigned char*>(mapped);
+                                                const bool bgra = op.sourceFormat == ctx->swapchainFormat() &&
+                                                                  ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                                                vulkan::readback::packColorBytes(src, pixels, dstChannels, bgra, dst);
+                                            }
+                                        }
+                                        vmaUnmapMemory(ctx->allocator(), op.staging.alloc);
+                                    } catch (...) {
+                                        vmaUnmapMemory(ctx->allocator(), op.staging.alloc);
+                                        throw;
+                                    }
+                                }
+
+                                cleanupOps(ctx, ops, cpool, fence, false);
+                                promise->set_value();
+                            } catch (...) {
+                                cleanupOps(ctx, ops, cpool, fence, false);
+                                promise->set_exception(std::current_exception());
+                            }
+                        });
+                impl.asyncReadbackWorkers_.push_back(std::move(worker));
+            } catch (...) {
+                cleanupOps(ctx, ops, cpool, fence, submitted);
+                throw;
+            }
+        } catch (...) {
+            promise->set_exception(std::current_exception());
+        }
+        return future;
+    }
+
+    void VulkanRenderer::readbackTextureAsync(
+            Texture& texture,
+            std::function<void(const ReadbackResult& result)> onComplete,
+            std::function<void(const std::string& error)> onError) {
+        if (!onComplete) return;
+        try {
+            auto& impl = *pimpl_;
+            if (impl.renderTargets_) {
+                auto* rtImage = impl.renderTargets_->findByTexture(texture);
+                if (rtImage && rtImage->target && rtImage->image &&
+                    rtImage->aspect == VK_IMAGE_ASPECT_COLOR_BIT &&
+                    texture.type == Type::UnsignedByte &&
+                    (texture.format == Format::RGB || texture.format == Format::RGBA)) {
+                    PixelReadbackRequest request;
+                    request.renderTarget = rtImage->target;
+                    request.width = static_cast<int>(rtImage->image->width);
+                    request.height = static_cast<int>(rtImage->image->height);
+                    request.format = texture.format;
+                    request.type = texture.type;
+                    request.textureIndex = static_cast<int>(rtImage->textureIndex);
+
+                    auto pixelFuture = readRenderTargetPixelsAsync(request);
+                    auto worker = std::async(
+                            std::launch::async,
+                            [future = std::move(pixelFuture),
+                             onComplete = std::move(onComplete),
+                             onError = std::move(onError)]() mutable {
+                                try {
+                                    auto pixels = future.get();
+                                    ReadbackResult result{};
+                                    result.data = pixels.data;
+                                    result.width = pixels.width;
+                                    result.height = pixels.height;
+                                    result.bytesPerRow = pixels.bytesPerRow;
+                                    result.format = pixels.format;
+                                    result.type = pixels.type;
+                                    onComplete(result);
+                                } catch (const std::exception& e) {
+                                    if (onError) onError(e.what());
+                                } catch (...) {
+                                    if (onError) onError("VulkanRenderer::readbackTextureAsync failed");
+                                }
+                            });
+                    impl.asyncReadbackWorkers_.push_back(std::move(worker));
+                    return;
+                }
+            }
+
+            auto textureFuture = copyTextureToImageAsync(texture);
+            auto* texturePtr = &texture;
+            auto worker = std::async(
+                    std::launch::async,
+                    [future = std::move(textureFuture),
+                     texturePtr,
+                     onComplete = std::move(onComplete),
+                     onError = std::move(onError)]() mutable {
+                        try {
+                            future.get();
+                            const auto& image = texturePtr->image();
+                            ReadbackResult result{};
+                            result.width = image.width();
+                            result.height = image.height();
+                            result.format = texturePtr->format;
+                            result.type = texturePtr->type;
+                            if (texturePtr->type == Type::Float) {
+                                const auto& data = image.data<float>();
+                                result.data = reinterpret_cast<const unsigned char*>(data.data());
+                                result.bytesPerRow = image.width() * sizeof(float);
+                            } else {
+                                const auto& data = image.data<unsigned char>();
+                                result.data = data.data();
+                                result.bytesPerRow = image.width() *
+                                                     vulkan::VulkanRenderTargets::channelCount(texturePtr->format);
+                            }
+                            onComplete(result);
+                        } catch (const std::exception& e) {
+                            if (onError) onError(e.what());
+                        } catch (...) {
+                            if (onError) onError("VulkanRenderer::readbackTextureAsync failed");
+                        }
+                    });
+            impl.asyncReadbackWorkers_.push_back(std::move(worker));
+        } catch (const std::exception& e) {
+            if (onError) onError(e.what());
+        }
+    }
+
+    std::future<PixelReadbackBuffer> VulkanRenderer::readRenderTargetPixelsAsync(
+            const PixelReadbackRequest& request) {
+        if (!request.renderTarget) {
+            throw std::invalid_argument("VulkanRenderer::readRenderTargetPixelsAsync requires a render target");
+        }
+        if (request.width <= 0 || request.height <= 0) {
+            throw std::invalid_argument("VulkanRenderer::readRenderTargetPixelsAsync requires a positive readback size");
+        }
+        if (request.x < 0 || request.y < 0) {
+            throw std::invalid_argument("VulkanRenderer::readRenderTargetPixelsAsync requires a non-negative origin");
+        }
+        auto& renderTarget = *request.renderTarget;
+        const auto textureIndex = static_cast<std::size_t>(request.textureIndex);
+        std::shared_ptr<Texture> selectedTexture;
+        if (!renderTarget.textures.empty()) {
+            if (textureIndex >= renderTarget.textures.size() || !renderTarget.textures[textureIndex]) {
+                throw std::out_of_range("VulkanRenderer::readRenderTargetPixelsAsync textureIndex is out of range");
+            }
+            selectedTexture = renderTarget.textures[textureIndex];
+        } else {
+            if (request.textureIndex != 0 || !renderTarget.texture) {
+                throw std::out_of_range("VulkanRenderer::readRenderTargetPixelsAsync textureIndex is out of range");
+            }
+            selectedTexture = renderTarget.texture;
+        }
+
+        const bool stencilAspect = request.aspect == PixelReadbackAspect::Stencil;
+        const bool cubeTarget = dynamic_cast<CubeTexture*>(selectedTexture.get()) != nullptr;
+        if (request.depth != 1) {
+            throw std::runtime_error("VulkanRenderer::readRenderTargetPixelsAsync currently supports only single-slice color target readback");
+        }
+        if (request.activeCubeFace < 0 || request.activeCubeFace >= (cubeTarget ? 6 : 1)) {
+            throw std::runtime_error(cubeTarget
+                    ? "VulkanRenderer::readRenderTargetPixelsAsync active cube face is out of range"
+                    : "VulkanRenderer::readRenderTargetPixelsAsync non-cube targets require activeCubeFace == 0");
+        }
+        if (request.activeLayer < 0 || (cubeTarget && request.activeLayer != 0)) {
+            throw std::runtime_error(cubeTarget
+                    ? "VulkanRenderer::readRenderTargetPixelsAsync cube targets require activeLayer == 0"
+                    : "VulkanRenderer::readRenderTargetPixelsAsync active layer must be non-negative");
+        }
+        if (request.activeMipmapLevel < 0) {
+            throw std::runtime_error("VulkanRenderer::readRenderTargetPixelsAsync active mip level must be non-negative");
+        }
+        auto fmtValue = [](Format format) {
+            return std::to_string(static_cast<int>(format));
+        };
+        auto typeValue = [](Type type) {
+            return std::to_string(static_cast<int>(type));
+        };
+        if (stencilAspect) {
+            if (request.type != Type::UnsignedByte || request.format != Format::RedInteger) {
+                throw std::runtime_error(
+                        "VulkanRenderer::readRenderTargetPixelsAsync supports only RedInteger UnsignedByte stencil readback; request format=" +
+                        fmtValue(request.format) + " type=" + typeValue(request.type));
+            }
+        } else if (request.type != Type::UnsignedByte ||
+                   (request.format != Format::RGB && request.format != Format::RGBA)) {
+            throw std::runtime_error(
+                    "VulkanRenderer::readRenderTargetPixelsAsync supports only RGB/RGBA UnsignedByte readback; request format=" +
+                    fmtValue(request.format) + " type=" + typeValue(request.type));
+        }
+
+        auto& impl = *pimpl_;
+        auto* ctx = impl.ctx.get();
+        if (!ctx || !impl.renderTargets_) {
+            throw std::runtime_error("VulkanRenderer::readRenderTargetPixelsAsync requires an initialized Vulkan context");
+        }
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+        }
+        impl.reapAsyncReadbackWorkers();
+
+        const vulkan::Image2D* srcImagePtr = nullptr;
+        VkImageLayout* srcLayout = nullptr;
+        VkImageAspectFlags copyAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        VkImageAspectFlags barrierAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+        uint32_t sourceMip = static_cast<uint32_t>(request.activeMipmapLevel);
+        const auto sourceLayer = cubeTarget
+                ? static_cast<uint32_t>(request.activeCubeFace)
+                : static_cast<uint32_t>(request.activeLayer);
+        unsigned int channels = 0;
+        Format outputFormat = request.format;
+        Type outputType = request.type;
+        bool bgraSource = false;
+        bool rawBytes = false;
+
+        if (stencilAspect) {
+            if (request.activeMipmapLevel != 0) {
+                throw std::runtime_error("VulkanRenderer::readRenderTargetPixelsAsync stencil readback requires activeMipmapLevel == 0");
+            }
+            auto& rt = impl.renderTargets_->getOrCreate(renderTarget,
+                                                        request.activeCubeFace,
+                                                        0,
+                                                        impl.defaultFramebufferSamples_,
+                                                        request.activeLayer);
+            if (rt.depth.image == VK_NULL_HANDLE || !Impl::hasStencilAspect(rt.depth.format)) {
+                throw std::runtime_error("VulkanRenderer::readRenderTargetPixelsAsync render target has no readable stencil aspect");
+            }
+            srcImagePtr = &rt.depth;
+            srcLayout = &rt.depthLayout;
+            copyAspect = VK_IMAGE_ASPECT_STENCIL_BIT;
+            barrierAspect = Impl::depthBarrierAspect(rt.depth.format);
+            sourceMip = 0;
+            channels = 1;
+            outputFormat = Format::RedInteger;
+            outputType = Type::UnsignedByte;
+            rawBytes = true;
+        } else {
+            auto* rtImage = impl.renderTargets_->findByTexture(*selectedTexture);
+            if (!rtImage || !rtImage->image || rtImage->image->image == VK_NULL_HANDLE || !rtImage->layout ||
+                rtImage->aspect != VK_IMAGE_ASPECT_COLOR_BIT) {
+                throw std::runtime_error("VulkanRenderer::readRenderTargetPixelsAsync render target texture is not readable");
+            }
+            srcImagePtr = rtImage->image;
+            srcLayout = rtImage->layout;
+            copyAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrierAspect = VK_IMAGE_ASPECT_COLOR_BIT;
+            if (request.format != selectedTexture->format) {
+                throw std::runtime_error(
+                        "VulkanRenderer::readRenderTargetPixelsAsync request format must match the render target texture format; request format=" +
+                        fmtValue(request.format) + " type=" + typeValue(request.type) +
+                        " target format=" + fmtValue(selectedTexture->format) +
+                        " type=" + typeValue(selectedTexture->type));
+            }
+            channels = vulkan::VulkanRenderTargets::channelCount(selectedTexture->format);
+            outputFormat = selectedTexture->format;
+            outputType = selectedTexture->type;
+            bgraSource = srcImagePtr->format == ctx->swapchainFormat() &&
+                         ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+        }
+
+        const auto& srcImage = *srcImagePtr;
+        if (sourceLayer >= std::max(1u, srcImage.arrayLayers)) {
+            throw std::out_of_range("VulkanRenderer::readRenderTargetPixelsAsync requested layer was not read back");
+        }
+        if (sourceMip >= std::max(1u, srcImage.mipLevels)) {
+            throw std::out_of_range("VulkanRenderer::readRenderTargetPixelsAsync active mip level is out of range");
+        }
+        const auto mipWidth = std::max(1u, srcImage.width >> sourceMip);
+        const auto mipHeight = std::max(1u, srcImage.height >> sourceMip);
+        if (request.x + request.width > static_cast<int>(mipWidth) ||
+            request.y + request.height > static_cast<int>(mipHeight)) {
+            throw std::out_of_range("VulkanRenderer::readRenderTargetPixelsAsync source region is outside the render target");
+        }
+        const auto dstRowBytes = static_cast<unsigned int>(request.width) * channels;
+        const auto stagingBytes = static_cast<VkDeviceSize>(request.width) *
+                                  static_cast<VkDeviceSize>(request.height) *
+                                  (rawBytes ? 1u : 4u);
+
+        struct AsyncReadbackOp {
+            VulkanContext* ctx = nullptr;
+            vulkan::Buffer staging{};
+            VkCommandPool commandPool = VK_NULL_HANDLE;
+            VkFence fence = VK_NULL_HANDLE;
+            VkDeviceSize bytes = 0;
+            unsigned int width = 0;
+            unsigned int height = 0;
+            unsigned int channels = 0;
+            unsigned int bytesPerRow = 0;
+            Format format = Format::RGBA;
+            Type type = Type::UnsignedByte;
+            bool bgra = false;
+            bool rawBytes = false;
+            bool submitted = false;
+        };
+
+        auto promise = std::make_shared<std::promise<PixelReadbackBuffer>>();
+        auto future = promise->get_future();
+        auto op = std::make_shared<AsyncReadbackOp>();
+        op->ctx = ctx;
+        op->bytes = stagingBytes;
+        op->width = static_cast<unsigned int>(request.width);
+        op->height = static_cast<unsigned int>(request.height);
+        op->channels = channels;
+        op->bytesPerRow = dstRowBytes;
+        op->format = outputFormat;
+        op->type = outputType;
+        op->bgra = bgraSource;
+        op->rawBytes = rawBytes;
+
+        auto cleanupOp = [&impl](const std::shared_ptr<AsyncReadbackOp>& state, bool waitForSubmit) {
+            auto* opCtx = state->ctx;
+            if (!opCtx) return;
+            if (waitForSubmit && state->submitted && state->fence != VK_NULL_HANDLE) {
+                (void) vkWaitForFences(opCtx->device(), 1, &state->fence, VK_TRUE, UINT64_MAX);
+            }
+            if (state->fence != VK_NULL_HANDLE) {
+                vkDestroyFence(opCtx->device(), state->fence, nullptr);
+                state->fence = VK_NULL_HANDLE;
+            }
+            if (state->commandPool != VK_NULL_HANDLE) {
+                vkDestroyCommandPool(opCtx->device(), state->commandPool, nullptr);
+                state->commandPool = VK_NULL_HANDLE;
+            }
+            if (state->staging.handle != VK_NULL_HANDLE) {
+                impl.releaseAsyncReadbackStaging(state->staging);
+            }
+        };
+
+        try {
+            op->staging = impl.acquireAsyncReadbackStaging(op->bytes);
+
+            VkCommandPoolCreateInfo cpci{};
+            cpci.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+            cpci.queueFamilyIndex = ctx->queueFamilies().graphics;
+            vulkan::check(vkCreateCommandPool(ctx->device(), &cpci, nullptr, &op->commandPool),
+                          "vkCreateCommandPool(readRenderTargetPixelsAsync)");
+
+            VkCommandBufferAllocateInfo cbai{};
+            cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            cbai.commandPool = op->commandPool;
+            cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            cbai.commandBufferCount = 1;
+            VkCommandBuffer cb = VK_NULL_HANDLE;
+            vulkan::check(vkAllocateCommandBuffers(ctx->device(), &cbai, &cb),
+                          "vkAllocateCommandBuffers(readRenderTargetPixelsAsync)");
+
+            VkCommandBufferBeginInfo bi{};
+            bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+            bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+            vulkan::check(vkBeginCommandBuffer(cb, &bi),
+                          "vkBeginCommandBuffer(readRenderTargetPixelsAsync)");
+
+            const auto restoreLayout = *srcLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                    ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                    : *srcLayout;
+            impl.transitionImage(cb, srcImage.image,
+                                 *srcLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                         VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                         VK_ACCESS_2_SHADER_READ_BIT |
+                                         VK_ACCESS_2_SHADER_WRITE_BIT |
+                                         VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                 VK_ACCESS_2_TRANSFER_READ_BIT,
+                                 barrierAspect,
+                                 sourceMip,
+                                 1,
+                                 0,
+                                 std::max(1u, srcImage.arrayLayers));
+
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = copyAspect;
+            region.imageSubresource.mipLevel = sourceMip;
+            region.imageSubresource.baseArrayLayer = sourceLayer;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset = {request.x, request.y, 0};
+            region.imageExtent = {
+                    static_cast<uint32_t>(request.width),
+                    static_cast<uint32_t>(request.height),
+                    1};
+            vkCmdCopyImageToBuffer(cb, srcImage.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   op->staging.handle, 1, &region);
+
+            impl.transitionImage(cb, srcImage.image,
+                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, restoreLayout,
+                                 VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                 VK_ACCESS_2_TRANSFER_READ_BIT,
+                                 VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                         VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT |
+                                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                                 VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                         VK_ACCESS_2_SHADER_READ_BIT,
+                                 barrierAspect,
+                                 sourceMip,
+                                 1,
+                                 0,
+                                 std::max(1u, srcImage.arrayLayers));
+
+            vulkan::check(vkEndCommandBuffer(cb), "vkEndCommandBuffer(readRenderTargetPixelsAsync)");
+
+            VkFenceCreateInfo fci{};
+            fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            vulkan::check(vkCreateFence(ctx->device(), &fci, nullptr, &op->fence),
+                          "vkCreateFence(readRenderTargetPixelsAsync)");
+
+            VkSubmitInfo si{};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            si.commandBufferCount = 1;
+            si.pCommandBuffers = &cb;
+            vulkan::check(vkQueueSubmit(ctx->graphicsQueue(), 1, &si, op->fence),
+                          "vkQueueSubmit(readRenderTargetPixelsAsync)");
+            op->submitted = true;
+            *srcLayout = restoreLayout;
+
+            auto worker = std::async(std::launch::async, [op, promise, cleanupOp] {
+                try {
+                    auto* opCtx = op->ctx;
+                    vulkan::check(vkWaitForFences(opCtx->device(), 1, &op->fence, VK_TRUE, UINT64_MAX),
+                                  "vkWaitForFences(readRenderTargetPixelsAsync)");
+                    void* mapped = nullptr;
+                    vmaInvalidateAllocation(opCtx->allocator(), op->staging.alloc, 0, op->bytes);
+                    vulkan::check(vmaMapMemory(opCtx->allocator(), op->staging.alloc, &mapped),
+                                  "vmaMapMemory(readRenderTargetPixelsAsync)");
+
+                    PixelReadbackBuffer out;
+                    if (op->rawBytes) {
+                        const auto* src = static_cast<const std::uint8_t*>(mapped);
+                        out.bytes.assign(src, src + static_cast<std::size_t>(op->bytes));
+                    } else {
+                        vulkan::readback::packColorBytes(
+                                static_cast<const unsigned char*>(mapped),
+                                static_cast<std::size_t>(op->width) * op->height,
+                                op->channels,
+                                op->bgra,
+                                out.bytes);
+                    }
+                    vmaUnmapMemory(opCtx->allocator(), op->staging.alloc);
+
+                    out.data = out.bytes.data();
+                    out.byteLength = out.bytes.size();
+                    out.width = op->width;
+                    out.height = op->height;
+                    out.depth = 1;
+                    out.bytesPerPixel = op->channels;
+                    out.bytesPerRow = op->bytesPerRow;
+                    out.bytesPerImage = out.bytesPerRow * out.height;
+                    out.format = op->format;
+                    out.type = op->type;
+
+                    cleanupOp(op, false);
+                    promise->set_value(std::move(out));
+                } catch (...) {
+                    cleanupOp(op, false);
+                    promise->set_exception(std::current_exception());
+                }
+            });
+            impl.asyncReadbackWorkers_.push_back(std::move(worker));
+        } catch (...) {
+            cleanupOp(op, true);
+            throw;
+        }
+        return future;
+    }
+
+    MaterialPrewarmStatus VulkanRenderer::prewarmMaterial(RawShaderMaterial& material) {
+        MaterialPrewarmRequest request;
+        request.material = &material;
+        return prewarmMaterial(request);
+    }
+
+    MaterialPrewarmStatus VulkanRenderer::prewarmMaterial(const MaterialPrewarmRequest& request) {
+        if (!request.material) return MaterialPrewarmStatus::Ready;
+        try {
+            pimpl_->getOrCreateCustomShaderPipeline(*request.material);
+        } catch (...) {
+            return MaterialPrewarmStatus::Failed;
+        }
+        return MaterialPrewarmStatus::Ready;
     }
 
     void VulkanRenderer::setSceneCaptureEnabled(bool enabled) {
@@ -16412,34 +21246,36 @@ namespace threepp {
 
     std::vector<unsigned char> VulkanRenderer::readSceneRGBPixels() {
         auto& impl = *pimpl_;
-        if (!impl.sceneCaptureEnabled_ || impl.sceneCaptureBuf_.handle == VK_NULL_HANDLE) {
+        auto* ctx = impl.ctx.get();
+        if (!impl.sceneCaptureEnabled_ || !ctx || impl.sceneCaptureBuf_.handle == VK_NULL_HANDLE) {
             return {};
+        }
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+            ctx = impl.ctx.get();
+            if (!impl.sceneCaptureEnabled_ || !ctx || impl.sceneCaptureBuf_.handle == VK_NULL_HANDLE) {
+                return {};
+            }
         }
 
         // Wait so the most recent frame's capture is flushed before we
         // memcpy. Same trade-off as readRGBPixels — cheap unless the
         // caller hammers it back-to-back.
-        vkDeviceWaitIdle(impl.ctx->device());
+        vkDeviceWaitIdle(ctx->device());
 
         const uint32_t w = impl.sceneCaptureBufW_;
         const uint32_t h = impl.sceneCaptureBufH_;
         const VkDeviceSize bytes = static_cast<VkDeviceSize>(w) * h * 4;
         if (bytes == 0) return {};
 
-        vmaInvalidateAllocation(impl.ctx->allocator(), impl.sceneCaptureBuf_.alloc, 0, bytes);
+        vmaInvalidateAllocation(ctx->allocator(), impl.sceneCaptureBuf_.alloc, 0, bytes);
         void* mapped = nullptr;
-        if (vmaMapMemory(impl.ctx->allocator(), impl.sceneCaptureBuf_.alloc, &mapped) != VK_SUCCESS) {
+        if (vmaMapMemory(ctx->allocator(), impl.sceneCaptureBuf_.alloc, &mapped) != VK_SUCCESS) {
             return {};
         }
         const auto* bgra = static_cast<const unsigned char*>(mapped);
-        std::vector<unsigned char> rgb(static_cast<size_t>(w) * h * 3);
-        const size_t pixels = static_cast<size_t>(w) * h;
-        for (size_t i = 0; i < pixels; ++i) {
-            rgb[i * 3 + 0] = bgra[i * 4 + 2];// R ← B
-            rgb[i * 3 + 1] = bgra[i * 4 + 1];// G ← G
-            rgb[i * 3 + 2] = bgra[i * 4 + 0];// B ← R
-        }
-        vmaUnmapMemory(impl.ctx->allocator(), impl.sceneCaptureBuf_.alloc);
+        auto rgb = vulkan::readback::bgraToRgb(bgra, static_cast<size_t>(w) * h);
+        vmaUnmapMemory(ctx->allocator(), impl.sceneCaptureBuf_.alloc);
         return rgb;
     }
 
@@ -16500,23 +21336,38 @@ namespace threepp {
     }
 
     std::vector<unsigned char> VulkanRenderer::readEventCameraVisualisation() const {
-        const auto& impl = *pimpl_;
+        auto& impl = *pimpl_;
         if (!impl.eventCamEnabled_ || !impl.eventCam_) return {};
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+            if (!impl.eventCamEnabled_ || !impl.eventCam_) return {};
+        }
         return impl.eventCam_->readVisualisation();
     }
 
     size_t VulkanRenderer::readEventCameraVisualisationInto(unsigned char* dst, size_t cap) const {
-        const auto& impl = *pimpl_;
+        auto& impl = *pimpl_;
         if (!impl.eventCamEnabled_ || !impl.eventCam_) return 0;
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+            if (!impl.eventCamEnabled_ || !impl.eventCam_) return 0;
+        }
         return impl.eventCam_->readVisualisationInto(dst, cap);
     }
 
     size_t VulkanRenderer::readEventStreamInto(Event* dst, size_t cap,
                                                bool* overflowed) const {
-        const auto& impl = *pimpl_;
+        auto& impl = *pimpl_;
         if (!impl.eventCamEnabled_ || !impl.eventCam_) {
             if (overflowed) *overflowed = false;
             return 0;
+        }
+        if (impl.frameState_ != Impl::FrameState::Idle) {
+            impl.endFrame();
+            if (!impl.eventCamEnabled_ || !impl.eventCam_) {
+                if (overflowed) *overflowed = false;
+                return 0;
+            }
         }
         // Public Event and detector Event are layout-identical (both 16B
         // {x, y, polarity, t_us}); reinterpret is safe and avoids any
