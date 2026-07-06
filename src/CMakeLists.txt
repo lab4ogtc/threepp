@@ -654,6 +654,7 @@ if (THREEPP_WITH_VULKAN)
             "threepp/renderers/vulkan/GpuTimings.hpp"
             "threepp/renderers/vulkan/OverlayPass.hpp"
             "threepp/renderers/vulkan/VulkanFrameTypes.hpp"
+            "threepp/renderers/vulkan/VulkanWireframeGeometry.hpp"
             "threepp/renderers/vulkan/VulkanShaderMaterial.hpp"
             "threepp/renderers/vulkan/TaaResolve.hpp"
             "threepp/renderers/vulkan/WaterDisplacePipeline.hpp"
@@ -675,6 +676,7 @@ if (THREEPP_WITH_VULKAN)
             "threepp/renderers/vulkan/TetSkinningPipeline.cpp"
             "threepp/renderers/vulkan/GpuTimings.cpp"
             "threepp/renderers/vulkan/OverlayPass.cpp"
+            "threepp/renderers/vulkan/VulkanWireframeGeometry.cpp"
             "threepp/renderers/wgpu/WgpuShaderTranslator.cpp"
             "threepp/renderers/vulkan/VulkanShaderMaterial.cpp"
             "threepp/renderers/vulkan/TaaResolve.cpp"
@@ -779,6 +781,23 @@ if (THREEPP_WITH_SLANG)
     target_compile_definitions(threepp PUBLIC THREEPP_HAS_SLANG=1)
     target_link_libraries(threepp PRIVATE slang::slang)
     threepp_configure_slang_runtime(threepp)
+endif ()
+
+if (THREEPP_WITH_PERFETTO)
+    set(THREEPP_PERFETTO_SOURCE "${PROJECT_SOURCE_DIR}/examples/external/perfetto/perfetto.cc")
+    if (NOT EXISTS "${THREEPP_PERFETTO_SOURCE}")
+        message(FATAL_ERROR "THREEPP_WITH_PERFETTO requires ${THREEPP_PERFETTO_SOURCE}")
+    endif ()
+
+    target_sources(threepp PRIVATE "${THREEPP_PERFETTO_SOURCE}")
+    target_compile_definitions(threepp PRIVATE THREEPP_WITH_PERFETTO=1)
+    target_include_directories(threepp SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/examples/external/perfetto")
+    if (MSVC)
+        set_source_files_properties("${THREEPP_PERFETTO_SOURCE}" PROPERTIES COMPILE_OPTIONS "/bigobj")
+    endif ()
+    if (WIN32)
+        target_link_libraries(threepp PRIVATE ws2_32)
+    endif ()
 endif ()
 
 target_include_directories(threepp

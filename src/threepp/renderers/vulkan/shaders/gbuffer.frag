@@ -102,14 +102,15 @@ layout(location = 4) out vec4 outAlbedoMetal;
 // screen-door (the PT accumulator converges it; the deferred one can't).
 layout(constant_id = 0) const uint DECAL_PASS = 0u;
 
-// Per-pixel, per-frame hash in [0,1) for the stochastic alpha-blend screen-
-// door. Folds the Halton sub-pixel jitter (changes every frame) into the seed
-// so the dither pattern decorrelates over time and the temporal accumulator /
-// TAA resolve it toward the true alpha-weighted blend instead of a fixed grid.
-float alphaHash(vec2 fragXY, vec2 jitter) {
+// Per-pixel, per-frame, per-instance hash in [0,1) for the stochastic alpha-
+// blend screen-door. Folds the Halton sub-pixel jitter (changes every frame)
+// and instance id (changes per transparent layer) into the seed so stacked
+// alpha layers do not share the same discard mask.
+float alphaHash(vec2 fragXY, vec2 jitter, uint instanceIdx) {
     uint h = uint(fragXY.x) * 1973u + uint(fragXY.y) * 9277u
            + floatBitsToUint(jitter.x) * 26699u
-           + floatBitsToUint(jitter.y) * 53401u + 0x9e3779b9u;
+           + floatBitsToUint(jitter.y) * 53401u
+           + instanceIdx * 73856093u + 0x9e3779b9u;
     h ^= h >> 16; h *= 0x7feb352du;
     h ^= h >> 15; h *= 0x846ca68bu;
     h ^= h >> 16;
@@ -247,6 +248,10 @@ void main() {
         const vec2 uvAlpha = (m.uvTransformAlpha * vec3(vUv, 1.0)).xy;
         albedoAlpha *= texture(gbufAlbedoMaps[ai], uvAlpha).g;
     }
+    const bool isCleanAlpha = (m.transmission > 0.0 && m.transmission <= 1.0 && m.ior < 1.05);
+    if (isCleanAlpha) {
+        albedoAlpha *= 1.0 - clamp(m.transmission, 0.0, 1.0);
+    }
     // Per-vertex color (material.vertexColors): vColor is white when the mesh
     // has no "color" attribute, so this multiply is a no-op then. Linear working
     // space — matches m.albedo and the closest_hit.rchit vertex-color path.
@@ -304,13 +309,17 @@ void main() {
             if (albedoAlpha < m.alphaCutoff) discard;
         } else if (isDecal) {
             if (albedoAlpha <= 0.004) discard;// nothing to blend
+        } else if (isCleanAlpha) {
+            // ReferencePT uses this G-buffer only for primary visibility hints.
+            // Keep clean constant-opacity surfaces here; closest_hit handles
+            // the actual GL-style alpha blend by tracing straight through.
         } else {
             // BLEND: variance-reduced stochastic rejection, matching the PT
             // any-hit's 0.99 (accept) / 0.01 (reject) early-outs.
             if (albedoAlpha <= 0.01) {
                 discard;
             } else if (albedoAlpha < 0.99) {
-                if (alphaHash(gl_FragCoord.xy, cam.jitter.xy) >= albedoAlpha) discard;
+                if (alphaHash(gl_FragCoord.xy, cam.jitter.xy, vInstanceIdx) >= albedoAlpha) discard;
             }
         }
     }

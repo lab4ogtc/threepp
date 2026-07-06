@@ -4,8 +4,10 @@
 # or vcpkg's glslang port) and emit a C++ header with the SPIR-V embedded
 # as a `static const uint32_t <var_name>[]` array via glslangValidator's
 # --vn option. The generated header is placed under the project build dir
-# at threepp/renderers/vulkan/shaders/<basename>.spv.h and added to
-# <target> as a generated source dependency.
+# at generated/<target>/threepp/renderers/vulkan/shaders/<basename>.spv.h
+# and added to <target> as a generated source dependency. Each target gets
+# its own generated include root, so engine shaders are embedded by the
+# threepp library target and example shaders are embedded by their executables.
 #
 # Out arg <out_header_var> receives the generated header's absolute path
 # so callers can pin it as a target dependency.
@@ -34,7 +36,8 @@ function(compile_vulkan_shader target shader_src var_name out_header_var)
 
     get_filename_component(_name "${shader_src}" NAME)
     get_filename_component(_src_dir "${shader_src}" DIRECTORY)
-    set(_gen_dir "${CMAKE_BINARY_DIR}/generated/threepp/renderers/vulkan/shaders")
+    set(_target_gen_include_root "${CMAKE_BINARY_DIR}/generated/${target}")
+    set(_gen_dir "${_target_gen_include_root}/threepp/renderers/vulkan/shaders")
     if (ARG_VARIANT_SUFFIX)
         set(_out_header "${_gen_dir}/${_name}.${ARG_VARIANT_SUFFIX}.spv.h")
     else()
@@ -95,8 +98,9 @@ function(compile_vulkan_shader target shader_src var_name out_header_var)
         COMMENT "Compiling Vulkan shader ${_name} -> ${var_name}"
         VERBATIM)
 
+    set_source_files_properties("${_out_header}" PROPERTIES GENERATED TRUE HEADER_FILE_ONLY TRUE)
     target_sources(${target} PRIVATE "${_out_header}")
-    target_include_directories(${target} PRIVATE "${CMAKE_BINARY_DIR}/generated")
+    target_include_directories(${target} BEFORE PRIVATE "${_target_gen_include_root}")
 
     set(${out_header_var} "${_out_header}" PARENT_SCOPE)
 endfunction()

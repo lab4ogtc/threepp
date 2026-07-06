@@ -122,6 +122,7 @@ namespace threepp::vulkan {
         const SpriteGeomRec*  ensureSpriteGeometryUploaded(const BufferGeometry* geom);
         const TexturedMeshGeomRec* ensureTexturedMeshGeometryUploaded(const BufferGeometry* geom);
         LineRec*              ensureLineGeometryUploaded(const BufferGeometry* geom);
+        WireframeRec*         ensureWireframeGeometryUploaded(const BufferGeometry* geom);
 
         VulkanContext&      ctx_;
         uint32_t            framesInFlight_;
@@ -145,7 +146,6 @@ namespace threepp::vulkan {
         VkPipeline       orthoLineColoredStripPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoMeshPipeline_            = VK_NULL_HANDLE;
         VkPipeline       orthoMeshTransparentPipeline_ = VK_NULL_HANDLE;
-        VkPipeline       orthoMeshWireframePipeline_   = VK_NULL_HANDLE;
         VkPipeline       orthoTexturedMeshPipeline_    = VK_NULL_HANDLE;
         VkPipeline       orthoDepthTextureMeshPipeline_ = VK_NULL_HANDLE;
 
@@ -161,6 +161,7 @@ namespace threepp::vulkan {
         std::unordered_map<const BufferGeometry*, SpriteGeomRec>  spriteGeomCache_;
         std::unordered_map<const BufferGeometry*, TexturedMeshGeomRec> texturedMeshGeomCache_;
         std::unordered_map<const BufferGeometry*, LineRec> lineGeomCache_;
+        std::unordered_map<const BufferGeometry*, WireframeRec> wireframeGeomCache_;
         uint64_t overlayFrameCounter_ = 0;
     };
 

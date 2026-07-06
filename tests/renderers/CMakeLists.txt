@@ -58,6 +58,28 @@ if (THREEPP_WITH_VULKAN AND THREEPP_WITH_SLANG)
     add_test(NAME VulkanShaderMaterial_test COMMAND VulkanShaderMaterial_test)
 endif ()
 
+if (THREEPP_WITH_VULKAN)
+    add_executable(VulkanShaderEmbeddingContract_test VulkanShaderEmbeddingContract_test.cpp)
+    target_link_libraries(VulkanShaderEmbeddingContract_test PRIVATE Catch2::Catch2WithMain)
+    target_compile_definitions(VulkanShaderEmbeddingContract_test PRIVATE PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME VulkanShaderEmbeddingContract_test COMMAND VulkanShaderEmbeddingContract_test)
+
+    add_executable(VulkanPerfettoTracingContract_test VulkanPerfettoTracingContract_test.cpp)
+    target_link_libraries(VulkanPerfettoTracingContract_test PRIVATE Catch2::Catch2WithMain)
+    target_compile_definitions(VulkanPerfettoTracingContract_test PRIVATE PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME VulkanPerfettoTracingContract_test COMMAND VulkanPerfettoTracingContract_test)
+
+    add_executable(VulkanWireframeParityContract_test VulkanWireframeParityContract_test.cpp)
+    target_link_libraries(VulkanWireframeParityContract_test PRIVATE Catch2::Catch2WithMain)
+    target_compile_definitions(VulkanWireframeParityContract_test PRIVATE PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME VulkanWireframeParityContract_test COMMAND VulkanWireframeParityContract_test)
+
+    add_executable(VulkanWireframeGeometry_test VulkanWireframeGeometry_test.cpp)
+    target_link_libraries(VulkanWireframeGeometry_test PRIVATE threepp Catch2::Catch2WithMain)
+    target_include_directories(VulkanWireframeGeometry_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    add_test(NAME VulkanWireframeGeometry_test COMMAND VulkanWireframeGeometry_test)
+endif ()
+
 if (THREEPP_WITH_VULKAN AND THREEPP_WITH_GLFW)
     add_executable(VulkanRenderTargets_test VulkanRenderTargets_test.cpp)
     target_link_libraries(VulkanRenderTargets_test PRIVATE threepp Catch2::Catch2WithMain)
@@ -206,6 +228,13 @@ if (THREEPP_WITH_VULKAN AND THREEPP_WITH_GLFW)
     target_link_libraries(VulkanWireframeRuntime_test PRIVATE threepp)
     add_test(NAME VulkanWireframeRuntime_test COMMAND VulkanWireframeRuntime_test)
     set_tests_properties(VulkanWireframeRuntime_test PROPERTIES
+            SKIP_RETURN_CODE 42
+            FAIL_REGULAR_EXPRESSION "\\[Vulkan\\]")
+
+    add_executable(VulkanTransparentOverlayRuntime_test VulkanTransparentOverlayRuntime_test.cpp)
+    target_link_libraries(VulkanTransparentOverlayRuntime_test PRIVATE threepp)
+    add_test(NAME VulkanTransparentOverlayRuntime_test COMMAND VulkanTransparentOverlayRuntime_test)
+    set_tests_properties(VulkanTransparentOverlayRuntime_test PROPERTIES
             SKIP_RETURN_CODE 42
             FAIL_REGULAR_EXPRESSION "\\[Vulkan\\]")
 

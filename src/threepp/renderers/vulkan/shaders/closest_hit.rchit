@@ -853,6 +853,28 @@ void main() {
         if (legacyEnvMap) {
             unlitRadiance = applyLegacyEnvMap(mdesc, unlitRadiance, reflect(-V, N), 1.0);
         }
+        if (mdesc.ior < 1.05 && mdesc.transmission > 0.0) {
+            const float cleanTransmission = clamp(mdesc.transmission, 0.0, 1.0);
+            const float opacity = 1.0 - cleanTransmission;
+            const bool additive = mdesc.transmission > 1.0;
+            payload.radianceDiff  = additive
+                    ? unlitRadiance * clamp(mdesc.transmission - 1.0, 0.0, 1.0)
+                    : unlitRadiance * opacity;
+            payload.radianceSpec  = vec3(0.0);
+            payload.brdfWeight    = additive ? vec3(1.0) : vec3(cleanTransmission);
+            payload.nextOrigin    = hitPosUnlit;
+            payload.nextDir       = gl_WorldRayDirectionEXT;
+            payload.flags         = 4u | 16u;
+            payload.hitWorldPos     = vec3(0.0);
+            payload.prevWorldPos    = vec3(0.0);
+            payload.hitInstanceId   = 0u;
+            payload.hitRoughness    = 1.0;
+            payload.hitMetalness    = 0.0;
+            payload.hitTransmission = 0.0;
+            payload.hitSpecFrac     = 0.0;
+            payload.hitNormal       = vec3(0.0);
+            return;
+        }
         // Unlit: emit base color as direct radiance. Route to diff channel
         // (unlit is view-independent by definition).
         payload.radianceDiff  = unlitRadiance;

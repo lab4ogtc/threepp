@@ -36,6 +36,7 @@
 #include "vulkan/GpuTimings.hpp"
 #include "vulkan/OverlayPass.hpp"
 #include "vulkan/VulkanFrameTypes.hpp"
+#include "vulkan/VulkanWireframeGeometry.hpp"
 #include "vulkan/TaaResolve.hpp"
 #include "vulkan/BloomPass.hpp"
 #include "vulkan/DeferredShade.hpp"
@@ -138,6 +139,15 @@
 
 #include <GLFW/glfw3.h>
 
+#ifdef THREEPP_WITH_PERFETTO
+#include "perfetto.h"
+
+PERFETTO_DEFINE_CATEGORIES(
+        perfetto::Category("threepp.vulkan")
+                .SetDescription("threepp Vulkan renderer startup and frame events"));
+PERFETTO_TRACK_EVENT_STATIC_STORAGE();
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <array>
@@ -146,6 +156,8 @@
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <future>
 #include <mutex>
@@ -215,6 +227,160 @@ namespace threepp {
         // and rewrite the temporal image bindings per frame) instead of
         // bumping this to an odd value.
         constexpr uint32_t kFramesInFlight = 2;
+
+#ifdef THREEPP_WITH_PERFETTO
+        class VulkanStartupTrace {
+        public:
+            VulkanStartupTrace() {
+                const char* path = std::getenv("THREEPP_VULKAN_STARTUP_TRACE");
+                if (!path || path[0] == '\0') return;
+
+                framesRemaining_ = parseFrameCount(std::getenv("THREEPP_VULKAN_STARTUP_TRACE_FRAMES"));
+                path_ = path;
+                std::call_once(initOnce_, [] {
+                    perfetto::TracingInitArgs args;
+                    args.backends |= perfetto::kInProcessBackend;
+                    perfetto::Tracing::Initialize(args);
+                    perfetto::TrackEvent::Register();
+                });
+
+                perfetto::TraceConfig cfg;
+                cfg.add_buffers()->set_size_kb(4096);
+                auto* ds = cfg.add_data_sources()->mutable_config();
+                ds->set_name("track_event");
+                perfetto::protos::gen::TrackEventConfig teCfg;
+                teCfg.add_disabled_categories("*");
+                teCfg.add_enabled_categories("threepp.vulkan");
+                ds->set_track_event_config_raw(teCfg.SerializeAsString());
+
+                session_ = perfetto::Tracing::NewTrace();
+                session_->Setup(cfg);
+                session_->StartBlocking();
+                enabled_ = true;
+            }
+
+            ~VulkanStartupTrace() {
+                close();
+            }
+
+            bool enabled() const {
+                return enabled_ && !closed_;
+            }
+
+            void begin(const char* name) {
+                if (enabled()) {
+                    TRACE_EVENT_BEGIN("threepp.vulkan", perfetto::StaticString{name});
+                }
+            }
+
+            void end(bool completesFrame) {
+                if (!enabled()) return;
+                TRACE_EVENT_END("threepp.vulkan");
+                if (completesFrame) frameComplete();
+            }
+
+            void frameComplete() {
+                if (!enabled()) return;
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (!enabled_ || closed_) return;
+                if (--framesRemaining_ <= 0) {
+                    closeLocked();
+                }
+            }
+
+        private:
+            static int parseFrameCount(const char* value) {
+                if (!value || value[0] == '\0') return 3;
+                char* end = nullptr;
+                const long parsed = std::strtol(value, &end, 10);
+                if (end == value || parsed <= 0) return 3;
+                return static_cast<int>(std::min<long>(parsed, 120));
+            }
+
+            void close() {
+                std::lock_guard<std::mutex> lock(mutex_);
+                closeLocked();
+            }
+
+            void closeLocked() {
+                if (!enabled_ || closed_) return;
+                session_->StopBlocking();
+                const auto trace = session_->ReadTraceBlocking();
+                session_.reset();
+
+                const std::filesystem::path outPath{path_};
+                if (outPath.has_parent_path()) {
+                    std::error_code ec;
+                    std::filesystem::create_directories(outPath.parent_path(), ec);
+                }
+                std::ofstream out(outPath, std::ios::out | std::ios::trunc | std::ios::binary);
+                out.write(trace.data(), static_cast<std::streamsize>(trace.size()));
+                closed_ = true;
+                enabled_ = false;
+            }
+
+            std::unique_ptr<perfetto::TracingSession> session_;
+            std::string path_;
+            std::mutex mutex_;
+            int framesRemaining_ = 3;
+            bool enabled_ = false;
+            bool closed_ = false;
+            inline static std::once_flag initOnce_;
+        };
+
+        VulkanStartupTrace& vulkanStartupTrace() {
+            static VulkanStartupTrace trace;
+            return trace;
+        }
+
+        class VulkanStartupTraceScope {
+        public:
+            VulkanStartupTraceScope(VulkanStartupTrace* trace, const char* name, bool completesFrame)
+                : trace_(trace), completesFrame_(completesFrame) {
+                if (trace_) trace_->begin(name);
+            }
+
+            VulkanStartupTraceScope(const VulkanStartupTraceScope&) = delete;
+            VulkanStartupTraceScope& operator=(const VulkanStartupTraceScope&) = delete;
+
+            VulkanStartupTraceScope(VulkanStartupTraceScope&& other) noexcept
+                : trace_(other.trace_), completesFrame_(other.completesFrame_) {
+                other.trace_ = nullptr;
+            }
+
+            ~VulkanStartupTraceScope() {
+                if (!trace_) return;
+                trace_->end(completesFrame_);
+            }
+
+        private:
+            VulkanStartupTrace* trace_ = nullptr;
+            bool completesFrame_ = false;
+        };
+
+        VulkanStartupTraceScope makeVulkanStartupTraceScope(const char* name, bool completesFrame = false) {
+            auto& trace = vulkanStartupTrace();
+            return {trace.enabled() ? &trace : nullptr, name, completesFrame};
+        }
+#else
+        class VulkanStartupTraceScope {
+        public:
+            VulkanStartupTraceScope(const char*, bool = false) {}
+        };
+
+        VulkanStartupTraceScope makeVulkanStartupTraceScope(const char* name, bool completesFrame = false) {
+            (void) name;
+            (void) completesFrame;
+            return {};
+        }
+#endif
+
+#define THREEPP_VK_TRACE_JOIN2(a, b) a##b
+#define THREEPP_VK_TRACE_JOIN(a, b) THREEPP_VK_TRACE_JOIN2(a, b)
+#define THREEPP_VK_TRACE_SCOPE(name) \
+    auto THREEPP_VK_TRACE_JOIN(_threeppVkStartupTraceScope_, __LINE__) = makeVulkanStartupTraceScope(name)
+#define THREEPP_VK_TRACE_FRAME_SCOPE(name) \
+    auto THREEPP_VK_TRACE_JOIN(_threeppVkStartupTraceFrameScope_, __LINE__) = makeVulkanStartupTraceScope(name, true)
     }// namespace
 
     struct VulkanRenderer::Impl {
@@ -1487,11 +1653,10 @@ namespace threepp {
         // occluded by path-traced geometry. No descriptor sets — the only
         // input is a push constant (mvp + color).
         VkPipelineLayout overlayPipelineLayout      = VK_NULL_HANDLE;
-        VkPipeline       overlayWireframePipeline   = VK_NULL_HANDLE;
         // Solid-fill counterpart for MeshBasicMaterial-style overlays — flat
         // color, depth-tested, but rendered as filled triangles instead of
-        // wireframe lines. Selected per-draw based on the material's
-        // `wireframe` flag (true → wireframe pipeline, false → basic).
+        // wireframe lines. Wireframe meshes use explicit line-list indices
+        // and share overlayLineListPipeline.
         VkPipeline       overlayBasicPipeline       = VK_NULL_HANDLE;
         // Alpha-blended counterpart to overlayBasicPipeline. Same state
         // except colorBlendAttachmentState's blendEnable=TRUE with
@@ -1973,7 +2138,7 @@ namespace threepp {
         // PT-accent passes land, so this currently only stores the user's
         // preference and does not yet branch the frame graph. Default
         // ReferencePT keeps today's behaviour byte-for-byte.
-        VulkanRenderer::RenderMode renderMode_ = VulkanRenderer::RenderMode::RasterFirst;
+        VulkanRenderer::RenderMode renderMode_ = VulkanRenderer::RenderMode::ReferencePT;
 
         // Debug: gate raygen to exit immediately after step-0 primary trace
         // so pathTraceMs measures roughly the primary-trace cost. See
@@ -2114,54 +2279,83 @@ namespace threepp {
         bool pendingDeferredRewrite_    = false;
 
         explicit Impl(Canvas& c) : canvas(c), size(c.size()) {
-            ctx = std::make_unique<VulkanContext>(
-                    static_cast<GLFWwindow*>(canvas.windowPtr()),
-                    /*enableRayTracing*/ true,
-                    /*vsync*/ canvas.vsync());
-            renderTargets_ = std::make_unique<vulkan::VulkanRenderTargets>(*ctx);
+            THREEPP_VK_TRACE_SCOPE("Impl.constructor");
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.VulkanContext");
+                ctx = std::make_unique<VulkanContext>(
+                        static_cast<GLFWwindow*>(canvas.windowPtr()),
+                        /*enableRayTracing*/ true,
+                        /*vsync*/ canvas.vsync());
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.VulkanRenderTargets");
+                renderTargets_ = std::make_unique<vulkan::VulkanRenderTargets>(*ctx);
+            }
             defaultFramebufferSamples_ = chooseDefaultFramebufferSamples(canvas.samples());
             viewport.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
             scissor.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
 
             // The scene-dependent AS build runs lazily on the first render()
             // call. Everything below is scene-independent and safe at ctor time.
-            createCommandResources();
-            createCameraUbos();
-            createLightsUbos();
-            createFogUbos();
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.frameResources");
+                createCommandResources();
+                createCameraUbos();
+                createLightsUbos();
+                createFogUbos();
+            }
             // EnvPrefilter owns the PMREM compute pipeline + descriptor pool.
             // Construct before createDefaultEnvImage so the env upload path is
             // ready if scene.environment is set before the first render().
-            envPrefilter_ = std::make_unique<vulkan::EnvPrefilter>(*ctx, cmdPool);
-            createDefaultEnvImage();
-            rebuildDefaultEnvCdfImages();// 1×1 dummy so descriptors are valid before any HDR upload
-            createTextureSampler();
-            createDefaultMaterialTexture();
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.envResources");
+                envPrefilter_ = std::make_unique<vulkan::EnvPrefilter>(*ctx, cmdPool);
+                createDefaultEnvImage();
+                rebuildDefaultEnvCdfImages();// 1×1 dummy so descriptors are valid before any HDR upload
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.defaultTextures");
+                createTextureSampler();
+                createDefaultMaterialTexture();
+            }
             // Builds both fallback + SER variants (when supported) and their
             // SBTs in one pass.
-            createRtPipeline();
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.createRtPipelineLayout");
+                createRtPipeline();
+            }
             // Denoiser reuses rtDsLayout for its descriptor set (single
             // per-frame set drives raygen + atrous + finalize) and needs
             // cmdPool for one-shot image transitions in createImages. Must
             // construct before createAccumImage since clearGbufImages now
             // includes denoiser_->momentsImage(0/1).
-            denoiser_ = std::make_unique<vulkan::Denoiser>(*ctx, rtDsLayout, cmdPool);
-            createAccumImage();
-            skinning_ = std::make_unique<vulkan::SkinningPipeline>(*ctx);
-            tetSkinning_ = std::make_unique<vulkan::TetSkinningPipeline>(*ctx);
-            photon_ = std::make_unique<vulkan::PhotonCaustics>(*ctx, rtPipelineLayout);
-            waterDisplace_ = std::make_unique<vulkan::WaterDisplacePipeline>(*ctx);
-            foamWorld_     = std::make_unique<vulkan::FoamWorldPipeline>(*ctx);
-            grassWind_     = std::make_unique<vulkan::GrassWindPipeline>(*ctx);
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.denoiserAndAccum");
+                denoiser_ = std::make_unique<vulkan::Denoiser>(*ctx, rtDsLayout, cmdPool);
+                createAccumImage();
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.auxComputePipelines");
+                skinning_ = std::make_unique<vulkan::SkinningPipeline>(*ctx);
+                tetSkinning_ = std::make_unique<vulkan::TetSkinningPipeline>(*ctx);
+                photon_ = std::make_unique<vulkan::PhotonCaustics>(*ctx, rtPipelineLayout);
+                waterDisplace_ = std::make_unique<vulkan::WaterDisplacePipeline>(*ctx);
+                foamWorld_     = std::make_unique<vulkan::FoamWorldPipeline>(*ctx);
+                grassWind_     = std::make_unique<vulkan::GrassWindPipeline>(*ctx);
+            }
             // Hybrid raster G-buffer infrastructure. Costs a few hundred MB
             // at 1080p for six attachments × kFramesInFlight.
-            ensureHybridResources();
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.ensureHybridResources");
+                ensureHybridResources();
+            }
             // TAA pipeline + images. The RT descriptor's binding 1 (denoise
             // output target) always points at the TAA input view.
             imageCount_ = static_cast<uint32_t>(ctx->swapchainImages().size());
-            taa_ = std::make_unique<vulkan::TaaResolve>(
-                    *ctx, cmdPool, imageCount_, kFramesInFlight);
             {
+                THREEPP_VK_TRACE_SCOPE("Impl.TaaResolve");
+                taa_ = std::make_unique<vulkan::TaaResolve>(
+                        *ctx, cmdPool, imageCount_, kFramesInFlight);
                 // TAA input is the path-trace render extent; history +
                 // output are the swapchain extent. When they differ the
                 // resolve pass runs as a temporal upsampler.
@@ -2173,41 +2367,43 @@ namespace threepp {
             // HDR bloom + tone-map/sRGB composite. sceneHdr lives at the
             // path-trace render extent (it is the shared set's binding 1
             // target); the bloom ping-pong buffers are half that.
-            bloom_ = std::make_unique<vulkan::BloomPass>(*ctx, cmdPool, kFramesInFlight);
-            bloom_->createImages(renderExtent().width, renderExtent().height);
-            // Raster-first deferred lighting pass. Writes bloom_->sceneHdr, so
-            // it must exist after bloom_; its descriptors reference the camera /
-            // lights UBOs, the env image, the raster gbuffer and sceneHdr — all
-            // created above by this point.
-            // The deferred base traces ray-query shadow rays, so only stand it
-            // up when the device supports VK_KHR_ray_query. Without it,
-            // deferredShade_ stays null and RasterFirst falls back to ReferencePT.
-            if (ctx->rayQuerySupported()) {
-                deferredShade_ = std::make_unique<vulkan::DeferredShade>(*ctx, kFramesInFlight);
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.BloomPass");
+                bloom_ = std::make_unique<vulkan::BloomPass>(*ctx, cmdPool, kFramesInFlight);
+                bloom_->createImages(renderExtent().width, renderExtent().height);
             }
-            createDescriptorPool();
-            createBlueNoiseImage_();// must run before descriptor writes (binding 27)
-            createOceanFineDummy_();// must run before descriptor writes (binding 32)
-            createOceanFoamDummy_();// must run before descriptor writes (binding 33)
-            createFoamDetailImage_();// must run before descriptor writes (binding 45 + deferred 34)
-            rewriteTaaDescriptors();// after ensureHybridResources gave us raster gbuf views
-            rewriteBloomDescriptors();// bloom composite reads gbuf + writes the TAA input
-            rewriteDeferredDescriptors();// raster-first deferred shade inputs
-            gpuTimings_ = std::make_unique<vulkan::GpuTimings>(*ctx, kFramesInFlight);
-            overlayPass_ = std::make_unique<vulkan::OverlayPass>(
-                    *ctx, kFramesInFlight,
-                    [this](uint32_t w, uint32_t h, VkFormat fmt,
-                           const void* pix, VkDeviceSize sz,
-                           VkFilter filter,
-                           VkSamplerAddressMode addrU,
-                           VkSamplerAddressMode addrV,
-                           const char* name) {
-                        return createSampledImage2D(w, h, fmt, pix, sz,
-                                                   filter, addrU, addrV, name);
-                    },
-                    [this](const Texture* texture) -> const Image2D* {
-                        return framebufferTextureImage(texture);
-                    });
+            // Raster-first DeferredShade is expensive to compile on some drivers.
+            // Keep Vulkan's menu/default path as the path tracer and build the
+            // deferred pipeline only when RasterFirst is explicitly selected.
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.descriptorSetup");
+                createDescriptorPool();
+                createBlueNoiseImage_();// must run before descriptor writes (binding 27)
+                createOceanFineDummy_();// must run before descriptor writes (binding 32)
+                createOceanFoamDummy_();// must run before descriptor writes (binding 33)
+                createFoamDetailImage_();// must run before descriptor writes (binding 45 + deferred 34)
+                rewriteTaaDescriptors();// after ensureHybridResources gave us raster gbuf views
+                rewriteBloomDescriptors();// bloom composite reads gbuf + writes the TAA input
+                rewriteDeferredDescriptors();// raster-first deferred shade inputs
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.overlayAndTimings");
+                gpuTimings_ = std::make_unique<vulkan::GpuTimings>(*ctx, kFramesInFlight);
+                overlayPass_ = std::make_unique<vulkan::OverlayPass>(
+                        *ctx, kFramesInFlight,
+                        [this](uint32_t w, uint32_t h, VkFormat fmt,
+                               const void* pix, VkDeviceSize sz,
+                               VkFilter filter,
+                               VkSamplerAddressMode addrU,
+                               VkSamplerAddressMode addrV,
+                               const char* name) {
+                            return createSampledImage2D(w, h, fmt, pix, sz,
+                                                       filter, addrU, addrV, name);
+                        },
+                        [this](const Texture* texture) -> const Image2D* {
+                            return framebufferTextureImage(texture);
+                        });
+            }
         }
 
         ~Impl() {
@@ -2493,7 +2689,6 @@ namespace threepp {
             if (rasterDsLayout)         vkDestroyDescriptorSetLayout(d, rasterDsLayout, nullptr);
             if (rasterDescPool)         vkDestroyDescriptorPool(d, rasterDescPool, nullptr);
             if (rasterGbufRenderPass)   vkDestroyRenderPass(d, rasterGbufRenderPass, nullptr);
-            if (overlayWireframePipeline)         vkDestroyPipeline(d, overlayWireframePipeline, nullptr);
             if (overlayBasicPipeline)             vkDestroyPipeline(d, overlayBasicPipeline, nullptr);
             if (overlayBasicTransparentPipeline)  vkDestroyPipeline(d, overlayBasicTransparentPipeline, nullptr);
             if (overlayLineListPipeline)          vkDestroyPipeline(d, overlayLineListPipeline, nullptr);
@@ -2550,6 +2745,10 @@ namespace threepp {
                 if (rec.lineDistance.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.lineDistance);
             }
             lineGeomCache_.clear();
+            for (auto& [g, rec] : wireframeGeomCache_) {
+                destroyWireframeRec(rec);
+            }
+            wireframeGeomCache_.clear();
             overlayPass_.reset();// destroy sprite/line pipelines + caches while device is alive
             for (auto& [_, rec] : framebufferTextureImages_) {
                 destroyImage2D(ctx->allocator(), d, rec.image);
@@ -6314,28 +6513,24 @@ namespace threepp {
                 d.transmission = 1.0f + std::clamp(mat->opacity, 0.0f, 1.0f);
                 d.ior          = 1.0f;
             }
-            // Alpha-blend transparency (transparent=true, opacity<1) has no
-            // physical analogue in a PT, so treat it as stochastic pass-through:
-            // with probability (1-opacity) the ray continues straight through
-            // (ior=1 → refract returns the incident direction unchanged, F=0).
-            // Deferred reads ior≈1 as the "clean alpha blend" marker (vs ior>1
-            // real refractive glass).
+            // Constant opacity has no alpha texel to sample. Encode it as clean
+            // straight-through alpha. alphaCutoff=-2 routes RasterFirst through
+            // the deterministic G-buffer alpha-blend path; ReferencePT's gbuffer
+            // keeps the surface and lets closest_hit do the clean pass-through.
             if (d.transmission == 0.0f && mat->transparent && mat->opacity < 1.0f) {
-                d.transmission = 1.0f - mat->opacity;
+                d.transmission = 1.0f - std::clamp(mat->opacity, 0.0f, 1.0f);
                 d.ior          = 1.0f;
+                d.alphaCutoff  = -2.0f;
             }
             // BLEND mode with texture alpha (alphaMode=BLEND, opacity=1.0):
             // alphaCutoff=-1.0 sentinel triggers per-texel stochastic blend in
             // closest_hit using the albedo texture's alpha channel.
             //
             // DECAL refinement (-2.0): transparent + depthWrite=false +
-            // polygonOffset is the decal authoring signature (DecalGeometry
-            // scorch splats etc.). The gbuffer raster routes these to a
-            // dedicated pipeline that alpha-blends ONLY the albedo attachment
-            // over the receiving surface (normal/ids/motion/depth untouched) —
-            // a deterministic lerp matching GL's forward blend, instead of the
-            // stochastic screen-door whose per-frame id flicker defeats the
-            // temporal accumulator and lets the denoiser dilate the splat.
+            // polygonOffset is the decal authoring signature. The gbuffer raster
+            // routes these to a dedicated pipeline that alpha-blends ONLY the
+            // albedo attachment over the receiving surface (normal/ids/motion/
+            // depth untouched).
             // Every shader-side blend test is a sign test (alphaCutoff < 0),
             // so -2 inherits all -1 semantics (no shadow cast, stochastic
             // pass-through in the PT chit) automatically.
@@ -6407,6 +6602,10 @@ namespace threepp {
 
         static MaterialDesc materialFromMesh(const Mesh& m) {
             return materialFromMaterial(m.material());
+        }
+
+        static bool materialPassesThroughOverlayDepth(const MaterialDesc& d) {
+            return (d.ior < 1.05f && d.transmission > 0.0f) || d.alphaCutoff < 0.0f;
         }
 
         MaterialDesc materialDescForMaterial(const std::shared_ptr<Material>& material) const {
@@ -12754,7 +12953,7 @@ namespace threepp {
 
             VkPipelineColorBlendAttachmentState cbas{};
             cbas.blendEnable         = VK_TRUE;
-            cbas.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+            cbas.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
             cbas.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
             cbas.colorBlendOp        = VK_BLEND_OP_ADD;
             cbas.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
@@ -13162,14 +13361,12 @@ namespace threepp {
             vkDestroyShaderModule(ctx->device(), fragIndModule, nullptr);
         }
 
-        // ── Hybrid raster overlay pipeline (wireframe variant) ──────────────
+        // ── Hybrid raster overlay pipelines ────────────────────────────────
         // Dynamic-rendering pipeline targeting the swapchain (B8G8R8A8_UNORM)
         // + the existing G-buffer depth (D32_SFLOAT, read-only). Pushes
-        // mat4 mvp + vec4 color (80B). Triangle topology + polygon-mode
-        // line draws each visible mesh as a wireframe; the host gates
-        // per-draw on material.wireframe / overlayLayer membership.
-        // Line/LineSegments get their own pipeline variants + cached
-        // vertex buffer, also built below.
+        // mat4 mvp + vec4 color (80B). Filled meshes use triangle topology;
+        // wireframe meshes are converted to explicit line-list indices and
+        // share the Line/LineSegments pipeline variants built below.
         void createOverlayPipeline() {
             VkShaderModuleCreateInfo vsmci{};
             vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -13228,12 +13425,13 @@ namespace threepp {
             vp.viewportCount = 1;
             vp.scissorCount  = 1;
 
-            // POLYGON_MODE_LINE renders each tri as 3 lines — that's the
-            // wireframe effect. cullMode NONE so back-facing geometry's
-            // edges are visible too (helps see structure on closed meshes).
+            // Mesh overlays use fill-mode pipelines here. Wireframe meshes are
+            // converted to explicit line-list indices at draw time and share
+            // the Line/LineSegments pipeline below, matching the non-native
+            // line-list path used by the other backends.
             VkPipelineRasterizationStateCreateInfo rs{};
             rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-            rs.polygonMode = VK_POLYGON_MODE_LINE;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
             rs.cullMode    = VK_CULL_MODE_NONE;
             rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
             rs.lineWidth   = 1.0f;
@@ -13311,17 +13509,11 @@ namespace threepp {
             gpci.pColorBlendState    = &cb;
             gpci.pDynamicState       = &dyn;
             gpci.layout              = overlayPipelineLayout;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
-                                            &overlayWireframePipeline),
-                  "vkCreateGraphicsPipelines(overlayWireframe)");
 
             // Solid-fill variant for MeshBasicMaterial-style overlays. Same
-            // shaders + state otherwise; only the rasterization mode flips
-            // to FILL and we cull back faces (no need to draw the inside of
-            // a closed convex overlay). Reuses the just-created shader
-            // modules → cheap second pipeline.
+            // shaders + state otherwise; only culling flips to back faces (no
+            // need to draw the inside of a closed convex overlay).
             VkPipelineRasterizationStateCreateInfo rsBasic = rs;
-            rsBasic.polygonMode = VK_POLYGON_MODE_FILL;
             rsBasic.cullMode    = VK_CULL_MODE_BACK_BIT;
             VkGraphicsPipelineCreateInfo gpciBasic = gpci;
             gpciBasic.pRasterizationState = &rsBasic;
@@ -13621,7 +13813,7 @@ namespace threepp {
             vkDestroyShaderModule(ctx->device(), pfragTextured, nullptr);
 
             // ── Overlay depth prepass pipeline ──────────────────────────────
-            // Renders all non-overlay scene geometry with the unjittered VP
+            // Renders depth-occluding non-overlay scene geometry with the unjittered VP
             // into rasterGbufs[f].unjitDepth. Reuses rasterPipelineLayout
             // (same camera UBO + push constant). Position-only vertex input;
             // no color attachments. depthCompareOp = LESS so the closest
@@ -14126,7 +14318,13 @@ namespace threepp {
         // path; stale eviction intentionally omitted here (3D overlay
         // objects are persistent scene objects, not transient geometry).
         std::unordered_map<const BufferGeometry*, vulkan::LineRec> lineGeomCache_;
+        std::unordered_map<const BufferGeometry*, vulkan::WireframeRec> wireframeGeomCache_;
         uint64_t overlayFrameCounter_ = 0;// lastTouch reference for lineGeomCache_ entries
+
+        void destroyWireframeRec(vulkan::WireframeRec& rec) {
+            if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.index);
+            rec = {};
+        }
 
         void destroyLineLoopRanges(std::vector<vulkan::LineRec::LoopRange>& ranges) {
             for (auto& range : ranges) {
@@ -14402,6 +14600,74 @@ namespace threepp {
             return &lineGeomCache_.emplace(geom, std::move(rec)).first->second;
         }
 
+        vulkan::WireframeRec* ensureWireframeGeometryUploaded(const BufferGeometry* geom) {
+            if (!geom || !geom->hasAttribute("position")) return nullptr;
+            const auto* idxAttr = geom->getIndex();
+            const auto* posAttr = geom->getAttribute<float>("position");
+            if ((!idxAttr || idxAttr->count() == 0) && (!posAttr || posAttr->count() < 3)) {
+                return nullptr;
+            }
+
+            const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : ~0u;
+            const uint32_t posVer = (idxAttr && idxAttr->count() > 0) ? ~0u : (posAttr ? posAttr->version : ~0u);
+            const uint32_t attrVer = geom->attributesVersion();
+
+            auto upload = [&](vulkan::WireframeRec& rec) {
+                const auto indices = vulkan::buildWireframeIndices(*geom);
+                rec.indexCount = static_cast<uint32_t>(indices.size());
+                rec.indexVersion = idxVer;
+                rec.positionVersion = posVer;
+                rec.attributesVersion = attrVer;
+                rec.geomId = geom->id;
+                rec.lastTouch = overlayFrameCounter_;
+
+                if (indices.empty()) {
+                    if (rec.index.handle != VK_NULL_HANDLE) {
+                        destroyBuffer(ctx->allocator(), rec.index);
+                        rec.index = {};
+                    }
+                    return;
+                }
+
+                const VkDeviceSize bytes = indices.size() * sizeof(unsigned int);
+                if (rec.index.handle == VK_NULL_HANDLE || bytes > rec.index.size) {
+                    if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.index);
+                    rec.index = createBuffer(
+                            ctx->allocator(), ctx->device(), bytes,
+                            VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                            VMA_MEMORY_USAGE_AUTO,
+                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                }
+
+                void* mapped = nullptr;
+                vmaMapMemory(ctx->allocator(), rec.index.alloc, &mapped);
+                std::memcpy(mapped, indices.data(), bytes);
+                vmaUnmapMemory(ctx->allocator(), rec.index.alloc);
+            };
+
+            auto it = wireframeGeomCache_.find(geom);
+            if (it != wireframeGeomCache_.end() && it->second.geomId != geom->id) {
+                destroyWireframeRec(it->second);
+                wireframeGeomCache_.erase(it);
+                it = wireframeGeomCache_.end();
+            }
+            if (it != wireframeGeomCache_.end()) {
+                auto& rec = it->second;
+                rec.lastTouch = overlayFrameCounter_;
+                if (rec.indexVersion == idxVer &&
+                    rec.positionVersion == posVer &&
+                    rec.attributesVersion == attrVer) {
+                    return &rec;
+                }
+                upload(rec);
+                return &rec;
+            }
+
+            vulkan::WireframeRec rec{};
+            upload(rec);
+            return &wireframeGeomCache_.emplace(geom, std::move(rec)).first->second;
+        }
+
         // ── TAA resources ───────────────────────────────────────────────────
         // Pipeline + images + descriptor sets now live in vulkan::TaaResolve.
         // This helper packs the external view sources (raster gbuffer +
@@ -14446,6 +14712,14 @@ namespace threepp {
         // depth / ids) and writes bloom_->sceneHdr. Call after the raster
         // gbuffer or sceneHdr is reallocated (resize) and after the env image
         // is rebuilt. The UBO buffers are stable; rewriting them is harmless.
+        bool ensureDeferredShade() {
+            if (deferredShade_) return true;
+            if (!ctx->rayQuerySupported()) return false;
+            deferredShade_ = std::make_unique<vulkan::DeferredShade>(*ctx, kFramesInFlight);
+            rewriteDeferredDescriptors();
+            return true;
+        }
+
         void rewriteDeferredDescriptors() {
             // Needs a built TLAS (binding 8) + material buffer (binding 9). Both
             // come from the scene build; before then there's nothing to bind and
@@ -14588,7 +14862,7 @@ namespace threepp {
                 createRasterDsLayoutAndPool();
                 createRasterGbufPipeline();
             }
-            if (overlayWireframePipeline == VK_NULL_HANDLE) {
+            if (overlayBasicPipeline == VK_NULL_HANDLE || overlayLineListPipeline == VK_NULL_HANDLE) {
                 createOverlayPipeline();
             }
             if (particlePipelineNormal_ == VK_NULL_HANDLE) {
@@ -16094,6 +16368,7 @@ namespace threepp {
         // users never toggle, so we pay 1 compile at startup and only the
         // others if the user actually flips a switch.
         void buildAllRtPipelines() {
+            THREEPP_VK_TRACE_SCOPE("buildAllRtPipelines");
             const uint32_t sceneFeats = currentSceneFeatures();
             buildSingleRtVariant(shouldUseSerRaygen(), restirDIEnabled_, sceneFeats);
             lastBuiltSceneFeatures_ = sceneFeats;
@@ -16128,6 +16403,7 @@ namespace threepp {
         // hang on subsequent vkCreateRayTracingPipelinesKHR calls against
         // the same pipeline layout appears to be tied to overlapping work.
         void ensureCurrentRtVariantBuilt() {
+            THREEPP_VK_TRACE_SCOPE("ensureCurrentRtVariantBuilt.impl");
             const uint32_t newFeats = currentSceneFeatures();
             if (rtPipelinesBuilt_ && newFeats != lastBuiltSceneFeatures_) {
                 // Scene features changed since last build (model swap).
@@ -16135,6 +16411,7 @@ namespace threepp {
                 // gather / clearcoat lobe / iridescence Fresnel / sheen NEE
                 // DCE states no longer match what the chit needs. Discard
                 // everything; the active variant will rebuild below.
+                THREEPP_VK_TRACE_SCOPE("ensureCurrentRtVariantBuilt.invalidateAllRtVariants");
                 invalidateAllRtVariants();
                 lastBuiltSceneFeatures_ = newFeats;
             }
@@ -16142,8 +16419,14 @@ namespace threepp {
             const bool rdi = restirDIEnabled_;
             const uint32_t idx = rtVariantIndex(useSer, rdi);
             if (rtVariants_[idx].pipeline != VK_NULL_HANDLE) return;
-            vkDeviceWaitIdle(ctx->device());
-            buildSingleRtVariant(useSer, rdi, newFeats);
+            {
+                THREEPP_VK_TRACE_SCOPE("ensureCurrentRtVariantBuilt.vkDeviceWaitIdle");
+                vkDeviceWaitIdle(ctx->device());
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("ensureCurrentRtVariantBuilt.buildSingleRtVariant");
+                buildSingleRtVariant(useSer, rdi, newFeats);
+            }
         }
 
         // Scene-feature bitmask matching chit's kSceneFeatures spec constant.
@@ -16167,6 +16450,7 @@ namespace threepp {
         // toggle that lands in an unbuilt slot.
         void buildSingleRtVariant(bool useSer, bool restirDISpec,
                                   uint32_t sceneFeatures) {
+            THREEPP_VK_TRACE_SCOPE("buildSingleRtVariant");
             auto loadModule = [this](const uint32_t* code, size_t size) {
                 VkShaderModuleCreateInfo smci{};
                 smci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -16178,14 +16462,23 @@ namespace threepp {
                 return m;
             };
 
-            VkShaderModule rgenMod = useSer
-                    ? loadModule(kRaygenRgenSerSpv, sizeof(kRaygenRgenSerSpv))
-                    : loadModule(kRaygenRgenSpv,    sizeof(kRaygenRgenSpv));
-            VkShaderModule missMod    = loadModule(kMissRmissSpv,            sizeof(kMissRmissSpv));
-            VkShaderModule sMissMod   = loadModule(kShadowMissRmissSpv,      sizeof(kShadowMissRmissSpv));
-            VkShaderModule chitMod    = loadModule(kClosestHitRchitSpv,      sizeof(kClosestHitRchitSpv));
-            VkShaderModule ahitMod    = loadModule(kClosestHitAlphaRahitSpv, sizeof(kClosestHitAlphaRahitSpv));
-            VkShaderModule sahitMod   = loadModule(kShadowAnyhitRahitSpv,    sizeof(kShadowAnyhitRahitSpv));
+            VkShaderModule rgenMod = VK_NULL_HANDLE;
+            VkShaderModule missMod = VK_NULL_HANDLE;
+            VkShaderModule sMissMod = VK_NULL_HANDLE;
+            VkShaderModule chitMod = VK_NULL_HANDLE;
+            VkShaderModule ahitMod = VK_NULL_HANDLE;
+            VkShaderModule sahitMod = VK_NULL_HANDLE;
+            {
+                THREEPP_VK_TRACE_SCOPE("buildSingleRtVariant.createShaderModules");
+                rgenMod = useSer
+                        ? loadModule(kRaygenRgenSerSpv, sizeof(kRaygenRgenSerSpv))
+                        : loadModule(kRaygenRgenSpv,    sizeof(kRaygenRgenSpv));
+                missMod    = loadModule(kMissRmissSpv,            sizeof(kMissRmissSpv));
+                sMissMod   = loadModule(kShadowMissRmissSpv,      sizeof(kShadowMissRmissSpv));
+                chitMod    = loadModule(kClosestHitRchitSpv,      sizeof(kClosestHitRchitSpv));
+                ahitMod    = loadModule(kClosestHitAlphaRahitSpv, sizeof(kClosestHitAlphaRahitSpv));
+                sahitMod   = loadModule(kShadowAnyhitRahitSpv,    sizeof(kShadowAnyhitRahitSpv));
+            }
 
             // Shader groups: same layout as other variants.
             std::array<VkRayTracingShaderGroupCreateInfoKHR, 5> groups{};
@@ -16279,18 +16572,27 @@ namespace threepp {
             rci.layout = rtPipelineLayout;
 
             const uint32_t idx = rtVariantIndex(useSer, restirDISpec);
-            check(ctx->rt().createRayTracingPipelines(
-                          ctx->device(), VK_NULL_HANDLE, ctx->pipelineCache(),
-                          1, &rci, nullptr, &rtVariants_[idx].pipeline),
-                  "vkCreateRayTracingPipelinesKHR (single)");
-            createShaderBindingTable(useSer, restirDISpec);
+            {
+                THREEPP_VK_TRACE_SCOPE("buildSingleRtVariant.vkCreateRayTracingPipelinesKHR");
+                check(ctx->rt().createRayTracingPipelines(
+                              ctx->device(), VK_NULL_HANDLE, ctx->pipelineCache(),
+                              1, &rci, nullptr, &rtVariants_[idx].pipeline),
+                      "vkCreateRayTracingPipelinesKHR (single)");
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("buildSingleRtVariant.createShaderBindingTable");
+                createShaderBindingTable(useSer, restirDISpec);
+            }
 
-            vkDestroyShaderModule(ctx->device(), rgenMod,  nullptr);
-            vkDestroyShaderModule(ctx->device(), missMod,  nullptr);
-            vkDestroyShaderModule(ctx->device(), sMissMod, nullptr);
-            vkDestroyShaderModule(ctx->device(), chitMod,  nullptr);
-            vkDestroyShaderModule(ctx->device(), ahitMod,  nullptr);
-            vkDestroyShaderModule(ctx->device(), sahitMod, nullptr);
+            {
+                THREEPP_VK_TRACE_SCOPE("buildSingleRtVariant.destroyShaderModules");
+                vkDestroyShaderModule(ctx->device(), rgenMod,  nullptr);
+                vkDestroyShaderModule(ctx->device(), missMod,  nullptr);
+                vkDestroyShaderModule(ctx->device(), sMissMod, nullptr);
+                vkDestroyShaderModule(ctx->device(), chitMod,  nullptr);
+                vkDestroyShaderModule(ctx->device(), ahitMod,  nullptr);
+                vkDestroyShaderModule(ctx->device(), sahitMod, nullptr);
+            }
         }
 
         void createShaderBindingTable(bool useSer, bool restirDISpec) {
@@ -17642,10 +17944,11 @@ namespace threepp {
                 gpuTimings_->end(cb, TP_RasterGbuf, currentFrame);
                 // ── Overlay depth prepass ──────────────────────────────────
                 // Fills rasterGbufs[currentFrame].unjitDepth with the
-                // unjittered VP. Consumed by the post-TAA wireframe overlay
-                // pass for occlusion testing. Only runs when an overlay
-                // pipeline exists AND the scene actually has overlay
-                // candidates this frame (else the prepass is wasted work).
+                // unjittered VP for opaque/depth-occluding scene surfaces.
+                // Consumed by the post-TAA wireframe overlay pass for
+                // occlusion testing. Only runs when an overlay pipeline
+                // exists AND the scene actually has overlay candidates
+                // this frame (else the prepass is wasted work).
                 if (overlayDepthPrepassPipeline != VK_NULL_HANDLE && sceneHasOverlayContent()) {
                     gpuTimings_->begin(cb, TP_OverlayDepth, currentFrame);
                     // Swapchain extent — unjitDepth is full-res so the
@@ -17709,10 +18012,27 @@ namespace threepp {
                     VkRect2D dsc{{regionDstX_, regionDstY_}, regionSwapExt_};
                     vkCmdSetScissor(cb, 0, 1, &dsc);
 
+                    auto skipsOverlayDepth = [&](size_t entryIndex) {
+                        if (entryIndex < matDescsCached_.size() &&
+                            materialPassesThroughOverlayDepth(matDescsCached_[entryIndex])) {
+                            return true;
+                        }
+                        if (entryIndex < rasterGroupMaterialDescIndices_.size()) {
+                            for (const auto& groupDesc : rasterGroupMaterialDescIndices_[entryIndex]) {
+                                if (groupDesc.descIndex < matDescsCached_.size() &&
+                                    materialPassesThroughOverlayDepth(matDescsCached_[groupDesc.descIndex])) {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    };
+
                     for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                         const auto& en = lastVisibleEntries_[i];
                         if (en.isOverlay) continue;// overlay meshes drawn by overlay pass instead
                         if (!en.inFrustum) continue;// frustum cull (same lever as the gbuf prepass)
+                        if (skipsOverlayDepth(i)) continue;
                         const BlasRecord* rec = resolveBlasForEntry(en);
                         if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
@@ -18293,7 +18613,7 @@ namespace threepp {
             // Skip the whole block when not in hybrid (depth attachment isn't
             // built), pipeline failed to create, or the early scan didn't
             // find any overlay candidates this frame.
-            if (overlayWireframePipeline != VK_NULL_HANDLE) {
+            if (overlayBasicPipeline != VK_NULL_HANDLE && overlayLineListPipeline != VK_NULL_HANDLE) {
                 // Gate on the same current-frame answer the unjittered-depth
                 // prepass keyed off, so the prepass that filled + transitioned
                 // unjitDepth to DEPTH_STENCIL_READ_ONLY_OPTIMAL ran iff we draw
@@ -18445,7 +18765,7 @@ namespace threepp {
                         // typically opaque even when material.transparent
                         // is incidentally true.
                         VkPipeline want;
-                        if (wireframe)        want = overlayWireframePipeline;
+                        if (wireframe)        want = overlayLineListPipeline;
                         else if (transparent) want = overlayBasicTransparentPipeline;
                         else                  want = overlayBasicPipeline;
                         if (want != curPipeline) {
@@ -18478,7 +18798,14 @@ namespace threepp {
                         VkBuffer     vbufs[1] = {rec->vertex.handle};
                         VkDeviceSize voffs[1] = {0};
                         vkCmdBindVertexBuffers(cb, 0, 1, vbufs, voffs);
-                        if (rec->index.handle != VK_NULL_HANDLE) {
+                        if (wireframe) {
+                            auto* wrec = ensureWireframeGeometryUploaded(en.mesh->geometry().get());
+                            if (!wrec || wrec->index.handle == VK_NULL_HANDLE || wrec->indexCount == 0) {
+                                continue;
+                            }
+                            vkCmdBindIndexBuffer(cb, wrec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                            vkCmdDrawIndexed(cb, wrec->indexCount, 1, 0, 0, 0);
+                        } else if (rec->index.handle != VK_NULL_HANDLE) {
                             vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
                             auto* idxAttr = en.mesh->geometry()->getIndex();
                             if (idxAttr) {
@@ -19406,14 +19733,21 @@ namespace threepp {
         // endFrame() finishes it (overlay + present-src + submit + present).
         // Returns false on swapchain OUT_OF_DATE — caller leaves state Idle.
         bool beginFrameForPT(Object3D& scene, Camera& camera) {
+            THREEPP_VK_TRACE_SCOPE("beginFrameForPT");
             VkDevice d = ctx->device();
-            vkWaitForFences(d, 1, &inFlight[currentFrame], VK_TRUE, UINT64_MAX);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.vkWaitForFences");
+                vkWaitForFences(d, 1, &inFlight[currentFrame], VK_TRUE, UINT64_MAX);
+            }
             // Fence has signaled → the previous render that wrote into this
             // frame's query pool has retired. Read it now, before we reset
             // the pool and re-record. Result is stored in gpuTimings_ for
             // the public getter to read.
-            gpuTimings_->readBack(currentFrame, pendingCpuEnsureSceneMs_);
-            resetCustomShaderFrameResources(currentFrame);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.readBackAndReset");
+                gpuTimings_->readBack(currentFrame, pendingCpuEnsureSceneMs_);
+                resetCustomShaderFrameResources(currentFrame);
+            }
 
             // Apply any setter requests deferred from mid-frame. setRenderScale
             // / resetAccumulation issue vkDeviceWaitIdle + reallocate descriptor
@@ -19421,6 +19755,7 @@ namespace threepp {
             // prior frame. We're past the fence wait now so the GPU is idle for
             // *this* slot at minimum; vkDeviceWaitIdle below drains the rest.
             if (pendingRenderScaleRealloc_ || pendingAccumulationReset_ || pendingDeferredRewrite_) {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.applyDeferredRequests");
                 vkDeviceWaitIdle(d);
                 if (pendingRenderScaleRealloc_) {
                     reallocateRenderExtentResources();// also rewrites deferred descriptors
@@ -19440,8 +19775,12 @@ namespace threepp {
             }
 
             uint32_t imageIndex = 0;
-            VkResult acq = vkAcquireNextImageKHR(d, ctx->swapchain(), UINT64_MAX,
-                                                 imageAvailable[currentFrame], VK_NULL_HANDLE, &imageIndex);
+            VkResult acq = VK_SUCCESS;
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.vkAcquireNextImageKHR");
+                acq = vkAcquireNextImageKHR(d, ctx->swapchain(), UINT64_MAX,
+                                            imageAvailable[currentFrame], VK_NULL_HANDLE, &imageIndex);
+            }
             if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
                 recreateSwapchainAndDescriptors();
                 return false;
@@ -19451,33 +19790,48 @@ namespace threepp {
             }
             frameImageIndex_ = imageIndex;
 
-            updateCameraUbo(currentFrame, camera);
-            updateLightsUbo(currentFrame, scene);
-            updateFogUbo(currentFrame, scene);
-            // Safe to write motionMatBuffers[currentFrame] now that the
-            // inFlight[currentFrame] fence has been signaled — the GPU has
-            // finished its previous use of this slot.
-            computeAndUploadMotionMatrices(currentFrame, lastVisibleEntries_);
-            // Same fence guarantee covers materialDescsBuffers[currentFrame].
-            // ensureSceneBuilt staged any material-value change in
-            // matDescsCached_ + flipped matDescsDirty_[*]=true; flush this
-            // slot now (the other slot flushes when its frame comes around).
-            flushMaterialDescsIfDirty(currentFrame);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.frameUploads");
+                updateCameraUbo(currentFrame, camera);
+                updateLightsUbo(currentFrame, scene);
+                updateFogUbo(currentFrame, scene);
+                // Safe to write motionMatBuffers[currentFrame] now that the
+                // inFlight[currentFrame] fence has been signaled — the GPU has
+                // finished its previous use of this slot.
+                computeAndUploadMotionMatrices(currentFrame, lastVisibleEntries_);
+                // Same fence guarantee covers materialDescsBuffers[currentFrame].
+                // ensureSceneBuilt staged any material-value change in
+                // matDescsCached_ + flipped matDescsDirty_[*]=true; flush this
+                // slot now (the other slot flushes when its frame comes around).
+                flushMaterialDescsIfDirty(currentFrame);
+            }
             // Per-frame frustum cull: tags every entry with `inFrustum`
             // for the raster passes to consume, and resolves the photon-
             // emit gating flag (glassVisibleThisFrame_) as a side effect.
-            cullEntriesAgainstFrustum(camera);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.cullEntriesAgainstFrustum");
+                cullEntriesAgainstFrustum(camera);
+            }
             // Hybrid raster prepass: lazy-create resources on first use,
             // refresh attachments on resize, then upload the per-frame
             // camera VPs (curr jittered, curr unjittered, prev unjittered).
             // Must run after computeAndUploadMotionMatrices so the descriptor
             // rewrite picks up the populated motionMat buffer for this frame.
-            ensureHybridResources();
-            uploadRasterCameraUbo(currentFrame, camera);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.ensureHybridResources");
+                ensureHybridResources();
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.uploadRasterCameraUbo");
+                uploadRasterCameraUbo(currentFrame, camera);
+            }
             // Build the per-frame DrawInfo + indirect-cmd buffers used
             // by the indirect-drawing gbuf pass. Runs after the cull
             // pass + camera upload (depends on both) and before record.
-            buildIndirectDrawData(currentFrame);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.buildIndirectDrawData");
+                buildIndirectDrawData(currentFrame);
+            }
             // Binding 1 (RT denoise output) always targets the TAA input;
             // TAA resolves it to the swapchain (upsampling when renderScale_
             // < 1). Only rewrite when this slot's actual binding differs from the
@@ -19491,6 +19845,7 @@ namespace threepp {
             {
                 const int8_t desired = 1;// binding 1 → bloom sceneHdr (HDR resolve)
                 if (binding1Mode_[currentFrame] != desired) {
+                    THREEPP_VK_TRACE_SCOPE("beginFrameForPT.rewriteBinding1");
                     for (uint32_t i = 0; i < imageCount_; ++i) {
                         const uint32_t idx = currentFrame * imageCount_ + i;
                         VkDescriptorImageInfo info{};
@@ -19511,11 +19866,20 @@ namespace threepp {
                     binding1Mode_[currentFrame] = desired;
                 }
             }
-            uploadMeshMovedBits(currentFrame);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.uploadMeshMovedBits");
+                uploadMeshMovedBits(currentFrame);
+            }
             // Same fence guarantees emissiveTriBuffers[currentFrame] is no
             // longer in use; rebuild the per-frame CDF and rewrite binding 14
             // if the buffer grew.
-            if (buildAndUploadEmissiveTris(currentFrame, lastVisibleEntries_)) {
+            bool emissiveChanged = false;
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.buildAndUploadEmissiveTris");
+                emissiveChanged = buildAndUploadEmissiveTris(currentFrame, lastVisibleEntries_);
+            }
+            if (emissiveChanged) {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.rewriteEmissiveDescriptors");
                 rewriteEmissiveTriDescriptors(currentFrame);
                 // Keep the raster-first deferred pass's emissive binding fresh
                 // (same per-frame buffer grows for it too).
@@ -19524,7 +19888,13 @@ namespace threepp {
                                                     emissiveTriBuffers[currentFrame].handle);
                 }
             }
-            if (refreshEnvTextureFromScene(scene)) {
+            bool envChanged = false;
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.refreshEnvTextureFromScene");
+                envChanged = refreshEnvTextureFromScene(scene);
+            }
+            if (envChanged) {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.rewriteEnvAndClearHistory");
                 rewriteEnvDescriptors();
                 // Env is a primary radiance source — can't reproject, so
                 // wipe history. Clearing the gbuf alone makes the mesh-ID
@@ -19534,12 +19904,18 @@ namespace threepp {
                 clearGbufImages();
             }
 
-            vkResetFences(d, 1, &inFlight[currentFrame]);
-            vkResetCommandBuffer(cmdBuffers[currentFrame], 0);
-            beginCommandRecording(cmdBuffers[currentFrame]);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.resetAndBeginCommandBuffer");
+                vkResetFences(d, 1, &inFlight[currentFrame]);
+                vkResetCommandBuffer(cmdBuffers[currentFrame], 0);
+                beginCommandRecording(cmdBuffers[currentFrame]);
+            }
             // Record the full PT body into the now-open cmd buffer. Leaves
             // the swapchain image in GENERAL.
-            recordCommandBuffer(cmdBuffers[currentFrame], imageIndex);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordCommandBuffer");
+                recordCommandBuffer(cmdBuffers[currentFrame], imageIndex);
+            }
             const auto swapExtentForCustomRt = ctx->swapchainExtent();
             const auto customRtExtent = currentRenderTarget_
                     ? activeRenderTargetExtent(*currentRenderTarget_)
@@ -19552,7 +19928,10 @@ namespace threepp {
             if (currentRenderTarget_ && directCustomToRenderTarget) {
                 recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
             }
-            recordCustomShaderMaterialPass(cmdBuffers[currentFrame], imageIndex, currentFrame, camera);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordCustomShaderMaterialPass");
+                recordCustomShaderMaterialPass(cmdBuffers[currentFrame], imageIndex, currentFrame, camera);
+            }
             if (currentRenderTarget_ && !directCustomToRenderTarget) {
                 recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
             }
@@ -19563,6 +19942,7 @@ namespace threepp {
             // visualisation drawn on top of it, otherwise they'd see
             // their own readout as scene motion and feedback-loop.
             if (sceneCaptureEnabled_) {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordSceneCapture");
                 recordSceneCapture(cmdBuffers[currentFrame], imageIndex);
             }
 
@@ -19572,6 +19952,7 @@ namespace threepp {
             // then dispatch the detector against that buffer.
             if (eventCamEnabled_ && eventCam_ &&
                 eventShadePipeline_ != VK_NULL_HANDLE) {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordEventCamera");
                 recordEventShade(cmdBuffers[currentFrame], currentFrame);
                 eventCam_->record(cmdBuffers[currentFrame],
                                   eventLumaBuf_.handle,
@@ -19597,8 +19978,11 @@ namespace threepp {
                 screenSpaceCam_->bottom = 0.f;
                 screenSpaceCam_->updateProjectionMatrix();
             }
-            overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
-                                 scene, *screenSpaceCam_, /*screenSpaceOnly=*/true);
+            {
+                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordScreenSpaceSprites");
+                overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                     scene, *screenSpaceCam_, /*screenSpaceOnly=*/true);
+            }
             return true;
         }
 
@@ -19647,6 +20031,7 @@ namespace threepp {
         // unexpectedly starts a second perspective render mid-frame.
         void endFrame() {
             if (frameState_ == FrameState::Idle) return;
+            THREEPP_VK_TRACE_FRAME_SCOPE("endFrame");
 
             const uint32_t imageIndex = frameImageIndex_;
             VkCommandBuffer cb = cmdBuffers[currentFrame];
@@ -19655,9 +20040,18 @@ namespace threepp {
             }
             const VkSemaphore presentReady = renderFinishedByImage_[imageIndex];
 
-            recordOverlayAndPresentTransition(cb, imageIndex);
-            check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
-            gpuTimings_->finishRecord();
+            {
+                THREEPP_VK_TRACE_SCOPE("endFrame.recordOverlayAndPresentTransition");
+                recordOverlayAndPresentTransition(cb, imageIndex);
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("endFrame.vkEndCommandBuffer");
+                check(vkEndCommandBuffer(cb), "vkEndCommandBuffer");
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("endFrame.gpuTimingsFinishRecord");
+                gpuTimings_->finishRecord();
+            }
 
             VkSemaphoreSubmitInfo waitInfo{};
             waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -19681,8 +20075,11 @@ namespace threepp {
             submit.pCommandBufferInfos = &cbInfo;
             submit.signalSemaphoreInfoCount = 1;
             submit.pSignalSemaphoreInfos = &signalInfo;
-            check(vkQueueSubmit2(ctx->graphicsQueue(), 1, &submit, inFlight[currentFrame]),
-                  "vkQueueSubmit2");
+            {
+                THREEPP_VK_TRACE_SCOPE("endFrame.vkQueueSubmit2");
+                check(vkQueueSubmit2(ctx->graphicsQueue(), 1, &submit, inFlight[currentFrame]),
+                      "vkQueueSubmit2");
+            }
 
             VkPresentInfoKHR pi{};
             pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
@@ -19693,7 +20090,11 @@ namespace threepp {
             pi.pSwapchains = &sc;
             pi.pImageIndices = &imageIndex;
 
-            VkResult pr = vkQueuePresentKHR(ctx->presentQueue(), &pi);
+            VkResult pr = VK_SUCCESS;
+            {
+                THREEPP_VK_TRACE_SCOPE("endFrame.vkQueuePresentKHR");
+                pr = vkQueuePresentKHR(ctx->presentQueue(), &pi);
+            }
             if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR || needsResize) {
                 needsResize = false;
                 recreateSwapchainAndDescriptors();
@@ -19721,6 +20122,7 @@ namespace threepp {
         // endFrame() runs from the Canvas frame-end callback at the tail of
         // animateOnce().
         void renderFrame(Object3D& scene, Camera& camera) {
+            THREEPP_VK_TRACE_SCOPE("renderFrame");
             const bool isOrtho = camera.is<OrthographicCamera>();
             const bool orthoDepthOverlayToRenderTarget =
                     isOrtho &&
@@ -19858,8 +20260,15 @@ namespace threepp {
     };
 
     VulkanRenderer::VulkanRenderer(Canvas& canvas) {
-        canvas.initWindow(GraphicsAPI::Vulkan);
-        pimpl_ = std::make_unique<Impl>(canvas);
+        THREEPP_VK_TRACE_SCOPE("VulkanRenderer.constructor");
+        {
+            THREEPP_VK_TRACE_SCOPE("VulkanRenderer.canvasInitWindow");
+            canvas.initWindow(GraphicsAPI::Vulkan);
+        }
+        {
+            THREEPP_VK_TRACE_SCOPE("VulkanRenderer.makeImpl");
+            pimpl_ = std::make_unique<Impl>(canvas);
+        }
         // Mirror WgpuRenderer: the user's animate lambda may call render()
         // multiple times in one iteration (e.g. main scene + HUD overlay
         // via threepp::HUD). Each render() opens or extends the in-flight
@@ -19874,6 +20283,7 @@ namespace threepp {
     VulkanRenderer::~VulkanRenderer() = default;
 
     void VulkanRenderer::render(Object3D& scene, Camera& camera) {
+        THREEPP_VK_TRACE_SCOPE("VulkanRenderer.render");
         const auto frameStart = std::chrono::high_resolution_clock::now();
         const auto cur = pimpl_->canvas.size();
         if (cur.width() != pimpl_->size.width() || cur.height() != pimpl_->size.height()) {
@@ -19954,13 +20364,19 @@ namespace threepp {
                 camera.updateMatrixWorld();
             }
             const auto sceneStart = std::chrono::high_resolution_clock::now();
-            pimpl_->ensureSceneBuilt(scene, camera);
+            {
+                THREEPP_VK_TRACE_SCOPE("VulkanRenderer.ensureSceneBuilt");
+                pimpl_->ensureSceneBuilt(scene, camera);
+            }
             // World-space Sprites (screenSpace == false) are drawn by the overlay
             // billboard pass, not the PT/G-buffer path. Snapshot them each frame
             // with fresh world matrices (ensureSceneBuilt just ran
             // updateMatrixWorld) — independent of the snapshot/lean machinery,
             // since impact sprites move/spawn/expire every frame.
-            pimpl_->collectWorldSprites(scene);
+            {
+                THREEPP_VK_TRACE_SCOPE("VulkanRenderer.collectWorldSprites");
+                pimpl_->collectWorldSprites(scene);
+            }
             pimpl_->pendingCpuEnsureSceneMs_ =
                     std::chrono::duration<float, std::milli>(
                             std::chrono::high_resolution_clock::now() - sceneStart)
@@ -19972,14 +20388,21 @@ namespace threepp {
         // detected values from ensureSceneBuilt above. Subsequent frames hit
         // the early-out for free.
         if (!pimpl_->rtPipelinesBuilt_) {
+            THREEPP_VK_TRACE_SCOPE("VulkanRenderer.buildAllRtPipelines");
             pimpl_->buildAllRtPipelines();
         }
         // After init, also ensure the *current* variant is built. The first-
         // frame build only constructs the active variant; if the user has
         // since toggled into an unbuilt slot, fill it in now (pays a one-time
         // pipeline-compile cost on first toggle, then never again).
-        pimpl_->ensureCurrentRtVariantBuilt();
-        pimpl_->renderFrame(scene, camera);
+        {
+            THREEPP_VK_TRACE_SCOPE("VulkanRenderer.ensureCurrentRtVariantBuilt");
+            pimpl_->ensureCurrentRtVariantBuilt();
+        }
+        {
+            THREEPP_VK_TRACE_SCOPE("VulkanRenderer.renderFrame");
+            pimpl_->renderFrame(scene, camera);
+        }
         pimpl_->gpuTimings_->setCpuFrameMs(
                 std::chrono::duration<float, std::milli>(
                         std::chrono::high_resolution_clock::now() - frameStart)
@@ -21575,6 +21998,9 @@ namespace threepp {
     }
 
     void VulkanRenderer::setRenderMode(RenderMode mode) {
+        if (mode == RenderMode::RasterFirst) {
+            pimpl_->ensureDeferredShade();
+        }
         if (pimpl_->renderMode_ == mode) return;
         pimpl_->renderMode_ = mode;
         // The deferred (RasterFirst) descriptor set is only rewritten on scene

@@ -1,6 +1,7 @@
 #include "threepp/renderers/vulkan/OverlayPass.hpp"
 #include "threepp/renderers/vulkan/VulkanContext.hpp"
 #include "threepp/renderers/vulkan/VulkanResources.hpp"
+#include "threepp/renderers/vulkan/VulkanWireframeGeometry.hpp"
 
 #include "threepp/cameras/Camera.hpp"
 #include "threepp/cameras/PerspectiveCamera.hpp"
@@ -72,6 +73,11 @@ namespace {
             if (range.index.handle != VK_NULL_HANDLE) destroyBuffer(allocator, range.index);
         }
         ranges.clear();
+    }
+
+    void destroyWireframeRec(VmaAllocator allocator, WireframeRec& rec) {
+        if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(allocator, rec.index);
+        rec = {};
     }
 
     void pruneLineLoopRanges(VmaAllocator allocator, std::vector<LineRec::LoopRange>& ranges, uint64_t cutoff) {
@@ -168,7 +174,6 @@ OverlayPass::~OverlayPass() {
     if (orthoLineColoredStripPipeline_) vkDestroyPipeline(d, orthoLineColoredStripPipeline_, nullptr);
     if (orthoMeshPipeline_)         vkDestroyPipeline(d, orthoMeshPipeline_, nullptr);
     if (orthoMeshTransparentPipeline_) vkDestroyPipeline(d, orthoMeshTransparentPipeline_, nullptr);
-    if (orthoMeshWireframePipeline_) vkDestroyPipeline(d, orthoMeshWireframePipeline_, nullptr);
     if (orthoTexturedMeshPipeline_) vkDestroyPipeline(d, orthoTexturedMeshPipeline_, nullptr);
     if (orthoDepthTextureMeshPipeline_) vkDestroyPipeline(d, orthoDepthTextureMeshPipeline_, nullptr);
     if (orthoPointListPipeline_)    vkDestroyPipeline(d, orthoPointListPipeline_, nullptr);
@@ -201,6 +206,10 @@ OverlayPass::~OverlayPass() {
         if (rec.lineDistance.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.lineDistance);
     }
     lineGeomCache_.clear();
+    for (auto& [g, rec] : wireframeGeomCache_) {
+        destroyWireframeRec(ctx_.allocator(), rec);
+    }
+    wireframeGeomCache_.clear();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,14 +448,6 @@ void OverlayPass::createOrthoLinePipelines() {
     check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMesh, nullptr,
                                     &orthoMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoMesh)");
-
-    VkPipelineRasterizationStateCreateInfo rsWire = rs;
-    rsWire.polygonMode = VK_POLYGON_MODE_LINE;
-    VkGraphicsPipelineCreateInfo gpciMeshWire = gpciMesh;
-    gpciMeshWire.pRasterizationState = &rsWire;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshWire, nullptr,
-                                    &orthoMeshWireframePipeline_),
-          "vkCreateGraphicsPipelines(orthoMeshWireframe)");
 
     VkPipelineColorBlendAttachmentState cbasT = cbas;
     cbasT.blendEnable         = VK_TRUE;
@@ -1448,6 +1449,75 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
     return &lineGeomCache_.emplace(geom, std::move(rec)).first->second;
 }
 
+WireframeRec*
+OverlayPass::ensureWireframeGeometryUploaded(const BufferGeometry* geom) {
+    if (!geom || !geom->hasAttribute("position")) return nullptr;
+    const auto* idxAttr = geom->getIndex();
+    const auto* posAttr = geom->getAttribute<float>("position");
+    if ((!idxAttr || idxAttr->count() == 0) && (!posAttr || posAttr->count() < 3)) {
+        return nullptr;
+    }
+
+    const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : ~0u;
+    const uint32_t posVer = (idxAttr && idxAttr->count() > 0) ? ~0u : (posAttr ? posAttr->version : ~0u);
+    const uint32_t attrVer = geom->attributesVersion();
+
+    auto upload = [&](WireframeRec& rec) {
+        const auto indices = buildWireframeIndices(*geom);
+        rec.indexCount = static_cast<uint32_t>(indices.size());
+        rec.indexVersion = idxVer;
+        rec.positionVersion = posVer;
+        rec.attributesVersion = attrVer;
+        rec.geomId = geom->id;
+        rec.lastTouch = overlayFrameCounter_;
+
+        if (indices.empty()) {
+            if (rec.index.handle != VK_NULL_HANDLE) {
+                destroyBuffer(ctx_.allocator(), rec.index);
+                rec.index = {};
+            }
+            return;
+        }
+
+        const VkDeviceSize bytes = indices.size() * sizeof(unsigned int);
+        if (rec.index.handle == VK_NULL_HANDLE || bytes > rec.index.size) {
+            if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
+            rec.index = createBuffer(
+                    ctx_.allocator(), ctx_.device(), bytes,
+                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        }
+
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.index.alloc, &mapped);
+        std::memcpy(mapped, indices.data(), bytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.index.alloc);
+    };
+
+    auto it = wireframeGeomCache_.find(geom);
+    if (it != wireframeGeomCache_.end() && it->second.geomId != geom->id) {
+        destroyWireframeRec(ctx_.allocator(), it->second);
+        wireframeGeomCache_.erase(it);
+        it = wireframeGeomCache_.end();
+    }
+    if (it != wireframeGeomCache_.end()) {
+        auto& rec = it->second;
+        rec.lastTouch = overlayFrameCounter_;
+        if (rec.indexVersion == idxVer &&
+            rec.positionVersion == posVer &&
+            rec.attributesVersion == attrVer) {
+            return &rec;
+        }
+        upload(rec);
+        return &rec;
+    }
+
+    WireframeRec rec{};
+    upload(rec);
+    return &wireframeGeomCache_.emplace(geom, std::move(rec)).first->second;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Main record entry point
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1489,6 +1559,14 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                 it = lineGeomCache_.erase(it);
             } else {
                 pruneLineLoopRanges(ctx_.allocator(), it->second.loopRanges, cutoff);
+                ++it;
+            }
+        }
+        for (auto it = wireframeGeomCache_.begin(); it != wireframeGeomCache_.end();) {
+            if (it->second.lastTouch < cutoff) {
+                destroyWireframeRec(ctx_.allocator(), it->second);
+                it = wireframeGeomCache_.erase(it);
+            } else {
                 ++it;
             }
         }
@@ -1785,7 +1863,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
             VkPipeline want;
-            if (md.wireframe)       want = orthoMeshWireframePipeline_;
+            if (md.wireframe)       want = orthoLineListPipeline_;
             else if (md.transparent) want = orthoMeshTransparentPipeline_;
             else                    want = orthoMeshPipeline_;
             if (want != curMesh) {
@@ -1808,7 +1886,12 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             VkBuffer     vb[1] = {rec->vertex.handle};
             VkDeviceSize vo[1] = {0};
             vkCmdBindVertexBuffers(cb, 0, 1, vb, vo);
-            if (rec->index.handle != VK_NULL_HANDLE) {
+            if (md.wireframe) {
+                auto* wrec = ensureWireframeGeometryUploaded(md.mesh->geometry().get());
+                if (!wrec || wrec->index.handle == VK_NULL_HANDLE || wrec->indexCount == 0) continue;
+                vkCmdBindIndexBuffer(cb, wrec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, wrec->indexCount, 1, 0, 0, 0);
+            } else if (rec->index.handle != VK_NULL_HANDLE) {
                 vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cb, rec->indexCount, 1, 0, 0, 0);
             } else {

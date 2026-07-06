@@ -487,8 +487,6 @@ namespace threepp::vulkan {
         // pulling the feature in keeps the door open for future per-draw
         // pulls and is universally supported on RT-capable hardware.
         features2.features.multiDrawIndirect = VK_TRUE;
-        // VK_POLYGON_MODE_LINE for the wireframe overlay pipeline.
-        features2.features.fillModeNonSolid = VK_TRUE;
         // Storage-image writes without a format qualifier — lets shaders write
         // to BGRA8 swap targets without declaring rgba8 (which would mismatch
         // the underlying VkImageView format and produce a validation warning).

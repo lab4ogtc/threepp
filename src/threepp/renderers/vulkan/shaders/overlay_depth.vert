@@ -1,8 +1,8 @@
 #version 460
 
-// Hybrid raster overlay's UNJITTERED depth prepass. Same scene-geometry
-// submit as gbuffer.vert but writes only depth, using cam.currVPunjittered
-// instead of cam.currVPjittered. This produces a depth attachment whose
+// Hybrid raster overlay's UNJITTERED depth prepass. Same opaque/depth-occluding
+// scene-geometry submit as gbuffer.vert but writes only depth, using
+// cam.currVPunjittered instead of cam.currVPjittered. This produces a depth attachment whose
 // per-pixel z values exactly match what overlay.vert computes when shading
 // wireframe / line overlays — so the overlay pass's depth test compares
 // like-with-like and doesn't shimmer between frames.

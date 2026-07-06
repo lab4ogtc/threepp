@@ -45,6 +45,16 @@ namespace threepp::vulkan {
         std::vector<LoopRange> loopRanges;
     };
 
+    struct WireframeRec {
+        Buffer   index;
+        uint32_t indexCount = 0;
+        uint32_t indexVersion = ~0u;
+        uint32_t positionVersion = ~0u;
+        uint32_t attributesVersion = ~0u;
+        unsigned int geomId = 0;
+        uint64_t lastTouch = 0;
+    };
+
 }// namespace threepp::vulkan
 
 #endif// THREEPP_VULKAN_FRAME_TYPES_HPP
