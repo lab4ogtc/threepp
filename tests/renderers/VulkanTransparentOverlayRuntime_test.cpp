@@ -122,6 +122,14 @@ namespace {
         return scene;
     }
 
+    Scene makeMutableBasicMaterialScene(const std::shared_ptr<MeshBasicMaterial>& material) {
+        Scene scene;
+        scene.background = Color::black;
+        material->side = Side::Double;
+        scene.add(Mesh::create(PlaneGeometry::create(2.4f, 2.4f), material));
+        return scene;
+    }
+
 }// namespace
 
 int main() {
@@ -148,6 +156,8 @@ int main() {
         auto referenceScene = makeReferenceOpacityScene();
         auto referenceCubeScene = makeReferenceCubeOpacityScene();
         auto transparentLayerScene = makeTransparentCubeOverTranslucentPlaneScene();
+        auto mutableMaterial = MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color(0xffff00)));
+        auto mutableScene = makeMutableBasicMaterialScene(mutableMaterial);
 
         PerspectiveCamera camera(60.f, 1.f, 0.1f, 10.f);
         camera.position.z = 3.f;
@@ -292,6 +302,48 @@ int main() {
                             static_cast<unsigned long long>(center.sumG),
                             static_cast<unsigned long long>(center.sumB),
                             center.red, center.green, center.blue,
+                            pass ? "PASS" : "FAIL");
+                if (!pass) std::exit(1);
+                renderer.render(mutableScene, camera);
+                ++frame;
+                return;
+            }
+
+            if (frame < 88) {
+                renderer.render(mutableScene, camera);
+                ++frame;
+                return;
+            }
+
+            if (frame == 88) {
+                mutableMaterial->color = Color(0x0000ff);
+                renderer.render(mutableScene, camera);
+                ++frame;
+                return;
+            }
+
+            if (frame < 96) {
+                renderer.render(mutableScene, camera);
+                ++frame;
+                return;
+            }
+
+            if (frame == 96) {
+                const auto center = countCenter(framebuffer);
+                const auto pixels = center.samples;
+                const auto avgR = center.sumR / pixels;
+                const auto avgG = center.sumG / pixels;
+                const auto avgB = center.sumB / pixels;
+                const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
+                                  center.nonBlack > static_cast<int>(pixels / 2) &&
+                                  avgB > 180 &&
+                                  avgR < 80 &&
+                                  avgG < 80;
+                std::printf("[transparent] MeshBasic live color mutation without needsUpdate bytes=%zu avg=(%llu,%llu,%llu) -> %s\n",
+                            framebuffer.size(),
+                            static_cast<unsigned long long>(avgR),
+                            static_cast<unsigned long long>(avgG),
+                            static_cast<unsigned long long>(avgB),
                             pass ? "PASS" : "FAIL");
                 std::exit(pass ? 0 : 1);
             }

@@ -1464,6 +1464,7 @@ namespace threepp {
             unsigned int geomVersion = 0;// composite BufferAttribute version (pos+norm+idx+uv+uv2)
             std::array<float, 16> matrix{};
             std::array<float, 21> pbr{};// + normalScale.xy + transmission/ior + clearcoat/roughness + clearcoatNormalScale.xy + envMapIntensity/envMapCombine + aoMapIntensity/lightMapIntensity
+            std::array<float, 40> materialValues{};// public scalar fields can change without Material::needsUpdate()
             // TYPED views + attribute-pointer cache for the snapshot lean diff
             // (the void* fields above are compare-only). attrVersion gates the
             // cached attribute pointers: while BufferGeometry::
@@ -6742,6 +6743,82 @@ namespace threepp {
             d.albedo[2] *= values[base + 2];
         }
 
+        static std::array<float, 21> materialPbrFingerprint(const MaterialDesc& md) {
+            return {md.albedo[0], md.albedo[1], md.albedo[2],
+                    md.roughness, md.metalness,
+                    md.emissive[0], md.emissive[1], md.emissive[2],
+                    md.emissiveIntensity,
+                    md.normalScale[0], md.normalScale[1],
+                    md.transmission, md.ior,
+                    md.clearcoat, md.clearcoatRoughness,
+                    md.clearcoatNormalScale[0], md.clearcoatNormalScale[1],
+                    md.envMapIntensity,
+                    static_cast<float>(md.envMapCombine),
+                    md.aoMapIntensity,
+                    md.lightMapIntensity};
+        }
+
+        static std::array<float, 40> materialValueFingerprint(const Mesh& m) {
+            std::array<float, 40> out{};
+            const auto mat = m.material();
+            if (!mat) return out;
+
+            out[0] = mat->opacity;
+            out[1] = mat->transparent ? 1.f : 0.f;
+            out[2] = mat->alphaTest;
+            out[3] = static_cast<float>(as_integer(mat->side));
+            out[4] = static_cast<float>(as_integer(mat->blending));
+            if (auto* col = dynamic_cast<MaterialWithColor*>(mat.get())) {
+                out[8] = col->color.r;
+                out[9] = col->color.g;
+                out[10] = col->color.b;
+            }
+            if (auto* rg = dynamic_cast<MaterialWithRoughness*>(mat.get())) out[11] = rg->roughness;
+            if (auto* mt = dynamic_cast<MaterialWithMetalness*>(mat.get())) out[12] = mt->metalness;
+            if (auto* em = dynamic_cast<MaterialWithEmissive*>(mat.get())) {
+                out[13] = em->emissive.r;
+                out[14] = em->emissive.g;
+                out[15] = em->emissive.b;
+                out[16] = em->emissiveIntensity;
+            }
+            if (auto* sp = dynamic_cast<MaterialWithSpecular*>(mat.get())) {
+                out[17] = sp->specular.r;
+                out[18] = sp->specular.g;
+                out[19] = sp->specular.b;
+                out[20] = sp->shininess;
+            }
+            if (auto* env = dynamic_cast<MaterialWithEnvMap*>(mat.get())) out[21] = env->envMapIntensity;
+            if (auto* combine = dynamic_cast<MaterialWithCombine*>(mat.get())) out[22] = static_cast<float>(as_integer(combine->combine));
+            if (auto* ao = dynamic_cast<MaterialWithAoMap*>(mat.get())) out[23] = ao->aoMapIntensity;
+            if (auto* light = dynamic_cast<MaterialWithLightMap*>(mat.get())) out[24] = light->lightMapIntensity;
+            if (auto* nm = dynamic_cast<MaterialWithNormalMap*>(mat.get())) {
+                out[25] = nm->normalScale.x;
+                out[26] = nm->normalScale.y;
+            }
+            if (auto* tr = dynamic_cast<MaterialWithTransmission*>(mat.get())) {
+                out[27] = tr->transmission;
+                out[28] = tr->ior;
+                out[39] = tr->dispersion;
+            }
+            if (auto* cc = dynamic_cast<MaterialWithClearcoat*>(mat.get())) {
+                out[29] = cc->clearcoat;
+                out[30] = cc->clearcoatRoughness;
+                out[31] = cc->clearcoatNormalScale.x;
+                out[32] = cc->clearcoatNormalScale.y;
+            }
+            if (auto* at = dynamic_cast<MaterialWithAttenuation*>(mat.get())) {
+                out[33] = at->attenuationColor.r;
+                out[34] = at->attenuationColor.g;
+                out[35] = at->attenuationColor.b;
+                out[36] = at->attenuationDistance;
+            }
+            if (auto* disp = dynamic_cast<MaterialWithDisplacementMap*>(mat.get())) {
+                out[37] = disp->displacementScale;
+                out[38] = disp->displacementBias;
+            }
+            return out;
+        }
+
         static std::shared_ptr<Texture> emissiveTexOf(const Mesh& m) {
             auto mat = m.material();
             if (!mat) return nullptr;
@@ -7346,6 +7423,7 @@ namespace threepp {
                     const bool xfmChanged =
                             std::memcmp(fp.matrix.data(), en.worldMatrix.data(), sizeof(fp.matrix)) != 0;
                     bool matChanged = false;
+                    const auto materialValues = materialValueFingerprint(*en.mesh);
                     const unsigned int matVer = fp.matTyped ? fp.matTyped->version() : 0u;
                     if (matVer != fp.matVersion) {
                         Mesh* m = en.mesh;
@@ -7372,18 +7450,14 @@ namespace threepp {
                         fp.matVersion = matVer;
                         MaterialDesc md = materialDescForMesh(*m);
                         applyInstanceColor(md, en);
-                        fp.pbr = {md.albedo[0], md.albedo[1], md.albedo[2],
-                                  md.roughness, md.metalness,
-                                  md.emissive[0], md.emissive[1], md.emissive[2],
-                                  md.emissiveIntensity,
-                                  md.normalScale[0], md.normalScale[1],
-                                  md.transmission, md.ior,
-                                  md.clearcoat, md.clearcoatRoughness,
-                                  md.clearcoatNormalScale[0], md.clearcoatNormalScale[1],
-                                  md.envMapIntensity,
-                                  static_cast<float>(md.envMapCombine),
-                                  md.aoMapIntensity,
-                                  md.lightMapIntensity};
+                        fp.pbr = materialPbrFingerprint(md);
+                        fp.materialValues = materialValues;
+                    } else if (materialValues != fp.materialValues) {
+                        matChanged = true;
+                        MaterialDesc md = materialDescForMesh(*en.mesh);
+                        applyInstanceColor(md, en);
+                        fp.pbr = materialPbrFingerprint(md);
+                        fp.materialValues = materialValues;
                     }
                     BufferGeometry* g = fp.geomTyped;
                     const unsigned int av = g->attributesVersion();
@@ -7455,6 +7529,7 @@ namespace threepp {
                 auto matSp = m->material();
                 const Material* matPtr = matSp.get();
                 const unsigned int matVer = matPtr ? matPtr->version() : 0u;
+                const auto materialValues = materialValueFingerprint(*m);
                 const void* geomPtr = m->geometry().get();
                 const unsigned int geomVer = geomVersionOf(*m->geometry());
 
@@ -7464,11 +7539,11 @@ namespace threepp {
                     const auto& p = prevSceneFingerprint[i];
                     if (p.mesh == m && p.mat == matPtr && p.geom == geomPtr &&
                         p.instanceIndex == en.instanceIndex &&
-                        p.matVersion == matVer && p.geomVersion == geomVer) {
-                        // Texture pointers + pbr live on the material; matVersion
-                        // unchanged means none of them moved. Copy everything from
-                        // prev, then overwrite matrix (transform can change without
-                        // bumping mat version — Object3D xfm is independent).
+                        p.matVersion == matVer && p.geomVersion == geomVer &&
+                        p.materialValues == materialValues) {
+                        // Texture pointers + material values match. Copy
+                        // everything from prev, then overwrite matrix (transform
+                        // can change without bumping material version).
                         fp = p;
                         fp.matrix = en.worldMatrix;
                         fastPath = true;
@@ -7480,6 +7555,7 @@ namespace threepp {
                     fp.geom = geomPtr;
                     fp.mat  = matPtr;
                     fp.matVersion = matVer;
+                    fp.materialValues = materialValues;
                     fp.geomVersion = geomVer;
                     fp.matTyped  = matPtr;
                     fp.geomTyped = m->geometry().get();
@@ -7509,18 +7585,7 @@ namespace threepp {
                     fp.matrix                = en.worldMatrix;
                     MaterialDesc md = materialDescForMesh(*m);
                     applyInstanceColor(md, en);
-                    fp.pbr = {md.albedo[0], md.albedo[1], md.albedo[2],
-                              md.roughness, md.metalness,
-                              md.emissive[0], md.emissive[1], md.emissive[2],
-                              md.emissiveIntensity,
-                              md.normalScale[0], md.normalScale[1],
-                              md.transmission, md.ior,
-                              md.clearcoat, md.clearcoatRoughness,
-                              md.clearcoatNormalScale[0], md.clearcoatNormalScale[1],
-                              md.envMapIntensity,
-                              static_cast<float>(md.envMapCombine),
-                              md.aoMapIntensity,
-                              md.lightMapIntensity};
+                    fp.pbr = materialPbrFingerprint(md);
                 }
             }
             }// !leanOk (fingerprint re-derivation)
@@ -7675,8 +7740,9 @@ namespace threepp {
                     // on every setMaterialProperty hit, so this fires whenever
                     // anything on the material has been touched even if the
                     // PBR floats themselves didn't move.
-                    const bool matChanged   = std::memcmp(a.pbr.data(),    b.pbr.data(),    sizeof(a.pbr))    != 0
-                                              || a.matVersion != b.matVersion;
+                    const bool matChanged   = std::memcmp(a.pbr.data(), b.pbr.data(), sizeof(a.pbr)) != 0 ||
+                                              a.materialValues != b.materialValues ||
+                                              a.matVersion != b.matVersion;
                     const bool bonesChanged = entryBonesDirty[i];
                     const bool dispChanged  = entryDisplacedDirty[i];
                     const bool grassChanged = entryGrassDirty[i];
