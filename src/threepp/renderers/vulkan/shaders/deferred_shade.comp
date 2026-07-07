@@ -191,6 +191,7 @@ layout(set = 0, binding = 35, scalar) uniform ShadowMapUbo {
 } shadowMaps;
 layout(set = 0, binding = 36) uniform sampler2DArrayShadow shadowDepthMaps;
 
+// depthTest=false 或 depthWrite=false 时，深度附件不是当前片元深度。
 const uint kGbufFlagNoDepth = 64u;
 
 float gbufferSurfaceDepth(ivec2 q, uint flags) {
@@ -379,6 +380,29 @@ float distGGX(float NdotH, float roughness) {
 float geomSmithG1(float NdotX, float k) { return NdotX / (NdotX * (1.0 - k) + k); }
 vec3 fresnelSchlick(float cosTheta, vec3 F0) {
     return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+}
+
+vec3 blinnPhongFresnel(vec3 specularColor, float dotLH) {
+    const float fresnel = exp2((-5.55473 * dotLH - 6.98316) * dotLH);
+    return (vec3(1.0) - specularColor) * fresnel + specularColor;
+}
+
+vec3 directBlinnPhong(vec3 radiance, vec3 N, vec3 V, vec3 L, vec3 albedo,
+                      vec3 specularColor, float shininess,
+                      float specularMapStrength, bool useLegacyLights) {
+    const float NdotL = max(dot(N, L), 0.0);
+    vec3 irradiance = radiance * NdotL;
+    if (useLegacyLights) {
+        irradiance *= PI;
+    }
+    const vec3 diffuse = irradiance * albedo * (1.0 / PI);
+    const vec3 H = normalize(L + V);
+    const float dotNH = max(dot(N, H), 0.0);
+    const float dotLH = max(dot(L, H), 0.0);
+    const vec3 fresnel = blinnPhongFresnel(specularColor, dotLH);
+    const float specularStrength = 0.25 * (1.0 / PI) * (shininess * 0.5 + 1.0)
+                                 * pow(dotNH, shininess) * specularMapStrength;
+    return diffuse + irradiance * fresnel * specularStrength;
 }
 vec2 envBRDFApprox(float NdotV, float r) {
     const vec4 c0 = vec4(-1.0, -0.0275, -0.572, 0.022);
@@ -848,7 +872,14 @@ vec3 evalLight(vec3 N, vec3 clearcoatN, vec3 V, vec3 L,
                float NdotV, float clearcoatNdotV, vec3 F0, vec3 albedo,
                float roughness, float metalness, float k,
                float clearcoat, float clearcoatRoughness,
-               vec3 sheenColor, float sheenRoughness) {
+               vec3 sheenColor, float sheenRoughness,
+               float specularIntensity, vec3 specularColor,
+               float legacyPhongShininess) {
+    if (legacyPhongShininess >= 0.0) {
+        return directBlinnPhong(vec3(1.0), N, V, L, albedo,
+                                specularColor, legacyPhongShininess,
+                                specularIntensity, false);
+    }
     const float NdotL = max(dot(N, L), 0.0);
     const vec3  H     = normalize(V + L);
     const float VdotH = max(dot(V, H), 0.0);
@@ -1459,6 +1490,7 @@ vec3 emissiveIrradiance(vec3 P, vec3 N, int EM_SAMPLES, bool doShadows) {
 }
 
 vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float missLod, inout uint seed, bool cheapHits);// fwd decl
+vec3 traceRadianceMasked(vec3 origin, vec3 dir, bool doShadows, float maxLod, float missLod, inout uint seed, bool cheapHits, uint cullMask);// fwd decl
 vec3 giRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, inout uint seed);// fwd decl (cheap 1-bounce GI)
 
 vec3 traceAccentRadiance(vec3 origin, vec3 dir, bool doShadows,
@@ -1623,6 +1655,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
                         float clearcoat, float clearcoatRoughness,
                         vec3 sheenColor, float sheenRoughness,
                         float specularIntensity, vec3 specularColor,
+                        float legacyPhongShininess,
                         float iridescence, float iridescenceIOR, float iridescenceThicknessNm,
                         inout uint seed, bool addEmissive, bool cheapHit) {
     const float NdotV = max(dot(N, V), 1e-4);
@@ -1670,7 +1703,8 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
         const float vis = (doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? directShadowVis(lights.dirLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0) * wPick;
         if (vis <= 0.0) continue;
         lit += evalLight(N, clearcoatN, V, L, NdotV, clearcoatNdotV, F0, albedo, roughness, metalness, k,
-                         clearcoat, clearcoatRoughness, sheenColor, sheenRoughness)
+                         clearcoat, clearcoatRoughness, sheenColor, sheenRoughness,
+                         specularIntensity, specularColor, legacyPhongShininess)
                * lights.dirLights[i].color * vis;
     }
     for (uint i = 0u; i < lights.pointCount; ++i) {
@@ -1692,7 +1726,8 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
             atten *= wnd * wnd;
         }
         lit += evalLight(N, clearcoatN, V, toL, NdotV, clearcoatNdotV, F0, albedo, roughness, metalness, k,
-                         clearcoat, clearcoatRoughness, sheenColor, sheenRoughness)
+                         clearcoat, clearcoatRoughness, sheenColor, sheenRoughness,
+                         specularIntensity, specularColor, legacyPhongShininess)
                * lights.pointLights[i].color * atten * vis;
     }
     for (uint i = 0u; i < lights.spotCount; ++i) {
@@ -1719,7 +1754,8 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
         }
         atten *= spotAtten;
         lit += evalLight(N, clearcoatN, V, toL, NdotV, clearcoatNdotV, F0, albedo, roughness, metalness, k,
-                         clearcoat, clearcoatRoughness, sheenColor, sheenRoughness)
+                         clearcoat, clearcoatRoughness, sheenColor, sheenRoughness,
+                         specularIntensity, specularColor, legacyPhongShininess)
                * lights.spotLights[i].color * atten * vis;
     }
 
@@ -1964,7 +2000,7 @@ vec3 sampleGGXReflectionFib(vec3 V, vec3 N, float roughness, int s, int count) {
 // reaches the screen UNBLURRED — clear glass (its denoise path is deliberately
 // sharp), additive/alpha-blend behind-traces straight into `lit` — must pass
 // false: the stochastic pick showed as per-pixel noise in the glass sphere.
-vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float missLod, inout uint seed, bool cheapHits) {
+vec3 traceRadianceMasked(vec3 origin, vec3 dir, bool doShadows, float maxLod, float missLod, inout uint seed, bool cheapHits, uint cullMask) {
     const int REFL_MAX_BOUNCES = 3;
     vec3  radiance   = vec3(0.0);
     vec3  tput       = vec3(1.0);
@@ -1974,7 +2010,7 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
 
     for (int b = 0; b < REFL_MAX_BOUNCES; ++b) {
         rayQueryEXT rq;
-        rayQueryInitializeEXT(rq, topAS, gl_RayFlagsOpaqueEXT, 0xFFu, o, 1e-3, d, 1e30);
+        rayQueryInitializeEXT(rq, topAS, gl_RayFlagsOpaqueEXT, cullMask, o, 1e-3, d, 1e30);
         while (rayQueryProceedEXT(rq)) {}
         if (rayQueryGetIntersectionTypeEXT(rq, true) == gl_RayQueryCommittedIntersectionNoneEXT) {
             radiance += tput * sampleEnvLod(d, curMissLod);// escaped → environment
@@ -2075,6 +2111,7 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
                                               hClearcoat, hClearcoatRoughness,
                                               hm.sheenColor, hm.sheenRoughness,
                                               hSpecularIntensity, hm.specularColor,
+                                              hm.dispersion < 0.0 ? -hm.dispersion : -1.0,
                                               hm.iridescence, hm.iridescenceIOR, hm.iridescenceThicknessNm, seed,
                                               /*addEmissive=*/true,// reflected hit: no per-pixel reservoir → coherent emissiveNEE
                                               /*cheapHit=*/cheapHits);// caller decides (see header comment)
@@ -2109,6 +2146,10 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
         curMissLod = hRough * maxLod;
     }
     return radiance;
+}
+
+vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float missLod, inout uint seed, bool cheapHits) {
+    return traceRadianceMasked(origin, dir, doShadows, maxLod, missLod, seed, cheapHits, 0xFFu);
 }
 
 // CHEAP 1-bounce diffuse GI — replaces the recursive traceRadiance on the GI
@@ -2433,6 +2474,7 @@ vec3 shadeWater(vec3 P, vec3 N, vec3 V, MaterialDesc pm, int instIdx,
                                                           0.0, 0.0,
                                                           vec3(0.0), 0.0,
                                                           1.0, vec3(1.0),
+                                                          -1.0,
                                                           0.0, 1.3, 0.0, seed,
                                                           /*addEmissive=*/true,// foam: no iridescence
                                                           /*cheapHit=*/false);
@@ -2521,6 +2563,7 @@ void traceGlassInterior(vec3 origin, vec3 dir, float maxLod, bool doShadows, ino
                                                         hClearcoat, hClearcoatRoughness,
                                                         hm.sheenColor, hm.sheenRoughness,
                                                         hSpecularIntensity, hm.specularColor,
+                                                        hm.dispersion < 0.0 ? -hm.dispersion : -1.0,
                                                         hm.iridescence, hm.iridescenceIOR, hm.iridescenceThicknessNm, seed,
                                                         /*addEmissive=*/true, /*cheapHit=*/true);
                 overT *= (1.0 - a);
@@ -2605,6 +2648,7 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
     // glass — with the lobe now capped near-mirror, a gentle floor keeps the
     // sky crisp and the sun reads as a real glint. Scene hits stay sharp.
     const float missLod = max(gr, 0.10) * maxLod;
+    const bool glThinWalledThrough = pm.thinWalled != 0 && pm.attenuationDistance > 0.0;
 
     vec3 sum = vec3(0.0);
     for (int s = 0; s < kGlassSamples; ++s) {
@@ -2629,8 +2673,11 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
             // "washed, detail-destroyed" look over e.g. a watch dial.
             const vec3 dT = -V;// straight-through (net-zero thin-shell bend)
             {
-                const vec3 behind = traceAccentRadiance(P - N * SHADOW_EPS, dT, doShadows, maxLod, missLod, seed,
-                                                        /*cheapHits=*/false);// refracted content is sharp
+                const vec3 behind = glThinWalledThrough
+                        ? traceRadianceMasked(P - N * SHADOW_EPS, dT, doShadows, maxLod, missLod, seed,
+                                              /*cheapHits=*/false, kRayMaskOpaque)
+                        : traceAccentRadiance(P - N * SHADOW_EPS, dT, doShadows, maxLod, missLod, seed,
+                                              /*cheapHits=*/false);
                 vec3 tint = albedo;
                 if (pm.attenuationDistance > 0.0 && pm.thickness > 0.0)
                     tint *= pow(max(pm.attenuationColor, vec3(1e-6)), vec3(pm.thickness / pm.attenuationDistance));
@@ -2685,7 +2732,10 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
         // speckle. 6.0 (was 2.5): with the lobe capped near-mirror the scatter
         // is coherent, and the old cap flattened every highlight — glass needs
         // its bright glints or it reads dull.
-        vec3 contrib = mix(transmitColor, reflectColor, F);
+        // GL 路径下带体吸收的 thinWalled 更接近直通背景乘 tint；不要再叠加
+        // deferred 专属的玻璃反射，否则 thickness=0 的面也会被天空反射洗掉。
+        const float surfaceF = glThinWalledThrough ? 0.0 : F;
+        vec3 contrib = mix(transmitColor, reflectColor, surfaceF);
         const float cl = max(max(contrib.r, contrib.g), contrib.b);
         if (cl > 6.0) contrib *= 6.0 / cl;
         sum += contrib;
@@ -2700,7 +2750,7 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
     // (possibly denoise-blurred) reflect/refract channel, like a real
     // highlight rides on frosted glass.
     vec3 glint = vec3(0.0);
-    {
+    if (!glThinWalledThrough) {
         const float NdotV = max(dot(N, V), 1e-4);
         const float kG    = (gr + 1.0) * (gr + 1.0) / 8.0;
         const vec3  iorRgb = dispersionIorRgb(ior, pm.dispersion);
@@ -3246,6 +3296,7 @@ void main() {
                                   clearcoat, clearcoatRoughness,
                                   pm.sheenColor, pm.sheenRoughness,
                                   specularIntensity, pm.specularColor,
+                                  pm.dispersion < 0.0 ? -pm.dispersion : -1.0,
                                   pm.iridescence, pm.iridescenceIOR, pm.iridescenceThicknessNm, seed,
                                   /*addEmissive=*/rayAccentsOn() && ((pc.flags & 8u) == 0u),// ReSTIR on → emissive via main()/diffInd; off → coherent emissiveNEE here
                                   /*cheapHit=*/false);// primary: exhaustive lights + full NEE

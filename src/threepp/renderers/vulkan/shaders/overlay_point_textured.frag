@@ -14,9 +14,6 @@ layout(push_constant) uniform Pc {
 layout(location = 0) out vec4 outColor;
 
 void main() {
-    vec2 d = gl_PointCoord - vec2(0.5);
-    if (dot(d, d) > 0.25) discard;
-
     vec4 tex = pc.point.z > 0.5 ? texture(mapTex, gl_PointCoord) : vec4(1.0);
     float alpha = tex.a;
     if (pc.point.w > 0.5) {

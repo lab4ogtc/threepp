@@ -28,7 +28,7 @@ namespace threepp::vulkan {
 
         Buffer   vertex;
         Buffer   index;// VK_NULL_HANDLE if non-indexed
-        Buffer   color;// VK_NULL_HANDLE if no "color" attribute
+        Buffer   color;// per-vertex color, or white fallback when no "color" attribute
         Buffer   lineDistance;// VK_NULL_HANDLE if no "lineDistance" attribute
         uint32_t vertexCount     = 0;
         uint32_t indexCount      = 0;
@@ -36,6 +36,7 @@ namespace threepp::vulkan {
         uint32_t indexVersion    = 0;
         uint32_t colorVersion    = 0;
         uint32_t lineDistanceVersion = 0;
+        bool colorIsFallback = false;
         // BufferGeometry::id (monotonic per construction). Detects pointer
         // recycle — a freed geometry's address reused for a new geometry
         // would have fresh version=0 fields that match the stale record,

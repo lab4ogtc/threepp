@@ -72,7 +72,7 @@ layout(location = 1) out vec4 outMotion;
 //        clears IDs to 0 before any draw)
 //   .y = instanceCustomIndex + 1 for geometry lookups / same-mesh guards
 //   .z = flags (bit 0 is_water, bit 3 skinned, bit 4 flatShading, bit 5 receiveShadow,
-//               bit 6 noDepthTest)
+//               bit 6 depth attachment not valid for this pixel)
 //   .w = reserved
 layout(location = 2) out uvec4 outIds;
 

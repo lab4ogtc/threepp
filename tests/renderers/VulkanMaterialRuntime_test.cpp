@@ -1512,6 +1512,28 @@ int main() {
         thicknessMapLight->position.set(0.f, 0.f, 5.f);
         thicknessMapScene.add(thicknessMapLight);
 
+        Scene thinWalledThroughScene;
+        auto emissiveBehind = MeshStandardMaterial::create(
+                MeshStandardMaterial::Params{}
+                        .color(Color::black)
+                        .emissive(Color(0x00ff00))
+                        .emissiveIntensity(20.f)
+                        .roughness(1.f)
+                        .metalness(0.f));
+        thinWalledThroughScene.add(Mesh::create(makePanel(-1.15f, 1.15f, -0.35f), emissiveBehind));
+        auto thinAbsorber = MeshPhysicalMaterial::create(
+                MeshPhysicalMaterial::Params{}
+                        .color(Color(0xffffff))
+                        .roughness(1.f)
+                        .metalness(0.f)
+                        .transmission(1.f)
+                        .ior(1.5f)
+                        .thickness(0.f)
+                        .attenuationColor(Color(0xffffff))
+                        .attenuationDistance(1.f));
+        thinAbsorber->thinWalled = true;
+        thinWalledThroughScene.add(Mesh::create(makePanel(-1.15f, 1.15f, 0.f), thinAbsorber));
+
         Scene sideScene;
         sideScene.add(Mesh::create(makeUvQuad(1.6f, -0.35f), background));
         auto frontSide = MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color(0x00ff00)));
@@ -2616,6 +2638,22 @@ int main() {
                             right.red, right.nonBlack,
                             thicknessMapPass ? "PASS" : "FAIL");
                 if (!thicknessMapPass) std::exit(1);
+                renderer.render(thinWalledThroughScene, camera);
+                ++frame;
+                return;
+            }
+
+            if (frame == 58) {
+                const auto through = countRegion(framebuffer, 128, 16, 112);
+                const bool throughPass = framebuffer.size() == expectedReadbackBytes() &&
+                                         through.green > 3500 &&
+                                         through.red < 1200 &&
+                                         through.blue < 1200;
+                std::printf("[phase5] MeshPhysical thinWalled attenuation behind-shade bytes=%zu green=%d red=%d blue=%d nonBlack=%d -> %s\n",
+                            framebuffer.size(),
+                            through.green, through.red, through.blue, through.nonBlack,
+                            throughPass ? "PASS" : "FAIL");
+                if (!throughPass) std::exit(1);
                 renderer.render(pbrDepthWriteScene, camera);
                 ++frame;
                 return;

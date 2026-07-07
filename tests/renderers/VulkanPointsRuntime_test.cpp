@@ -61,6 +61,14 @@ namespace {
         return geometry;
     }
 
+    std::shared_ptr<BufferGeometry> makeSinglePointGeometryWithoutColor() {
+        auto geometry = BufferGeometry::create();
+        geometry->setAttribute("position", FloatBufferAttribute::create({
+                0.f, 0.f, 0.f,
+        }, 3));
+        return geometry;
+    }
+
     std::shared_ptr<DataTexture> makeSolidTexture(unsigned char r, unsigned char g,
                                                   unsigned char b, unsigned char a) {
         std::vector<unsigned char> pixels = {r, g, b, a};
@@ -116,6 +124,11 @@ int main() {
         colorScene.add(Points::create(colorGeometry, colorMaterial));
 
         OrthographicCamera colorCamera(-1, 1, 0.75f, -0.75f, 0, 1);
+
+        auto noColorMaterial = PointsMaterial::create(
+                PointsMaterial::Params{}.size(28.f).color(Color(0xff0000)));
+        Scene noColorScene;
+        noColorScene.add(Points::create(makeSinglePointGeometryWithoutColor(), noColorMaterial));
 
         auto attenuationGeometry = BufferGeometry::create();
         attenuationGeometry->setAttribute("position", FloatBufferAttribute::create(
@@ -174,13 +187,24 @@ int main() {
                             framebuffer.size(), counts.red, counts.green, counts.blue,
                             pass ? "PASS" : "FAIL");
                 if (!pass) std::exit(1);
+                renderer.render(noColorScene, colorCamera);
+                return;
+            }
+
+            if (frame == 2) {
+                ++frame;
+                const auto counts = countPointColors(framebuffer);
+                const bool pass = counts.red > 100 && counts.green < 50 && counts.blue < 50;
+                std::printf("[phase4] Points material color fallback red=%d green=%d blue=%d -> %s\n",
+                            counts.red, counts.green, counts.blue, pass ? "PASS" : "FAIL");
+                if (!pass) std::exit(1);
                 renderer.render(attenuationScene, attenuationCamera);
                 return;
             }
 
             const int nearWhite = countWhiteRegion(framebuffer, 160, 120, 0, 0, 80, 120);
             const int farWhite = countWhiteRegion(framebuffer, 160, 120, 80, 0, 160, 120);
-            if (frame == 2) {
+            if (frame == 3) {
                 ++frame;
                 const bool pass = nearWhite > 250 && nearWhite > farWhite * 2;
                 std::printf("[phase4] Points sizeAttenuation nearWhite=%d farWhite=%d -> %s\n",
@@ -191,7 +215,7 @@ int main() {
             }
 
             const auto counts = countPointColors(framebuffer);
-            if (frame == 3) {
+            if (frame == 4) {
                 ++frame;
                 const bool pass = counts.green > 300 && counts.red < 50 && counts.blue < 50;
                 std::printf("[phase4] Points map green=%d red=%d blue=%d -> %s\n",

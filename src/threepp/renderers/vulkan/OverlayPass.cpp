@@ -1274,8 +1274,48 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
 
     const uint32_t posVer = posAttr->version;
     const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : 0u;
-    const uint32_t colVer = (colAttr && colAttr->count() > 0) ? colAttr->version : 0u;
+    const bool hasColorAttr = colAttr && colAttr->count() > 0;
+    const uint32_t colVer = hasColorAttr ? colAttr->version : 0u;
     const uint32_t distVer = (distAttr && distAttr->count() > 0) ? distAttr->version : 0u;
+    auto uploadColorBuffer = [&](LineRec& rec) {
+        if (hasColorAttr) {
+            const auto& colArr = colAttr->array();
+            const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
+            if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
+                if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+                rec.color = createBuffer(
+                        ctx_.allocator(), ctx_.device(), cbBytes,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            }
+            void* mapped = nullptr;
+            vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
+            std::memcpy(mapped, colArr.data(), cbBytes);
+            vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+            rec.colorVersion = colVer;
+            rec.colorIsFallback = false;
+            return;
+        }
+
+        const auto count = static_cast<std::size_t>(posAttr->count()) * 3u;
+        const VkDeviceSize cbBytes = count * sizeof(float);
+        if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
+            if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+            rec.color = createBuffer(
+                    ctx_.allocator(), ctx_.device(), cbBytes,
+                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        }
+        const std::vector<float> white(count, 1.f);
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
+        std::memcpy(mapped, white.data(), cbBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+        rec.colorVersion = 0;
+        rec.colorIsFallback = true;
+    };
 
     auto it = lineGeomCache_.find(geom);
     if (it != lineGeomCache_.end() && it->second.geomId != geom->id) {
@@ -1296,6 +1336,7 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
         if (rec.positionVersion == posVer &&
             rec.indexVersion    == idxVer &&
             rec.colorVersion    == colVer &&
+            rec.colorIsFallback == !hasColorAttr &&
             rec.lineDistanceVersion == distVer) {
             return &rec;
         }
@@ -1340,27 +1381,7 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
             rec.indexCount   = 0;
             rec.indexVersion = 0;
         }
-        // Color buffer follows the same in-place / recreate logic.
-        if (colAttr && colAttr->count() > 0) {
-            const auto& colArr = colAttr->array();
-            const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
-            if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
-                if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
-                rec.color = createBuffer(
-                        ctx_.allocator(), ctx_.device(), cbBytes,
-                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                        VMA_MEMORY_USAGE_AUTO,
-                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-            }
-            vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
-            std::memcpy(mapped, colArr.data(), cbBytes);
-            vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
-            rec.colorVersion = colVer;
-        } else if (rec.color.handle != VK_NULL_HANDLE) {
-            destroyBuffer(ctx_.allocator(), rec.color);
-            rec.color        = {};
-            rec.colorVersion = 0;
-        }
+        uploadColorBuffer(rec);
 
         if (distAttr && distAttr->count() > 0) {
             const auto& distArr = distAttr->array();
@@ -1418,19 +1439,7 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
         std::memcpy(mapped, indices.data(), ibBytes);
         vmaUnmapMemory(ctx_.allocator(), rec.index.alloc);
     }
-    if (colAttr && colAttr->count() > 0) {
-        const auto& colArr = colAttr->array();
-        rec.colorVersion = colVer;
-        const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
-        rec.color = createBuffer(
-                ctx_.allocator(), ctx_.device(), cbBytes,
-                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                VMA_MEMORY_USAGE_AUTO,
-                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-        vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
-        std::memcpy(mapped, colArr.data(), cbBytes);
-        vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
-    }
+    uploadColorBuffer(rec);
 
     if (distAttr && distAttr->count() > 0) {
         const auto& distArr = distAttr->array();
@@ -1727,8 +1736,8 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     }
 
     // Collect Points objects (point clouds). POINT_LIST topology; the push
-    // constant's color.w carries PointsMaterial::size (pixels). Requires a
-    // per-vertex "color" attribute — the point pipeline always reads binding 1.
+    // constant's color.w carries PointsMaterial::size (pixels). Geometries
+    // without a "color" attribute get a white fallback buffer.
     // Same ortho/HUD gating as lines/meshes (never the PT screen-space pass).
     struct OrthoPointDraw {
         Points* points = nullptr;
@@ -1743,7 +1752,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             auto* p = dynamic_cast<Points*>(&o);
             if (!p) return;
             auto g = p->geometry();
-            if (!g || !g->hasAttribute("position") || !g->hasAttribute("color")) return;
+            if (!g || !g->hasAttribute("position")) return;
             OrthoPointDraw pd;
             pd.points = p;
             std::memcpy(pd.world.elements.data(), p->matrixWorld->elements.data(), 64);
@@ -2216,8 +2225,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         for (const auto& pd : pointDraws) {
             auto g = pd.points->geometry();
             LineRec* prec = ensureLineGeometryUploaded(g.get());
-            if (!prec || prec->vertex.handle == VK_NULL_HANDLE) continue;
-            if (prec->color.handle == VK_NULL_HANDLE) continue;// pipeline reads binding 1
+            if (!prec || prec->vertex.handle == VK_NULL_HANDLE || prec->color.handle == VK_NULL_HANDLE) continue;
 
             Matrix4 mvp;
             mvp.multiplyMatrices(cvp, pd.world);

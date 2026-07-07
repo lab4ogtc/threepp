@@ -1,4 +1,4 @@
-﻿// VulkanRenderer — hardware ray-traced renderer with dynamic scene rebuild.
+// VulkanRenderer — hardware ray-traced renderer with dynamic scene rebuild.
 //
 // On every render() we walk the scene and fingerprint each visible Mesh
 // (geometry/material identity + world matrix + PBR scalars). When the
@@ -6523,6 +6523,8 @@ namespace threepp {
                 d.specularColor[2] = sp->specular.b;
                 d.specularIntensity = 1.0f;
                 d.roughness = std::clamp(std::sqrt(2.0f / (std::max(0.0f, sp->shininess) + 2.0f)), 0.04f, 1.0f);
+                // ponytail: 复用非透射 MeshPhong 不使用的 dispersion 槽；若以后 MeshPhong 支持色散再加独立字段。
+                d.dispersion = -std::max(0.0f, sp->shininess);
             }
             if (auto* em = dynamic_cast<MaterialWithEmissive*>(mat.get())) {
                 d.emissive[0] = em->emissive.r;
@@ -9831,12 +9833,7 @@ namespace threepp {
                                          (materialDescIndex < matDescsCached_.size()) &&
                                          (matDescsCached_[materialDescIndex].alphaCutoff == -2.0f);
                     const bool noDepthTest = !material->depthTest;
-                    const bool forceDeferredDepth =
-                            renderMode_ == VulkanRenderer::RenderMode::RasterFirst &&
-                            !isDecal &&
-                            !material->transparent &&
-                            material->opacity >= 1.0f;
-                    const bool noDepthWrite = !material->depthWrite && !forceDeferredDepth;
+                    const bool noDepthWrite = !material->depthWrite;
                     const int baseBucket = noDepthTest ? 6 : (noDepthWrite ? 3 : 0);
                     const int b = isDecal ? 9 : (baseBucket + bucketOf(wantCull));
 
@@ -9870,7 +9867,8 @@ namespace threepp {
                     di.materialIndex = materialDescIndex;
                     // Flag bits match the G-buffer IDs attachment layout:
                     //   bit 0 = is_water (DisplacedMesh), bit 3 = is_skinned,
-                    //   bit 4 = flatShading, bit 5 = receiveShadow, bit 6 = noDepthTest.
+                    //   bit 4 = flatShading, bit 5 = receiveShadow,
+                    //   bit 6 = depth attachment not valid for this pixel.
                     uint32_t flags = 0u;
                     if (en.isDisplaced) flags |= 1u;
                     if (en.isSkinned)   flags |= 8u;
@@ -9878,7 +9876,7 @@ namespace threepp {
                         flags |= 16u;
                     }
                     if (shadowMapEnabled_ && (!sceneHasShadowCaster || en.mesh->receiveShadow)) flags |= 32u;
-                    if (noDepthTest) flags |= 64u;
+                    if (noDepthTest || noDepthWrite) flags |= 64u;
                     di.flags   = flags;
                     di.indexed = indexed ? 1u : 0u;
                     // polygonOffset → per-mesh clip-z depth bias (decals). Reverse-Z:
@@ -14366,12 +14364,10 @@ namespace threepp {
                   "vkCreateGraphicsPipelines(overlayLineStripColoredNoDepth)");
 
             // ── Point list pipeline ─────────────────────────────────────────
-            // POINT_LIST topology. Uses overlay_point.vert/.frag which write
-            // gl_PointSize from the push constant's color.w slot and discard
-            // fragments outside a unit-radius disk (round sprite). Shares the
-            // same overlayPipelineLayout + 2-binding vertex input (pos + color)
-            // as the colored line variants — a Points object without a "color"
-            // attribute is skipped at draw-record time.
+            // POINT_LIST 拓扑。overlay_point.vert/.frag 从 push constant 的
+            // color.w 写 gl_PointSize，并保持 GL PointsMaterial 的方形覆盖。
+            // 与彩色线变体共享 overlayPipelineLayout 和 2-binding 顶点输入；
+            // 缺失 color 属性时由 ensureLineGeometryUploaded() 上传白色 fallback。
             VkShaderModuleCreateInfo pvsmci{};
             pvsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
             pvsmci.codeSize = sizeof(kOverlayPointVertSpv);
@@ -15095,8 +15091,48 @@ namespace threepp {
 
             const uint32_t posVer = posAttr->version;
             const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : 0u;
-            const uint32_t colVer = (colAttr && colAttr->count() > 0) ? colAttr->version : 0u;
+            const bool hasColorAttr = colAttr && colAttr->count() > 0;
+            const uint32_t colVer = hasColorAttr ? colAttr->version : 0u;
             const uint32_t distVer = (distAttr && distAttr->count() > 0) ? distAttr->version : 0u;
+            const auto uploadColorBuffer = [&](vulkan::LineRec& rec) {
+                if (hasColorAttr) {
+                    const auto& colArr = colAttr->array();
+                    const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
+                    if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
+                        if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.color);
+                        rec.color = createBuffer(
+                                ctx->allocator(), ctx->device(), cbBytes,
+                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                VMA_MEMORY_USAGE_AUTO,
+                                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                    }
+                    void* mapped = nullptr;
+                    vmaMapMemory(ctx->allocator(), rec.color.alloc, &mapped);
+                    std::memcpy(mapped, colArr.data(), cbBytes);
+                    vmaUnmapMemory(ctx->allocator(), rec.color.alloc);
+                    rec.colorVersion = colVer;
+                    rec.colorIsFallback = false;
+                    return;
+                }
+
+                const auto count = static_cast<std::size_t>(posAttr->count()) * 3u;
+                const VkDeviceSize cbBytes = count * sizeof(float);
+                if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
+                    if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.color);
+                    rec.color = createBuffer(
+                            ctx->allocator(), ctx->device(), cbBytes,
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                            VMA_MEMORY_USAGE_AUTO,
+                            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                }
+                const std::vector<float> white(count, 1.f);
+                void* mapped = nullptr;
+                vmaMapMemory(ctx->allocator(), rec.color.alloc, &mapped);
+                std::memcpy(mapped, white.data(), cbBytes);
+                vmaUnmapMemory(ctx->allocator(), rec.color.alloc);
+                rec.colorVersion = 0;
+                rec.colorIsFallback = true;
+            };
 
             auto it = lineGeomCache_.find(geom);
             if (it != lineGeomCache_.end() && it->second.geomId != geom->id) {
@@ -15117,6 +15153,7 @@ namespace threepp {
                 if (rec.positionVersion == posVer &&
                     rec.indexVersion    == idxVer &&
                     rec.colorVersion    == colVer &&
+                    rec.colorIsFallback == !hasColorAttr &&
                     rec.lineDistanceVersion == distVer) {
                     return &rec;
                 }
@@ -15161,27 +15198,7 @@ namespace threepp {
                     rec.indexCount   = 0;
                     rec.indexVersion = 0;
                 }
-                // Color buffer follows the same in-place / recreate logic.
-                if (colAttr && colAttr->count() > 0) {
-                    const auto& colArr = colAttr->array();
-                    const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
-                    if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
-                        if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), rec.color);
-                        rec.color = createBuffer(
-                                ctx->allocator(), ctx->device(), cbBytes,
-                                VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                VMA_MEMORY_USAGE_AUTO,
-                                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-                    }
-                    vmaMapMemory(ctx->allocator(), rec.color.alloc, &mapped);
-                    std::memcpy(mapped, colArr.data(), cbBytes);
-                    vmaUnmapMemory(ctx->allocator(), rec.color.alloc);
-                    rec.colorVersion = colVer;
-                } else if (rec.color.handle != VK_NULL_HANDLE) {
-                    destroyBuffer(ctx->allocator(), rec.color);
-                    rec.color        = {};
-                    rec.colorVersion = 0;
-                }
+                uploadColorBuffer(rec);
                 if (distAttr && distAttr->count() > 0) {
                     const auto& distArr = distAttr->array();
                     const VkDeviceSize dbBytes = distArr.size() * sizeof(float);
@@ -15238,19 +15255,7 @@ namespace threepp {
                 std::memcpy(mapped, indices.data(), ibBytes);
                 vmaUnmapMemory(ctx->allocator(), rec.index.alloc);
             }
-            if (colAttr && colAttr->count() > 0) {
-                const auto& colArr = colAttr->array();
-                rec.colorVersion = colVer;
-                const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
-                rec.color = createBuffer(
-                        ctx->allocator(), ctx->device(), cbBytes,
-                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                        VMA_MEMORY_USAGE_AUTO,
-                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-                vmaMapMemory(ctx->allocator(), rec.color.alloc, &mapped);
-                std::memcpy(mapped, colArr.data(), cbBytes);
-                vmaUnmapMemory(ctx->allocator(), rec.color.alloc);
-            }
+            uploadColorBuffer(rec);
 
             if (distAttr && distAttr->count() > 0) {
                 const auto& distArr = distAttr->array();
@@ -19588,8 +19593,8 @@ namespace threepp {
                         const bool useListTopology = le.isSegments || drawLoop;
                         VkPipeline want;
                         if (le.isPoints) {
-                            // Point pipeline always reads the color binding;
-                            // skip the draw if the geometry has none.
+                            // Point pipeline always reads the color binding.
+                            // ensureLineGeometryUploaded() supplies white fallback.
                             if (lrec->color.handle == VK_NULL_HANDLE) continue;
                             want = usePointTexture ? overlayPointListTexturedPipeline
                                                    : overlayPointListPipeline;
