@@ -59,6 +59,21 @@ if (THREEPP_WITH_VULKAN AND THREEPP_WITH_SLANG)
 endif ()
 
 if (THREEPP_WITH_VULKAN)
+    add_executable(VulkanShaderEmbeddingContract_test VulkanShaderEmbeddingContract_test.cpp)
+    target_link_libraries(VulkanShaderEmbeddingContract_test PRIVATE Catch2::Catch2WithMain)
+    target_compile_definitions(VulkanShaderEmbeddingContract_test PRIVATE PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME VulkanShaderEmbeddingContract_test COMMAND VulkanShaderEmbeddingContract_test)
+
+    add_executable(VulkanPerfettoTracingContract_test VulkanPerfettoTracingContract_test.cpp)
+    target_link_libraries(VulkanPerfettoTracingContract_test PRIVATE Catch2::Catch2WithMain)
+    target_compile_definitions(VulkanPerfettoTracingContract_test PRIVATE PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME VulkanPerfettoTracingContract_test COMMAND VulkanPerfettoTracingContract_test)
+
+    add_executable(VulkanWireframeParityContract_test VulkanWireframeParityContract_test.cpp)
+    target_link_libraries(VulkanWireframeParityContract_test PRIVATE Catch2::Catch2WithMain)
+    target_compile_definitions(VulkanWireframeParityContract_test PRIVATE PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
+    add_test(NAME VulkanWireframeParityContract_test COMMAND VulkanWireframeParityContract_test)
+
     add_executable(VulkanWireframeGeometry_test VulkanWireframeGeometry_test.cpp)
     target_link_libraries(VulkanWireframeGeometry_test PRIVATE threepp Catch2::Catch2WithMain)
     target_include_directories(VulkanWireframeGeometry_test PRIVATE "${PROJECT_SOURCE_DIR}/src")

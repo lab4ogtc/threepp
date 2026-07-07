@@ -108,7 +108,7 @@ namespace {
         return scene;
     }
 
-    Scene makeDemoCubeOpacityScene() {
+    Scene makeTransparentCubeOverTranslucentPlaneScene() {
         Scene scene;
         scene.background = Color::aliceblue;
 
@@ -147,7 +147,7 @@ int main() {
         auto overlayScene = makeTransparentOverlayScene();
         auto referenceScene = makeReferenceOpacityScene();
         auto referenceCubeScene = makeReferenceCubeOpacityScene();
-        auto demoCubeScene = makeDemoCubeOpacityScene();
+        auto transparentLayerScene = makeTransparentCubeOverTranslucentPlaneScene();
 
         PerspectiveCamera camera(60.f, 1.f, 0.1f, 10.f);
         camera.position.z = 3.f;
@@ -171,8 +171,9 @@ int main() {
                 const auto avgB = center.sumB / pixels;
                 const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
                                   center.nonBlack > static_cast<int>(pixels / 2) &&
-                                  avgR > avgB &&
-                                  avgG > avgB;
+                                  avgR > 240 && avgR < 253 &&
+                                  avgG > 245 && avgG < 255 &&
+                                  avgB > 175 && avgB < 205;
                 std::printf("[transparent] RasterFirst MeshBasic opacity over background bytes=%zu avg=(%llu,%llu,%llu) -> %s\n",
                             framebuffer.size(),
                             static_cast<unsigned long long>(avgR),
@@ -199,8 +200,9 @@ int main() {
                 const auto avgB = center.sumB / pixels;
                 const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
                                   center.nonBlack > static_cast<int>(pixels / 2) &&
-                                  avgR > avgB * 2u &&
-                                  avgG > avgB * 2u;
+                                  avgR > 250 &&
+                                  avgG > 245 && avgG < 254 &&
+                                  avgB < 20;
                 std::printf("[transparent] RasterFirst MeshBasic cube opacity over yellow bytes=%zu avg=(%llu,%llu,%llu) -> %s\n",
                             framebuffer.size(),
                             static_cast<unsigned long long>(avgR),
@@ -208,13 +210,13 @@ int main() {
                             static_cast<unsigned long long>(avgB),
                             pass ? "PASS" : "FAIL");
                 if (!pass) std::exit(1);
-                renderer.render(demoCubeScene, camera);
+                renderer.render(transparentLayerScene, camera);
                 ++frame;
                 return;
             }
 
             if (frame < 64) {
-                renderer.render(demoCubeScene, camera);
+                renderer.render(transparentLayerScene, camera);
                 ++frame;
                 return;
             }
@@ -227,9 +229,12 @@ int main() {
                 const auto avgB = center.sumB / pixels;
                 const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
                                   center.nonBlack > static_cast<int>(pixels / 2) &&
-                                  avgR > avgB &&
+                                  avgR > 240 && avgR < 255 &&
+                                  avgG > 225 && avgG < 248 &&
+                                  avgB > 155 && avgB < 205 &&
+                                  avgR > avgG &&
                                   avgG > avgB;
-                std::printf("[transparent] RasterFirst demo cube fill over transparent plane bytes=%zu avg=(%llu,%llu,%llu) -> %s\n",
+                std::printf("[transparent] RasterFirst transparent cube over translucent plane bytes=%zu avg=(%llu,%llu,%llu) -> %s\n",
                             framebuffer.size(),
                             static_cast<unsigned long long>(avgR),
                             static_cast<unsigned long long>(avgG),
@@ -252,6 +257,8 @@ int main() {
                 const auto center = countCenter(framebuffer);
                 const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
                                   center.nonBlack > static_cast<int>(center.samples / 2) &&
+                                  center.sumR > 120000 &&
+                                  center.sumG > 120000 &&
                                   center.sumB > center.sumR &&
                                   center.sumB > center.sumG;
                 std::printf("[transparent] MeshBasic stacked opacity bytes=%zu sum=(%llu,%llu,%llu) rgb=(%d,%d,%d) -> %s\n",
@@ -276,7 +283,8 @@ int main() {
             if (frame == 80) {
                 const auto center = countCenter(framebuffer);
                 const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
-                                  center.green > 0 &&
+                                  center.green > 80 &&
+                                  center.sumG > 100000 &&
                                   center.sumG > center.sumB;
                 std::printf("[transparent] MeshBasic opacity over wire overlay bytes=%zu sum=(%llu,%llu,%llu) rgb=(%d,%d,%d) -> %s\n",
                             framebuffer.size(),
