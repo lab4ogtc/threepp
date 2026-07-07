@@ -40,9 +40,9 @@ layout(set = 0, binding = 5) uniform FogUbo {
     vec3  color;
     float anisotropy;
     float waterSurfaceY;
-    float _pad0;
-    float _pad1;
-    float _pad2;
+    float linearNear;
+    float linearFar;
+    float mode;
 } fog;
 
 layout(push_constant) uniform Pc {

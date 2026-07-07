@@ -922,17 +922,17 @@ namespace threepp {
         uint32_t shadowMapSize_ = 0;
         bool shadowMapDescriptorsDirty_ = true;
 
-        // Homogeneous fog (participating media). FogExp2.density maps directly
-        // to sigma_t; linear Fog (near/far) is converted to an equivalent
-        // density. Enabled flag = 0 short-circuits all fog work in the shaders.
-        // anisotropy is the Henyey-Greenstein g for single-scattering.
+        // FogExp2 继续走体积 sigma 路径；线性 Fog 保留 near/far，
+        // 避免从 d=0 就开始把表面染成背景色。
         struct GpuFogUbo {
-            float sigmaT[3];     // per-channel extinction (1/world unit)
-            float enabled;       // 1.0 = fog active, 0.0 = disabled
-            float color[3];      // inscatter tint (sRGB-linear)
-            float anisotropy;    // HG g, clamped [-0.95, 0.95] by setFogAnisotropy
-            float waterSurfaceY; // world-Y of the water surface; 1e30 = no limit
-            float _pad[3];
+            float sigmaT[3];     // 每通道消光系数（1/世界单位）
+            float enabled;       // 1.0 = 启用 fog，0.0 = 关闭
+            float color[3];      // 入射散射颜色（线性 sRGB）
+            float anisotropy;    // HG g，由 setFogAnisotropy 限制到 [-0.95, 0.95]
+            float waterSurfaceY; // 水面世界 Y；1e30 表示不限制
+            float linearNear;    // mode == 1 时有效
+            float linearFar;     // mode == 1 时有效
+            float mode;          // 0 = 指数/介质，1 = 线性 Fog
         };
         static_assert(sizeof(GpuFogUbo) == 48);
         std::array<Buffer, kFramesInFlight> fogUbos{};
@@ -11306,11 +11306,8 @@ namespace threepp {
             }
         }
 
-        // Pack scene.fog (Fog/FogExp2 variant) into the per-frame fog UBO.
-        // Mirrors WgpuPathTracer.cpp — FogExp2.density maps directly
-        // to sigma_t; linear Fog reaches ~63% extinction at farPlane via
-        // sigma = 1 / (far - near). Hash detect changes so the per-pixel motion
-        // path halves FC and the new fog state converges quickly.
+        // 将 scene.fog（Fog/FogExp2）打包到每帧 fog UBO。
+        // 通过 hash 检测变化，让每像素运动路径降低 FC 并快速收敛到新 fog 状态。
         void updateFogUbo(uint32_t frame, Object3D& scene) {
             GpuFogUbo ubo{};
 
@@ -11326,6 +11323,9 @@ namespace threepp {
                     const float span = std::max(1e-4f, f.farPlane - f.nearPlane);
                     sigma = 1.f / span;
                     tint  = f.color;
+                    ubo.linearNear = f.nearPlane;
+                    ubo.linearFar  = f.farPlane;
+                    ubo.mode       = 1.f;
                 }
                 if (sigma > 0.f) {
                     ubo.sigmaT[0] = sigma;

@@ -359,6 +359,11 @@ vec3 uvToEquirectDir(vec2 uv) {
 bool fogEnabled() { return fog.enabled > 0.5; }
 vec3 fogTransmittance(float dist) {
     const float d = clamp(dist, 0.0, 1e6);
+    if (fog.mode > 0.5) {
+        const float span = max(fog.linearFar - fog.linearNear, 1e-4);
+        const float f = smoothstep(0.0, 1.0, clamp((d - fog.linearNear) / span, 0.0, 1.0));
+        return vec3(1.0 - f);
+    }
     return exp(-fog.sigmaT * d);
 }
 

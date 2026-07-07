@@ -173,6 +173,9 @@ layout(set = 0, binding = 17) uniform FogUbo {
     vec3  color;
     float anisotropy;
     float waterSurfaceY;
+    float linearNear;
+    float linearFar;
+    float mode;
 } fog;
 
 // Beer-Lambert fog transmittance + fogEnabled() helper live in shade_common.glsl
