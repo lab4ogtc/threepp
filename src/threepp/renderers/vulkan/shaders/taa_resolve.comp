@@ -137,10 +137,10 @@ vec3 fxaa(sampler2D tex, vec2 uv, vec2 rcpFrame) {
     const vec3 L = vec3(0.299, 0.587, 0.114);
     const vec3 rgbM = texture(tex, uv).rgb;
     const float lM  = dot(rgbM, L);
-    const float lNW = dot(textureOffset(tex, uv, ivec2(-1, -1)).rgb, L);
-    const float lNE = dot(textureOffset(tex, uv, ivec2( 1, -1)).rgb, L);
-    const float lSW = dot(textureOffset(tex, uv, ivec2(-1,  1)).rgb, L);
-    const float lSE = dot(textureOffset(tex, uv, ivec2( 1,  1)).rgb, L);
+    const float lNW = dot(textureLodOffset(tex, uv, 0.0, ivec2(-1, -1)).rgb, L);
+    const float lNE = dot(textureLodOffset(tex, uv, 0.0, ivec2( 1, -1)).rgb, L);
+    const float lSW = dot(textureLodOffset(tex, uv, 0.0, ivec2(-1,  1)).rgb, L);
+    const float lSE = dot(textureLodOffset(tex, uv, 0.0, ivec2( 1,  1)).rgb, L);
     const float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
     const float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
     if (lMax - lMin < max(0.0312, lMax * 0.125)) return rgbM;// no edge → passthrough

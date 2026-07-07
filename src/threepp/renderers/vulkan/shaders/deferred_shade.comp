@@ -1985,6 +1985,15 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
         const mat4x3 w2o    = rayQueryGetIntersectionWorldToObjectEXT(rq, true);
         vec3 hitN; vec2 hitUv; vec2 hitUv2;
         fetchHit(hitId, primId, bary, w2o, hitN, hitUv, hitUv2);
+        const bool frontFace = rayQueryGetIntersectionFrontFaceEXT(rq, true);
+        const bool wrongSide =
+            (hm.sideMode == 0 && !frontFace) ||
+            (hm.sideMode == 1 && frontFace);
+        const bool cleanAlpha = hm.ior < 1.05 && hm.transmission > 0.0 && hm.transmission <= 1.0;
+        if (wrongSide && (hm.transmission <= 0.0 || cleanAlpha)) {
+            o = o + d * (tHit + 1e-3);
+            continue;
+        }
 
         // Cutout (MASK): the query runs force-opaque, so alpha-test here —
         // sub-cutoff texels pass through (mirrors gbuffer.frag / shadow_anyhit).
@@ -2016,6 +2025,14 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
         if (hm.roughness < 0.0) {
             if (hm.roughness > -1.5 && hm.lightTexIndex >= 0)
                 hAlbedo *= sampleLightMapIrradiance(hm, hitUv2);
+            if (cleanAlpha) {
+                const float opacity = 1.0 - clamp(hm.transmission, 0.0, 1.0);
+                radiance += tput * hAlbedo * opacity;
+                tput *= 1.0 - opacity;
+                if (max(max(tput.r, tput.g), tput.b) < 0.02) break;
+                o = o + d * (tHit + 1e-3);
+                continue;
+            }
             radiance += tput * hAlbedo;
             break;
         }// unlit hit
@@ -2937,8 +2954,8 @@ void main() {
             uint seedU = pcgHash(uint(px.x) ^ pcgHash(uint(px.y) ^ 0x85ebca6bu));
             const bool sceneShadowsOnU = ((pc.flags & 1u) != 0u);
             const float opacity = 1.0 - clamp(pm.transmission, 0.0, 1.0);
-            const vec3 behind = traceAccentRadiance(wpU - VU * SHADOW_EPS, -VU, sceneShadowsOnU, maxLod, 0.0, seedU,
-                                                    /*cheapHits=*/false);
+            const vec3 behind = traceRadiance(wpU - VU * SHADOW_EPS, -VU, sceneShadowsOnU, maxLod, 0.0, seedU,
+                                              /*cheapHits=*/false);
             litU = mix(behind, litU, opacity);
         }
         imageStore(outImage, px, vec4(litU, 1.0));
@@ -3355,8 +3372,8 @@ void main() {
         // straight (-V) ray to recover it. Host encodes strength = transmission-1
         // (transmission>1 is the additive marker).
         const float strength = clamp(transmission - 1.0, 0.0, 1.0);
-        const vec3  behind   = traceAccentRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
-                                                   /*cheapHits=*/false);// straight into lit, unblurred
+        const vec3  behind   = traceRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
+                                             /*cheapHits=*/false);// straight into lit, unblurred
         lit = behind + lit * strength;
     } else if (transmission > 0.0) {
         if (pm.ior < 1.05) {
@@ -3366,8 +3383,8 @@ void main() {
             // darkening. (One transparent layer over opaque: the behind ray sees
             // opaque geometry shaded as PBR; overlapping transparent isn't sorted.)
             const float opacity = 1.0 - clamp(transmission, 0.0, 1.0);
-            const vec3  behind  = traceAccentRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
-                                                      /*cheapHits=*/false);// straight into lit, unblurred
+            const vec3  behind  = traceRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
+                                                /*cheapHits=*/false);// straight into lit, unblurred
             lit = mix(behind, lit, opacity);
         } else {
             // REAL refractive glass (ior>1). ONE sharp Fresnel reflect+refract

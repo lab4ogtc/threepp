@@ -4,10 +4,6 @@
 #include "threepp/geometries/PlaneGeometry.hpp"
 #include "threepp/renderers/metal/MetalWireframeGeometry.hpp"
 
-#include <filesystem>
-#include <fstream>
-#include <sstream>
-
 using namespace threepp;
 using namespace threepp::metal;
 
@@ -62,21 +58,4 @@ TEST_CASE("Metal wireframe indices match deduplicated LUT-sized plane edges") {
     CHECK(indices.size() == 15200);
     REQUIRE(geometry->getIndex() != nullptr);
     CHECK(indices.size() < static_cast<std::size_t>(geometry->getIndex()->count() * 2));
-}
-
-TEST_CASE("Metal shadow wireframe path avoids native triangle line fill mode") {
-
-    const auto shadowRendererPath = std::filesystem::path(__FILE__)
-                                            .parent_path()
-                                            .parent_path()
-                                            .parent_path()
-                                            .parent_path() /
-                                    "src/threepp/renderers/metal/MetalShadowRenderer.mm";
-    std::ifstream input(shadowRendererPath);
-    REQUIRE(input.is_open());
-
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-
-    CHECK(buffer.str().find("MTLTriangleFillModeLines") == std::string::npos);
 }

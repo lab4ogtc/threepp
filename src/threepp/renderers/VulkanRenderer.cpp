@@ -2355,12 +2355,11 @@ namespace threepp {
                 createShadowMapUbos();
                 createFogUbos();
             }
-            // EnvPrefilter owns the PMREM compute pipeline + descriptor pool.
-            // Construct before createDefaultEnvImage so the env upload path is
-            // ready if scene.environment is set before the first render().
+            // Solid-color backgrounds do not need PMREM. EnvPrefilter owns a
+            // static compute pipeline, so create it lazily only when a real env
+            // texture is uploaded.
             {
                 THREEPP_VK_TRACE_SCOPE("Impl.envResources");
-                envPrefilter_ = std::make_unique<vulkan::EnvPrefilter>(*ctx, cmdPool);
                 createDefaultEnvImage();
                 rebuildDefaultEnvCdfImages();// 1×1 dummy so descriptors are valid before any HDR upload
             }
@@ -2369,8 +2368,8 @@ namespace threepp {
                 createTextureSampler();
                 createDefaultMaterialTexture();
             }
-            // Builds both fallback + SER variants (when supported) and their
-            // SBTs in one pass.
+            // RT descriptor/pipeline layout only. Actual RT pipelines/SBTs stay
+            // behind the render-mode gate and are built lazily by render().
             {
                 THREEPP_VK_TRACE_SCOPE("Impl.createRtPipelineLayout");
                 createRtPipeline();
@@ -2386,13 +2385,8 @@ namespace threepp {
                 createAccumImage();
             }
             {
-                THREEPP_VK_TRACE_SCOPE("Impl.auxComputePipelines");
-                skinning_ = std::make_unique<vulkan::SkinningPipeline>(*ctx);
-                tetSkinning_ = std::make_unique<vulkan::TetSkinningPipeline>(*ctx);
+                THREEPP_VK_TRACE_SCOPE("Impl.photonCaustics");
                 photon_ = std::make_unique<vulkan::PhotonCaustics>(*ctx, rtPipelineLayout);
-                waterDisplace_ = std::make_unique<vulkan::WaterDisplacePipeline>(*ctx);
-                foamWorld_     = std::make_unique<vulkan::FoamWorldPipeline>(*ctx);
-                grassWind_     = std::make_unique<vulkan::GrassWindPipeline>(*ctx);
             }
             // Hybrid raster G-buffer infrastructure. Costs a few hundred MB
             // at 1080p for six attachments × kFramesInFlight.
@@ -2454,6 +2448,42 @@ namespace threepp {
                         [this](const Texture* texture) -> const Image2D* {
                             return framebufferTextureImage(texture);
                         });
+            }
+        }
+
+        void ensureEnvPrefilter() {
+            if (!envPrefilter_) {
+                envPrefilter_ = std::make_unique<vulkan::EnvPrefilter>(*ctx, cmdPool);
+            }
+        }
+
+        void ensureSkinningPipeline() {
+            if (!skinning_) {
+                skinning_ = std::make_unique<vulkan::SkinningPipeline>(*ctx);
+            }
+        }
+
+        void ensureTetSkinningPipeline() {
+            if (!tetSkinning_) {
+                tetSkinning_ = std::make_unique<vulkan::TetSkinningPipeline>(*ctx);
+            }
+        }
+
+        void ensureWaterDisplacePipeline() {
+            if (!waterDisplace_) {
+                waterDisplace_ = std::make_unique<vulkan::WaterDisplacePipeline>(*ctx);
+            }
+        }
+
+        void ensureFoamWorldPipeline() {
+            if (!foamWorld_) {
+                foamWorld_ = std::make_unique<vulkan::FoamWorldPipeline>(*ctx);
+            }
+        }
+
+        void ensureGrassWindPipeline() {
+            if (!grassWind_) {
+                grassWind_ = std::make_unique<vulkan::GrassWindPipeline>(*ctx);
             }
         }
 
@@ -3675,6 +3705,7 @@ namespace threepp {
             }
 
             // Descriptor set — wires base inputs + bone mats + BLAS outputs.
+            ensureSkinningPipeline();
             state->skinDescSet = skinning_->allocateMeshDescriptorSet();
 
             std::array<VkDescriptorBufferInfo, 7> bi{};
@@ -3878,6 +3909,7 @@ namespace threepp {
                     VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
 
             // Descriptor set — 9 storage buffers (see tet_skinning.comp).
+            ensureTetSkinningPipeline();
             state->tetDescSet = tetSkinning_->allocateMeshDescriptorSet();
             std::array<VkDescriptorBufferInfo, 9> bi{};
             const Buffer* bufs[9] = {
@@ -5151,6 +5183,7 @@ namespace threepp {
             }
 
             // Allocate this mesh's displace descriptor set + write bindings.
+            ensureWaterDisplacePipeline();
             state->displaceDS = waterDisplace_->allocateMeshDescriptorSet();
 
             // Bind each enabled cascade's spatial images to its (height, displace)
@@ -5181,6 +5214,7 @@ namespace threepp {
 
             // Foam-world descriptor set — same cascade bindings 0..5 as the
             // displace set, plus binding 6 = the storage image foam target.
+            ensureFoamWorldPipeline();
             state->foamWorldDS = foamWorld_->allocateMeshDescriptorSet();
             std::array<VkDescriptorImageInfo, 6> foamCascadeInfos{};
             for (uint32_t i = 0; i < 3; ++i) {
@@ -6567,14 +6601,14 @@ namespace threepp {
                 d.transmission = 1.0f + std::clamp(mat->opacity, 0.0f, 1.0f);
                 d.ior          = 1.0f;
             }
-            // Constant opacity has no alpha texel to sample. Encode it as clean
-            // straight-through alpha. alphaCutoff=-2 routes RasterFirst through
-            // the deterministic G-buffer alpha-blend path; ReferencePT's gbuffer
-            // keeps the surface and lets closest_hit do the clean pass-through.
+            // 常量 opacity 没有 alpha texel 可采样，编码成干净的直通 alpha。
+            // 普通透明 mesh 必须留在常规 G-buffer 中，让 RasterFirst 写入
+            // depth/ids，deferred shade 才能追踪到背后的场景；只有明确按 decal
+            // 写法创建的材质才走 albedo-only blend 管线。
             if (d.transmission == 0.0f && mat->transparent && mat->opacity < 1.0f) {
                 d.transmission = 1.0f - std::clamp(mat->opacity, 0.0f, 1.0f);
                 d.ior          = 1.0f;
-                d.alphaCutoff  = -2.0f;
+                d.alphaCutoff  = (!mat->depthWrite && mat->polygonOffset) ? -2.0f : -1.0f;
             }
             // BLEND mode with texture alpha (alphaMode=BLEND, opacity=1.0):
             // alphaCutoff=-1.0 sentinel triggers per-texel stochastic blend in
@@ -15458,15 +15492,14 @@ namespace threepp {
                 createRasterDsLayoutAndPool();
                 createRasterGbufPipeline();
             }
-            if (overlayBasicPipeline == VK_NULL_HANDLE || overlayLineListPipeline == VK_NULL_HANDLE) {
-                createOverlayPipeline();
-            }
-            if (particlePipelineNormal_ == VK_NULL_HANDLE) {
-                createParticlePipeline();
-            }
-            if (defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT &&
-                overlayCompositePipeline_ == VK_NULL_HANDLE) {
-                createOverlayCompositePipeline();
+            if (sceneHasOverlayContent()) {
+                if (overlayBasicPipeline == VK_NULL_HANDLE || overlayLineListPipeline == VK_NULL_HANDLE) {
+                    createOverlayPipeline();
+                }
+                if (defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT &&
+                    overlayCompositePipeline_ == VK_NULL_HANDLE) {
+                    createOverlayCompositePipeline();
+                }
             }
             // Raster G-buffer matches the PT render extent — in hybrid mode
             // raygen reads it 1:1 by launch coord, so it must launch at the
@@ -16490,6 +16523,7 @@ namespace threepp {
 
                 vkDeviceWaitIdle(ctx->device());
                 destroyImage2D(ctx->allocator(), ctx->device(), envImage);
+                ensureEnvPrefilter();
                 envImage = envPrefilter_->buildPmrem(
                         cubeW, cubeH, cubeEquirect.data(), cubeEquirect.size() * sizeof(float));
                 envIsDefault = false;
@@ -16519,6 +16553,7 @@ namespace threepp {
 
             vkDeviceWaitIdle(ctx->device());
             destroyImage2D(ctx->allocator(), ctx->device(), envImage);
+            ensureEnvPrefilter();
 
             // GGX-prefilter the env into a mip chain so the closest_hit
             // shader can sample at a roughness-derived LOD instead of the cheap
@@ -18245,7 +18280,8 @@ namespace threepp {
             // BLAS rebuild per state → barrier. The BLAS rebuild reads the
             // deformed vertex/normal buffers the dispatch just wrote. The
             // raygen/raster downstream reads the BLAS via TLAS.
-            if (!pendingSkinnedRebuilds_.empty() && skinning_) {
+            if (!pendingSkinnedRebuilds_.empty()) {
+                ensureSkinningPipeline();
                 // ── Step 1: snapshot current vertex → prevVertex ──────────
                 // Before the skinning compute overwrites vertex with frame
                 // N's deformed positions, copy what's there (frame N-1's
@@ -18375,7 +18411,8 @@ namespace threepp {
             // ── Tet-skinning (PhysX soft bodies) — same structure as the skinned
             // block above: prevVertex snapshot → barrier → tet_skinning dispatch →
             // barrier → BLAS refit → barrier. Separate pipeline + pending list.
-            if (!pendingTetRebuilds_.empty() && tetSkinning_) {
+            if (!pendingTetRebuilds_.empty()) {
+                ensureTetSkinningPipeline();
                 for (auto* st : pendingTetRebuilds_) {
                     if (st->blas->prevVertex.handle == VK_NULL_HANDLE) continue;
                     VkBufferCopy region{};
@@ -18488,7 +18525,8 @@ namespace threepp {
             // a final AS-write→RT-read barrier publishes the rebuilt geometry to
             // the trace. (The TLAS sees last frame's bounds — fine for the small
             // sway envelope, same 1-frame-late deal as skinned.)
-            if (!pendingGrassDeforms_.empty() && grassWind_) {
+            if (!pendingGrassDeforms_.empty()) {
+                ensureGrassWindPipeline();
                 for (auto& [gm, st] : pendingGrassDeforms_) {
                     recordGrassDeform(cb, *gm, *st);
                 }
@@ -19630,13 +19668,16 @@ namespace threepp {
                     // tested against unjitDepth (Normal) or unconditionally drawn
                     // (Additive). The vertex data lives in particleGeomCache_, the
                     // texture in particleTexCache_ (white default if untextured).
-                    if (particlePipelineNormal_ != VK_NULL_HANDLE) {
+                    {
                         bool anyParticle = false;
                         for (const auto& en : lastVisibleEntries_) {
                             if (en.isParticle && en.mesh) { anyParticle = true; break; }
                         }
                         const bool anySprite = !lastVisibleSprites_.empty();
                         if (anyParticle || anySprite) {
+                            if (particlePipelineNormal_ == VK_NULL_HANDLE) {
+                                createParticlePipeline();
+                            }
                             // Shared per-frame descriptor pool + unjittered camera
                             // for both billboard kinds (particles + world sprites).
                             vkResetDescriptorPool(ctx->device(), particleDescPools_[currentFrame], 0);
