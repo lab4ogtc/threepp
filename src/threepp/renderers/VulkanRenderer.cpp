@@ -1985,20 +1985,12 @@ namespace threepp {
         float bloomThreshold_ = 1.0f;// soft-knee bright-pass cutoff (linear HDR)
         float bloomClamp_ = 0.0f;    // per-tap HDR cap before the bright pass; <= 0 = off
         float sharpenStrength_ = 0.0f;// post-TAA RCAS amount; 0 = off
-        float taaBlendAlpha_ = 0.1f;// 10% current, 90% history at the reference rate;
-                                    // frame-rate-corrected per frame (see taaPrevTimeSec_)
-        // Wall-clock anchor for the frame-rate-aware TAA blend. taaBlendAlpha_ is a
-        // per-FRAME new-sample weight, so holding it fixed ties the history half-life
-        // to frame COUNT: the same 90 %/frame retention is an invisible ~10 ms ghost
-        // at 200 fps but a long visible smear on a 30 fps (or vsync-capped + heavy)
-        // frame — the "moving object leaves edge trails" report. Each frame the
-        // weight is re-solved (in recordCommandBuffer, against kTaaRefFps) so
-        // (1-alpha) is held constant in wall-clock time instead of per frame; the
-        // shader's velocity/deviation gates are already per-frame-displacement based,
-        // so only this base weight needs the correction.
+        float taaBlendAlpha_ = 1.0f;// 默认不保留时间历史。
+        // 启用历史混合时，recordCommandBuffer 会按真实帧间隔修正权重，
+        // 避免低帧率下拖尾时间随帧数拉长。
         double taaPrevTimeSec_ = -1.0;
 
-        bool perSppJitterHybrid_ = true;
+        bool perSppJitterHybrid_ = false;
         // Tracks what each per-frame slot's binding 1 (RT denoise output)
         // currently points at, so the per-frame rewrite block only fires on
         // a real state change: -1 = unknown/needs rewrite, 0 = swapchain
@@ -9515,13 +9507,8 @@ namespace threepp {
             // sub-pixel jitter still happens in raygen's hybrid primary via
             // the blue-noise tile (see primaryDirHybrid), so interior AA
             // doesn't disappear — only the coverage jitter is gone.
-            // Raster jitter ON: sub-pixel Halton coverage +
-            // temporal accumulation = proper TAA/TSR (replaces FXAA). The earlier
-            // "flicker" was silhouette coverage-flip on MOVING objects with a loose
-            // RGB AABB history clamp; the resolve now uses a YCoCg variance clip
-            // (tighter history rejection) to suppress it. Static views converge to
-            // clean AA over the 16-frame Halton cycle.
-            constexpr bool kRasterJitterEnabled = true;
+            // Raster jitter 跟随 TAA 历史混合启用；Vulkan 默认走 GL 风格的稳定当前帧。
+            const bool kRasterJitterEnabled = taaBlendAlpha_ < 1.0f;
             const float jClipX = kRasterJitterEnabled ? 2.f * jx / float(ext.width)  : 0.f;
             const float jClipY = kRasterJitterEnabled ? 2.f * jy / float(ext.height) : 0.f;
 
