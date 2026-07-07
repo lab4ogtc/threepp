@@ -15,9 +15,9 @@
 //     area lights) + a sampled bounce direction; raygen loops to kMaxBounces
 //     with Russian Roulette, accumulating into a persistent rgba32f image that
 //     resets on camera/env/scene change.
-//   • RasterFirst — a hybrid: a raster G-buffer supplies primary visibility,
-//     then deferred_shade.comp lights it analytically and adds ray-query
-//     accents (shadows, reflections, AO/GI), denoised + TAA-resolved.
+//   • RasterFirst — default: a raster G-buffer supplies primary visibility,
+//     then deferred_shade.comp lights it analytically with GL-style shadow
+//     maps. Optional ray-query accents (reflections, AO/GI) are feature-gated.
 // Both sample `scene.environment` / `scene.background` HDR equirects (GGX-
 // prefiltered into a PMREM mip chain) for the background miss and IBL.
 
@@ -114,6 +114,7 @@
 #include "threepp/renderers/vulkan/shaders/gbuffer.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/gbuffer.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/gbuffer_indirect.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/shadow_depth.vert.spv.h"
 // (taa_resolve.comp.spv moved into vulkan/TaaResolve.cpp)
 #include "threepp/renderers/vulkan/shaders/overlay.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay.frag.spv.h"
@@ -835,6 +836,8 @@ namespace threepp {
         static constexpr uint32_t kMaxPointLights = 8;
         static constexpr uint32_t kMaxSpotLights  = 8;
         static constexpr uint32_t kMaxRectLights  = 4;
+        static constexpr uint32_t kMaxHemiLights  = 4;
+        static constexpr uint32_t kMaxShadowMapLights = 8;
 
         struct GpuDirLight {
             float direction[3];
@@ -861,6 +864,11 @@ namespace threepp {
             float normal[3]; // emission direction into scene
             float color[3];
         };
+        struct GpuHemiLight {
+            float direction[3];
+            float skyColor[3];
+            float groundColor[3];
+        };
         struct GpuLightsUbo {
             float       ambient[3];
             uint32_t    dirCount;
@@ -871,12 +879,48 @@ namespace threepp {
             GpuPointLight pointLights[kMaxPointLights];
             GpuSpotLight  spotLights[kMaxSpotLights];
             GpuRectLight  rectLights[kMaxRectLights];
+            uint32_t      hemiCount;
+            GpuHemiLight  hemiLights[kMaxHemiLights];
         };
         static_assert(sizeof(GpuDirLight)   == 28);
         static_assert(sizeof(GpuPointLight) == 36);
         static_assert(sizeof(GpuSpotLight)  == 56);
         static_assert(sizeof(GpuRectLight)  == 60);
+        static_assert(sizeof(GpuHemiLight)  == 36);
         std::array<Buffer, kFramesInFlight> lightsUbos{};
+
+        struct GpuShadowMapLight {
+            float lightVP[16];
+            float params[4];// bias, normalBias, radius, type(0=dir, 1=spot)
+        };
+        struct GpuShadowMapUbo {
+            uint32_t count = 0;
+            uint32_t _pad[3]{};
+            GpuShadowMapLight lights[kMaxShadowMapLights]{};
+        };
+        static_assert(sizeof(GpuShadowMapLight) == 80);
+        static_assert(sizeof(GpuShadowMapUbo) == 16 + kMaxShadowMapLights * 80);
+
+        struct ActiveShadowMapLight {
+            Light* light = nullptr;
+            LightShadow* shadow = nullptr;
+            uint32_t layer = 0;
+            Matrix4 lightVP;
+            float bias = 0.f;
+            float normalBias = 0.f;
+            float radius = 1.f;
+            bool isSpot = false;
+        };
+        std::vector<ActiveShadowMapLight> activeShadowMapLights_;
+        std::array<Buffer, kFramesInFlight> shadowMapUbos{};
+        Image2D shadowDepthArray_{};
+        std::array<VkImageView, kMaxShadowMapLights> shadowLayerViews_{};
+        VkSampler shadowCompareSampler_ = VK_NULL_HANDLE;
+        VkPipelineLayout shadowDepthPipelineLayout_ = VK_NULL_HANDLE;
+        VkPipeline shadowDepthPipeline_ = VK_NULL_HANDLE;
+        VkImageLayout shadowDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+        uint32_t shadowMapSize_ = 0;
+        bool shadowMapDescriptorsDirty_ = true;
 
         // Homogeneous fog (participating media). FogExp2.density maps directly
         // to sigma_t; linear Fog (near/far) is converted to an equivalent
@@ -1075,6 +1119,7 @@ namespace threepp {
         // moving mesh anywhere in the scene would halve FC scene-wide
         // (uniformly noisy background equilibrating at FC≈2).
         bool cameraMovedThisFrame_ = false;
+        bool shadowCasterMovedThisFrame_ = false;
 
         // Per-entry "moved" bitmask, one bit per TLAS instance. Bit i set when
         // entry i's effective worldMatrix / pose / displacement changed since
@@ -1671,14 +1716,20 @@ namespace threepp {
         // Mesh entries and walked in the overlay record loop.
         VkPipeline       overlayLineListPipeline    = VK_NULL_HANDLE;
         VkPipeline       overlayLineStripPipeline   = VK_NULL_HANDLE;
+        VkPipeline       overlayLineListNoDepthPipeline    = VK_NULL_HANDLE;
+        VkPipeline       overlayLineStripNoDepthPipeline   = VK_NULL_HANDLE;
         VkPipeline       overlayLineDashedListPipeline  = VK_NULL_HANDLE;
         VkPipeline       overlayLineDashedStripPipeline = VK_NULL_HANDLE;
+        VkPipeline       overlayLineDashedListNoDepthPipeline  = VK_NULL_HANDLE;
+        VkPipeline       overlayLineDashedStripNoDepthPipeline = VK_NULL_HANDLE;
         // Per-vertex color counterparts. Use overlay_color.vert/.frag
         // (location 1 = inColor) and require a 2-binding vertex input.
         // Picked when the Line's geometry has a "color" attribute AND the
         // material has vertexColors == true (matches three.js semantics).
         VkPipeline       overlayLineListColoredPipeline  = VK_NULL_HANDLE;
         VkPipeline       overlayLineStripColoredPipeline = VK_NULL_HANDLE;
+        VkPipeline       overlayLineListColoredNoDepthPipeline  = VK_NULL_HANDLE;
+        VkPipeline       overlayLineStripColoredNoDepthPipeline = VK_NULL_HANDLE;
         // Points pipeline — POINT_LIST topology. Always vertex-coloured;
         // a Points object without a "color" attribute renders as plain
         // material colour (vertex colour defaults to white in that case
@@ -1913,11 +1964,11 @@ namespace threepp {
         // history reproject pending). setDenoise(false) → clean fallback.
         // (One flag for BOTH paths — denoiseEnabled_ — so a single toggle
         // follows the active RenderMode; setDeferredDenoise is an alias.)
-        // Ray-traced env ambient occlusion / GI (RasterFirst). ON: gives the
-        // "dirty realistic" PT-like grounding (contact darkening + 1-bounce GI).
-        // Uses the deterministic Fibonacci 64-sample gather (clean + settles), so
-        // it's the realistic look WITHOUT the old per-frame flicker.
-        bool  deferredAO_ = true;
+        // Ray-query env ambient occlusion / GI (RasterFirst). Default off so the
+        // Vulkan default path stays aligned with GL's deterministic direct-light
+        // raster result; callers can opt in for PT-like grounding.
+        bool  deferredAO_ = false;
+        bool  deferredRayAccents_ = false;
         // Deferred volumetric spot-light beams (ray-marched single scattering in
         // deferred_shade.comp). σ = 0 disables (the march is skipped entirely).
         float deferredVolDensity_ = 0.f;
@@ -2055,7 +2106,7 @@ namespace threepp {
         // bypassed and the legacy per-light NEE classic loops run instead
         // (same pattern as bounces). Forwarded to chit via
         // pc.motionFlags bit 4 each frame.
-        bool restirDIEnabled_ = true;
+        bool restirDIEnabled_ = false;
         // ReSTIR DI visibility reuse (Bitterli 2020 §5). When on, the chit
         // shadow-tests the RIS-selected candidate before temporal/spatial reuse
         // and discards occluded ones, so history converges onto visible lights.
@@ -2134,11 +2185,10 @@ namespace threepp {
         HybridDebugView hybridDebugView_ = HybridDebugView::Off;
 
         // Shading strategy (see VulkanRenderer::RenderMode in the public
-        // header). RasterFirst aliases ReferencePT until the deferred base +
-        // PT-accent passes land, so this currently only stores the user's
-        // preference and does not yet branch the frame graph. Default
-        // ReferencePT keeps today's behaviour byte-for-byte.
-        VulkanRenderer::RenderMode renderMode_ = VulkanRenderer::RenderMode::ReferencePT;
+        // header). Default is RasterFirst so Vulkan follows the GL-style
+        // deterministic raster path unless the user explicitly selects the
+        // reference path tracer.
+        VulkanRenderer::RenderMode renderMode_ = VulkanRenderer::RenderMode::RasterFirst;
 
         // Debug: gate raygen to exit immediately after step-0 primary trace
         // so pathTraceMs measures roughly the primary-trace cost. See
@@ -2302,6 +2352,7 @@ namespace threepp {
                 createCommandResources();
                 createCameraUbos();
                 createLightsUbos();
+                createShadowMapUbos();
                 createFogUbos();
             }
             // EnvPrefilter owns the PMREM compute pipeline + descriptor pool.
@@ -2623,6 +2674,7 @@ namespace threepp {
             for (auto& b : cameraUbos) destroyBuffer(ctx->allocator(), b);
             for (auto& b : prevCameraUbos) destroyBuffer(ctx->allocator(), b);
             for (auto& b : lightsUbos) destroyBuffer(ctx->allocator(), b);
+            for (auto& b : shadowMapUbos) destroyBuffer(ctx->allocator(), b);
             for (auto& b : fogUbos) destroyBuffer(ctx->allocator(), b);
             for (auto& b : motionMatBuffers) destroyBuffer(ctx->allocator(), b);
             for (auto& b : meshMovedBitsBuffers) destroyBuffer(ctx->allocator(), b);
@@ -2631,6 +2683,11 @@ namespace threepp {
             destroyImage2D(ctx->allocator(), d, envCdfImage);
             destroyImage2D(ctx->allocator(), d, envMargImage);
             destroyImage2D(ctx->allocator(), d, blueNoiseImage);
+            destroyShadowMapResources();
+            if (shadowCompareSampler_) {
+                vkDestroySampler(d, shadowCompareSampler_, nullptr);
+                shadowCompareSampler_ = VK_NULL_HANDLE;
+            }
             destroyImage2D(ctx->allocator(), d, oceanFineHeightDummy);
             destroyImage2D(ctx->allocator(), d, oceanFoamDummy);
             destroyImage2D(ctx->allocator(), d, foamDetailImage);
@@ -2689,14 +2746,22 @@ namespace threepp {
             if (rasterDsLayout)         vkDestroyDescriptorSetLayout(d, rasterDsLayout, nullptr);
             if (rasterDescPool)         vkDestroyDescriptorPool(d, rasterDescPool, nullptr);
             if (rasterGbufRenderPass)   vkDestroyRenderPass(d, rasterGbufRenderPass, nullptr);
+            if (shadowDepthPipeline_)       vkDestroyPipeline(d, shadowDepthPipeline_, nullptr);
+            if (shadowDepthPipelineLayout_) vkDestroyPipelineLayout(d, shadowDepthPipelineLayout_, nullptr);
             if (overlayBasicPipeline)             vkDestroyPipeline(d, overlayBasicPipeline, nullptr);
             if (overlayBasicTransparentPipeline)  vkDestroyPipeline(d, overlayBasicTransparentPipeline, nullptr);
             if (overlayLineListPipeline)          vkDestroyPipeline(d, overlayLineListPipeline, nullptr);
             if (overlayLineStripPipeline)         vkDestroyPipeline(d, overlayLineStripPipeline, nullptr);
+            if (overlayLineListNoDepthPipeline)   vkDestroyPipeline(d, overlayLineListNoDepthPipeline, nullptr);
+            if (overlayLineStripNoDepthPipeline)  vkDestroyPipeline(d, overlayLineStripNoDepthPipeline, nullptr);
             if (overlayLineDashedListPipeline)    vkDestroyPipeline(d, overlayLineDashedListPipeline, nullptr);
             if (overlayLineDashedStripPipeline)   vkDestroyPipeline(d, overlayLineDashedStripPipeline, nullptr);
+            if (overlayLineDashedListNoDepthPipeline)  vkDestroyPipeline(d, overlayLineDashedListNoDepthPipeline, nullptr);
+            if (overlayLineDashedStripNoDepthPipeline) vkDestroyPipeline(d, overlayLineDashedStripNoDepthPipeline, nullptr);
             if (overlayLineListColoredPipeline)   vkDestroyPipeline(d, overlayLineListColoredPipeline, nullptr);
             if (overlayLineStripColoredPipeline)  vkDestroyPipeline(d, overlayLineStripColoredPipeline, nullptr);
+            if (overlayLineListColoredNoDepthPipeline)  vkDestroyPipeline(d, overlayLineListColoredNoDepthPipeline, nullptr);
+            if (overlayLineStripColoredNoDepthPipeline) vkDestroyPipeline(d, overlayLineStripColoredNoDepthPipeline, nullptr);
             if (overlayPointListPipeline)         vkDestroyPipeline(d, overlayPointListPipeline, nullptr);
             if (overlayPointListTexturedPipeline) vkDestroyPipeline(d, overlayPointListTexturedPipeline, nullptr);
             if (overlayPointPipelineLayout_)      vkDestroyPipelineLayout(d, overlayPointPipelineLayout_, nullptr);
@@ -3544,22 +3609,9 @@ namespace threepp {
             if (!rec) return nullptr;
             rec->liveCheck = sm.geometry();
 
-            // Per-vertex previous-pose buffer. Used for two purposes:
-            // (1) Hybrid raster motion-vector source (existing).
-            // (2) Per-vertex prev-world-position reproject (2026-05-13):
-            //     chit reads via gdesc.prevVertexAddress, interpolates, and
-            //     writes payload.prevWorldPos which raygen consumes for the
-            //     motionMat reproject. TRANSFER_DST_BIT lets the per-frame
-            //     vkCmdCopyBuffer push current→prev before the skinning
-            //     compute writes new positions. Device-local (no host
-            //     access) — the per-frame update happens entirely on GPU.
-            const VkDeviceSize vbBytes = posAttr->array().size() * sizeof(float);
-            rec->prevVertex = createBuffer(
-                    ctx->allocator(), ctx->device(), vbBytes,
-                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                    VMA_MEMORY_USAGE_AUTO);
+            // buildBlasFor() already allocates and seeds prevVertex with the
+            // TRANSFER_DST | VERTEX_BUFFER | SHADER_DEVICE_ADDRESS usage needed
+            // by the per-frame skinning copy below. Reuse that buffer here.
 
             auto state = std::make_unique<SkinnedMeshState>();
             state->blas = std::move(rec);
@@ -6066,14 +6118,10 @@ namespace threepp {
                                                                     bool instanced = false,
                                                                     uint32_t colorAttachmentCount = 1,
                                                                     VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT) {
-            auto& compiler = ensureCustomShaderCompiler();
-            const auto compiled = compiler.compile(material, instanced);
-            if (!compiled.success()) {
-                throw std::runtime_error("Vulkan ShaderMaterial compile failed:\n" + compiled.diagnostics);
-            }
+            const auto key = vulkan::makeVulkanShaderMaterialKey(material, instanced);
             const auto colorFormat = ctx->swapchainFormat();
             for (auto& record : customShaderPipelines_) {
-                if (record.key == compiled.key &&
+                if (record.key == key &&
                     record.colorFormat == colorFormat &&
                     record.colorAttachmentCount == colorAttachmentCount &&
                     record.sampleCount == sampleCount) {
@@ -6081,10 +6129,16 @@ namespace threepp {
                 }
             }
 
+            auto& compiler = ensureCustomShaderCompiler();
+            const auto compiled = compiler.compile(material, instanced);
+            if (!compiled.success()) {
+                throw std::runtime_error("Vulkan ShaderMaterial compile failed:\n" + compiled.diagnostics);
+            }
+
             auto layout = vulkan::makeVulkanShaderMaterialLayout(material, instanced);
 
             CustomShaderPipelineRecord record;
-            record.key = compiled.key;
+            record.key = key;
             record.colorFormat = colorFormat;
             record.colorAttachmentCount = colorAttachmentCount;
             record.sampleCount = sampleCount;
@@ -7017,6 +7071,7 @@ namespace threepp {
             // before dispatch.
             motionThisFrame_ = false;
             cameraMovedThisFrame_ = false;
+            shadowCasterMovedThisFrame_ = false;
             std::fill(meshMovedBits_.begin(), meshMovedBits_.end(), 0u);
 
             // SNAPSHOT FAST PATH: replay the last expansion's traversal against
@@ -7710,6 +7765,17 @@ namespace threepp {
                         meshMovedBits_[w] |= (1u << (i & 31u));
                     }
                     if (tetDirtyAny) motionThisFrame_ = true;
+                    if (shadowMapEnabled_ && motionThisFrame_) {
+                        for (size_t i = 0; i < entries.size(); ++i) {
+                            const size_t w = i >> 5;
+                            if (w >= meshMovedBits_.size()) continue;
+                            if ((meshMovedBits_[w] & (1u << (i & 31u))) != 0u &&
+                                entries[i].mesh && entries[i].mesh->castShadow) {
+                                shadowCasterMovedThisFrame_ = true;
+                                break;
+                            }
+                        }
+                    }
                     // Geometries whose prevVertex was re-snapshotted (to OLD
                     // positions) this frame. The prevVertex re-sync pass below
                     // must SKIP these so their legitimate change-frame deformation
@@ -9678,7 +9744,12 @@ namespace threepp {
                                          (materialDescIndex < matDescsCached_.size()) &&
                                          (matDescsCached_[materialDescIndex].alphaCutoff == -2.0f);
                     const bool noDepthTest = !material->depthTest;
-                    const bool noDepthWrite = !material->depthWrite;
+                    const bool forceDeferredDepth =
+                            renderMode_ == VulkanRenderer::RenderMode::RasterFirst &&
+                            !isDecal &&
+                            !material->transparent &&
+                            material->opacity >= 1.0f;
+                    const bool noDepthWrite = !material->depthWrite && !forceDeferredDepth;
                     const int baseBucket = noDepthTest ? 6 : (noDepthWrite ? 3 : 0);
                     const int b = isDecal ? 9 : (baseBucket + bucketOf(wantCull));
 
@@ -10872,6 +10943,119 @@ namespace threepp {
             }
         }
 
+        void createShadowMapUbos() {
+            const GpuShadowMapUbo zero{};
+            for (auto& b : shadowMapUbos) {
+                b = createBuffer(
+                        ctx->allocator(), ctx->device(),
+                        sizeof(GpuShadowMapUbo),
+                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                        VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                                VMA_ALLOCATION_CREATE_MAPPED_BIT);
+                void* mapped = nullptr;
+                vmaMapMemory(ctx->allocator(), b.alloc, &mapped);
+                std::memcpy(mapped, &zero, sizeof(zero));
+                vmaUnmapMemory(ctx->allocator(), b.alloc);
+            }
+        }
+
+        int shadowLayerForLight(const Light* light) const {
+            if (!light) return -1;
+            for (const auto& entry : activeShadowMapLights_) {
+                if (entry.light == light) return static_cast<int>(entry.layer);
+            }
+            return -1;
+        }
+
+        static Matrix4 shadowProjectionToVkDepth(const Matrix4& glProj) {
+            Matrix4 out = glProj;
+            auto& e = out.elements;
+            e[2]  = 0.5f * e[2]  + 0.5f * e[3];
+            e[6]  = 0.5f * e[6]  + 0.5f * e[7];
+            e[10] = 0.5f * e[10] + 0.5f * e[11];
+            e[14] = 0.5f * e[14] + 0.5f * e[15];
+            return out;
+        }
+
+        void updateShadowMapUbo(uint32_t frame) {
+            GpuShadowMapUbo ubo{};
+            ubo.count = static_cast<uint32_t>(
+                    std::min<std::size_t>(activeShadowMapLights_.size(), kMaxShadowMapLights));
+            for (uint32_t i = 0; i < ubo.count; ++i) {
+                const auto& src = activeShadowMapLights_[i];
+                std::memcpy(ubo.lights[i].lightVP, src.lightVP.elements.data(), 64);
+                ubo.lights[i].params[0] = src.bias;
+                ubo.lights[i].params[1] = src.normalBias;
+                ubo.lights[i].params[2] = src.radius;
+                ubo.lights[i].params[3] = src.isSpot ? 1.f : 0.f;
+            }
+            void* mapped = nullptr;
+            vmaMapMemory(ctx->allocator(), shadowMapUbos[frame].alloc, &mapped);
+            std::memcpy(mapped, &ubo, sizeof(ubo));
+            vmaUnmapMemory(ctx->allocator(), shadowMapUbos[frame].alloc);
+        }
+
+        void prepareShadowMapLights(Object3D& scene) {
+            activeShadowMapLights_.clear();
+            if (!shadowMapEnabled_) return;
+
+            struct Candidate {
+                Light* light = nullptr;
+                std::shared_ptr<LightShadow> shadow;
+                bool isSpot = false;
+            };
+            std::vector<Candidate> candidates;
+            candidates.reserve(kMaxShadowMapLights);
+
+            scene.traverseVisible([&](Object3D& o) {
+                if (candidates.size() >= kMaxShadowMapLights) return;
+                if (auto* dl = dynamic_cast<DirectionalLight*>(&o)) {
+                    if (dl->castShadow && dl->shadow) {
+                        candidates.push_back({dl, dl->shadow, false});
+                    }
+                } else if (auto* sl = dynamic_cast<SpotLight*>(&o)) {
+                    if (sl->castShadow && sl->shadow) {
+                        candidates.push_back({sl, sl->shadow, true});
+                    }
+                }
+            });
+            if (candidates.empty()) return;
+
+            std::stable_partition(candidates.begin(), candidates.end(), [](const Candidate& c) {
+                return !c.isSpot;
+            });
+
+            uint32_t desired = 0;
+            for (const auto& c : candidates) {
+                desired = std::max(desired, static_cast<uint32_t>(std::max(c.shadow->mapSize.x, c.shadow->mapSize.y)));
+            }
+            desired = std::clamp(desired == 0u ? 2048u : desired, 1024u, 4096u);
+            ensureShadowMapResources(desired);
+
+            for (uint32_t i = 0; i < static_cast<uint32_t>(candidates.size()); ++i) {
+                auto& c = candidates[i];
+                c.shadow->updateMatrices(*c.light);
+                const Matrix4 lightProj = shadowProjectionToVkDepth(c.shadow->camera->projectionMatrix);
+                Matrix4 lightVP;
+                lightVP.multiplyMatrices(lightProj, c.shadow->camera->matrixWorldInverse);
+
+                ActiveShadowMapLight active{};
+                active.light = c.light;
+                active.shadow = c.shadow.get();
+                active.layer = i;
+                active.lightVP = lightVP;
+                active.bias = c.shadow->bias;
+                active.normalBias = c.shadow->normalBias;
+                active.radius = c.shadow->radius;
+                active.isSpot = c.isSpot;
+                activeShadowMapLights_.push_back(active);
+            }
+            if (shadowMapDescriptorsDirty_ && deferredShade_ && tlas != VK_NULL_HANDLE) {
+                rewriteDeferredDescriptors();
+            }
+        }
+
         // Walk the scene each frame for AmbientLight + DirectionalLight; pack
         // into the per-frame lights UBO. Direction is computed from the
         // light's world-space position toward its (possibly defaulted) target,
@@ -10885,11 +11069,18 @@ namespace threepp {
 
             GpuLightsUbo ubo{};
             const bool vsmShadows = shadowMapType_ == ShadowMap::VSM;
-            const auto shadowFlag = [&](bool castShadow, const std::shared_ptr<LightShadow>& shadow) -> uint32_t {
+            const auto shadowFlag = [&](const Light* light, bool castShadow, const std::shared_ptr<LightShadow>& shadow) -> uint32_t {
                 if (!castShadow) return 0u;
-                if (!vsmShadows || !shadow) return 1u;
-                const auto radius = std::max(0.f, std::min(255.f, shadow->radius));
-                return 1u | (static_cast<uint32_t>(radius * 16.f) << 8u);
+                uint32_t encoded = 1u;
+                if (vsmShadows && shadow) {
+                    const auto radius = std::max(0.f, std::min(255.f, shadow->radius));
+                    encoded |= (static_cast<uint32_t>(radius * 16.f) << 8u);
+                }
+                const int layer = shadowLayerForLight(light);
+                if (layer >= 0) {
+                    encoded |= (static_cast<uint32_t>(layer) + 1u) << 16u;
+                }
+                return encoded;
             };
 
             // traverseVisible so a hidden parent prunes its child lights too.
@@ -10899,9 +11090,19 @@ namespace threepp {
                     ubo.ambient[1] += a->color.g * a->intensity;
                     ubo.ambient[2] += a->color.b * a->intensity;
                 } else if (auto* h = dynamic_cast<HemisphereLight*>(&o)) {
-                    ubo.ambient[0] += 0.5f * (h->color.r + h->groundColor.r) * h->intensity;
-                    ubo.ambient[1] += 0.5f * (h->color.g + h->groundColor.g) * h->intensity;
-                    ubo.ambient[2] += 0.5f * (h->color.b + h->groundColor.b) * h->intensity;
+                    if (ubo.hemiCount >= kMaxHemiLights) return;
+                    Vector3 dir;
+                    h->getWorldPosition(dir);
+                    if (dir.lengthSq() < 1e-12f) dir.set(0.f, 1.f, 0.f);
+                    dir.normalize();
+                    auto& g = ubo.hemiLights[ubo.hemiCount++];
+                    g.direction[0] = dir.x; g.direction[1] = dir.y; g.direction[2] = dir.z;
+                    g.skyColor[0] = h->color.r * h->intensity;
+                    g.skyColor[1] = h->color.g * h->intensity;
+                    g.skyColor[2] = h->color.b * h->intensity;
+                    g.groundColor[0] = h->groundColor.r * h->intensity;
+                    g.groundColor[1] = h->groundColor.g * h->intensity;
+                    g.groundColor[2] = h->groundColor.b * h->intensity;
                 } else if (auto* dl = dynamic_cast<DirectionalLight*>(&o)) {
                     if (ubo.dirCount >= kMaxDirLights) return;
                     Vector3 lp, tp;
@@ -10915,7 +11116,7 @@ namespace threepp {
                     g.color[0] = dl->color.r * dl->intensity;
                     g.color[1] = dl->color.g * dl->intensity;
                     g.color[2] = dl->color.b * dl->intensity;
-                    g.castShadow = shadowFlag(dl->castShadow, dl->shadow);
+                    g.castShadow = shadowFlag(dl, dl->castShadow, dl->shadow);
                 } else if (auto* pl = dynamic_cast<PointLight*>(&o)) {
                     if (ubo.pointCount >= kMaxPointLights) return;
                     Vector3 wp; pl->getWorldPosition(wp);
@@ -10926,7 +11127,7 @@ namespace threepp {
                     g.color[1] = pl->color.g * pl->intensity;
                     g.color[2] = pl->color.b * pl->intensity;
                     g.decay = pl->decay;
-                    g.castShadow = shadowFlag(pl->castShadow, pl->shadow);
+                    g.castShadow = shadowFlag(pl, pl->castShadow, pl->shadow);
                 } else if (auto* sl = dynamic_cast<SpotLight*>(&o)) {
                     if (ubo.spotCount >= kMaxSpotLights) return;
                     Vector3 lp, tp;
@@ -10945,7 +11146,7 @@ namespace threepp {
                     g.direction[0] = emDir.x; g.direction[1] = emDir.y; g.direction[2] = emDir.z;
                     g.cosAngleOuter = std::cos(sl->angle);
                     g.cosAngleInner = std::cos(sl->angle * (1.0f - sl->penumbra));
-                    g.castShadow = shadowFlag(sl->castShadow, sl->shadow);
+                    g.castShadow = shadowFlag(sl, sl->castShadow, sl->shadow);
                 } else if (auto* rl = dynamic_cast<RectAreaLight*>(&o)) {
                     if (ubo.rectCount >= kMaxRectLights) return;
                     Vector3 wp; rl->getWorldPosition(wp);
@@ -12485,6 +12686,354 @@ namespace threepp {
             return out;
         }
 
+        void destroyShadowMapResources() {
+            if (!ctx) return;
+            VkDevice d = ctx->device();
+            for (auto& view : shadowLayerViews_) {
+                if (view != VK_NULL_HANDLE) {
+                    vkDestroyImageView(d, view, nullptr);
+                    view = VK_NULL_HANDLE;
+                }
+            }
+            destroyImage2D(ctx->allocator(), d, shadowDepthArray_);
+            shadowDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            shadowMapSize_ = 0;
+            shadowMapDescriptorsDirty_ = true;
+        }
+
+        void ensureShadowDepthPipeline() {
+            if (shadowDepthPipeline_ != VK_NULL_HANDLE) return;
+
+            VkShaderModuleCreateInfo vsmci{};
+            vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vsmci.codeSize = sizeof(kShadowDepthVertSpv);
+            vsmci.pCode    = kShadowDepthVertSpv;
+            VkShaderModule vert = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &vsmci, nullptr, &vert),
+                  "vkCreateShaderModule(shadow_depth.vert)");
+
+            VkShaderModuleCreateInfo fsmci{};
+            fsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fsmci.codeSize = sizeof(kOverlayDepthFragSpv);
+            fsmci.pCode    = kOverlayDepthFragSpv;
+            VkShaderModule frag = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx->device(), &fsmci, nullptr, &frag),
+                  "vkCreateShaderModule(shadow_depth.frag)");
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vert;
+            stages[0].pName  = "main";
+            stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = frag;
+            stages[1].pName  = "main";
+
+            VkPushConstantRange pcRange{};
+            pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+            pcRange.offset = 0;
+            pcRange.size = 16 * sizeof(float);
+            VkPipelineLayoutCreateInfo plci{};
+            plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            plci.pushConstantRangeCount = 1;
+            plci.pPushConstantRanges = &pcRange;
+            check(vkCreatePipelineLayout(ctx->device(), &plci, nullptr, &shadowDepthPipelineLayout_),
+                  "vkCreatePipelineLayout(shadow depth)");
+
+            VkVertexInputBindingDescription vib{};
+            vib.binding = 0;
+            vib.stride = 3 * sizeof(float);
+            vib.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+            VkVertexInputAttributeDescription via{};
+            via.location = 0;
+            via.binding = 0;
+            via.format = VK_FORMAT_R32G32B32_SFLOAT;
+            via.offset = 0;
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            vi.vertexBindingDescriptionCount = 1;
+            vi.pVertexBindingDescriptions = &vib;
+            vi.vertexAttributeDescriptionCount = 1;
+            vi.pVertexAttributeDescriptions = &via;
+
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount = 1;
+
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_FRONT_BIT;
+            rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth = 1.0f;
+
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+            VkPipelineDepthStencilStateCreateInfo ds{};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            ds.depthTestEnable = VK_TRUE;
+            ds.depthWriteEnable = VK_TRUE;
+            ds.depthCompareOp = VK_COMPARE_OP_LESS;
+
+            VkPipelineColorBlendStateCreateInfo cb{};
+            cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.attachmentCount = 0;
+
+            VkDynamicState dyns[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dyn{};
+            dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dyn.dynamicStateCount = 2;
+            dyn.pDynamicStates = dyns;
+
+            VkPipelineRenderingCreateInfo prci{};
+            prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            prci.colorAttachmentCount = 0;
+            prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.pNext = &prci;
+            gpci.stageCount = 2;
+            gpci.pStages = stages;
+            gpci.pVertexInputState = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState = &ms;
+            gpci.pDepthStencilState = &ds;
+            gpci.pColorBlendState = &cb;
+            gpci.pDynamicState = &dyn;
+            gpci.layout = shadowDepthPipelineLayout_;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
+                                            &shadowDepthPipeline_),
+                  "vkCreateGraphicsPipelines(shadow depth)");
+
+            vkDestroyShaderModule(ctx->device(), vert, nullptr);
+            vkDestroyShaderModule(ctx->device(), frag, nullptr);
+        }
+
+        void ensureShadowMapResources(uint32_t mapSize) {
+            ensureShadowDepthPipeline();
+            if (shadowCompareSampler_ == VK_NULL_HANDLE) {
+                VkSamplerCreateInfo sci{};
+                sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+                sci.magFilter = VK_FILTER_LINEAR;
+                sci.minFilter = VK_FILTER_LINEAR;
+                sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+                sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+                sci.compareEnable = VK_TRUE;
+                sci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+                sci.minLod = 0.0f;
+                sci.maxLod = 0.0f;
+                check(vkCreateSampler(ctx->device(), &sci, nullptr, &shadowCompareSampler_),
+                      "vkCreateSampler(shadow compare)");
+            }
+            if (shadowDepthArray_.image != VK_NULL_HANDLE && shadowMapSize_ == mapSize) return;
+
+            if (shadowDepthArray_.image != VK_NULL_HANDLE) {
+                vkDeviceWaitIdle(ctx->device());
+                destroyShadowMapResources();
+            }
+
+            Image2D out{};
+            out.width = mapSize;
+            out.height = mapSize;
+            out.format = VK_FORMAT_D32_SFLOAT;
+            out.arrayLayers = kMaxShadowMapLights;
+
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = out.format;
+            ici.extent = {mapSize, mapSize, 1};
+            ici.mipLevels = 1;
+            ici.arrayLayers = kMaxShadowMapLights;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO;
+            check(vmaCreateImage(ctx->allocator(), &ici, &aci, &out.image, &out.alloc, nullptr),
+                  "vmaCreateImage(shadow depth array)");
+
+            VkImageViewCreateInfo avci{};
+            avci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            avci.image = out.image;
+            avci.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            avci.format = out.format;
+            avci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            avci.subresourceRange.levelCount = 1;
+            avci.subresourceRange.baseArrayLayer = 0;
+            avci.subresourceRange.layerCount = kMaxShadowMapLights;
+            check(vkCreateImageView(ctx->device(), &avci, nullptr, &out.view),
+                  "vkCreateImageView(shadow depth array)");
+
+            for (uint32_t i = 0; i < kMaxShadowMapLights; ++i) {
+                VkImageViewCreateInfo lvci = avci;
+                lvci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                lvci.subresourceRange.baseArrayLayer = i;
+                lvci.subresourceRange.layerCount = 1;
+                check(vkCreateImageView(ctx->device(), &lvci, nullptr, &shadowLayerViews_[i]),
+                      "vkCreateImageView(shadow depth layer)");
+            }
+            ctx->setObjectName(out.image, "shadowDepthArray");
+            ctx->setObjectName(out.view, "shadowDepthArrayView");
+            shadowDepthArray_ = out;
+            shadowMapSize_ = mapSize;
+            shadowDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
+            shadowMapDescriptorsDirty_ = true;
+
+            VkCommandBuffer cb = beginOneShot();
+            transitionImage(cb, shadowDepthArray_.image,
+                            VK_IMAGE_LAYOUT_UNDEFINED,
+                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT,
+                            0, 1, 0, kMaxShadowMapLights);
+            endAndSubmitOneShot(cb, "shadow depth init");
+            shadowDepthLayout_ = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        }
+
+        void recordShadowCasterDraw(VkCommandBuffer cb, const MeshEntry& entry,
+                                    const BlasRecord& rec, const Matrix4& lightVP) {
+            if (!entry.mesh || !entry.mesh->castShadow) return;
+            auto geometry = entry.mesh->geometry();
+            if (!geometry) return;
+            const bool indexed = rec.index.handle != VK_NULL_HANDLE;
+            const uint32_t dataCount = indexed ? rec.indexCount : rec.vertexCount;
+            if (dataCount == 0u) return;
+
+            VkBuffer vbuf = rec.vertex.handle;
+            VkDeviceSize voff = 0;
+            vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
+            if (indexed) {
+                vkCmdBindIndexBuffer(cb, rec.index.handle, 0, VK_INDEX_TYPE_UINT32);
+            }
+
+            Matrix4 world;
+            std::memcpy(world.elements.data(), entry.worldMatrix.data(), 64);
+            Matrix4 mvp;
+            mvp.multiplyMatrices(lightVP, world);
+            vkCmdPushConstants(cb, shadowDepthPipelineLayout_,
+                               VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp.elements.data());
+
+            const auto drawSpan = [&](const std::optional<GeometryGroup>& group) {
+                const VulkanDrawSpan span = resolveVulkanDrawSpan(dataCount, geometry->drawRange, group);
+                if (span.count == 0u) return;
+                if (indexed) {
+                    vkCmdDrawIndexed(cb, span.count, 1, span.first, 0, 0);
+                } else {
+                    vkCmdDraw(cb, span.count, 1, span.first, 0);
+                }
+            };
+
+            const auto& materials = entry.mesh->materials();
+            if (materials.size() > 1 && !geometry->groups.empty()) {
+                for (const auto& group : geometry->groups) {
+                    if (group.materialIndex >= materials.size()) continue;
+                    const auto& material = materials[group.materialIndex];
+                    if (!material || !material->visible) continue;
+                    drawSpan(group);
+                }
+            } else {
+                const auto material = entry.mesh->material();
+                if (!material || !material->visible) return;
+                drawSpan(std::nullopt);
+            }
+        }
+
+        void recordShadowMapPass(VkCommandBuffer cb) {
+            if (activeShadowMapLights_.empty() ||
+                shadowDepthArray_.image == VK_NULL_HANDLE ||
+                shadowDepthPipeline_ == VK_NULL_HANDLE) {
+                return;
+            }
+
+            transitionImage(cb, shadowDepthArray_.image,
+                            shadowDepthLayout_,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            shadowDepthLayout_ == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                    : VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            shadowDepthLayout_ == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? 0
+                                    : VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT,
+                            0, 1, 0, kMaxShadowMapLights);
+            shadowDepthLayout_ = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+
+            VkViewport vp{};
+            vp.x = 0.f;
+            vp.y = 0.f;
+            vp.width = static_cast<float>(shadowMapSize_);
+            vp.height = static_cast<float>(shadowMapSize_);
+            vp.minDepth = 0.f;
+            vp.maxDepth = 1.f;
+            VkRect2D sc{{0, 0}, {shadowMapSize_, shadowMapSize_}};
+
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowDepthPipeline_);
+            vkCmdSetViewport(cb, 0, 1, &vp);
+            vkCmdSetScissor(cb, 0, 1, &sc);
+
+            for (const auto& light : activeShadowMapLights_) {
+                VkRenderingAttachmentInfo depthAtt{};
+                depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+                depthAtt.imageView = shadowLayerViews_[light.layer];
+                depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+                depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+                depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+                depthAtt.clearValue.depthStencil = {1.0f, 0u};
+
+                VkRenderingInfo ri{};
+                ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+                ri.renderArea.offset = {0, 0};
+                ri.renderArea.extent = {shadowMapSize_, shadowMapSize_};
+                ri.layerCount = 1;
+                ri.colorAttachmentCount = 0;
+                ri.pDepthAttachment = &depthAtt;
+                vkCmdBeginRendering(cb, &ri);
+
+                for (const auto& entry : lastVisibleEntries_) {
+                    if (entry.isOverlay || !entry.mesh || !entry.mesh->castShadow) continue;
+                    const BlasRecord* rec = resolveBlasForEntry(entry);
+                    if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+                    recordShadowCasterDraw(cb, entry, *rec, light.lightVP);
+                }
+
+                vkCmdEndRendering(cb);
+            }
+
+            transitionImage(cb, shadowDepthArray_.image,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT,
+                            0, 1, 0, kMaxShadowMapLights);
+            shadowDepthLayout_ = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        }
+
         VkImageView createAttachmentImageView(VkImage image, VkFormat format,
                                               VkImageAspectFlags aspect,
                                               const char* debugName = nullptr) {
@@ -13453,6 +14002,9 @@ namespace threepp {
             ds.depthTestEnable  = VK_TRUE;
             ds.depthWriteEnable = VK_FALSE;
             ds.depthCompareOp   = VK_COMPARE_OP_GREATER_OR_EQUAL;// reverse-Z (overlay vs unjitDepth)
+            VkPipelineDepthStencilStateCreateInfo dsNoDepth = ds;
+            dsNoDepth.depthTestEnable = VK_FALSE;
+            dsNoDepth.depthCompareOp = VK_COMPARE_OP_ALWAYS;
 
             VkPipelineColorBlendAttachmentState cbas{};
             cbas.blendEnable    = VK_FALSE;
@@ -13569,6 +14121,11 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineList, nullptr,
                                             &overlayLineListPipeline),
                   "vkCreateGraphicsPipelines(overlayLineList)");
+            VkGraphicsPipelineCreateInfo gpciLineListNoDepth = gpciLineList;
+            gpciLineListNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListNoDepth, nullptr,
+                                            &overlayLineListNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineListNoDepth)");
 
             VkPipelineInputAssemblyStateCreateInfo iaLineStrip{};
             iaLineStrip.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
@@ -13579,6 +14136,11 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStrip, nullptr,
                                             &overlayLineStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStrip)");
+            VkGraphicsPipelineCreateInfo gpciLineStripNoDepth = gpciLineStrip;
+            gpciLineStripNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripNoDepth, nullptr,
+                                            &overlayLineStripNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineStripNoDepth)");
 
             VkShaderModuleCreateInfo dvsmci{};
             dvsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
@@ -13621,12 +14183,22 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedList, nullptr,
                                             &overlayLineDashedListPipeline),
                   "vkCreateGraphicsPipelines(overlayLineDashedList)");
+            VkGraphicsPipelineCreateInfo gpciDashedListNoDepth = gpciDashedList;
+            gpciDashedListNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedListNoDepth, nullptr,
+                                            &overlayLineDashedListNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineDashedListNoDepth)");
             VkGraphicsPipelineCreateInfo gpciDashedStrip = gpciLineStrip;
             gpciDashedStrip.pStages = dashedStages;
             gpciDashedStrip.pVertexInputState = &dashedVi;
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedStrip, nullptr,
                                             &overlayLineDashedStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineDashedStrip)");
+            VkGraphicsPipelineCreateInfo gpciDashedStripNoDepth = gpciDashedStrip;
+            gpciDashedStripNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedStripNoDepth, nullptr,
+                                            &overlayLineDashedStripNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineDashedStripNoDepth)");
 
             // ── Colored line pipelines ──────────────────────────────────────
             // Different shader pair (overlay_color.vert/.frag) + 2 vertex
@@ -13687,6 +14259,11 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListColored, nullptr,
                                             &overlayLineListColoredPipeline),
                   "vkCreateGraphicsPipelines(overlayLineListColored)");
+            VkGraphicsPipelineCreateInfo gpciLineListColoredNoDepth = gpciLineListColored;
+            gpciLineListColoredNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListColoredNoDepth, nullptr,
+                                            &overlayLineListColoredNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineListColoredNoDepth)");
 
             VkGraphicsPipelineCreateInfo gpciLineStripColored = gpciLineStrip;
             gpciLineStripColored.stageCount        = 2;
@@ -13695,6 +14272,11 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripColored, nullptr,
                                             &overlayLineStripColoredPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStripColored)");
+            VkGraphicsPipelineCreateInfo gpciLineStripColoredNoDepth = gpciLineStripColored;
+            gpciLineStripColoredNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripColoredNoDepth, nullptr,
+                                            &overlayLineStripColoredNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayLineStripColoredNoDepth)");
 
             // ── Point list pipeline ─────────────────────────────────────────
             // POINT_LIST topology. Uses overlay_point.vert/.frag which write
@@ -14713,10 +15295,17 @@ namespace threepp {
         // gbuffer or sceneHdr is reallocated (resize) and after the env image
         // is rebuilt. The UBO buffers are stable; rewriting them is harmless.
         bool ensureDeferredShade() {
+            THREEPP_VK_TRACE_SCOPE("Impl.ensureDeferredShade");
             if (deferredShade_) return true;
             if (!ctx->rayQuerySupported()) return false;
-            deferredShade_ = std::make_unique<vulkan::DeferredShade>(*ctx, kFramesInFlight);
-            rewriteDeferredDescriptors();
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.ensureDeferredShade.createDeferredShade");
+                deferredShade_ = std::make_unique<vulkan::DeferredShade>(*ctx, kFramesInFlight);
+            }
+            {
+                THREEPP_VK_TRACE_SCOPE("Impl.ensureDeferredShade.rewriteDescriptors");
+                rewriteDeferredDescriptors();
+            }
             return true;
         }
 
@@ -14727,8 +15316,10 @@ namespace threepp {
             // (which runs right after the TLAS build) calls this, so the first
             // valid write lands before the first RasterFirst dispatch.
             if (!deferredShade_ || tlas == VK_NULL_HANDLE) return;
+            ensureShadowMapResources(shadowMapSize_ != 0u ? shadowMapSize_ : 2048u);
             std::array<VkBuffer, kFramesInFlight>    camBufs{};
             std::array<VkBuffer, kFramesInFlight>    lightBufs{};
+            std::array<VkBuffer, kFramesInFlight>    shadowBufs{};
             std::array<VkBuffer, kFramesInFlight>    matBufs{};
             std::array<VkBuffer, kFramesInFlight>    emBufs{};
             std::array<VkImageView, kFramesInFlight> normalViews{};
@@ -14748,6 +15339,7 @@ namespace threepp {
             for (uint32_t f = 0; f < kFramesInFlight; ++f) {
                 camBufs[f]       = cameraUbos[f].handle;
                 lightBufs[f]     = lightsUbos[f].handle;
+                shadowBufs[f]    = shadowMapUbos[f].handle;
                 fogBufs[f]       = fogUbos[f].handle;
                 matBufs[f]       = materialDescsBuffers[f].handle;
                 emBufs[f]        = emissiveTriBuffers[f].handle;
@@ -14773,6 +15365,9 @@ namespace threepp {
             vulkan::DeferredShade::DescriptorWriteInputs in{};
             in.cameraUbo        = camBufs.data();
             in.lightsUbo        = lightBufs.data();
+            in.shadowUbo        = shadowBufs.data();
+            in.shadowDepthView  = shadowDepthArray_.view;
+            in.shadowSampler    = shadowCompareSampler_;
             in.envView          = envImage.view;
             in.envSampler       = envImage.sampler;
             in.gbufNormal       = normalViews.data();
@@ -14816,6 +15411,7 @@ namespace threepp {
             in.reservoirPos     = resPosViews;
             in.reservoirW       = resWViews;
             deferredShade_->rewriteDescriptors(in);
+            shadowMapDescriptorsDirty_ = false;
         }
 
 
@@ -16303,7 +16899,8 @@ namespace threepp {
             //   [4] motionFlags: bit 0 = any motion this frame (mesh or
             //       camera), bit 1 = camera viewProj changed, bit 2 = scene
             //       has any glass material, bit 3 = shadowMap enabled for
-            //       analytic-light shadows. Raygen takes a self-tap of
+            //       analytic-light shadows, bit 9 = a shadow-casting mesh
+            //       moved this frame. Raygen takes a self-tap of
             //       accum/gbuf when bit 0 is clear, avoiding round-trip
             //       reproject precision drift on static scenes.
             //   [5]  emissiveCount       (closest_hit reads for NEE CDF)
@@ -17932,6 +18529,11 @@ namespace threepp {
                 pendingTlasRefit_ = false;
             }
 
+            // ── GL-style shadow map pass ───────────────────────────────────
+            // Render shadow-casting meshes from each shadow light's camera
+            // before the raster/deferred lighting path consumes the maps.
+            recordShadowMapPass(cb);
+
             // ── Hybrid raster G-buffer pass ─────────────────────────────────
             // Runs ahead of any RT work so the gbuffer is ready when raygen
             // wants to read primary visibility. In G-buffer debug mode we blit
@@ -18389,6 +18991,7 @@ namespace threepp {
             //                  bit 8 = ReSTIR DI visibility reuse (shadow-test
             //                          the RIS pick before reuse, discard if
             //                          occluded; only set when bit 4 is too),
+            //                  bit 9 = a shadow-casting mesh moved this frame,
             // [5] emissiveCount, [6] emissiveTotalPower (float bits).
             // Per-instance moved bits live in the binding 21 SSBO.
             // (exposure / exposureBits hoisted above the mode branch.)
@@ -18401,7 +19004,8 @@ namespace threepp {
                     (perSppJitterHybrid_        ? 32u  : 0u) |
                     (restirGIEnabled_           ? 64u  : 0u) |
                     (measurePrimaryTraceOnly_   ? 128u : 0u) |
-                    ((restirDIEnabled_ && restirDIVisibilityReuse_) ? 256u : 0u);
+                    ((restirDIEnabled_ && restirDIVisibilityReuse_) ? 256u : 0u) |
+                    (shadowCasterMovedThisFrame_ ? 512u : 0u);
             uint32_t emPowerBits;
             std::memcpy(&emPowerBits, &emissiveTotalPowerThisFrame_, sizeof(emPowerBits));
             uint32_t envSumBits;
@@ -18494,11 +19098,9 @@ namespace threepp {
                     vkCmdPipelineBarrier2(cb, &asdep);
                 }
                 gpuTimings_->begin(cb, TP_PathTrace, currentFrame);
-                // This flag gates ray-query visibility for more than analytic-light
-                // shadows: emissive NEE, ReSTIR DI and secondary GI all need scene
-                // occlusion even when no Directional/Point/Spot light casts shadows.
-                // Analytic-light shadows are further gated by the receiver bit,
-                // TLAS shadow mask, and the per-light castShadow flag.
+                // Direct-light shadowing is GL-style by default: the deferred
+                // shader samples shadow-map layers prepared above. Optional
+                // ray-query effects remain behind their own feature flags.
                 const bool visibilityShadows = true;
                 deferredShade_->recordDispatch(cb, currentFrame,
                                                regionRenderExt_.width, regionRenderExt_.height,
@@ -18510,6 +19112,8 @@ namespace threepp {
                                                fireflyClamp_,
                                                oceanFineTileSize, oceanFoamTileSize,
                                                denoiseEnabled_, restirDIEnabled_,
+                                               deferredRayAccents_,
+                                               envIsBgColor,
                                                deferredVolDensity_, deferredVolAniso_,
                                                deferredStarIntensity_,
                                                deferredCamDeltaLen_, deferredCamRotAngle_,
@@ -18856,11 +19460,13 @@ namespace threepp {
                         std::shared_ptr<Texture> pointMap;
                         std::shared_ptr<Texture> pointAlphaMap;
                         bool useVertexColors = false;
+                        bool noDepthTest = false;
                         LineDashedMaterial* dashed = nullptr;
                         if (matPtr) {
                             if (auto* mc = dynamic_cast<MaterialWithColor*>(matPtr.get())) {
                                 color = mc->color;
                             }
+                            noDepthTest = !matPtr->depthTest;
                             dashed = dynamic_cast<LineDashedMaterial*>(matPtr.get());
                             if (le.isPoints) {
                                 if (auto* ms = dynamic_cast<MaterialWithSize*>(matPtr.get())) {
@@ -18897,14 +19503,17 @@ namespace threepp {
                             want = usePointTexture ? overlayPointListTexturedPipeline
                                                    : overlayPointListPipeline;
                         } else if (useDashed) {
-                            want = useListTopology ? overlayLineDashedListPipeline
-                                                   : overlayLineDashedStripPipeline;
+                            want = useListTopology
+                                           ? (noDepthTest ? overlayLineDashedListNoDepthPipeline : overlayLineDashedListPipeline)
+                                           : (noDepthTest ? overlayLineDashedStripNoDepthPipeline : overlayLineDashedStripPipeline);
                         } else if (useVertexColors) {
-                            want = useListTopology ? overlayLineListColoredPipeline
-                                                   : overlayLineStripColoredPipeline;
+                            want = useListTopology
+                                           ? (noDepthTest ? overlayLineListColoredNoDepthPipeline : overlayLineListColoredPipeline)
+                                           : (noDepthTest ? overlayLineStripColoredNoDepthPipeline : overlayLineStripColoredPipeline);
                         } else {
-                            want = useListTopology ? overlayLineListPipeline
-                                                   : overlayLineStripPipeline;
+                            want = useListTopology
+                                           ? (noDepthTest ? overlayLineListNoDepthPipeline : overlayLineListPipeline)
+                                           : (noDepthTest ? overlayLineStripNoDepthPipeline : overlayLineStripPipeline);
                         }
                         if (want != curPipeline) {
                             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
@@ -19793,7 +20402,9 @@ namespace threepp {
             {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.frameUploads");
                 updateCameraUbo(currentFrame, camera);
+                prepareShadowMapLights(scene);
                 updateLightsUbo(currentFrame, scene);
+                updateShadowMapUbo(currentFrame);
                 updateFogUbo(currentFrame, scene);
                 // Safe to write motionMatBuffers[currentFrame] now that the
                 // inFlight[currentFrame] fence has been signaled — the GPU has
@@ -20382,20 +20993,21 @@ namespace threepp {
                             std::chrono::high_resolution_clock::now() - sceneStart)
                             .count();
         }
-        // Lazy RT pipeline build (first frame). Deferred from constructor so
-        // scene-feature spec constants (kSceneFeatures bitmask, e.g. has-glass
-        // gating the caustic gather DCE) can be baked into chit with the
-        // detected values from ensureSceneBuilt above. Subsequent frames hit
-        // the early-out for free.
-        if (!pimpl_->rtPipelinesBuilt_) {
+        if (pimpl_->renderMode_ == VulkanRenderer::RenderMode::RasterFirst) {
+            pimpl_->ensureDeferredShade();
+        }
+        const bool needsRtPipelines =
+                pimpl_->renderMode_ == VulkanRenderer::RenderMode::ReferencePT ||
+                !pimpl_->deferredShade_;
+        // Lazy RT pipeline build. RasterFirst does not compile raygen/SBT unless
+        // deferred shade is unavailable or the user explicitly selects ReferencePT.
+        if (needsRtPipelines && !pimpl_->rtPipelinesBuilt_) {
             THREEPP_VK_TRACE_SCOPE("VulkanRenderer.buildAllRtPipelines");
             pimpl_->buildAllRtPipelines();
         }
-        // After init, also ensure the *current* variant is built. The first-
-        // frame build only constructs the active variant; if the user has
-        // since toggled into an unbuilt slot, fill it in now (pays a one-time
-        // pipeline-compile cost on first toggle, then never again).
-        {
+        // After init, also ensure the *current* RT variant is built, but only
+        // when the frame graph will actually use the ReferencePT fallback.
+        if (needsRtPipelines) {
             THREEPP_VK_TRACE_SCOPE("VulkanRenderer.ensureCurrentRtVariantBuilt");
             pimpl_->ensureCurrentRtVariantBuilt();
         }
@@ -21937,6 +22549,14 @@ namespace threepp {
 
     bool VulkanRenderer::deferredAO() const {
         return pimpl_->deferredAO_;
+    }
+
+    void VulkanRenderer::setDeferredRayAccents(bool enabled) {
+        pimpl_->deferredRayAccents_ = enabled;
+    }
+
+    bool VulkanRenderer::deferredRayAccents() const {
+        return pimpl_->deferredRayAccents_;
     }
 
     void VulkanRenderer::setBloomThreshold(float threshold) {

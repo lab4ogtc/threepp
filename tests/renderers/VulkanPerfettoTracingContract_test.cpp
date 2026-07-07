@@ -28,4 +28,23 @@ TEST_CASE("Vulkan startup tracing is backed by Perfetto SDK") {
     REQUIRE(renderer.find("#include \"perfetto.h\"") != std::string::npos);
     REQUIRE(renderer.find("TRACE_EVENT") != std::string::npos);
     REQUIRE(renderer.find("THREEPP_VULKAN_STARTUP_TRACE") != std::string::npos);
+    REQUIRE(renderer.find("Impl.ensureDeferredShade.createDeferredShade") != std::string::npos);
+    REQUIRE(renderer.find("Impl.ensureDeferredShade.rewriteDescriptors") != std::string::npos);
+}
+
+TEST_CASE("Vulkan custom ShaderMaterial pipeline cache is checked before compiling") {
+    const auto root = std::filesystem::path{PROJECT_SOURCE_DIR};
+    const auto renderer = readFile(root / "src/threepp/renderers/VulkanRenderer.cpp");
+
+    const auto function = renderer.find("CustomShaderPipelineRecord& getOrCreateCustomShaderPipeline");
+    REQUIRE(function != std::string::npos);
+
+    const auto key = renderer.find("makeVulkanShaderMaterialKey", function);
+    const auto cacheLoop = renderer.find("for (auto& record : customShaderPipelines_)", function);
+    const auto compiler = renderer.find("ensureCustomShaderCompiler", function);
+    REQUIRE(key != std::string::npos);
+    REQUIRE(cacheLoop != std::string::npos);
+    REQUIRE(compiler != std::string::npos);
+    CHECK(key < cacheLoop);
+    CHECK(cacheLoop < compiler);
 }

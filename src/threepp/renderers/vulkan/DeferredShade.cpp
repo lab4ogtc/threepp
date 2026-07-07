@@ -45,7 +45,7 @@ namespace threepp::vulkan {
         sci.maxLod       = 0.f;
         check(vkCreateSampler(d, &sci, nullptr, &gbufSampler_), "vkCreateSampler(deferred)");
 
-        VkDescriptorSetLayoutBinding b[35]{};
+        VkDescriptorSetLayoutBinding b[37]{};
         auto set = [&](uint32_t i, VkDescriptorType t) {
             b[i].binding = i;
             b[i].descriptorType = t;
@@ -91,10 +91,12 @@ namespace threepp::vulkan {
         set(32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // PREV reflAux (other fif index) = 1-frame reflection-denoiser history (mirrors 26)
         set(33, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);         // scene fog UBO (shared with the PT path)
         set(34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // tileable foam detail (R=bubbles, G=lace; mirrors RT binding 45)
+        set(35, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);         // GL-style shadow-map matrices/params
+        set(36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER); // GL-style shadow-map depth array
 
         VkDescriptorSetLayoutCreateInfo dlci{};
         dlci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-        dlci.bindingCount = 35;
+        dlci.bindingCount = 37;
         dlci.pBindings = b;
         check(vkCreateDescriptorSetLayout(d, &dlci, nullptr, &dsLayout_),
               "vkCreateDescriptorSetLayout(deferred)");
@@ -152,9 +154,9 @@ namespace threepp::vulkan {
     void DeferredShade::createDescriptorPool() {
         VkDescriptorPoolSize sizes[5]{};
         sizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        sizes[0].descriptorCount = framesInFlight_ * 3;// camera + lights + fog
+        sizes[0].descriptorCount = framesInFlight_ * 4;// camera + lights + fog + shadow maps
         sizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sizes[1].descriptorCount = framesInFlight_ * (16 + kMaxMaterialTextures);// env + 5 gbuf + 2 ocean + foam detail + bindless + prevIndirect + motion + normalPrev + momentsSqPrev + depthPrev + reflectPrev + reflAuxPrev
+        sizes[1].descriptorCount = framesInFlight_ * (17 + kMaxMaterialTextures);// env + 5 gbuf + 2 ocean + foam detail + shadow maps + bindless + prevIndirect + motion + normalPrev + momentsSqPrev + depthPrev + reflectPrev + reflAuxPrev
         sizes[2].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         sizes[2].descriptorCount = framesInFlight_ * 11;// sceneHdr + indirect + momentsSq + atrousA/B + reflect + reflAux + 4 reservoir (pos/W × write/read)
         sizes[3].type            = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
@@ -191,6 +193,10 @@ namespace threepp::vulkan {
             lightInfo.buffer = in.lightsUbo[f];
             lightInfo.offset = 0;
             lightInfo.range  = VK_WHOLE_SIZE;
+            VkDescriptorBufferInfo shadowInfo{};
+            shadowInfo.buffer = in.shadowUbo[f];
+            shadowInfo.offset = 0;
+            shadowInfo.range  = VK_WHOLE_SIZE;
 
             auto sampled = [&](VkImageView v, VkSampler s) {
                 VkDescriptorImageInfo i{};
@@ -291,6 +297,10 @@ namespace threepp::vulkan {
             foamDetailInfo.sampler     = in.foamDetailSampler;
             foamDetailInfo.imageView   = in.foamDetailView;
             foamDetailInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkDescriptorImageInfo shadowDepthInfo{};
+            shadowDepthInfo.sampler     = in.shadowSampler;
+            shadowDepthInfo.imageView   = in.shadowDepthView;
+            shadowDepthInfo.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
 
             VkDescriptorBufferInfo matInfo{};
             matInfo.buffer = in.materialBuf[f];
@@ -333,7 +343,7 @@ namespace threepp::vulkan {
             resWReadInfo.imageView   = in.reservoirW[resRs];
             resWReadInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
-            VkWriteDescriptorSet w[35]{};
+            VkWriteDescriptorSet w[37]{};
             auto setw = [&](int n, uint32_t bind, VkDescriptorType t,
                             const VkDescriptorImageInfo* img, const VkDescriptorBufferInfo* buf) {
                 w[n].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -388,7 +398,9 @@ namespace threepp::vulkan {
             setw(32, 32, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &prevReflAuxInfo, nullptr);
             setw(33, 33, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         nullptr,          &fogInfo);
             setw(34, 34, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &foamDetailInfo,  nullptr);
-            vkUpdateDescriptorSets(ctx_.device(), 35, w, 0, nullptr);
+            setw(35, 35, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         nullptr,          &shadowInfo);
+            setw(36, 36, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, &shadowDepthInfo, nullptr);
+            vkUpdateDescriptorSets(ctx_.device(), 37, w, 0, nullptr);
         }
     }
 
@@ -413,16 +425,19 @@ namespace threepp::vulkan {
                                        uint32_t emissiveCount, float emissiveTotalPower,
                                        float fireflyClamp,
                                        float oceanFineTileSize, float oceanFoamTileSize,
-                                        bool denoise, bool restirDI,
-                                        float volDensity, float volAniso,
-                                        float starIntensity,
-                                        float camDeltaLen, float camRotAngle,
+                                       bool denoise, bool restirDI, bool rayAccents,
+                                       bool solidBackgroundEnv,
+                                       float volDensity, float volAniso,
+                                       float starIntensity,
+                                       float camDeltaLen, float camRotAngle,
                                         float timeSec) {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipe_);
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
                                 pipeLayout_, 0, 1, &sets_[frame], 0, nullptr);
         const uint32_t flags = (visibilityShadows ? 1u : 0u) | (ao ? 2u : 0u) |
-                               (denoise ? 4u : 0u) | (restirDI ? 8u : 0u);
+                               (denoise ? 4u : 0u) | (restirDI ? 8u : 0u) |
+                               (rayAccents ? 16u : 0u) |
+                               (solidBackgroundEnv ? 32u : 0u);
         uint32_t emPowerBits, fireflyBits, oceanFineBits, oceanFoamBits, volDensBits, volAnisoBits, starBits,
                 camDeltaBits, camRotBits, timeBits;
         std::memcpy(&emPowerBits,   &emissiveTotalPower, sizeof(emPowerBits));

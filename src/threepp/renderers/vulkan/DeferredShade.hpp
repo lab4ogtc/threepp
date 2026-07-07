@@ -39,6 +39,9 @@ namespace threepp::vulkan {
         struct DescriptorWriteInputs {
             const VkBuffer*    cameraUbo  = nullptr;// [framesInFlight] viewInverse/projInverse
             const VkBuffer*    lightsUbo  = nullptr;// [framesInFlight] GpuLightsUbo (scalar)
+            const VkBuffer*    shadowUbo  = nullptr;// [framesInFlight] GL-style shadow-map light matrices
+            VkImageView        shadowDepthView = VK_NULL_HANDLE;// depth 2D-array, one layer per shadow light
+            VkSampler          shadowSampler   = VK_NULL_HANDLE;// comparison sampler
             VkImageView        envView    = VK_NULL_HANDLE;// prefiltered PMREM mip chain
             VkSampler          envSampler = VK_NULL_HANDLE;
             const VkImageView* gbufNormal = nullptr;// [framesInFlight]
@@ -106,7 +109,8 @@ namespace threepp::vulkan {
                             uint32_t emissiveCount, float emissiveTotalPower,
                             float fireflyClamp,
                             float oceanFineTileSize, float oceanFoamTileSize,
-                            bool denoise, bool restirDI,
+                            bool denoise, bool restirDI, bool rayAccents,
+                            bool solidBackgroundEnv,
                             float volDensity, float volAniso,
                             float starIntensity,
                             float camDeltaLen, float camRotAngle,

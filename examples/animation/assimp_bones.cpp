@@ -101,12 +101,10 @@ int main() {
 
     Clock clock;
     canvas.animate([&] {
-        renderer->render(scene, camera);
-
         const auto dt = clock.getDelta();
-
         solderMixer.update(dt);
         trooperMixer.update(dt);
 
+        renderer->render(scene, camera);
     });
 }

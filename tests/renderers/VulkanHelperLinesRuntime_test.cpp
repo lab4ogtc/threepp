@@ -143,6 +143,28 @@ int main() {
         partialPerspectiveLoopGeometry->setDrawRange(1, 4);
         partialPerspectiveLoopScene.add(LineLoop::create(partialPerspectiveLoopGeometry, loopMaterial));
 
+        Scene noDepthLineScene;
+        auto occluderMaterial = MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color::blue));
+        auto occluder = Mesh::create(PlaneGeometry::create(1.4f, 1.4f), occluderMaterial);
+        occluder->position.z = 0.5f;
+        noDepthLineScene.add(occluder);
+        auto noDepthLineGeometry = BufferGeometry::create();
+        noDepthLineGeometry->setAttribute("position", FloatBufferAttribute::create({
+                -0.55f, -0.10f, 0.25f,
+                 0.55f, -0.10f, 0.25f,
+                -0.55f,  0.00f, 0.25f,
+                 0.55f,  0.00f, 0.25f,
+                -0.55f,  0.10f, 0.25f,
+                 0.55f,  0.10f, 0.25f,
+        }, 3));
+        auto noDepthLineMaterial = LineBasicMaterial::create(LineBasicMaterial::Params{}.color(Color::green));
+        noDepthLineMaterial->depthTest = false;
+        noDepthLineScene.add(LineSegments::create(noDepthLineGeometry, noDepthLineMaterial));
+        PerspectiveCamera noDepthLineCamera(45.f, 1.f, 0.1f, 10.f);
+        noDepthLineCamera.position.z = 3.f;
+        noDepthLineCamera.updateProjectionMatrix();
+        noDepthLineCamera.updateMatrixWorld();
+
         int frame = 0;
         bool axesPass = false;
         canvas.animate([&] {
@@ -237,12 +259,31 @@ int main() {
                 return;
             }
 
-            const auto partialPerspectiveFramebuffer = renderer.readRGBPixels();
-            const int loopLeftEdgeGreen = countGreenRegion(partialPerspectiveFramebuffer, 128, 128, 31, 43, 32, 96);
-            const bool loopPass = vt::hasExpectedRgbSize(partialPerspectiveFramebuffer) && loopLeftEdgeGreen > 10;
-            std::printf("[phase4] Perspective LineLoop drawRange closed leftEdgeGreen=%d -> %s\n",
-                        loopLeftEdgeGreen, loopPass ? "PASS" : "FAIL");
-            std::exit(loopPass ? 0 : 1);
+            if (frame == 29) {
+                const auto partialPerspectiveFramebuffer = renderer.readRGBPixels();
+                const int loopLeftEdgeGreen = countGreenRegion(partialPerspectiveFramebuffer, 128, 128, 31, 43, 32, 96);
+                const bool loopPass = vt::hasExpectedRgbSize(partialPerspectiveFramebuffer) && loopLeftEdgeGreen > 10;
+                std::printf("[phase4] Perspective LineLoop drawRange closed leftEdgeGreen=%d -> %s\n",
+                            loopLeftEdgeGreen, loopPass ? "PASS" : "FAIL");
+                if (!loopPass) std::exit(1);
+                renderer.render(noDepthLineScene, noDepthLineCamera);
+                ++frame;
+                return;
+            }
+
+            if (frame < 34) {
+                renderer.render(noDepthLineScene, noDepthLineCamera);
+                ++frame;
+                return;
+            }
+
+            const auto noDepthFramebuffer = renderer.readRGBPixels();
+            const auto noDepthCounts = countPixels(noDepthFramebuffer);
+            const int visibleGreen = countGreenRegion(noDepthFramebuffer, 128, 128, 38, 90, 54, 74);
+            const bool noDepthPass = vt::hasExpectedRgbSize(noDepthFramebuffer) && visibleGreen > 12;
+            std::printf("[phase4] Perspective Line depthTest=false visibleGreen=%d totalGreen=%d nonBlack=%d -> %s\n",
+                        visibleGreen, noDepthCounts.green, noDepthCounts.nonBlack, noDepthPass ? "PASS" : "FAIL");
+            std::exit(noDepthPass ? 0 : 1);
         });
     } catch (const std::exception& e) {
         std::printf("[phase4] Helper lines threw: %s\n", e.what());

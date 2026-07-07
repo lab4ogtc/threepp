@@ -386,7 +386,9 @@ vec3 sampleEquirectFog(vec3 dir) {
 // queries by primaryInstanceId-1 so FC-halving is per-pixel rather than
 // scene-wide. When motionFlags bit 0 is unset raygen takes the self-tap
 // accumulation path and skips the reproject math entirely — float-precision
-// pixel-snap drift on a static scene was visibly wobbly otherwise.
+// pixel-snap drift on a static scene was visibly wobbly otherwise. Bit 9
+// marks a moved shadow caster so static receivers do not average stale
+// shadow positions for many frames.
 layout(push_constant) uniform Pc {
     uint sampleIndex;
     uint envMipCount;
@@ -1081,11 +1083,11 @@ void main() {
     // Hybrid sky early-out: gbuf at this pixel is sky → primary direction is
     // fixed (primaryDirHybrid), env tap is deterministic, and the path
     // terminates at step 0. Replace the spp loop with one sky evaluation
-    // scaled by spp. Disabled when fog is enabled — the unbiased in-loop
-    // volumetric integrator needs per-spp scatter samples (each spp may
-    // scatter at a different depth + direction), so we fall through to the
-    // regular spp loop which performs the correct integration.
-    if (hybridOn && primaryHybridSky && !fogEnabled() && !isSilhouette) {
+    // scaled by spp. HDRI skies with fog still use the unbiased in-loop
+    // volumetric integrator. Solid/default backgrounds have no env CDF and
+    // should stay deterministic like GL's clear/background colour.
+    const bool solidSky = pc.envCdfTotalSum <= 0.0;
+    if (hybridOn && primaryHybridSky && (!fogEnabled() || solidSky) && !isSilhouette) {
         const float sppF   = float(spp);
         radianceSum        = primarySkyEnv * sppF;
         const float lumSky = dot(primarySkyEnv, vec3(0.2126, 0.7152, 0.0722));
@@ -1715,6 +1717,9 @@ void main() {
                 const vec4 pal = imageLoad(prevPrimaryAlbedoImage, px);
                 histAlbedoRGB = pal.rgb;
                 histAlbedoA   = pal.a;
+                if ((pc.motionFlags & 512u) != 0u) {
+                    histFc = min(histFc, float(effSpp));
+                }
             }
         } else {
             // 2026-05-13: hard cold-start when prev pixel held a now-vacated

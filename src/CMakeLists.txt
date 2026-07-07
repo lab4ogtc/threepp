@@ -1146,6 +1146,10 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/gbuffer_indirect.vert"
         kGbufferIndirectVertSpv
         _gbuffer_indirect_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/shadow_depth.vert"
+        kShadowDepthVertSpv
+        _shadow_depth_vert_spv_h)
     # Hybrid raster TAA: post-denoise temporal resolve. Reads taaInput +
     # history + gbufMotion → writes swapchain + new history.
     compile_vulkan_shader(threepp

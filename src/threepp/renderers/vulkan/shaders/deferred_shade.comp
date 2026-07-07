@@ -8,9 +8,9 @@
 #include "vulkan_shared.h"// MaterialDesc
 
 // Raster-first deferred shading. Shades the material G-buffer
-// from the raster prepass into a clean, analytic base + adds ray-traced
+// from the raster prepass into a clean, analytic base + optional ray-query
 // accents, writing linear HDR straight into the bloom sceneHdr image:
-//   • direct analytic lights (dir/point/spot) with ray-query HARD shadows,
+//   • direct analytic lights (dir/spot) with GL-style shadow-map shadows,
 //   • emissive (flat material emissive × intensity),
 //   • split-sum specular: ray-query REFLECTIONS on near-mirror surfaces
 //     (reflected hits are fully shaded — lit + shadowed), prefiltered-env IBL
@@ -47,6 +47,7 @@ struct PointLight { vec3 position; float range; vec3 color; float decay; uint ca
 struct SpotLight  { vec3 position; float range; vec3 color; float decay;
                     vec3 direction; float cosAngleOuter; float cosAngleInner; uint castShadow; };
 struct RectLight  { vec3 position; vec3 halfU; vec3 halfV; vec3 normal; vec3 color; };
+struct HemiLight  { vec3 direction; vec3 skyColor; vec3 groundColor; };
 layout(set = 0, binding = 1, scalar) uniform LightsUbo {
     vec3       ambient;
     uint       dirCount;
@@ -57,7 +58,18 @@ layout(set = 0, binding = 1, scalar) uniform LightsUbo {
     PointLight pointLights[8];
     SpotLight  spotLights[8];
     RectLight  rectLights[4];
+    uint       hemiCount;
+    HemiLight  hemiLights[4];
 } lights;
+
+vec3 ambientIrradiance(vec3 N) {
+    vec3 c = lights.ambient;
+    for (uint i = 0u; i < lights.hemiCount; ++i) {
+        const float w = dot(N, normalize(lights.hemiLights[i].direction)) * 0.5 + 0.5;
+        c += mix(lights.hemiLights[i].groundColor, lights.hemiLights[i].skyColor, clamp(w, 0.0, 1.0));
+    }
+    return c;
+}
 
 layout(set = 0, binding = 2) uniform sampler2D  envTex;        // prefiltered PMREM mip chain
 layout(set = 0, binding = 3) uniform sampler2D  gbufNormalTex; // .xyz = n*0.5+0.5, .w = roughness (<0 = unlit)
@@ -162,6 +174,20 @@ layout(set = 0, binding = 33, scalar) uniform FogUbo {
     float waterSurfaceY; // world-Y medium cap; 1e30 = unbounded
 } fog;
 
+const uint kMaxShadowMapLights = 8u;
+struct ShadowMapLight {
+    mat4 lightVP;
+    vec4 params; // x=bias, y=normalBias, z=radius, w=type(0=dir, 1=spot)
+};
+layout(set = 0, binding = 35, scalar) uniform ShadowMapUbo {
+    uint count;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+    ShadowMapLight lights[kMaxShadowMapLights];
+} shadowMaps;
+layout(set = 0, binding = 36) uniform sampler2DArrayShadow shadowDepthMaps;
+
 const uint kGbufFlagNoDepth = 64u;
 
 float gbufferSurfaceDepth(ivec2 q, uint flags) {
@@ -174,7 +200,7 @@ layout(push_constant) uniform Pc {
     uint  envMipCount;       // PMREM mip levels (>=1)
     uint  width;
     uint  height;
-    uint  flags;             // bit0 内部可见性遮挡，bit1 AO/GI，bit2 denoise，bit3 ReSTIR DI
+    uint  flags;             // bit0 shadow maps, bit1 AO/GI, bit2 denoise, bit3 ReSTIR DI, bit4 RT accents, bit5 solid bg
     uint  frame;             // sample/frame index — temporal jitter (TAA averages it)
     uint  emissiveCount;     // # emissive triangles (0 = none)
     float emissiveTotalPower;// power-CDF total (denominator)
@@ -188,6 +214,14 @@ layout(push_constant) uniform Pc {
     float camRot;            // camera forward-direction change this frame (rad)
     float timeSec;           // wall-clock seconds — foam noise drift (frame-rate independent)
 } pc;
+
+bool rayAccentsOn() {
+    return (pc.flags & 16u) != 0u;
+}
+
+bool solidBackgroundEnv() {
+    return (pc.flags & 32u) != 0u;
+}
 
 uint resolveMaterialIndex(uint instanceIndex, uint primitiveIndex) {
     const GeometryDesc g = geoms[instanceIndex];
@@ -355,6 +389,9 @@ vec3 sampleEnvLod(vec3 dir, float lod) {
     const float v = 0.5 + asin(clamp(dir.y, -1.0, 1.0)) / PI;
     return textureLod(envTex, vec2(u, v), lod).rgb;
 }
+vec3 sampleIblEnvLod(vec3 dir, float lod) {
+    return solidBackgroundEnv() ? vec3(0.0) : sampleEnvLod(dir, lod);
+}
 vec3 sampleMaterialEnvColorLod(MaterialDesc m, vec3 dir, float lod) {
     const float u = 0.5 + atan(dir.z, dir.x) / TWO_PI;
     const float v = 0.5 + asin(clamp(dir.y, -1.0, 1.0)) / PI;
@@ -362,7 +399,7 @@ vec3 sampleMaterialEnvColorLod(MaterialDesc m, vec3 dir, float lod) {
     return textureLod(albedoMaps[ti], vec2(u, v), lod).rgb;
 }
 vec3 sampleMaterialEnvLod(MaterialDesc m, vec3 dir, float lod) {
-    if (m.envTexIndex < 0) return sampleEnvLod(dir, lod);
+    if (m.envTexIndex < 0) return sampleIblEnvLod(dir, lod);
     return sampleMaterialEnvColorLod(m, dir, lod) * m.envMapIntensity;
 }
 bool hasLegacyEnvMap(MaterialDesc m) {
@@ -572,7 +609,44 @@ bool lightCastsShadow(uint encoded) {
 }
 
 float lightShadowRadius(uint encoded) {
-    return float(encoded >> 8u) * (1.0 / 16.0);
+    return float((encoded >> 8u) & 255u) * (1.0 / 16.0);
+}
+
+uint lightShadowMapLayer(uint encoded) {
+    const uint v = (encoded >> 16u) & 255u;
+    return v == 0u ? 0xffffffffu : v - 1u;
+}
+
+float shadowMapVis(uint encoded, vec3 worldPos, vec3 normal) {
+    const uint layer = lightShadowMapLayer(encoded);
+    if (layer >= shadowMaps.count) return -1.0;
+
+    const ShadowMapLight sm = shadowMaps.lights[layer];
+    const vec3 receiver = worldPos + normal * sm.params.y;
+    const vec4 clip = sm.lightVP * vec4(receiver, 1.0);
+    if (clip.w <= 0.0) return 1.0;
+
+    const vec3 proj = clip.xyz / clip.w;
+    const vec2 uv = vec2(proj.x * 0.5 + 0.5, -proj.y * 0.5 + 0.5);
+    const float currentDepth = proj.z - sm.params.x;
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
+        currentDepth < 0.0 || currentDepth > 1.0) {
+        return 1.0;
+    }
+
+    const ivec3 dims = textureSize(shadowDepthMaps, 0);
+    const float texel = dims.x > 0 ? (1.0 / float(dims.x)) : (1.0 / 2048.0);
+    const float radius = clamp(max(sm.params.z, 1.0), 1.0, 4.0);
+    float sum = 0.0;
+    float taps = 0.0;
+    for (int y = -1; y <= 1; ++y) {
+        for (int x = -1; x <= 1; ++x) {
+            const vec2 off = vec2(float(x), float(y)) * texel * radius;
+            sum += texture(shadowDepthMaps, vec4(uv + off, float(layer), currentDepth));
+            taps += 1.0;
+        }
+    }
+    return sum / max(taps, 1.0);
 }
 
 // Inline hard-shadow test (TerminateOnFirstHit). 1.0 lit / 0.0 occluded.
@@ -598,6 +672,13 @@ float shadowVis(vec3 origin, vec3 dir, float tMax) {
     }
     return (rayQueryGetIntersectionTypeEXT(rq, true) ==
             gl_RayQueryCommittedIntersectionNoneEXT) ? 1.0 : 0.0;
+}
+
+float directShadowVis(uint encoded, vec3 worldPos, vec3 normal,
+                      vec3 rayOrigin, vec3 rayDir, float rayTMax) {
+    const float mapVis = shadowMapVis(encoded, worldPos, normal);
+    if (mapVis >= 0.0) return mapVis;
+    return 1.0;
 }
 
 vec3 vsmShadowDir(vec3 dir, float radius) {
@@ -639,12 +720,12 @@ vec3 shadeToonGradientDirect(vec3 P, vec3 N, vec3 albedo, vec3 emissive,
                              MaterialDesc m, bool doShadows, float ambientOcclusion,
                              vec3 lightMapIrradiance) {
     const vec3 shadowOrig = P + N * SHADOW_EPS;
-    vec3 lit = emissive + albedo * (lights.ambient + lightMapIrradiance) * ambientOcclusion;
+    vec3 lit = emissive + albedo * (ambientIrradiance(N) + lightMapIrradiance) * ambientOcclusion;
 
     for (uint i = 0u; i < lights.dirCount; ++i) {
         const vec3 L = normalize(lights.dirLights[i].direction);
         const float nDotL = max(dot(N, L), 0.0);
-        const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) && nDotL > 0.0 ? shadowVis(shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
+        const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) && nDotL > 0.0 ? directShadowVis(lights.dirLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
         lit += albedo * sampleToonGradient(m, nDotL) * lights.dirLights[i].color * vis;
     }
     for (uint i = 0u; i < lights.pointCount; ++i) {
@@ -653,7 +734,7 @@ vec3 shadeToonGradientDirect(vec3 P, vec3 N, vec3 albedo, vec3 emissive,
         if (dist < 1e-4) continue;
         toL /= dist;
         const float nDotL = max(dot(N, toL), 0.0);
-        const float vis = doShadows && lightCastsShadow(lights.pointLights[i].castShadow) && nDotL > 0.0 ? shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2) : 1.0;
+        const float vis = doShadows && lightCastsShadow(lights.pointLights[i].castShadow) && nDotL > 0.0 ? directShadowVis(lights.pointLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2) : 1.0;
         const float decay = lights.pointLights[i].decay;
         float atten = 1.0 / max(pow(dist, decay), 0.01);
         const float range = lights.pointLights[i].range;
@@ -675,7 +756,7 @@ vec3 shadeToonGradientDirect(vec3 P, vec3 N, vec3 albedo, vec3 emissive,
         const float spotAtten = smoothstep(lights.spotLights[i].cosAngleOuter,
                                            lights.spotLights[i].cosAngleInner, spotCos);
         if (spotAtten <= 0.0) continue;
-        const float vis = doShadows && lightCastsShadow(lights.spotLights[i].castShadow) && nDotL > 0.0 ? shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0;
+        const float vis = doShadows && lightCastsShadow(lights.spotLights[i].castShadow) && nDotL > 0.0 ? directShadowVis(lights.spotLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0;
         const float decay = lights.spotLights[i].decay;
         float atten = 1.0 / max(pow(dist, decay), 0.01);
         const float range = lights.spotLights[i].range;
@@ -1377,6 +1458,13 @@ vec3 emissiveIrradiance(vec3 P, vec3 N, int EM_SAMPLES, bool doShadows) {
 vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float missLod, inout uint seed, bool cheapHits);// fwd decl
 vec3 giRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, inout uint seed);// fwd decl (cheap 1-bounce GI)
 
+vec3 traceAccentRadiance(vec3 origin, vec3 dir, bool doShadows,
+                         float maxLod, float missLod, inout uint seed,
+                         bool cheapHits) {
+    if (!rayAccentsOn()) return sampleEnvLod(dir, missLod);
+    return traceRadiance(origin, dir, doShadows, maxLod, missLod, seed, cheapHits);
+}
+
 // Scales the DIRECT emission of traceRadiance's hits — the emitter-specular
 // OWNERSHIP split for the opaque reflection. 1 = the ray owns emitter spec
 // (near-mirror: the tight lobe hits the emitter every frame → no variance).
@@ -1576,7 +1664,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
         if (pickOne && i != pickIdx) continue;
         const vec3 L = normalize(lights.dirLights[i].direction);
         if (dot(N, L) <= 0.0) continue;
-        const float vis = (doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? shadowVis(shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0) * wPick;
+        const float vis = (doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? directShadowVis(lights.dirLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0) * wPick;
         if (vis <= 0.0) continue;
         lit += evalLight(N, clearcoatN, V, L, NdotV, clearcoatNdotV, F0, albedo, roughness, metalness, k,
                          clearcoat, clearcoatRoughness, sheenColor, sheenRoughness)
@@ -1589,7 +1677,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
         if (dist < 1e-4) continue;
         toL /= dist;
         if (dot(N, toL) <= 0.0) continue;
-        const float vis = (doShadows && lightCastsShadow(lights.pointLights[i].castShadow) ? shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2) : 1.0) * wPick;
+        const float vis = (doShadows && lightCastsShadow(lights.pointLights[i].castShadow) ? directShadowVis(lights.pointLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2) : 1.0) * wPick;
         if (vis <= 0.0) continue;
         const float decay = lights.pointLights[i].decay;
         float atten = 1.0 / max(pow(dist, decay), 0.01);
@@ -1615,7 +1703,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
         const float spotAtten = smoothstep(lights.spotLights[i].cosAngleOuter,
                                            lights.spotLights[i].cosAngleInner, spotCos);
         if (spotAtten <= 0.0) continue;
-        const float vis = (doShadows && lightCastsShadow(lights.spotLights[i].castShadow) ? shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0) * wPick;
+        const float vis = (doShadows && lightCastsShadow(lights.spotLights[i].castShadow) ? directShadowVis(lights.spotLights[i].castShadow, P, N, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0) * wPick;
         if (vis <= 0.0) continue;
         const float decay = lights.spotLights[i].decay;
         float atten = 1.0 / max(pow(dist, decay), 0.01);
@@ -1648,12 +1736,9 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
         const vec3  vN   = rl.halfV / vLen;
         const float area = 4.0 * uLen * vLen;
 
-        // DIFFUSE — exact polygon form factor (smooth, matches the PT; no hotspots),
-        // gated by a SOFT shadow: average visibility over a jittered 4×4 grid of points
-        // on the rect (one shadow ray each) → a real penumbra instead of the hard single-
-        // ray shaft (the window-frame occlusion was projecting sharp light cones). The
-        // per-pixel jitter (stable PCG hash → no flicker) turns the grid's banding into
-        // fine high-frequency grain. The smooth form factor carries the falloff.
+        // DIFFUSE — exact polygon form factor (smooth, matches the PT; no hotspots).
+        // GL-style RasterFirst does not shadow RectLight by default, so this branch
+        // stays deterministic and does not issue ray-query visibility tests.
         {
             const vec3  toC   = rl.position - P;
             const float distC = length(toC);
@@ -1664,38 +1749,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
                 const vec3  c3 = rl.position - rl.halfU + rl.halfV;
                 const float ff = rectFormFactor(N, P, c0, c1, c2, c3);
                 if (ff > 0.0) {
-                    float vis = 1.0;
-                    if (doShadows) {
-                        // Blue-noise-like jitter via Interleaved Gradient Noise (Jiménez
-                        // 2014), replacing the old white-noise PCG hash so the per-pixel
-                        // penumbra error is spectrally blue (reads smooth, not clumpy).
-                        //
-                        // PRIMARY hits (SIDE=4, the clean raster base — NOT temporally
-                        // accumulated) keep a STATIC per-pixel pattern: deterministic, no
-                        // flicker (the property the static jitter was protecting).
-                        // REFLECTION / denoised hits (cheapHit, SIDE=1) are fed through the
-                        // reflection SVGF temporal pass, so ANIMATE the pattern per frame:
-                        // a static 1-sample shadow is a fixed pattern the temporal denoiser
-                        // cannot average — that's what baked in as a static weave + black
-                        // speckle on the reflections of distant metals. Per-frame rotation
-                        // lets SVGF integrate the single sample into a smooth soft shadow
-                        // (it joins the GGX ray + light pick, already animated via reflSeed).
-                        vec2 fpx = vec2(gl_GlobalInvocationID.xy);
-                        if (cheapHit) fpx += float(pc.frame & 0xFFFFu) * vec2(0.7548776662, 0.5698402910);
-                        const float jx  = fract(52.9829189 * fract(dot(fpx,    vec2(0.06711056, 0.00583715))));
-                        const float jy  = fract(52.9829189 * fract(dot(fpx.yx, vec2(0.06711056, 0.00583715)) + 0.5));
-                        const uint SIDE = cheapHit ? 1u : 4u;// 1-ray jittered at reflection hits
-                        float vsum = 0.0;
-                        for (uint sj = 0u; sj < SIDE; ++sj)
-                        for (uint si = 0u; si < SIDE; ++si) {
-                            const float fu = (float(si) + jx) / float(SIDE) * 2.0 - 1.0;
-                            const float fv = (float(sj) + jy) / float(SIDE) * 2.0 - 1.0;
-                            const vec3  sp = rl.position + fu * rl.halfU + fv * rl.halfV;
-                            const vec3  sl = sp - shadowOrig; const float sd = length(sl);
-                            vsum += (sd > 1e-4) ? shadowVis(shadowOrig, sl / sd, sd - 1e-2) : 1.0;
-                        }
-                        vis = vsum / float(SIDE * SIDE);
-                    }
+                    const float vis = 1.0;
                     lit += diffuseColor * rl.color * (ff * vis);
                 }
             }
@@ -1721,7 +1775,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
                 const float ndl  = dot(N, L);
                 const float cosE = dot(-L, rl.normal);
                 if (ndl > 0.0 && cosE > 0.0) {
-                    const float vis = doShadows ? shadowVis(shadowOrig, L, dist - 1e-2) : 1.0;
+                    const float vis = 1.0;
                     if (vis > 0.0) {
                         const vec3  H     = normalize(V + L);
                         const float NdotH = max(dot(N, H), 0.0);
@@ -1993,7 +2047,7 @@ vec3 traceRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, float mi
         const vec3 hEmissive = hitTex(hm.emissiveTexIndex, hm.uvTransformEmissive, hitUv,
                                       hm.emissive * hm.emissiveIntensity);
         const vec3 hitP = o + d * tHit;
-        const vec3 hitDiffInd = (sampleEnvLod(hitN, maxLod) + lights.ambient + sampleLightMapIrradiance(hm, hitUv2))
+        const vec3 hitDiffInd = (sampleEnvLod(hitN, maxLod) + ambientIrradiance(hitN) + sampleLightMapIrradiance(hm, hitUv2))
                               * sampleAmbientOcclusion(hm, hitUv2);
         radiance += tput * hitAlpha * shadeDiffuseDirect(hitP, hitN, hitN, hitV, hAlbedo, hRough, hMetal,
                                               hEmissive * gReflEmitterScale,
@@ -2108,7 +2162,7 @@ vec3 giRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, inout uint 
         const vec3  L   = normalize(lights.dirLights[i].direction);
         const float ndl = dot(hitN, L);
         if (ndl <= 0.0) continue;
-        const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? shadowVis(shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
+        const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? directShadowVis(lights.dirLights[i].castShadow, hitP, hitN, shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
         lit += diff * ndl * lights.dirLights[i].color * (vis * wL);
     }
     for (uint i = 0u; i < lights.pointCount; ++i) {
@@ -2123,7 +2177,7 @@ vec3 giRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, inout uint 
         const float range = lights.pointLights[i].range;
         if (range > 0.0) { const float tt = dist / range; const float t4 = tt*tt*tt*tt; const float wnd = max(1.0 - t4, 0.0); atten *= wnd * wnd; }
         if (atten <= 1e-6) continue;
-        const float vis = doShadows && lightCastsShadow(lights.pointLights[i].castShadow) ? shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2) : 1.0;
+        const float vis = doShadows && lightCastsShadow(lights.pointLights[i].castShadow) ? directShadowVis(lights.pointLights[i].castShadow, hitP, hitN, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2) : 1.0;
         lit += diff * ndl * lights.pointLights[i].color * (atten * vis * wL);
     }
     for (uint i = 0u; i < lights.spotCount; ++i) {
@@ -2142,7 +2196,7 @@ vec3 giRadiance(vec3 origin, vec3 dir, bool doShadows, float maxLod, inout uint 
         const float range = lights.spotLights[i].range;
         if (range > 0.0) { const float tt = dist / range; const float t4 = tt*tt*tt*tt; const float wnd = max(1.0 - t4, 0.0); atten *= wnd * wnd; }
         if (atten <= 1e-6) continue;
-        const float vis = doShadows && lightCastsShadow(lights.spotLights[i].castShadow) ? shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0;
+        const float vis = doShadows && lightCastsShadow(lights.spotLights[i].castShadow) ? directShadowVis(lights.spotLights[i].castShadow, hitP, hitN, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0;
         lit += diff * ndl * lights.spotLights[i].color * (atten * vis * wL);
     }
     // Emitter 1-bounce (e.g. enclosed scene lit only by an emissive sphere) —
@@ -2177,8 +2231,8 @@ vec3 shadeWater(vec3 P, vec3 N, vec3 V, MaterialDesc pm, int instIdx,
     // small bright moon) otherwise reflect off the chop-perturbed normals as
     // per-pixel white speckle; smooth day skies are visually unchanged.
     const vec3 R = reflect(-V, N);
-    const vec3 reflectColor = traceRadiance(P + N * SHADOW_EPS, R, doShadows, maxLod,
-                                            0.12 * maxLod, seed, /*cheapHits=*/true);// water: blur+temporal absorb
+    const vec3 reflectColor = traceAccentRadiance(P + N * SHADOW_EPS, R, doShadows, maxLod,
+                                                  0.12 * maxLod, seed, /*cheapHits=*/true);// water: blur+temporal absorb
 
     // Transmission: ANALYTIC deep-water body — deliberately NOT a refraction
     // ray. A downward ray self-intersects this same choppy surface (adjacent
@@ -2229,7 +2283,7 @@ vec3 shadeWater(vec3 P, vec3 N, vec3 V, MaterialDesc pm, int instIdx,
             const vec3  L   = normalize(lights.dirLights[i].direction);
             const float ndl = dot(N, L);
             if (ndl <= 0.0) continue;
-            const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? shadowVis(sunOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
+            const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? directShadowVis(lights.dirLights[i].castShadow, P, N, sunOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
             if (vis <= 0.0) continue;
             const vec3  H   = normalize(V + L);
             const float ndh = max(dot(N, H), 0.0);
@@ -2272,7 +2326,7 @@ vec3 shadeWater(vec3 P, vec3 N, vec3 V, MaterialDesc pm, int instIdx,
                 atten *= wnd * wnd;
             }
             if (atten <= 1e-6) continue;
-            const float vis = doShadows && lightCastsShadow(lights.spotLights[i].castShadow) ? shadowVis(sunOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0;
+            const float vis = doShadows && lightCastsShadow(lights.spotLights[i].castShadow) ? directShadowVis(lights.spotLights[i].castShadow, P, N, sunOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2) : 1.0;
             if (vis <= 0.0) continue;
             const vec3  H   = normalize(V + toL);
             const float ndh = max(dot(N, H), 0.0);
@@ -2386,6 +2440,10 @@ void traceGlassInterior(vec3 origin, vec3 dir, float maxLod, bool doShadows, ino
     float travelled = 0.0;
     miss = false; blocked = false;
     hitP = origin; hitN = vec3(0.0, 1.0, 0.0); dist = 0.0;
+    if (!rayAccentsOn()) {
+        miss = true;
+        return;
+    }
     for (int s = 0; s < 4; ++s) {
         rayQueryEXT rq;
         rayQueryInitializeEXT(rq, topAS, gl_RayFlagsOpaqueEXT, 0xFFu, o, 1e-3, dir, 1e30);
@@ -2422,7 +2480,7 @@ void traceGlassInterior(vec3 origin, vec3 dir, float maxLod, bool doShadows, ino
                 vec3 n = hitN;
                 if (dot(n, -dir) < 0.0) n = -n;
                 const vec3 alb     = hitTex(hm.albedoTexIndex, hm.uvTransform, uv, hm.albedo);
-                const vec3 diffInd = (sampleEnvLod(n, maxLod) + lights.ambient + sampleLightMapIrradiance(hm, uv2))
+                const vec3 diffInd = (sampleEnvLod(n, maxLod) + ambientIrradiance(n) + sampleLightMapIrradiance(hm, uv2))
                                    * sampleAmbientOcclusion(hm, uv2);
                 float hClearcoat = hm.clearcoat;
                 float hClearcoatRoughness = hm.clearcoatRoughness;
@@ -2537,8 +2595,8 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
 
         // Reflection (sky + scene) — multi-bounce / recursive.
         const vec3 R = reflect(-V, Ns);
-        const vec3 reflectColor = traceRadiance(P + N * SHADOW_EPS, R, doShadows, maxLod, missLod, seed,
-                                                /*cheapHits=*/false);// glass shows hits SHARP — deterministic shading
+        const vec3 reflectColor = traceAccentRadiance(P + N * SHADOW_EPS, R, doShadows, maxLod, missLod, seed,
+                                                      /*cheapHits=*/false);// glass shows hits SHARP — deterministic shading
 
         vec3 transmitColor;
         if (pm.thinWalled != 0) {
@@ -2551,8 +2609,8 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
             // "washed, detail-destroyed" look over e.g. a watch dial.
             const vec3 dT = -V;// straight-through (net-zero thin-shell bend)
             {
-                const vec3 behind = traceRadiance(P - N * SHADOW_EPS, dT, doShadows, maxLod, missLod, seed,
-                                                  /*cheapHits=*/false);// refracted content is sharp
+                const vec3 behind = traceAccentRadiance(P - N * SHADOW_EPS, dT, doShadows, maxLod, missLod, seed,
+                                                        /*cheapHits=*/false);// refracted content is sharp
                 vec3 tint = albedo;
                 if (pm.attenuationDistance > 0.0 && pm.thickness > 0.0)
                     tint *= pow(max(pm.attenuationColor, vec3(1e-6)), vec3(pm.thickness / pm.attenuationDistance));
@@ -2590,8 +2648,8 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                     dOut = (dot(o, o) < 1e-6) ? reflect(dIn, nb)// TIR → internal reflect
                                               : normalize(o);
                 }
-                const vec3 behind = traceRadiance(exitP + dOut * SHADOW_EPS, dOut, doShadows, maxLod, missLod, seed,
-                                                  /*cheapHits=*/false);// refracted content is sharp
+                const vec3 behind = traceAccentRadiance(exitP + dOut * SHADOW_EPS, dOut, doShadows, maxLod, missLod, seed,
+                                                        /*cheapHits=*/false);// refracted content is sharp
                 vec3 tint = albedo;
                 if (pm.attenuationDistance > 0.0)
                     tint *= pow(max(pm.attenuationColor, vec3(1e-6)), vec3(inDist / pm.attenuationDistance));
@@ -2630,7 +2688,7 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
             const vec3  L     = normalize(lights.dirLights[i].direction);
             const float NdotL = max(dot(N, L), 0.0);
             if (NdotL <= 0.0) continue;
-            const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? shadowVis(P + N * SHADOW_EPS, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
+            const float vis = doShadows && lightCastsShadow(lights.dirLights[i].castShadow) ? directShadowVis(lights.dirLights[i].castShadow, P, N, P + N * SHADOW_EPS, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30) : 1.0;
             if (vis <= 0.0) continue;
             const vec3  H = normalize(V + L);
             const float D = distGGX(max(dot(N, H), 0.0), gr);
@@ -2879,8 +2937,8 @@ void main() {
             uint seedU = pcgHash(uint(px.x) ^ pcgHash(uint(px.y) ^ 0x85ebca6bu));
             const bool sceneShadowsOnU = ((pc.flags & 1u) != 0u);
             const float opacity = 1.0 - clamp(pm.transmission, 0.0, 1.0);
-            const vec3 behind = traceRadiance(wpU - VU * SHADOW_EPS, -VU, sceneShadowsOnU, maxLod, 0.0, seedU,
-                                              /*cheapHits=*/false);
+            const vec3 behind = traceAccentRadiance(wpU - VU * SHADOW_EPS, -VU, sceneShadowsOnU, maxLod, 0.0, seedU,
+                                                    /*cheapHits=*/false);
             litU = mix(behind, litU, opacity);
         }
         imageStore(outImage, px, vec4(litU, 1.0));
@@ -3023,7 +3081,7 @@ void main() {
                 if (!lightCastsShadow(lights.dirLights[i].castShadow)) continue;
                 const vec3 L = normalize(lights.dirLights[i].direction);
                 if (dot(N, L) > 0.0)
-                    shadow = max(shadow, 1.0 - shadowVis(shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30));
+                    shadow = max(shadow, 1.0 - directShadowVis(lights.dirLights[i].castShadow, worldPos, N, shadowOrig, vsmShadowDir(L, lightShadowRadius(lights.dirLights[i].castShadow)), 1e30));
             }
             for (uint i = 0u; i < lights.pointCount; ++i) {
                 if (!lightCastsShadow(lights.pointLights[i].castShadow)) continue;
@@ -3032,7 +3090,7 @@ void main() {
                 if (dist > 1e-4) {
                     toL /= dist;
                     if (dot(N, toL) > 0.0)
-                        shadow = max(shadow, 1.0 - shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2));
+                        shadow = max(shadow, 1.0 - directShadowVis(lights.pointLights[i].castShadow, worldPos, N, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.pointLights[i].castShadow)), dist - 1e-2));
                 }
             }
             for (uint i = 0u; i < lights.spotCount; ++i) {
@@ -3045,14 +3103,14 @@ void main() {
                     const float spotAtten = smoothstep(lights.spotLights[i].cosAngleOuter,
                                                        lights.spotLights[i].cosAngleInner, spotCos);
                     if (spotAtten > 0.0 && dot(N, toL) > 0.0)
-                        shadow = max(shadow, 1.0 - shadowVis(shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2));
+                        shadow = max(shadow, 1.0 - directShadowVis(lights.spotLights[i].castShadow, worldPos, N, shadowOrig, vsmShadowDir(toL, lightShadowRadius(lights.spotLights[i].castShadow)), dist - 1e-2));
                 }
             }
         }
         const float opacity = shadow * clamp(pm.transmission, 0.0, 1.0);
-        const vec3 behind = traceRadiance(worldPos - V * SHADOW_EPS, -V,
-                                          sceneShadowsOn, maxLod, 0.0, seed,
-                                          /*cheapHits=*/false);
+        const vec3 behind = traceAccentRadiance(worldPos - V * SHADOW_EPS, -V,
+                                                sceneShadowsOn, maxLod, 0.0, seed,
+                                                /*cheapHits=*/false);
         vec3 lit = mix(behind, albedo, opacity);
         lit = applySceneFog(lit, camPos, worldPos);
         imageStore(outImage, px, vec4(lit, 1.0));
@@ -3138,11 +3196,11 @@ void main() {
         }
     } else if (aoOn && (pm.envTexIndex < 0 || legacyEnvMap)) {
         float openness;
-        diffInd = gatherEnv(worldPos, N, px, pc.frame, sceneShadowsOn, demodIndirect, giSpp, openness) + lights.ambient * openness;
+        diffInd = gatherEnv(worldPos, N, px, pc.frame, sceneShadowsOn, demodIndirect, giSpp, openness) + ambientIrradiance(N) * openness;
     } else if (legacyEnvMap) {
-        diffInd = sampleEnvLod(N, maxLod) + lights.ambient;
+        diffInd = sampleIblEnvLod(N, maxLod) + ambientIrradiance(N);
     } else {
-        diffInd = sampleMaterialEnvLod(pm, N, maxLod) + lights.ambient;
+        diffInd = sampleMaterialEnvLod(pm, N, maxLod) + ambientIrradiance(N);
     }
     diffInd = (diffInd + lightMapIrradiance) * ambientOcclusion;
     // ReSTIR DI emissive area lighting → DEMOD irradiance folded into the diffuse-
@@ -3164,7 +3222,7 @@ void main() {
                                   pm.sheenColor, pm.sheenRoughness,
                                   specularIntensity, pm.specularColor,
                                   pm.iridescence, pm.iridescenceIOR, pm.iridescenceThicknessNm, seed,
-                                  /*addEmissive=*/((pc.flags & 8u) == 0u),// ReSTIR on → emissive via main()/diffInd; off → coherent emissiveNEE here
+                                  /*addEmissive=*/rayAccentsOn() && ((pc.flags & 8u) == 0u),// ReSTIR on → emissive via main()/diffInd; off → coherent emissiveNEE here
                                   /*cheapHit=*/false);// primary: exhaustive lights + full NEE
 
     // Sharp surfaces trace the exact mirror ray; glossy surfaces GGX-importance-
@@ -3201,7 +3259,7 @@ void main() {
     // double-counts). The NEE add is faded by reflBlend so emitter spec follows
     // the same ≥0.7-roughness specular cutoff as the rest of the spec model.
     const float specNEET = smoothstep(0.10, 0.25, roughness);
-    if (opaqueRefl && reflBlend > 0.0 && specNEET > 0.0 && pc.emissiveCount > 0u) {
+    if (rayAccentsOn() && opaqueRefl && reflBlend > 0.0 && specNEET > 0.0 && pc.emissiveCount > 0u) {
         const float kS = (roughness + 1.0) * (roughness + 1.0) / 8.0;
         lit += (specNEET * reflBlend)
              * emissiveSpecNEE(worldPos, N, V, NdotV, F0, roughness, kS, sceneShadowsOn);
@@ -3226,7 +3284,7 @@ void main() {
         const float missLod = roughness * maxLod;// ray-miss reads the roughness-blurred env mip
         if (pm.envTexIndex >= 0) {
             reflOut = sampleMaterialEnvLod(pm, R, missLod) * (F0 * ab.x + ab.y) * reflBlend;
-        } else if (!reflSkip) {
+        } else if (rayAccentsOn() && !reflSkip) {
             // Emitter self-emission scale for the ray (the other half of the split):
             // DIELECTRICS → 0: F0≈0.04, a reflected small emitter is ~invisible in the
             // PT, yet a full-radiance hit produced bright "probe speckles" (their faint
@@ -3256,8 +3314,8 @@ void main() {
             // no amount of denoising should have to absorb. Mirror fallback matches
             // the bounce-continuation guard inside traceRadiance.
             if (dot(Rd, N) <= 0.0) Rd = R;
-            vec3 r = traceRadiance(shadowOrig, Rd, sceneShadowsOn, maxLod, missLod, reflSeed,
-                                   /*cheapHits=*/true);// reflection channel: blur+temporal absorb
+            vec3 r = traceAccentRadiance(shadowOrig, Rd, sceneShadowsOn, maxLod, missLod, reflSeed,
+                                         /*cheapHits=*/true);// reflection channel: blur+temporal absorb
             gReflEmitterScale = 1.0;
             const float rl = max(max(r.r, r.g), r.b);// firefly clamp the single sample
             if (rl > pc.fireflyClamp) r *= pc.fireflyClamp / rl;
@@ -3297,8 +3355,8 @@ void main() {
         // straight (-V) ray to recover it. Host encodes strength = transmission-1
         // (transmission>1 is the additive marker).
         const float strength = clamp(transmission - 1.0, 0.0, 1.0);
-        const vec3  behind   = traceRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
-                                             /*cheapHits=*/false);// straight into lit, unblurred
+        const vec3  behind   = traceAccentRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
+                                                   /*cheapHits=*/false);// straight into lit, unblurred
         lit = behind + lit * strength;
     } else if (transmission > 0.0) {
         if (pm.ior < 1.05) {
@@ -3308,8 +3366,8 @@ void main() {
             // darkening. (One transparent layer over opaque: the behind ray sees
             // opaque geometry shaded as PBR; overlapping transparent isn't sorted.)
             const float opacity = 1.0 - clamp(transmission, 0.0, 1.0);
-            const vec3  behind  = traceRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
-                                                /*cheapHits=*/false);// straight into lit, unblurred
+            const vec3  behind  = traceAccentRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
+                                                      /*cheapHits=*/false);// straight into lit, unblurred
             lit = mix(behind, lit, opacity);
         } else {
             // REAL refractive glass (ior>1). ONE sharp Fresnel reflect+refract

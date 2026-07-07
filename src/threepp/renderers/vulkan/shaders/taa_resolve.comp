@@ -365,10 +365,13 @@ void main() {
     // YCoCg variance clip + the motion-relaxed antiFlicker below keep this from
     // turning into flicker on a static view (dilatedMotionPx is 0 there).
     const float velocityBump = clamp(dilatedMotionPx / 18.0, 0.0, 0.4);
-    // is_skinned flag (bit 3) is informational; SkinnedMesh now has proper
-    // per-vertex motion vectors via a prev-pose vertex buffer (gbuffer.vert
-    // reads it at attribute 3). The previous force-high-alpha hack is gone —
-    // velocity bump alone now correctly tracks deformation.
+    // Skinned meshes have correct per-vertex motion, but articulated motion
+    // leaves history hanging on high-contrast limbs longer than rigid motion.
+    // Only release extra history when the local neighbourhood is actually
+    // moving, so static skinned meshes keep the same AA stability.
+    const float skinnedMotionBump = (isSkinned && dilatedMotionPx > 0.05)
+            ? clamp(dilatedMotionPx / 36.0, 0.0, 0.18)
+            : 0.0;
     //
     // LUMA ANTI-FLICKER (Karis): where the current (1-spp jittered) sample
     // disagrees strongly with the converged history — i.e. EDGES, especially
@@ -392,7 +395,7 @@ void main() {
     // stability — the behaviour the comments above guard — is unchanged).
     const float motionRelax = clamp(dilatedMotionPx * 0.5, 0.0, 1.0);
     antiFlicker = mix(antiFlicker, 1.0, motionRelax);
-    const float a = clamp((pc.blendAlpha + velocityBump) * antiFlicker, 0.01, 1.0);
+    const float a = clamp((pc.blendAlpha + velocityBump + skinnedMotionBump) * antiFlicker, 0.01, 1.0);
     const vec3 result = reprojValid ? mix(history, curr, a) : curr;
 
     // When a downstream RCAS pass owns the swapchain write, skip it here but

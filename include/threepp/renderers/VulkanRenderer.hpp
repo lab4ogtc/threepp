@@ -301,6 +301,13 @@ namespace threepp {
         void setDeferredAO(bool enabled);
         [[nodiscard]] bool deferredAO() const;
 
+        // RasterFirst optional ray-query accents: screen-visible scene
+        // reflections, glass/transmission tracing and water reflection tracing.
+        // OFF by default so the default Vulkan path matches GL-style raster
+        // lighting plus shadow maps. AO/GI and ReSTIR keep their own toggles.
+        void setDeferredRayAccents(bool enabled);
+        [[nodiscard]] bool deferredRayAccents() const;
+
         // RasterFirst volumetric SPOT-light beams: ray-marched single scattering
         // through a uniform thin haze — searchlight / lighthouse beams, visible
         // against sky and surfaces alike. `density` is the scattering coefficient
@@ -406,17 +413,11 @@ namespace threepp {
         //                 full PT noise and cost. Kept as the reference / high-
         //                 fidelity option.
         //
-        //   RasterFirst — raster shades a clean, analytic, noise-free base
-        //                 (direct analytic lights + IBL) and the path tracer
-        //                 contributes only additive accents (reflections, GI,
-        //                 caustics) on top. The intended default once built
-        //                 out: most of the look of PT without the noise or the
-        //                 per-pixel ray cost.
-        //
-        // NOTE: RasterFirst is being landed in stages. Until the deferred
-        // shading path exists it falls back to ReferencePT behaviour, so the
-        // two modes currently render identically. Default is ReferencePT and
-        // flips to RasterFirst once the base + accent passes are in.
+        //   RasterFirst — default. Raster shades a clean analytic base
+        //                 (direct lights + GL-style shadow maps + IBL). Optional
+        //                 ray-query accents such as AO/GI/reflections are opt-in.
+        //                 If the deferred path is unavailable it falls back to
+        //                 ReferencePT rather than rendering black.
         enum class RenderMode {
             RasterFirst,
             ReferencePT,
