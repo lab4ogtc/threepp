@@ -2,8 +2,7 @@
 
 // Pair to overlay.vert. Emits a constant tint for HUD/overlay geometry
 // (ortho-HUD filled meshes + lines, and the world-space wireframe/line
-// overlay). threepp material colors are linear; color-space conversion is
-// handled by the configured image formats rather than by this shader.
+// overlay). threepp material colors are linear.
 
 layout(push_constant) uniform Pc {
     mat4 mvp;

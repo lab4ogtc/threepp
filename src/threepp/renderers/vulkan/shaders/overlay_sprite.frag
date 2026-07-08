@@ -4,8 +4,6 @@
 // per-sprite atlas texture (e.g. TextSprite's rasterized glyph bitmap)
 // and modulates by the push-constant tint+opacity. Alpha-blending is set
 // by the pipeline's color-blend state (standard non-premultiplied alpha).
-// Color-space conversion is handled by the configured image formats rather
-// than by this shader.
 
 layout(set = 0, binding = 0) uniform sampler2D spriteMap;
 

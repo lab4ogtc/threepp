@@ -229,6 +229,25 @@ namespace threepp {
         // bumping this to an odd value.
         constexpr uint32_t kFramesInFlight = 2;
 
+        static float srgbToLinearScalar(float x) {
+            x = std::clamp(x, 0.0f, 1.0f);
+            if (x <= 0.04045f) return x / 12.92f;
+            return std::pow((x + 0.055f) / 1.055f, 2.4f);
+        }
+
+        static float displayAlphaToLinearAlpha(float opacity) {
+            const float a = std::clamp(opacity, 0.0f, 1.0f);
+            return 1.0f - srgbToLinearScalar(1.0f - a);
+        }
+
+        static bool isSrgbFormat(VkFormat format) {
+            return format == VK_FORMAT_B8G8R8A8_SRGB || format == VK_FORMAT_R8G8B8A8_SRGB;
+        }
+
+        static bool isBgra8Format(VkFormat format) {
+            return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+        }
+
 #ifdef THREEPP_WITH_PERFETTO
         class VulkanStartupTrace {
         public:
@@ -2004,13 +2023,9 @@ namespace threepp {
         double taaPrevTimeSec_ = -1.0;
 
         bool perSppJitterHybrid_ = false;
-        // Tracks what each per-frame slot's binding 1 (RT denoise output)
-        // currently points at, so the per-frame rewrite block only fires on
-        // a real state change: -1 = unknown/needs rewrite, 0 = swapchain
-        // image view, 1 = taa_->inputView(frame). allocateAndUpdate-
-        // Descriptors writes swapchain (sets to 0); swapchain recreation
-        // reruns that path. Used to be rewritten unconditionally every frame,
-        // burning imageCount_ vkUpdateDescriptorSets calls for nothing.
+        // 跟踪每个 frame slot 的 binding 1（RT denoise output）当前指向。
+        // -1 = 未知/需重写，0 = 初始内部占位图，1 = bloom_->sceneHdrView(frame)。
+        // 避免稳定状态下每帧重复 imageCount_ 次 vkUpdateDescriptorSets。
         std::array<int8_t, kFramesInFlight> binding1Mode_{};
         // Per-frame-slot gate for the raster descriptor's binding 3 — the
         // 2048-entry bindless material-texture array. Its contents are
@@ -2242,6 +2257,7 @@ namespace threepp {
         //                     swapchain). Rare; mostly defensive.
         enum class FrameState { Idle, RecordingPostPT, RecordingOrthoOnly };
         FrameState frameState_ = FrameState::Idle;
+        VkImageLayout swapchainFrameLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
 
         // Internal ortho camera used for the screen-space sprite overlay
         // auto-call from beginFrameForPT. Lazy-created on first use, then
@@ -2953,7 +2969,9 @@ namespace threepp {
         [[nodiscard]] VkClearColorValue encodedClearColorValue() const {
             Color cc;
             cc.copy(clearColor);
-            ColorManagement::workingToColorSpace(cc, SRGBColorSpace);
+            if (!isSrgbFormat(ctx->swapchainFormat())) {
+                ColorManagement::workingToColorSpace(cc, SRGBColorSpace);
+            }
             VkClearColorValue out{};
             out.float32[0] = cc.r;
             out.float32[1] = cc.g;
@@ -6670,7 +6688,8 @@ namespace threepp {
             }
             if (dynamic_cast<ShadowMaterial*>(mat.get())) {
                 d.alphaCutoff = -3.0f;
-                d.transmission = std::clamp(mat->opacity, 0.0f, 1.0f);
+                // GL 的 ShadowMaterial 在输出编码后混合；Vulkan 在线性路径里混合，需要换算 alpha。
+                d.transmission = displayAlphaToLinearAlpha(mat->opacity);
             }
             if (dynamic_cast<MeshNormalMaterial*>(mat.get())) {
                 d.roughness = -2.0f;
@@ -10512,6 +10531,7 @@ namespace threepp {
                                               directExtent.height <= swapExtent.height;
             vulkan::VulkanRenderTargets::Record* directRt = nullptr;
             VkImageMemoryBarrier2 toColor{};
+            VkImageLayout oldSwapLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             std::vector<VkRenderingAttachmentInfo> colorAttachments;
 
             if (directToRenderTarget) {
@@ -10626,6 +10646,7 @@ namespace threepp {
                 }
             } else {
                 VkImage image = ctx->swapchainImages()[imageIndex];
+                oldSwapLayout = swapchainFrameLayout_;
                 toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
                 toColor.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                        VK_PIPELINE_STAGE_2_TRANSFER_BIT |
@@ -10636,7 +10657,7 @@ namespace threepp {
                 toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                 toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toColor.oldLayout = oldSwapLayout;
                 toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -10865,26 +10886,27 @@ namespace threepp {
                     transitionAttachmentForRead(directRt->extraColors[i], directRt->extraColorLayouts[i]);
                 }
             } else {
-                VkImageMemoryBarrier2 toGeneral = toColor;
-                toGeneral.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-                toGeneral.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                toGeneral.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                VkImageMemoryBarrier2 toOldLayout = toColor;
+                toOldLayout.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                toOldLayout.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+                toOldLayout.dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                          VK_PIPELINE_STAGE_2_TRANSFER_BIT |
                                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
                                          VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-                toGeneral.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                toOldLayout.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
                                           VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
                                           VK_ACCESS_2_TRANSFER_READ_BIT |
                                           VK_ACCESS_2_TRANSFER_WRITE_BIT |
                                           VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                VkDependencyInfo toGeneralDep{};
-                toGeneralDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                toGeneralDep.imageMemoryBarrierCount = 1;
-                toGeneralDep.pImageMemoryBarriers = &toGeneral;
-                vkCmdPipelineBarrier2(cb, &toGeneralDep);
+                toOldLayout.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                toOldLayout.newLayout = oldSwapLayout;
+                VkDependencyInfo toOldLayoutDep{};
+                toOldLayoutDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                toOldLayoutDep.imageMemoryBarrierCount = 1;
+                toOldLayoutDep.pImageMemoryBarriers = &toOldLayout;
+                vkCmdPipelineBarrier2(cb, &toOldLayoutDep);
+                swapchainFrameLayout_ = oldSwapLayout;
             }
         }
 
@@ -11834,8 +11856,9 @@ namespace threepp {
             if (srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) return;
 
             const VkImage src = ctx->swapchainImages()[frameImageIndex_];
+            const VkImageLayout oldSwapLayout = swapchainFrameLayout_;
             transitionImage(cb, src,
-                            VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            oldSwapLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                     VK_PIPELINE_STAGE_2_TRANSFER_BIT |
                                     VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -12004,10 +12027,21 @@ namespace threepp {
             rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             recordCopyRenderTargetColorToExtras(cb, rt, activeMip, activeLayer);
 
-            transitionDefaultFramebufferToGeneral(cb, frameImageIndex_,
-                                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                                   VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                                                   VK_ACCESS_2_TRANSFER_READ_BIT);
+            transitionImage(cb, src,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, oldSwapLayout,
+                            VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
+                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT |
+                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                            VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
+                                    VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
+                                    VK_ACCESS_2_TRANSFER_READ_BIT |
+                                    VK_ACCESS_2_TRANSFER_WRITE_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
+                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                            VK_IMAGE_ASPECT_COLOR_BIT);
+            swapchainFrameLayout_ = oldSwapLayout;
             }
 
             const bool wantsDepthCopy = target.depthTexture ||
@@ -15394,8 +15428,8 @@ namespace threepp {
 
         // ── TAA resources ───────────────────────────────────────────────────
         // Pipeline + images + descriptor sets now live in vulkan::TaaResolve.
-        // This helper packs the external view sources (raster gbuffer +
-        // swapchain) into the args struct TaaResolve expects, then asks
+        // This helper packs the external raster gbuffer views into the args
+        // struct TaaResolve expects, then asks
         // TaaResolve to rewrite all per-(frame, swapchain-image) descriptor
         // sets. Call after createTaaImages OR after a swapchain resize OR
         // after the raster gbuffer is reallocated.
@@ -15406,12 +15440,10 @@ namespace threepp {
                 motionViews[f] = rasterGbufs[f].motion.view;
                 idsViews[f]    = rasterGbufs[f].ids.view;
             }
-            const auto& swapViews = ctx->swapchainImageViews();
             vulkan::TaaResolve::DescriptorWriteInputs in{};
             in.gbufSampler        = gbufSampler_;
             in.gbufMotionPerFrame = motionViews.data();
             in.gbufIdsPerFrame    = idsViews.data();
-            in.swapchainViews     = swapViews.data();
             taa_->rewriteDescriptors(in);
         }
 
@@ -17457,12 +17489,10 @@ namespace threepp {
                     wAS.descriptorCount = 1;
                     wAS.descriptorType = VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
 
-                    // Binding 1 (denoise output) is initialised to the
-                    // swapchain image as a placeholder; renderFrame rewrites
-                    // it per-frame to taa_->inputView(f) so TAA can resolve
-                    // it before swapchain present.
+                    // Binding 1（denoise output）必须始终指向 storage-capable
+                    // 内部图；SRGB swapchain 只通过 color-attachment pass 呈现。
                     VkDescriptorImageInfo imgInfo{};
-                    imgInfo.imageView = ctx->swapchainImageViews()[i];
+                    imgInfo.imageView = taa_->inputView(f);
                     imgInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                     VkWriteDescriptorSet wImg{};
                     wImg.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -18852,6 +18882,7 @@ namespace threepp {
                     // (which expects PRESENT_SRC) consistent and avoids the
                     // double vkEndCommandBuffer the bespoke finalize used to do.
                     recordHybridDebugBlit(cb, imageIndex, currentFrame);
+                    swapchainFrameLayout_ = VK_IMAGE_LAYOUT_GENERAL;
                     return;
                 }
             }
@@ -18941,6 +18972,7 @@ namespace threepp {
                 dVis.pImageMemoryBarriers = &visBar;
                 vkCmdPipelineBarrier2(cb, &dVis);
 
+                swapchainFrameLayout_ = VK_IMAGE_LAYOUT_GENERAL;
                 return;
             }
             // ── End events-only render mode ─────────────────────────────────
@@ -19401,21 +19433,16 @@ namespace threepp {
                         dOverlayColor.pImageMemoryBarriers = &toOverlayColor;
                         vkCmdPipelineBarrier2(cb, &dOverlayColor);
                     } else {
-                        // Swapchain GENERAL → COLOR_ATTACHMENT_OPTIMAL. The
-                        // overlay always composites onto the full-resolution
-                        // swapchain — TAA wrote it directly (upscaling there if
-                        // renderScale < 1), so there is no render-extent target
-                        // here even in scaled mode.
+                        // TAA present pass 会把 swapchain 留在
+                        // COLOR_ATTACHMENT_OPTIMAL；overlay load 前做同步。
                         VkImageMemoryBarrier2 toColor{};
                         toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                        toColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                                VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-                        toColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                                VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        toColor.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        toColor.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
                         toColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                         toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                        toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        toColor.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                         toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                         toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                         toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -19988,14 +20015,12 @@ namespace threepp {
 
                         VkImageMemoryBarrier2 swapToColor{};
                         swapToColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                        swapToColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT;
-                        swapToColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                                    VK_ACCESS_2_TRANSFER_WRITE_BIT;
+                        swapToColor.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+                        swapToColor.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
                         swapToColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                         swapToColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                                     VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                        swapToColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                        swapToColor.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                         swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                         swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                         swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -20039,59 +20064,29 @@ namespace threepp {
                         vkCmdEndRendering(cb);
                     }
 
-                    // Swapchain back to GENERAL so the downstream blocks
-                    // (ImGui overlay or the direct present-src transition)
-                    // see the layout they expect.
-                    VkImageMemoryBarrier2 toGeneral{};
-                    toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                    toGeneral.srcStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
-                    toGeneral.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                    toGeneral.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                              VK_PIPELINE_STAGE_2_TRANSFER_BIT |
-                                              VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                              VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
-                    toGeneral.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
-                                              VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
-                                              VK_ACCESS_2_TRANSFER_READ_BIT |
-                                              VK_ACCESS_2_TRANSFER_WRITE_BIT |
-                                              VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
-                                              VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                    toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-                    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-                    toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-                    toGeneral.image = img;
-                    toGeneral.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-                    toGeneral.subresourceRange.levelCount = 1;
-                    toGeneral.subresourceRange.layerCount = 1;
-                    VkDependencyInfo dBack{};
-                    dBack.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                    dBack.imageMemoryBarrierCount = 1;
-                    dBack.pImageMemoryBarriers = &toGeneral;
-                    vkCmdPipelineBarrier2(cb, &dBack);
                     gpuTimings_->end(cb, TP_OverlayDraw, currentFrame);
                 }
             }
             // ── End hybrid raster overlay pass ─────────────────────────────────
 
 
+            swapchainFrameLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             // ── End of PT recording. ───────────────────────────────────────────
-            // The swapchain image is left in VK_IMAGE_LAYOUT_GENERAL — endFrame
-            // handles the ImGui overlay pass + GENERAL → PRESENT_SRC transition,
+            // swapchain image 留在 COLOR_ATTACHMENT_OPTIMAL；endFrame 负责
+            // ImGui overlay pass 和 COLOR_ATTACHMENT → PRESENT transition，
             // closes the command buffer, and submits.
         }
 
         // Records the ImGui (or any overlay) callback inside a dynamic render
-        // pass, then transitions the swapchain image GENERAL → PRESENT_SRC.
-        // When no overlay callback is set, just emits the GENERAL → PRESENT_SRC
+        // pass, then transitions the swapchain image to PRESENT_SRC.
+        // When no overlay callback is set, just emits the PRESENT_SRC
         // barrier directly. Called from endFrame() immediately before
         // vkEndCommandBuffer + submit.
         // Snapshot the post-TAA swapchain image into the host-visible
         // sceneCaptureBuf_ before any overlay (sprites, ImGui) composites.
         // Allocates / resizes the buffer lazily on first use or swapchain
-        // resize. Inserts GENERAL → TRANSFER_SRC → GENERAL barriers so the
-        // downstream overlay passes see the swapchain in the layout they
-        // expect.
+        // resize. Inserts COLOR_ATTACHMENT → TRANSFER_SRC → COLOR_ATTACHMENT
+        // barriers so downstream overlay passes keep the swapchain layout.
         void recordSceneCapture(VkCommandBuffer cb, uint32_t imageIndex) {
             const VkExtent2D ext = ctx->swapchainExtent();
             if (ext.width == 0 || ext.height == 0) return;
@@ -20115,10 +20110,10 @@ namespace threepp {
 
             VkImageMemoryBarrier toSrc{};
             toSrc.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            toSrc.oldLayout                   = VK_IMAGE_LAYOUT_GENERAL;
+            const VkImageLayout oldLayout = swapchainFrameLayout_;
+            toSrc.oldLayout                   = oldLayout;
             toSrc.newLayout                   = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            toSrc.srcAccessMask               = VK_ACCESS_SHADER_WRITE_BIT |
-                                                VK_ACCESS_TRANSFER_WRITE_BIT;
+            toSrc.srcAccessMask               = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
             toSrc.dstAccessMask               = VK_ACCESS_TRANSFER_READ_BIT;
             toSrc.srcQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
             toSrc.dstQueueFamilyIndex         = VK_QUEUE_FAMILY_IGNORED;
@@ -20127,8 +20122,7 @@ namespace threepp {
             toSrc.subresourceRange.levelCount = 1;
             toSrc.subresourceRange.layerCount = 1;
             vkCmdPipelineBarrier(cb,
-                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  0, 0, nullptr, 0, nullptr, 1, &toSrc);
 
@@ -20139,11 +20133,11 @@ namespace threepp {
             vkCmdCopyImageToBuffer(cb, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    sceneCaptureBuf_.handle, 1, &region);
 
-            VkImageMemoryBarrier toGeneral = toSrc;
-            toGeneral.oldLayout      = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            toGeneral.newLayout      = VK_IMAGE_LAYOUT_GENERAL;
-            toGeneral.srcAccessMask  = VK_ACCESS_TRANSFER_READ_BIT;
-            toGeneral.dstAccessMask  = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+            VkImageMemoryBarrier toColor = toSrc;
+            toColor.oldLayout      = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toColor.newLayout      = oldLayout;
+            toColor.srcAccessMask  = VK_ACCESS_TRANSFER_READ_BIT;
+            toColor.dstAccessMask  = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                        VK_ACCESS_SHADER_READ_BIT |
                                        VK_ACCESS_SHADER_WRITE_BIT;
@@ -20151,7 +20145,8 @@ namespace threepp {
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+                                 0, 0, nullptr, 0, nullptr, 1, &toColor);
+            swapchainFrameLayout_ = oldLayout;
         }
 
         // ── Event-camera shade compute ─────────────────────────────────
@@ -20416,6 +20411,7 @@ namespace threepp {
                 dep.imageMemoryBarrierCount = 1;
                 dep.pImageMemoryBarriers = &toColor;
                 vkCmdPipelineBarrier2(cb, &dep);
+                swapchainFrameLayout_ = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
 
                 VkRenderingAttachmentInfo colorAtt{};
                 colorAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -20452,6 +20448,7 @@ namespace threepp {
                 dep.imageMemoryBarrierCount = 1;
                 dep.pImageMemoryBarriers = &toPresent;
                 vkCmdPipelineBarrier2(cb, &dep);
+                swapchainFrameLayout_ = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             } else {
                 VkImageMemoryBarrier2 toPresent{};
                 toPresent.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -20466,7 +20463,7 @@ namespace threepp {
                                           VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
                 toPresent.dstStageMask = VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT;
                 toPresent.dstAccessMask = 0;
-                toPresent.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toPresent.oldLayout = swapchainFrameLayout_;
                 toPresent.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
                 toPresent.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 toPresent.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -20477,6 +20474,7 @@ namespace threepp {
                 dep.imageMemoryBarrierCount = 1;
                 dep.pImageMemoryBarriers = &toPresent;
                 vkCmdPipelineBarrier2(cb, &dep);
+                swapchainFrameLayout_ = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             }
         }
 
@@ -20747,7 +20745,9 @@ namespace threepp {
             {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordScreenSpaceSprites");
                 overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
-                                     scene, *screenSpaceCam_, /*screenSpaceOnly=*/true);
+                                     scene, *screenSpaceCam_, /*screenSpaceOnly=*/true,
+                                     0, 0, 0, 0, false,
+                                     swapchainFrameLayout_, swapchainFrameLayout_);
             }
             return true;
         }
@@ -20786,6 +20786,7 @@ namespace threepp {
                                            shouldClearColor, shouldClearDepth, shouldClearStencil,
                                            VK_IMAGE_LAYOUT_UNDEFINED,
                                            VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0);
+            swapchainFrameLayout_ = VK_IMAGE_LAYOUT_GENERAL;
             return true;
         }
 
@@ -20954,18 +20955,20 @@ namespace threepp {
                         }
                         recordDefaultFramebufferClear(cmdBuffers[currentFrame], frameImageIndex_,
                                                        autoClearColor_, false, autoClearStencil_,
-                                                       VK_IMAGE_LAYOUT_GENERAL,
+                                                       swapchainFrameLayout_,
                                                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                                                VK_PIPELINE_STAGE_2_TRANSFER_BIT |
                                                                VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
                                                                VK_ACCESS_2_TRANSFER_WRITE_BIT |
                                                                VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+                        swapchainFrameLayout_ = VK_IMAGE_LAYOUT_GENERAL;
                         clearColor.copy(savedClearColor);
                         clearAlpha = savedClearAlpha;
                     }
                     overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
-                                         scene, camera, /*screenSpaceOnly=*/false, rx, ry, rw, rh);
+                                         scene, camera, /*screenSpaceOnly=*/false, rx, ry, rw, rh,
+                                         false, swapchainFrameLayout_, swapchainFrameLayout_);
                     return;
                 }
                 // User issued a second full-frame perspective render — finalize
@@ -20986,7 +20989,8 @@ namespace threepp {
                                      static_cast<uint32_t>(viewportRect.offset.y),
                                      viewportRect.extent.width,
                                      viewportRect.extent.height,
-                                     /*regionAsViewport=*/true);
+                                     /*regionAsViewport=*/true,
+                                     swapchainFrameLayout_, swapchainFrameLayout_);
             }
             if (currentRenderTarget_) {
                 recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
@@ -21009,13 +21013,14 @@ namespace threepp {
             stencil = false;
             recordDefaultFramebufferClear(cmdBuffers[currentFrame], frameImageIndex_,
                                            color, depth, stencil,
-                                           VK_IMAGE_LAYOUT_GENERAL,
+                                           swapchainFrameLayout_,
                                            VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                                    VK_PIPELINE_STAGE_2_TRANSFER_BIT |
                                                    VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
                                            VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT |
                                                    VK_ACCESS_2_TRANSFER_WRITE_BIT |
                                                    VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+            swapchainFrameLayout_ = VK_IMAGE_LAYOUT_GENERAL;
         }
 
         bool willAppendPerspectiveOverlayOnly(const Camera& camera) const {
@@ -21647,7 +21652,7 @@ namespace threepp {
                     const uint32_t dstChannels = vulkan::VulkanRenderTargets::channelCount(op.texture->format);
                     const auto* src = static_cast<const unsigned char*>(mapped);
                     const bool bgra = op.srcImage->format == ctx->swapchainFormat() &&
-                                      ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                                      isBgra8Format(ctx->swapchainFormat());
                     auto& images = op.texture->images();
                     images.clear();
                     images.reserve(op.layers);
@@ -21669,7 +21674,7 @@ namespace threepp {
                         auto& dst = image.data<unsigned char>();
                         const auto* src = static_cast<const unsigned char*>(mapped);
                         const bool bgra = op.srcImage->format == ctx->swapchainFormat() &&
-                                          ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                                          isBgra8Format(ctx->swapchainFormat());
                         vulkan::readback::packColorBytes(src, pixels, dstChannels, bgra, dst);
                     }
                 }
@@ -21923,7 +21928,7 @@ namespace threepp {
                                             const uint32_t dstChannels = vulkan::VulkanRenderTargets::channelCount(op.texture->format);
                                             const auto* src = static_cast<const unsigned char*>(mapped);
                                             const bool bgra = op.sourceFormat == ctx->swapchainFormat() &&
-                                                              ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                                                              isBgra8Format(ctx->swapchainFormat());
                                             auto& images = op.texture->images();
                                             images.clear();
                                             images.reserve(op.layers);
@@ -21945,7 +21950,7 @@ namespace threepp {
                                                 auto& dst = image.data<unsigned char>();
                                                 const auto* src = static_cast<const unsigned char*>(mapped);
                                                 const bool bgra = op.sourceFormat == ctx->swapchainFormat() &&
-                                                                  ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                                                                  isBgra8Format(ctx->swapchainFormat());
                                                 vulkan::readback::packColorBytes(src, pixels, dstChannels, bgra, dst);
                                             }
                                         }
@@ -22190,7 +22195,7 @@ namespace threepp {
             outputFormat = selectedTexture->format;
             outputType = selectedTexture->type;
             bgraSource = srcImagePtr->format == ctx->swapchainFormat() &&
-                         ctx->swapchainFormat() == VK_FORMAT_B8G8R8A8_UNORM;
+                         isBgra8Format(ctx->swapchainFormat());
         }
 
         const auto& srcImage = *srcImagePtr;

@@ -4,7 +4,7 @@
 //   binding 0: taaInputTex        — current frame, post-denoise (RENDER extent)
 //   binding 1: taaHistoryReadTex  — previous frame's output      (OUTPUT extent)
 //   binding 2: gbufMotionTex      — gbuffer motion vector         (RENDER extent)
-//   binding 3: taaSwapImage       — swapchain output (write)      (OUTPUT extent)
+//   binding 3: taaPresentImage    — optional internal output      (OUTPUT extent)
 //   binding 4: taaHistoryWriteImg — next-frame history (write)    (OUTPUT extent)
 //
 // When the path tracer renders below the swapchain resolution
@@ -31,11 +31,10 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform sampler2D taaInputTex;
 layout(set = 0, binding = 1) uniform sampler2D taaHistoryReadTex;
 layout(set = 0, binding = 2) uniform sampler2D gbufMotionTex;
-// No format qualifier: the bound image is VK_FORMAT_B8G8R8A8_UNORM (matches the
-// swapchain channel order) but GLSL has no BGRA8 format qualifier. Writing
-// without a format requires shaderStorageImageWriteWithoutFormat — channel
-// names (r/g/b/a) still map by component, so behaviour is unchanged.
-layout(set = 0, binding = 3) uniform writeonly image2D taaSwapImage;
+// No format qualifier: the bound image is BGRA8. GLSL has no BGRA8 format
+// qualifier, so writing without a format requires
+// shaderStorageImageWriteWithoutFormat. Channel names still map by component.
+layout(set = 0, binding = 3) uniform writeonly image2D taaPresentImage;
 // History storage is rgba16f (not rgba8) so the per-frame mix() result is
 // preserved at sub-quantum precision. With rgba8 history the running average
 // re-quantized every frame and locked into uint8 codes, producing visible
@@ -57,9 +56,8 @@ layout(push_constant) uniform Pc {
     uint  height;
     uint  inWidth;   // PANE (scissor region) input size (path-trace render extent)
     uint  inHeight;
-    uint  writeSwap; // 1 = write the swapchain here; 0 = a downstream RCAS
-                     //     sharpen pass owns the swapchain write (history is
-                     //     still written so it reads the resolved frame).
+    uint  writeSwap; // 1 = also write the internal present image here;
+                     //     0 = only history is written.
     float dtFrames;  // this frame's duration in REFERENCE frames (dt · 90 fps,
                      // host-clamped to [1, 6]; 1 at ≥90 fps). Converts the
                      // per-frame temporal constants below (deviation-streak
@@ -398,10 +396,6 @@ void main() {
     const float a = clamp((pc.blendAlpha + velocityBump + skinnedMotionBump) * antiFlicker, 0.01, 1.0);
     const vec3 result = reprojValid ? mix(history, curr, a) : curr;
 
-    // When a downstream RCAS pass owns the swapchain write, skip it here but
-    // still write history (RCAS reads the resolved frame from the history slot).
-    // When a downstream RCAS pass owns the swapchain write, skip it here but
-    // still write history (RCAS reads the resolved frame from the history slot).
-    if (pc.writeSwap != 0u) imageStore(taaSwapImage, dstPx, vec4(result, 1.0));
+    if (pc.writeSwap != 0u) imageStore(taaPresentImage, dstPx, vec4(result, 1.0));
     imageStore(taaHistoryWriteImg,  dstPx, vec4(result, devStreak));// .a = deviation streak
 }

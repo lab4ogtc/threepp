@@ -1,29 +1,27 @@
 #version 460
 
-// Tone-map + sRGB + bloom composite. Reads the linear-HDR scene (sceneHdr,
+// Tone-map + bloom composite. Reads the linear-HDR scene (sceneHdr,
 // written by denoise.comp resolve), optionally adds the blurred bloom buffer
-// in linear HDR, applies the tone-map curve + sRGB encode, and writes the
-// LDR result to the TAA input image.
+// in linear HDR, applies the tone-map curve, and writes linear LDR to the TAA
+// input image. The SRGB swapchain performs the final encode.
 //
 // Splitting this from the resolve lets bloom be added in linear HDR *before*
 // the tone-map curve (so a bright highlight blooms far more than a mid-tone —
 // the physically/perceptually correct "AAA" glow) instead of on already-
-// compressed LDR. With bloom disabled (intensity <= 0) this reproduces the
-// pre-split tone-map + sRGB + solid-bg-bypass exactly, so the image is
-// unchanged.
+// compressed LDR.
 
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D sceneHdrTex;            // linear HDR, render extent
 layout(set = 0, binding = 1) uniform sampler2D bloomTex;               // blurred bloom (half res)
 layout(set = 0, binding = 2, rgba32f) uniform readonly image2D gbufImg;// .w = instanceId+1 (0 = sky)
-// No format qualifier: the TAA-input image is VK_FORMAT_B8G8R8A8_UNORM (matches
-// the swapchain channel order) but GLSL has no bgra8 format qualifier. Declaring
+// No format qualifier: the TAA-input image is VK_FORMAT_B8G8R8A8_UNORM but
+// GLSL has no bgra8 format qualifier. Declaring
 // rgba8 here mismatches the bound VkImageView and yields undefined stores
 // (Undefined-Value-StorageImage-FormatMismatch-ImageView). Writing without a
 // format needs shaderStorageImageWriteWithoutFormat (enabled at device
 // creation) — channel names (r/g/b/a) still map by component, so the stored
-// value is unchanged. Matches taa_resolve.comp / rcas.comp's swapchain writes.
+// value is unchanged. Matches taa_resolve.comp / rcas.comp's internal BGRA8 writes.
 layout(set = 0, binding = 3) uniform writeonly image2D outImage;// TAA input (bgra8, no format)
 
 layout(push_constant) uniform Pc {
@@ -35,12 +33,6 @@ layout(push_constant) uniform Pc {
     uint height;
 } pc;
 
-vec3 linearToSRGB(vec3 x) {
-    const vec3 cutoff = vec3(lessThan(x, vec3(0.0031308)));
-    const vec3 lower  = 12.92 * x;
-    const vec3 higher = 1.055 * pow(max(x, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
-    return mix(higher, lower, cutoff);
-}
 vec3 reinhard(vec3 c) { return clamp(c / (vec3(1.0) + c), 0.0, 1.0); }
 vec3 cineon(vec3 c) {
     c = max(vec3(0.0), c - 0.004);
@@ -103,13 +95,12 @@ void main() {
     }
 
     const float exposure = uintBitsToFloat(pc.exposureBits);
-    // Solid-color background sky pixels skip tone mapping (so the flat bg
-    // isn't ACES-desaturated) but are still sRGB-encoded — matches the old
-    // finalize behaviour exactly.
+    // Solid-color background sky pixels skip tone mapping so the flat bg
+    // isn't ACES-desaturated.
     const float skyW = imageLoad(gbufImg, px).w;
     const bool bypass = (pc.bgIsSolidColor != 0u) && (skyW < 0.5);
     const vec3 outRgb = bypass
-            ? linearToSRGB(color)
-            : linearToSRGB(toneMap(color, pc.toneMapping, exposure));
-    imageStore(outImage, px, vec4(outRgb, 1.0));
+            ? color
+            : toneMap(color, pc.toneMapping, exposure);
+    imageStore(outImage, px, vec4(clamp(outRgb, 0.0, 1.0), 1.0));
 }

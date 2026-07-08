@@ -1535,7 +1535,9 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                           Object3D& scene, Camera& camera, bool screenSpaceOnly,
                           uint32_t regionX, uint32_t regionY,
                           uint32_t regionW, uint32_t regionH,
-                          bool regionAsViewport) {
+                          bool regionAsViewport,
+                          VkImageLayout inputLayout,
+                          VkImageLayout outputLayout) {
     // Lazy pipeline setup on first HUD overlay of the program.
     if (overlaySpritePipeline_ == VK_NULL_HANDLE) {
         createSpriteOverlayPipeline();
@@ -1777,12 +1779,8 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
 
     const VkExtent2D ext = ctx_.swapchainExtent();
 
-    // Open a fresh dynamic render pass on the swapchain so we can
-    // emit draw commands. The hybrid 3D overlay pass earlier in
-    // recordCommandBuffer leaves the swapchain in GENERAL; we
-    // transition GENERAL → COLOR_ATTACHMENT_OPTIMAL, draw, then
-    // transition back to GENERAL so endFrame's overlay/present
-    // logic sees the layout it expects.
+    // 在 swapchain 上开启动态 render pass。Perspective 帧经过 TAA present
+    // 后已经是 COLOR_ATTACHMENT；ortho-only 帧保持旧的 GENERAL 默认值。
     const VkImage img = ctx_.swapchainImages()[imageIndex];
     {
         VkImageMemoryBarrier2 toColor{};
@@ -1796,7 +1794,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         toColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toColor.oldLayout = inputLayout;
         toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2255,7 +2253,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
 
     vkCmdEndRendering(cb);
 
-    // Back to GENERAL for endFrame's overlay/present transition.
+    // 回到调用方要求的 layout，供后续 frame tail 使用。
     {
         VkImageMemoryBarrier2 toGeneral{};
         toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -2272,7 +2270,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.newLayout = outputLayout;
         toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toGeneral.image = img;

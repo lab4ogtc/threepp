@@ -60,7 +60,7 @@ namespace threepp::vulkan {
         OverlayPass& operator=(const OverlayPass&) = delete;
 
         // Record the entire ortho/HUD overlay into `cb`.
-        // cb       — the per-frame command buffer (already open, in GENERAL layout).
+        // cb       — the per-frame command buffer (already open).
         // frame    — which frame-in-flight slot to use (descriptor pool, etc.).
         // imageIndex — which swapchain image/view to render into.
         // scene / camera — the ortho HUD scene and its camera.
@@ -75,7 +75,9 @@ namespace threepp::vulkan {
                     Object3D& scene, Camera& camera, bool screenSpaceOnly,
                     uint32_t regionX = 0, uint32_t regionY = 0,
                     uint32_t regionW = 0, uint32_t regionH = 0,
-                    bool regionAsViewport = false);
+                    bool regionAsViewport = false,
+                    VkImageLayout inputLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    VkImageLayout outputLayout = VK_IMAGE_LAYOUT_GENERAL);
 
     private:
         // Cached uploaded sprite atlas. Keyed on Texture*; liveCheck detects

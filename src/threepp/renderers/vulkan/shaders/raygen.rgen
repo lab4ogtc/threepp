@@ -484,9 +484,7 @@ float blueNoise(uvec2 px, uint frame, uint salt) {
 
 // pcgNext / urand live in shade_common.glsl (same source the chit uses).
 
-// Swapchain is B8G8R8A8_UNORM but presented under SRGB_NONLINEAR — display
-// expects sRGB-encoded values. closest_hit returns linear HDR radiance, so
-// we encode here.
+// Used only for display-space transparent compositing inside the path tracer.
 vec3 linearToSRGB(vec3 x) {
     const vec3 cutoff = vec3(lessThan(x, vec3(0.0031308)));
     const vec3 lower  = 12.92 * x;
