@@ -11135,6 +11135,7 @@ namespace threepp {
 
             for (uint32_t i = 0; i < static_cast<uint32_t>(candidates.size()); ++i) {
                 auto& c = candidates[i];
+                c.shadow->camera->updateProjectionMatrix();
                 c.shadow->updateMatrices(*c.light);
                 const Matrix4 lightProj = shadowProjectionToVkDepth(c.shadow->camera->projectionMatrix);
                 Matrix4 lightVP;
@@ -12801,6 +12802,26 @@ namespace threepp {
             shadowMapDescriptorsDirty_ = true;
         }
 
+        static Side shadowDepthSide(const Material& material, ShadowMap shadowMapType) {
+            if (material.shadowSide) return *material.shadowSide;
+            if (shadowMapType == ShadowMap::VSM) return material.side;
+            switch (material.side) {
+                case Side::Back: return Side::Front;
+                case Side::Double: return Side::Double;
+                case Side::Front:
+                default: return Side::Back;
+            }
+        }
+
+        static VkCullModeFlags shadowDepthCullMode(const Material& material, ShadowMap shadowMapType) {
+            switch (shadowDepthSide(material, shadowMapType)) {
+                case Side::Back: return VK_CULL_MODE_FRONT_BIT;
+                case Side::Double: return VK_CULL_MODE_NONE;
+                case Side::Front:
+                default: return VK_CULL_MODE_BACK_BIT;
+            }
+        }
+
         void ensureShadowDepthPipeline() {
             if (shadowDepthPipeline_ != VK_NULL_HANDLE) return;
 
@@ -12887,10 +12908,10 @@ namespace threepp {
             cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
             cb.attachmentCount = 0;
 
-            VkDynamicState dyns[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkDynamicState dyns[3] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_CULL_MODE};
             VkPipelineDynamicStateCreateInfo dyn{};
             dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-            dyn.dynamicStateCount = 2;
+            dyn.dynamicStateCount = 3;
             dyn.pDynamicStates = dyns;
 
             VkPipelineRenderingCreateInfo prci{};
@@ -13048,11 +13069,13 @@ namespace threepp {
                     if (group.materialIndex >= materials.size()) continue;
                     const auto& material = materials[group.materialIndex];
                     if (!material || !material->visible) continue;
+                    vkCmdSetCullMode(cb, shadowDepthCullMode(*material, shadowMapType_));
                     drawSpan(group);
                 }
             } else {
                 const auto material = entry.mesh->material();
                 if (!material || !material->visible) return;
+                vkCmdSetCullMode(cb, shadowDepthCullMode(*material, shadowMapType_));
                 drawSpan(std::nullopt);
             }
         }
