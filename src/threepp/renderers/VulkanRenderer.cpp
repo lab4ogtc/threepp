@@ -1150,10 +1150,11 @@ namespace threepp {
             Mesh*    mesh;
             std::array<float, 16> worldMatrix;
             uint32_t instanceIndex;// 0 for non-instanced
-            // Hybrid overlay flag: wireframe-flagged material OR mesh.layers
-            // includes the configured overlayLayer_. Excluded from TLAS,
-            // raster G-buffer, and emissive-tri NEE so PT can't see/shadow
-            // them; drawn instead by the post-TAA overlay pass.
+            // Hybrid overlay flag: wireframe-flagged material, mesh.layers
+            // includes the configured overlayLayer_, or a plain no-depth
+            // MeshBasicMaterial debug mesh. Excluded from TLAS, raster
+            // G-buffer, and emissive-tri NEE so PT can't see/shadow them;
+            // drawn instead by the post-TAA overlay pass.
             bool     isOverlay = false;
             // ParticleSystem billboard mesh (material name == kParticleMaterialName).
             // Implies isOverlay (so all the PT-exclusion guards apply), but is
@@ -1245,6 +1246,14 @@ namespace threepp {
         Object3D* sceneSnapshotRoot_ = nullptr;
         unsigned int sceneSnapshotRootId_ = 0;
 
+        static bool isPlainNoDepthBasicOverlay(Mesh& m) {
+            auto mat = m.material();
+            auto* basic = mat ? dynamic_cast<MeshBasicMaterial*>(mat.get()) : nullptr;
+            return basic && !basic->depthTest &&
+                   !basic->map && !basic->alphaMap && !basic->lightMap &&
+                   !basic->aoMap && !basic->specularMap && !basic->envMap;
+        }
+
         // Classification-routing flags for a mesh — shared by the snapshot
         // build and the replay walk so the two can't drift.
         uint32_t snapMeshFlags(Mesh& m, const MaterialWithWireframe* wf) const {
@@ -1254,8 +1263,9 @@ namespace threepp {
                 if (geom->hasAttribute("normal")) fl |= kSnapHasNorm;
             }
             if (wf && wf->wireframe) fl |= kSnapWire;
-            if (overlayLayer_ >= 0 &&
-                m.layers.isEnabled(static_cast<unsigned>(overlayLayer_))) fl |= kSnapOverlay;
+            if ((overlayLayer_ >= 0 &&
+                 m.layers.isEnabled(static_cast<unsigned>(overlayLayer_))) ||
+                isPlainNoDepthBasicOverlay(m)) fl |= kSnapOverlay;
             if (auto mat = m.material(); mat && mat->tetSkinning && mat->tetTexture) fl |= kSnapTet;
             // ParticleSystem billboard mesh — detected by the unique material-name
             // marker (cheap: a length-mismatch reject for the empty-named common
@@ -1309,8 +1319,9 @@ namespace threepp {
                 // pointed-to material is alive (the mesh holding it just
                 // compared equal) and its dynamic type is fixed.
                 const bool wire = sn.wf && sn.wf->wireframe;
-                const bool over = overlayLayer_ >= 0 &&
-                                  o.layers.isEnabled(static_cast<unsigned>(overlayLayer_));
+                const bool over = (overlayLayer_ >= 0 &&
+                                   o.layers.isEnabled(static_cast<unsigned>(overlayLayer_))) ||
+                                  isPlainNoDepthBasicOverlay(*m);
                 const bool tet = sn.mat && sn.mat->tetSkinning && sn.mat->tetTexture != nullptr;
                 const bool particle = sn.mat && sn.mat->name == kParticleMaterialName;
                 const bool materialDisplaced = hasMaterialDisplacement(*m);
@@ -1704,11 +1715,13 @@ namespace threepp {
         // wireframe lines. Wireframe meshes use explicit line-list indices
         // and share overlayLineListPipeline.
         VkPipeline       overlayBasicPipeline       = VK_NULL_HANDLE;
+        VkPipeline       overlayBasicNoDepthPipeline = VK_NULL_HANDLE;
         // Alpha-blended counterpart to overlayBasicPipeline. Same state
         // except colorBlendAttachmentState's blendEnable=TRUE with
         // SRC_ALPHA / ONE_MINUS_SRC_ALPHA. Selected when the mesh's
         // material has `transparent == true`.
         VkPipeline       overlayBasicTransparentPipeline = VK_NULL_HANDLE;
+        VkPipeline       overlayBasicTransparentNoDepthPipeline = VK_NULL_HANDLE;
         // Line-topology pipelines for Line / LineSegments objects. Same
         // overlay shaders, only input-assembly topology differs:
         //   LineSegments → LINE_LIST  (vertices in pairs)
@@ -2772,7 +2785,9 @@ namespace threepp {
             if (shadowDepthPipeline_)       vkDestroyPipeline(d, shadowDepthPipeline_, nullptr);
             if (shadowDepthPipelineLayout_) vkDestroyPipelineLayout(d, shadowDepthPipelineLayout_, nullptr);
             if (overlayBasicPipeline)             vkDestroyPipeline(d, overlayBasicPipeline, nullptr);
+            if (overlayBasicNoDepthPipeline)      vkDestroyPipeline(d, overlayBasicNoDepthPipeline, nullptr);
             if (overlayBasicTransparentPipeline)  vkDestroyPipeline(d, overlayBasicTransparentPipeline, nullptr);
+            if (overlayBasicTransparentNoDepthPipeline) vkDestroyPipeline(d, overlayBasicTransparentNoDepthPipeline, nullptr);
             if (overlayLineListPipeline)          vkDestroyPipeline(d, overlayLineListPipeline, nullptr);
             if (overlayLineStripPipeline)         vkDestroyPipeline(d, overlayLineStripPipeline, nullptr);
             if (overlayLineListNoDepthPipeline)   vkDestroyPipeline(d, overlayLineListNoDepthPipeline, nullptr);
@@ -14157,6 +14172,11 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasic, nullptr,
                                             &overlayBasicPipeline),
                   "vkCreateGraphicsPipelines(overlayBasic)");
+            VkGraphicsPipelineCreateInfo gpciBasicNoDepth = gpciBasic;
+            gpciBasicNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicNoDepth, nullptr,
+                                            &overlayBasicNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayBasicNoDepth)");
 
             // Alpha-blended fill variant. Standard "non-premultiplied" alpha:
             //   srcColor·srcAlpha + dstColor·(1-srcAlpha)
@@ -14186,6 +14206,11 @@ namespace threepp {
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicTr, nullptr,
                                             &overlayBasicTransparentPipeline),
                   "vkCreateGraphicsPipelines(overlayBasicTransparent)");
+            VkGraphicsPipelineCreateInfo gpciBasicTrNoDepth = gpciBasicTr;
+            gpciBasicTrNoDepth.pDepthStencilState = &dsNoDepth;
+            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicTrNoDepth, nullptr,
+                                            &overlayBasicTransparentNoDepthPipeline),
+                  "vkCreateGraphicsPipelines(overlayBasicTransparentNoDepth)");
 
             // Line / LineSegments pipelines. Same overlay shaders, same
             // depth/blend state as the basic opaque variant; only the
@@ -14203,6 +14228,7 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciLineList = gpci;
             gpciLineList.pInputAssemblyState = &iaLineList;
             gpciLineList.pRasterizationState = &rsLine;
+            gpciLineList.pColorBlendState = &cbBlend;
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineList, nullptr,
                                             &overlayLineListPipeline),
                   "vkCreateGraphicsPipelines(overlayLineList)");
@@ -14218,6 +14244,7 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciLineStrip = gpci;
             gpciLineStrip.pInputAssemblyState = &iaLineStrip;
             gpciLineStrip.pRasterizationState = &rsLine;
+            gpciLineStrip.pColorBlendState = &cbBlend;
             check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStrip, nullptr,
                                             &overlayLineStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStrip)");
@@ -19451,6 +19478,7 @@ namespace threepp {
                         float opacity = 1.0f;
                         bool wireframe = false;
                         bool transparent = false;
+                        bool depthTest = true;
                         if (auto* m = en.mesh->material().get()) {
                             if (auto* mc = dynamic_cast<MaterialWithColor*>(m)) {
                                 color = mc->color;
@@ -19460,14 +19488,19 @@ namespace threepp {
                             }
                             opacity     = m->opacity;
                             transparent = m->transparent;
+                            depthTest   = m->depthTest;
                         }
                         // Wireframe takes precedence — wireframe lines are
                         // typically opaque even when material.transparent
                         // is incidentally true.
                         VkPipeline want;
-                        if (wireframe)        want = overlayLineListPipeline;
-                        else if (transparent) want = overlayBasicTransparentPipeline;
-                        else                  want = overlayBasicPipeline;
+                        if (wireframe) {
+                            want = depthTest ? overlayLineListPipeline : overlayLineListNoDepthPipeline;
+                        } else if (transparent) {
+                            want = depthTest ? overlayBasicTransparentPipeline : overlayBasicTransparentNoDepthPipeline;
+                        } else {
+                            want = depthTest ? overlayBasicPipeline : overlayBasicNoDepthPipeline;
+                        }
                         if (want != curPipeline) {
                             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
                             curPipeline = want;
@@ -19489,7 +19522,7 @@ namespace threepp {
                         pc.color[0] = color.r;
                         pc.color[1] = color.g;
                         pc.color[2] = color.b;
-                        pc.color[3] = opacity;
+                        pc.color[3] = transparent ? opacity : 1.0f;
                         vkCmdPushConstants(cb, overlayPipelineLayout,
                                            VK_SHADER_STAGE_VERTEX_BIT |
                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
@@ -19574,7 +19607,7 @@ namespace threepp {
                                 if (auto* mm = dynamic_cast<MaterialWithMap*>(matPtr.get())) pointMap = mm->map;
                                 if (auto* am = dynamic_cast<MaterialWithAlphaMap*>(matPtr.get())) pointAlphaMap = am->alphaMap;
                             } else {
-                                pcW = matPtr->opacity;
+                                pcW = matPtr->transparent ? matPtr->opacity : 1.0f;
                             }
                             useVertexColors = matPtr->vertexColors &&
                                               lrec->color.handle != VK_NULL_HANDLE;
