@@ -414,15 +414,15 @@ namespace threepp::vulkan {
         const uint32_t totalSets = imageCount_ * framesInFlight_;
         VkDescriptorPoolSize sizes[2]{};
         // Main resolve set: 5 sampled + 2 storage。RCAS set: 1 sampled + 1
-        // storage。Present sets: 2 sampled。所有 set family 都乘 totalSets。
+        // storage。Present sets: 3 sampled。所有 set family 都乘 totalSets。
         sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sizes[0].descriptorCount = totalSets * (5 + 1 + 2);
+        sizes[0].descriptorCount = totalSets * (5 + 1 + 3);
         sizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         sizes[1].descriptorCount = totalSets * (2 + 1);
 
         VkDescriptorPoolCreateInfo dpci{};
         dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets       = totalSets * 4;// main + rcas + present + presentSharpen
+        dpci.maxSets       = totalSets * 5;// main + rcas + present + presentSharpen + presentInput
         dpci.poolSizeCount = 2;
         dpci.pPoolSizes    = sizes;
         check(vkCreateDescriptorPool(ctx_.device(), &dpci, nullptr, &descPool_),
@@ -461,6 +461,10 @@ namespace threepp::vulkan {
         presentSharpenSets_.resize(totalSets);
         check(vkAllocateDescriptorSets(ctx_.device(), &pai, presentSharpenSets_.data()),
               "vkAllocateDescriptorSets(taa.presentSharpen)");
+
+        presentInputSets_.resize(totalSets);
+        check(vkAllocateDescriptorSets(ctx_.device(), &pai, presentInputSets_.data()),
+              "vkAllocateDescriptorSets(taa.presentInput)");
     }
 
     void TaaResolve::rewriteDescriptors(const DescriptorWriteInputs& inputs) {
@@ -573,6 +577,11 @@ namespace threepp::vulkan {
                 psw.dstSet     = presentSharpenSets_[idx];
                 psw.pImageInfo = &presentSharpenIn;
                 vkUpdateDescriptorSets(ctx_.device(), 1, &psw, 0, nullptr);
+
+                VkWriteDescriptorSet piw = pw;
+                piw.dstSet     = presentInputSets_[idx];
+                piw.pImageInfo = &inputI;
+                vkUpdateDescriptorSets(ctx_.device(), 1, &piw, 0, nullptr);
             }
         }
     }
@@ -756,6 +765,73 @@ namespace threepp::vulkan {
         vkCmdEndRendering(cb);
 
         historyValid_ = true;
+    }
+
+    void TaaResolve::recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex) {
+        const uint32_t descIdx = frame * imageCount_ + imageIndex;
+
+        VkMemoryBarrier2 presentReadBar{};
+        presentReadBar.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        presentReadBar.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        presentReadBar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        presentReadBar.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        presentReadBar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+        VkImageMemoryBarrier2 swapToColor{};
+        swapToColor.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        swapToColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        swapToColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        swapToColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        swapToColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        swapToColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapToColor.image = ctx_.swapchainImages()[imageIndex];
+        swapToColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        swapToColor.subresourceRange.levelCount = 1;
+        swapToColor.subresourceRange.layerCount = 1;
+
+        VkDependencyInfo presentDep{};
+        presentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        presentDep.memoryBarrierCount = 1;
+        presentDep.pMemoryBarriers = &presentReadBar;
+        presentDep.imageMemoryBarrierCount = 1;
+        presentDep.pImageMemoryBarriers = &swapToColor;
+        vkCmdPipelineBarrier2(cb, &presentDep);
+
+        VkRenderingAttachmentInfo colorAtt{};
+        colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAtt.imageView   = ctx_.swapchainImageViews()[imageIndex];
+        colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+        const VkExtent2D presentExtent = ctx_.swapchainExtent();
+        VkRenderingInfo ri{};
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.offset = {0, 0};
+        ri.renderArea.extent = presentExtent;
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &colorAtt;
+        vkCmdBeginRendering(cb, &ri);
+
+        VkViewport vp{0.f, 0.f,
+                      static_cast<float>(presentExtent.width),
+                      static_cast<float>(presentExtent.height),
+                      0.f, 1.f};
+        VkRect2D sc{{0, 0}, presentExtent};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipe_);
+        VkDescriptorSet presentSet = presentInputSets_[descIdx];
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                presentPipeLayout_, 0, 1, &presentSet, 0, nullptr);
+        vkCmdSetViewport(cb, 0, 1, &vp);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRendering(cb);
+
+        historyValid_ = false;
     }
 
 }// namespace threepp::vulkan

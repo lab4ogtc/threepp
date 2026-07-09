@@ -99,6 +99,7 @@ namespace threepp::vulkan {
                            uint32_t physInH = 0,
                            uint32_t physOutW = 0,
                            uint32_t physOutH = 0);
+        void recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex);
 
         // Denoise writes its output here when TAA is active (replaces the
         // direct-to-swapchain write of non-TAA mode).
@@ -162,6 +163,7 @@ namespace threepp::vulkan {
         VkPipeline            presentPipe_       = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> presentSets_;
         std::vector<VkDescriptorSet> presentSharpenSets_;
+        std::vector<VkDescriptorSet> presentInputSets_;
 
         bool historyValid_ = false;
 

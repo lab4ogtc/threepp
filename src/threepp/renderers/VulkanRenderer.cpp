@@ -937,6 +937,8 @@ namespace threepp {
         VkSampler shadowCompareSampler_ = VK_NULL_HANDLE;
         VkPipelineLayout shadowDepthPipelineLayout_ = VK_NULL_HANDLE;
         VkPipeline shadowDepthPipeline_ = VK_NULL_HANDLE;
+        VkPipeline shadowDepthLineListPipeline_ = VK_NULL_HANDLE;
+        VkPipeline shadowDepthLineStripPipeline_ = VK_NULL_HANDLE;
         VkImageLayout shadowDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
         uint32_t shadowMapSize_ = 0;
         bool shadowMapDescriptorsDirty_ = true;
@@ -2799,6 +2801,8 @@ namespace threepp {
             if (rasterDescPool)         vkDestroyDescriptorPool(d, rasterDescPool, nullptr);
             if (rasterGbufRenderPass)   vkDestroyRenderPass(d, rasterGbufRenderPass, nullptr);
             if (shadowDepthPipeline_)       vkDestroyPipeline(d, shadowDepthPipeline_, nullptr);
+            if (shadowDepthLineListPipeline_) vkDestroyPipeline(d, shadowDepthLineListPipeline_, nullptr);
+            if (shadowDepthLineStripPipeline_) vkDestroyPipeline(d, shadowDepthLineStripPipeline_, nullptr);
             if (shadowDepthPipelineLayout_) vkDestroyPipelineLayout(d, shadowDepthPipelineLayout_, nullptr);
             if (overlayBasicPipeline)             vkDestroyPipeline(d, overlayBasicPipeline, nullptr);
             if (overlayBasicNoDepthPipeline)      vkDestroyPipeline(d, overlayBasicNoDepthPipeline, nullptr);
@@ -12967,9 +12971,16 @@ namespace threepp {
             gpci.pColorBlendState = &cb;
             gpci.pDynamicState = &dyn;
             gpci.layout = shadowDepthPipelineLayout_;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
-                                            &shadowDepthPipeline_),
-                  "vkCreateGraphicsPipelines(shadow depth)");
+            const auto createPipeline = [&](VkPrimitiveTopology topology, VkPipeline& pipeline, const char* label) {
+                ia.topology = topology;
+                check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr, &pipeline), label);
+            };
+            createPipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, shadowDepthPipeline_,
+                           "vkCreateGraphicsPipelines(shadow depth)");
+            createPipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, shadowDepthLineListPipeline_,
+                           "vkCreateGraphicsPipelines(shadow depth line list)");
+            createPipeline(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, shadowDepthLineStripPipeline_,
+                           "vkCreateGraphicsPipelines(shadow depth line strip)");
 
             vkDestroyShaderModule(ctx->device(), vert, nullptr);
             vkDestroyShaderModule(ctx->device(), frag, nullptr);
@@ -13114,6 +13125,56 @@ namespace threepp {
             }
         }
 
+        void recordShadowLineCasterDraw(VkCommandBuffer cb, const LineEntry& entry, const Matrix4& lightVP) {
+            if (!entry.line || entry.isPoints || !entry.line->castShadow) return;
+            const auto material = entry.line->material();
+            if (!material || !material->visible) return;
+            const auto geometry = entry.line->geometry();
+            vulkan::LineRec* rec = ensureLineGeometryUploaded(geometry.get());
+            if (!rec || rec->vertex.handle == VK_NULL_HANDLE) return;
+
+            const auto& drawRange = geometry->drawRange;
+            vulkan::LineRec::LoopRange* loopRange = entry.isLoop
+                                                            ? ensureLineLoopRangeUploaded(*geometry, *rec, drawRange)
+                                                            : nullptr;
+            const bool drawLoop = loopRange &&
+                                  loopRange->index.handle != VK_NULL_HANDLE &&
+                                  loopRange->indexCount > 0;
+            VkPipeline pipeline = (entry.isSegments || drawLoop)
+                                          ? shadowDepthLineListPipeline_
+                                          : shadowDepthLineStripPipeline_;
+            if (pipeline == VK_NULL_HANDLE) return;
+
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            vkCmdSetCullMode(cb, VK_CULL_MODE_NONE);
+
+            Matrix4 world;
+            std::memcpy(world.elements.data(), entry.worldMatrix.data(), 64);
+            Matrix4 mvp;
+            mvp.multiplyMatrices(lightVP, world);
+            vkCmdPushConstants(cb, shadowDepthPipelineLayout_,
+                               VK_SHADER_STAGE_VERTEX_BIT, 0, 64, mvp.elements.data());
+
+            VkBuffer vbuf = rec->vertex.handle;
+            VkDeviceSize voff = 0;
+            vkCmdBindVertexBuffers(cb, 0, 1, &vbuf, &voff);
+            if (drawLoop) {
+                vkCmdBindIndexBuffer(cb, loopRange->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, loopRange->indexCount, 1, 0, 0, 0);
+            } else if (rec->index.handle != VK_NULL_HANDLE) {
+                vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                const uint32_t start = static_cast<uint32_t>(std::max(0, drawRange.start));
+                const uint32_t cap = (rec->indexCount > start) ? (rec->indexCount - start) : 0u;
+                const uint32_t count = std::min(cap, static_cast<uint32_t>(std::max(0, drawRange.count)));
+                if (count > 0) vkCmdDrawIndexed(cb, count, 1, start, 0, 0);
+            } else {
+                const uint32_t start = static_cast<uint32_t>(std::max(0, drawRange.start));
+                const uint32_t cap = (rec->vertexCount > start) ? (rec->vertexCount - start) : 0u;
+                const uint32_t count = std::min(cap, static_cast<uint32_t>(std::max(0, drawRange.count)));
+                if (count > 0) vkCmdDraw(cb, count, 1, start, 0);
+            }
+        }
+
         void recordShadowMapPass(VkCommandBuffer cb) {
             if (activeShadowMapLights_.empty() ||
                 shadowDepthArray_.image == VK_NULL_HANDLE ||
@@ -13169,11 +13230,15 @@ namespace threepp {
                 ri.pDepthAttachment = &depthAtt;
                 vkCmdBeginRendering(cb, &ri);
 
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowDepthPipeline_);
                 for (const auto& entry : lastVisibleEntries_) {
                     if (entry.isOverlay || !entry.mesh || !entry.mesh->castShadow) continue;
                     const BlasRecord* rec = resolveBlasForEntry(entry);
                     if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
                     recordShadowCasterDraw(cb, entry, *rec, light.lightVP);
+                }
+                for (const auto& entry : lastVisibleLines_) {
+                    recordShadowLineCasterDraw(cb, entry, light.lightVP);
                 }
 
                 vkCmdEndRendering(cb);
@@ -19371,15 +19436,20 @@ namespace threepp {
                 }
                 taaPrevTimeSec_ = now;
             }
-            gpuTimings_->begin(cb, TP_TAA, currentFrame);
-            taa_->recordResolve(cb, currentFrame, imageIndex,
-                                regionRenderExt_.width, regionRenderExt_.height,
-                                regionSwapExt_.width, regionSwapExt_.height, effAlpha, taaDtFrames,
-                                sharpenStrength_ > 0.0f, sharpenStrength_,
-                                taaSkyReproj_.data(),
-                                static_cast<uint32_t>(regionDstX_), static_cast<uint32_t>(regionDstY_),
-                                ptExt.width, ptExt.height, ext.width, ext.height);
-            gpuTimings_->end(cb, TP_TAA, currentFrame);
+            if (taaBlendAlpha_ >= 1.0f && sharpenStrength_ <= 0.0f) {
+                taa_->recordPresentInput(cb, currentFrame, imageIndex);
+                taaPrevTimeSec_ = -1.0;
+            } else {
+                gpuTimings_->begin(cb, TP_TAA, currentFrame);
+                taa_->recordResolve(cb, currentFrame, imageIndex,
+                                    regionRenderExt_.width, regionRenderExt_.height,
+                                    regionSwapExt_.width, regionSwapExt_.height, effAlpha, taaDtFrames,
+                                    sharpenStrength_ > 0.0f, sharpenStrength_,
+                                    taaSkyReproj_.data(),
+                                    static_cast<uint32_t>(regionDstX_), static_cast<uint32_t>(regionDstY_),
+                                    ptExt.width, ptExt.height, ext.width, ext.height);
+                gpuTimings_->end(cb, TP_TAA, currentFrame);
+            }
             // ── End raster TAA ─────────────────────────────────────────────────
 
             // ── Hybrid raster overlay pass ─────────────────────────────────────
