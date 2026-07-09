@@ -20458,9 +20458,8 @@ namespace threepp {
             if (overlayCallback) {
                 VkImageMemoryBarrier2 toColor{};
                 toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-                // Swapchain was last written by the TAA dispatch (compute).
-                // TRANSFER bits defensively cover any transfer-stage write to
-                // the image. Cover both.
+                // Swapchain may come from TAA compute, transfer, or a color
+                // attachment pass; keep the layout tracked by the recorder.
                 toColor.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                        VK_PIPELINE_STAGE_2_TRANSFER_BIT |
                                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -20470,7 +20469,7 @@ namespace threepp {
                 toColor.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
                 toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                         VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-                toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                toColor.oldLayout = swapchainFrameLayout_;
                 toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
