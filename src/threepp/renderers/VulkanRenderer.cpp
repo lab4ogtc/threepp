@@ -1270,7 +1270,8 @@ namespace threepp {
         static bool isPlainNoDepthBasicOverlay(Mesh& m) {
             auto mat = m.material();
             auto* basic = mat ? dynamic_cast<MeshBasicMaterial*>(mat.get()) : nullptr;
-            return basic && !basic->depthTest &&
+            return basic && (!basic->depthTest ||
+                             (basic->transparent && basic->opacity < 1.0f)) &&
                    !basic->map && !basic->alphaMap && !basic->lightMap &&
                    !basic->aoMap && !basic->specularMap && !basic->envMap;
         }
@@ -19587,6 +19588,7 @@ namespace threepp {
                     // share a mode (most do).
                     VkPipeline curPipeline = VK_NULL_HANDLE;
 
+                    auto drawOverlayMeshes = [&](bool transparentPass) {
                     for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                         const auto& en = lastVisibleEntries_[i];
                         if (!en.mesh || !en.isOverlay) continue;
@@ -19610,6 +19612,7 @@ namespace threepp {
                             transparent = m->transparent;
                             depthTest   = m->depthTest;
                         }
+                        if (transparent != transparentPass) continue;
                         // Wireframe takes precedence — wireframe lines are
                         // typically opaque even when material.transparent
                         // is incidentally true.
@@ -19672,6 +19675,8 @@ namespace threepp {
                             }
                         }
                     }
+                    };
+                    drawOverlayMeshes(false);
 
                     // ── Line / LineSegments / Points draws ─────────────────
                     // Always-drawn (no isOverlay flag — these are inherently
@@ -19869,6 +19874,9 @@ namespace threepp {
                             if (cnt > 0) vkCmdDraw(cb, cnt, 1, start, 0);
                         }
                     }
+
+                    // GL draws opaque points/lines before transparent meshes.
+                    drawOverlayMeshes(true);
 
                     // ── Particle billboards ────────────────────────────────
                     // ParticleSystem meshes (isParticle) are drawn here, after

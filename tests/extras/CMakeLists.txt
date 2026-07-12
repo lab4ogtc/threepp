@@ -1,2 +1,3 @@
 
 add_test_executable(PointCloud_test)
+add_test_executable(ConvexGeometry_test)
