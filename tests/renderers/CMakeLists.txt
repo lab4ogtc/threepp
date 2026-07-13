@@ -94,6 +94,13 @@ if (THREEPP_WITH_VULKAN AND THREEPP_WITH_GLFW)
     target_include_directories(VulkanReadback_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
     add_test(NAME VulkanReadback_test COMMAND VulkanReadback_test)
 
+    add_executable(LidarBackendParityRuntime_test LidarBackendParityRuntime_test.cpp)
+    target_link_libraries(LidarBackendParityRuntime_test PRIVATE threepp)
+    add_test(NAME LidarGLParityRuntime_test COMMAND LidarBackendParityRuntime_test gl)
+    add_test(NAME LidarVulkanParityRuntime_test COMMAND LidarBackendParityRuntime_test vulkan)
+    set_tests_properties(LidarGLParityRuntime_test LidarVulkanParityRuntime_test PROPERTIES
+            SKIP_RETURN_CODE 42)
+
     add_executable(VulkanRenderTargetRuntime_test VulkanRenderTargetRuntime_test.cpp)
     target_link_libraries(VulkanRenderTargetRuntime_test PRIVATE threepp)
     add_test(NAME VulkanRenderTargetRuntime_test COMMAND VulkanRenderTargetRuntime_test)

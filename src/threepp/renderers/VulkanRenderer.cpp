@@ -938,6 +938,7 @@ namespace threepp {
         VkSampler shadowCompareSampler_ = VK_NULL_HANDLE;
         VkPipelineLayout shadowDepthPipelineLayout_ = VK_NULL_HANDLE;
         VkPipeline shadowDepthPipeline_ = VK_NULL_HANDLE;
+        VkPipeline renderTargetDepthPipeline_ = VK_NULL_HANDLE;
         VkPipeline shadowDepthLineListPipeline_ = VK_NULL_HANDLE;
         VkPipeline shadowDepthLineStripPipeline_ = VK_NULL_HANDLE;
         VkImageLayout shadowDepthLayout_ = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -2809,6 +2810,7 @@ namespace threepp {
             if (rasterDescPool)         vkDestroyDescriptorPool(d, rasterDescPool, nullptr);
             if (rasterGbufRenderPass)   vkDestroyRenderPass(d, rasterGbufRenderPass, nullptr);
             if (shadowDepthPipeline_)       vkDestroyPipeline(d, shadowDepthPipeline_, nullptr);
+            if (renderTargetDepthPipeline_) vkDestroyPipeline(d, renderTargetDepthPipeline_, nullptr);
             if (shadowDepthLineListPipeline_) vkDestroyPipeline(d, shadowDepthLineListPipeline_, nullptr);
             if (shadowDepthLineStripPipeline_) vkDestroyPipeline(d, shadowDepthLineStripPipeline_, nullptr);
             if (shadowDepthPipelineLayout_) vkDestroyPipelineLayout(d, shadowDepthPipelineLayout_, nullptr);
@@ -11920,6 +11922,69 @@ namespace threepp {
             rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         }
 
+        void recordDepthDirectToRenderTarget(VkCommandBuffer cb,
+                                             vulkan::VulkanRenderTargets::Record& rt) {
+            ensureShadowDepthPipeline();
+            if (renderTargetDepthPipeline_ == VK_NULL_HANDLE ||
+                rt.depth.image == VK_NULL_HANDLE || rt.depth.arrayLayers != 1) {
+                return;
+            }
+
+            const auto aspect = depthBarrierAspect(rt.depth.format);
+            transitionImage(cb, rt.depth.image,
+                            rt.depthLayout, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                            rt.depthLayout == VK_IMAGE_LAYOUT_UNDEFINED
+                                    ? VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT
+                                    : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                            rt.depthLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 : VK_ACCESS_2_SHADER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            aspect);
+
+            VkRenderingAttachmentInfo depthAtt{};
+            depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+            depthAtt.imageView = rt.depth.view;
+            depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            depthAtt.clearValue.depthStencil = {0.f, 0u};
+
+            VkRenderingInfo rendering{};
+            rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+            rendering.renderArea.extent = {rt.depth.width, rt.depth.height};
+            rendering.layerCount = 1;
+            rendering.pDepthAttachment = &depthAtt;
+            vkCmdBeginRendering(cb, &rendering);
+
+            VkViewport viewport{0.f, 0.f, static_cast<float>(rt.depth.width),
+                                static_cast<float>(rt.depth.height), 0.f, 1.f};
+            const VkRect2D scissor{{0, 0}, {rt.depth.width, rt.depth.height}};
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, renderTargetDepthPipeline_);
+            vkCmdSetViewport(cb, 0, 1, &viewport);
+            vkCmdSetScissor(cb, 0, 1, &scissor);
+
+            Matrix4 cameraVP;
+            std::memcpy(cameraVP.elements.data(), currVPunjit_.data(), 64);
+            for (const auto& entry : lastVisibleEntries_) {
+                if (entry.isOverlay || !entry.inFrustum || !entry.mesh) continue;
+                const auto* rec = resolveBlasForEntry(entry);
+                if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+                recordShadowCasterDraw(cb, entry, *rec, cameraVP, false);
+            }
+            vkCmdEndRendering(cb);
+
+            transitionImage(cb, rt.depth.image,
+                            VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_READ_BIT,
+                            aspect);
+            rt.depthLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        }
+
         void recordCopyDefaultFramebufferToRenderTarget(VkCommandBuffer cb, RenderTarget& target) {
             if (!renderTargets_) return;
             auto& rt = renderTargets_->getOrCreate(target, activeCubeFace_, activeMipmapLevel_,
@@ -12131,6 +12196,12 @@ namespace threepp {
             const bool wantsStencilCopy = target.stencilBuffer ||
                                           (target.depthTexture &&
                                            target.depthTexture->format == Format::DepthStencil);
+            if (target.depthTexture && !wantsStencilCopy &&
+                rt.depth.arrayLayers == 1 && activeMipmapLevel_ == 0 &&
+                activeCubeFace_ == 0 && activeLayer_ == 0) {
+                recordDepthDirectToRenderTarget(cb, rt);
+                return;
+            }
             if ((wantsDepthCopy || wantsStencilCopy) && rt.depth.image != VK_NULL_HANDLE &&
                 rasterGbufs[currentFrame].depth.image != VK_NULL_HANDLE) {
                 auto& srcDepth = rasterGbufs[currentFrame].depth;
@@ -13074,6 +13145,12 @@ namespace threepp {
             };
             createPipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, shadowDepthPipeline_,
                            "vkCreateGraphicsPipelines(shadow depth)");
+            ds.depthCompareOp = VK_COMPARE_OP_GREATER;
+            prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
+            createPipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, renderTargetDepthPipeline_,
+                           "vkCreateGraphicsPipelines(render target depth)");
+            ds.depthCompareOp = VK_COMPARE_OP_LESS;
+            prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
             createPipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, shadowDepthLineListPipeline_,
                            "vkCreateGraphicsPipelines(shadow depth line list)");
             createPipeline(VK_PRIMITIVE_TOPOLOGY_LINE_STRIP, shadowDepthLineStripPipeline_,
@@ -13173,8 +13250,9 @@ namespace threepp {
         }
 
         void recordShadowCasterDraw(VkCommandBuffer cb, const MeshEntry& entry,
-                                    const BlasRecord& rec, const Matrix4& lightVP) {
-            if (!entry.mesh || !entry.mesh->castShadow) return;
+                                    const BlasRecord& rec, const Matrix4& lightVP,
+                                    bool shadowPass = true) {
+            if (!entry.mesh || (shadowPass && !entry.mesh->castShadow)) return;
             auto geometry = entry.mesh->geometry();
             if (!geometry) return;
             const bool indexed = rec.index.handle != VK_NULL_HANDLE;
@@ -13211,13 +13289,27 @@ namespace threepp {
                     if (group.materialIndex >= materials.size()) continue;
                     const auto& material = materials[group.materialIndex];
                     if (!material || !material->visible) continue;
-                    vkCmdSetCullMode(cb, shadowDepthCullMode(*material, shadowMapType_));
+                    const auto cull = shadowPass
+                                              ? shadowDepthCullMode(*material, shadowMapType_)
+                                              : material->side == Side::Double
+                                                        ? VK_CULL_MODE_NONE
+                                                        : material->side == Side::Back
+                                                                  ? VK_CULL_MODE_FRONT_BIT
+                                                                  : VK_CULL_MODE_BACK_BIT;
+                    vkCmdSetCullMode(cb, cull);
                     drawSpan(group);
                 }
             } else {
                 const auto material = entry.mesh->material();
                 if (!material || !material->visible) return;
-                vkCmdSetCullMode(cb, shadowDepthCullMode(*material, shadowMapType_));
+                const auto cull = shadowPass
+                                          ? shadowDepthCullMode(*material, shadowMapType_)
+                                          : material->side == Side::Double
+                                                    ? VK_CULL_MODE_NONE
+                                                    : material->side == Side::Back
+                                                              ? VK_CULL_MODE_FRONT_BIT
+                                                              : VK_CULL_MODE_BACK_BIT;
+                vkCmdSetCullMode(cb, cull);
                 drawSpan(std::nullopt);
             }
         }
@@ -21123,6 +21215,25 @@ namespace threepp {
                     frameState_ = perspectiveViewportComposition
                                           ? FrameState::RecordingPostPT
                                           : FrameState::RecordingOrthoOnly;
+                    if (orthoDepthOverlayToRenderTarget &&
+                        activeMipmapLevel_ == 0 && activeCubeFace_ == 0 && activeLayer_ == 0) {
+                        recordCopyDefaultFramebufferToRenderTarget(
+                                cmdBuffers[currentFrame], *currentRenderTarget_);
+                        auto& rt = renderTargets_->getOrCreate(
+                                *currentRenderTarget_, activeCubeFace_, activeMipmapLevel_,
+                                defaultFramebufferSamples_, activeLayer_);
+                        const auto extent = activeRenderTargetExtent(*currentRenderTarget_);
+                        overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                             rt.color.image, rt.color.view, extent,
+                                             scene, camera, /*screenSpaceOnly=*/false,
+                                             0, 0, extent.width, extent.height,
+                                             /*regionAsViewport=*/true,
+                                             rt.colorLayout,
+                                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                             linearOutput_);
+                        rt.colorLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+                        return;
+                    }
                     // Raster composition path: standalone ortho/HUD rendering and
                     // GL-style perspective multi-viewport rendering both draw the
                     // supplied scene directly into the active viewport.
