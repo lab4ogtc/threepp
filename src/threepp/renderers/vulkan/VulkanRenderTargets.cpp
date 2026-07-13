@@ -120,8 +120,11 @@ namespace threepp::vulkan {
         }
 
         VkFormat depthImageFormat(const RenderTargetKey& key) {
-            return key.stencilBuffer ||
-                           (key.hasDepthTexture && key.depthFormat == Format::DepthStencil)
+            // 需要从默认帧缓冲复制的深度目标必须保持相同格式，尺寸不同时才能合法 blit。
+            const bool copiedDepth = key.hasDepthTexture ||
+                                     key.format == Format::Depth ||
+                                     key.format == Format::DepthStencil;
+            return key.stencilBuffer || copiedDepth
                     ? VK_FORMAT_D32_SFLOAT_S8_UINT
                     : VK_FORMAT_D32_SFLOAT;
         }

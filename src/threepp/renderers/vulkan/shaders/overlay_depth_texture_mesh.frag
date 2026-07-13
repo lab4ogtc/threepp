@@ -18,11 +18,16 @@ float viewZToOrthographicDepth(float viewZ, float near, float far) {
     return (viewZ + near) / (near - far);
 }
 
+float srgbToLinear(float value) {
+    return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4);
+}
+
 void main() {
     vec2 uv = vec2(vUv.x, mix(vUv.y, 1.0 - vUv.y, pc.params.z));
     float reverseDepth = texture(depthMap, uv).x;
     float glDepth = 1.0 - reverseDepth;
     float viewZ = perspectiveDepthToViewZ(glDepth, pc.params.x, pc.params.y);
     float depth = viewZToOrthographicDepth(viewZ, pc.params.x, pc.params.y);
-    outColor = vec4(vec3(depth), pc.params.w);
+    float outputDepth = pc.params.w < 0.0 ? srgbToLinear(depth) : depth;
+    outColor = vec4(vec3(outputDepth), abs(pc.params.w));
 }

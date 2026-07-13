@@ -72,12 +72,14 @@ namespace threepp::vulkan {
         // Vulkan 动态 viewport 也使用同一区域；否则投影保持整帧，
         // 用于匹配 GL scissor 语义。
         void record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
+                    VkImage outputImage, VkImageView outputView, VkExtent2D outputExtent,
                     Object3D& scene, Camera& camera, bool screenSpaceOnly,
                     uint32_t regionX = 0, uint32_t regionY = 0,
                     uint32_t regionW = 0, uint32_t regionH = 0,
                     bool regionAsViewport = false,
                     VkImageLayout inputLayout = VK_IMAGE_LAYOUT_GENERAL,
-                    VkImageLayout outputLayout = VK_IMAGE_LAYOUT_GENERAL);
+                    VkImageLayout outputLayout = VK_IMAGE_LAYOUT_GENERAL,
+                    bool linearOutput = false);
 
     private:
         // Cached uploaded sprite atlas. Keyed on Texture*; liveCheck detects

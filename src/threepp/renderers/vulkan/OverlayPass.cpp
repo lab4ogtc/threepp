@@ -1595,12 +1595,14 @@ OverlayPass::ensureWireframeGeometryUploaded(const BufferGeometry* geom) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
-                          Object3D& scene, Camera& camera, bool screenSpaceOnly,
+                         VkImage outputImage, VkImageView outputView, VkExtent2D outputExtent,
+                         Object3D& scene, Camera& camera, bool screenSpaceOnly,
                           uint32_t regionX, uint32_t regionY,
                           uint32_t regionW, uint32_t regionH,
                           bool regionAsViewport,
                           VkImageLayout inputLayout,
-                          VkImageLayout outputLayout) {
+                          VkImageLayout outputLayout,
+                          bool linearOutput) {
     // Lazy pipeline setup on first HUD overlay of the program.
     if (overlaySpritePipeline_ == VK_NULL_HANDLE) {
         createSpriteOverlayPipeline();
@@ -1660,7 +1662,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     // synthesise this from screenAnchor + viewport + position
     // instead of using sp->matrixWorld (which carries the user's
     // 3D placement, irrelevant in screen-space mode).
-    const VkExtent2D extEarly = ctx_.swapchainExtent();
+    const VkExtent2D extEarly = outputExtent;
     struct SpriteDraw {
         Sprite* sprite = nullptr;
         std::shared_ptr<Texture> atlas;
@@ -1824,7 +1826,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (auto mat = p->material()) {
                 if (auto* mc = dynamic_cast<MaterialWithColor*>(mat.get())) pd.color = mc->color;
                 if (auto* ms = dynamic_cast<MaterialWithSize*>(mat.get())) {
-                    pd.size = std::max(1.f, ms->size);
+                    pd.size = ms->size;
                     pd.sizeAttenuation = ms->sizeAttenuation && camera.is<PerspectiveCamera>();
                 }
             }
@@ -1840,7 +1842,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         draws.resize(kMaxSpritesPerFrame);
     }
 
-    const VkExtent2D ext = ctx_.swapchainExtent();
+    const VkExtent2D ext = outputExtent;
     auto& depthImage = ensureDepthImage(frame, ext.width, ext.height);
 
     VkImageMemoryBarrier2 toDepth{};
@@ -1867,7 +1869,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
 
     // 在 swapchain 上开启动态 render pass。Perspective 帧经过 TAA present
     // 后已经是 COLOR_ATTACHMENT；ortho-only 帧保持旧的 GENERAL 默认值。
-    const VkImage img = ctx_.swapchainImages()[imageIndex];
+    const VkImage img = outputImage;
     {
         VkImageMemoryBarrier2 toColor{};
         toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -1897,7 +1899,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
 
     VkRenderingAttachmentInfo colorAtt{};
     colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAtt.imageView   = ctx_.swapchainImageViews()[imageIndex];
+    colorAtt.imageView   = outputView;
     colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
     colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
@@ -2087,7 +2089,10 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                 pc.color[0] = md.depthNear;
                 pc.color[1] = md.depthFar;
                 pc.color[2] = md.flipUv;
-                pc.color[3] = md.opacity;
+                const bool decodeLinearOutput = linearOutput &&
+                                                (ctx_.swapchainFormat() == VK_FORMAT_B8G8R8A8_SRGB ||
+                                                 ctx_.swapchainFormat() == VK_FORMAT_R8G8B8A8_SRGB);
+                pc.color[3] = decodeLinearOutput ? -md.opacity : md.opacity;
             } else {
                 pc.color[0] = md.color.r;
                 pc.color[1] = md.color.g;

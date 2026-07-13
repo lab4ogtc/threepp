@@ -34,3 +34,5 @@ examples/vulkan/scratch/*
 _build_aaa.bat
 
 MEMORY.md
+artifacts/
+docs/superpowers/

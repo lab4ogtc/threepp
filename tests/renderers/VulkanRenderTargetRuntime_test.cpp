@@ -173,6 +173,12 @@ int main() {
                 MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color::white)));
         depthSensorPlane->position.z = -3.f;
         depthSensorScene.add(depthSensorPlane);
+        Scene depthSensorScaledScene;
+        auto depthSensorScaledPlane = Mesh::create(
+                PlaneGeometry::create(1.f, 1.f),
+                MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color::white)));
+        depthSensorScaledPlane->position.z = -3.f;
+        depthSensorScaledScene.add(depthSensorScaledPlane);
         Scene lidarScene;
         auto lidarWhiteMesh = Mesh::create(BoxGeometry::create(0.8f, 0.8f, 0.8f), whiteMaterial);
         lidarWhiteMesh->position.x = -0.5f;
@@ -409,11 +415,19 @@ int main() {
             pathTracedLidar.updateMatrixWorld();
             std::vector<LidarReturn> pathTracedLidarReturns;
             pathTracedLidar.scan(renderer, pathTracedLidarReturns);
+            int offscreenOverlayCalls = 0;
+            renderer.setOverlayCallback([&offscreenOverlayCalls](void*) {
+                ++offscreenOverlayCalls;
+            });
             DepthSensor depthSensor(60.f, 32, 24, 0.1f, 10.f);
             depthSensor.rangeNoise = 0.f;
             depthSensor.updateMatrixWorld();
             std::vector<Vector3> depthCloud;
             depthSensor.scan(renderer, depthSensorScene, depthCloud);
+            renderer.setOverlayCallback({});
+            const bool offscreenOverlayPass = offscreenOverlayCalls == 0;
+            std::printf("[phase2] offscreen overlay calls=%d -> %s\n",
+                        offscreenOverlayCalls, offscreenOverlayPass ? "PASS" : "FAIL");
             double depthZSum = 0.0;
             for (const auto& point : depthCloud) {
                 depthZSum += point.z;
@@ -422,6 +436,15 @@ int main() {
             const bool depthSensorHit = depthCloud.size() > 600 &&
                                         depthAvgZ < -2.8 &&
                                         depthAvgZ > -3.2;
+            DepthSensor depthSensorScaled(60.f, 32, 24, 0.1f, 10.f);
+            depthSensorScaled.rangeNoise = 0.f;
+            depthSensorScaled.updateMatrixWorld();
+            std::vector<Vector3> depthScaledCloud;
+            depthSensorScaled.scan(renderer, depthSensorScaledScene, depthScaledCloud);
+            const bool depthSensorScaledHit = depthScaledCloud.size() >= 20 &&
+                                              depthScaledCloud.size() <= 100;
+            std::printf("[phase2] DepthSensor scaled target points=%zu -> %s\n",
+                        depthScaledCloud.size(), depthSensorScaledHit ? "PASS" : "FAIL");
             LidarSensor rasterLidar(16, 0.1f, 10.f);
             rasterLidar.rangeNoise = 0.f;
             std::vector<LidarReturn> rasterLidarCloud;
@@ -740,7 +763,9 @@ int main() {
                               lidarMediumAtmospherePass &&
                               lidarThresholdPass &&
                               pathTracedLidarPass &&
+                              offscreenOverlayPass &&
                               depthSensorHit &&
+                              depthSensorScaledHit &&
                               rasterLidarHit &&
                               mrtMsaaPass;
             std::printf("[phase2] RenderTarget sample+readback+default frame=%d targetBytes=%zu fbBytes=%zu "

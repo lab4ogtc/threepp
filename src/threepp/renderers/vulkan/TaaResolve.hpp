@@ -84,6 +84,9 @@ namespace threepp::vulkan {
         void recordResolve(VkCommandBuffer cb,
                            uint32_t frame,
                            uint32_t imageIndex,
+                           VkImage outputImage,
+                           VkImageView outputView,
+                           VkExtent2D outputExtent,
                            uint32_t inWidth,
                            uint32_t inHeight,
                            uint32_t outWidth,
@@ -99,7 +102,9 @@ namespace threepp::vulkan {
                            uint32_t physInH = 0,
                            uint32_t physOutW = 0,
                            uint32_t physOutH = 0);
-        void recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex);
+        void recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
+                                VkImage outputImage, VkImageView outputView,
+                                VkExtent2D outputExtent);
 
         // Denoise writes its output here when TAA is active (replaces the
         // direct-to-swapchain write of non-TAA mode).

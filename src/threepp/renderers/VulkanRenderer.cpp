@@ -441,6 +441,7 @@ namespace threepp {
         // resets the accumulator (tone mapping is display-only).
         ToneMapping toneMapping_ = ToneMapping::None;
         float       toneMappingExposure_ = 1.f;
+        bool        linearOutput_ = false;
 
         std::unique_ptr<VulkanContext> ctx;
         std::unique_ptr<vulkan::VulkanRenderTargets> renderTargets_;
@@ -2238,6 +2239,11 @@ namespace threepp {
 
         uint32_t currentFrame = 0;
         bool needsResize = false;
+        bool frameWaitsForAcquire_ = false;
+        bool frameTargetsSwapchain_ = false;
+        bool previousFrameTargetKnown_ = false;
+        bool previousFrameTargetsSwapchain_ = false;
+        Image2D offscreenFrameOutput_{};
 
         // ImGui (or any post-PT overlay) hook. When set, the swapchain image
         // is transitioned GENERAL → COLOR_ATTACHMENT_OPTIMAL after the trace,
@@ -2375,6 +2381,7 @@ namespace threepp {
             {
                 THREEPP_VK_TRACE_SCOPE("Impl.frameResources");
                 createCommandResources();
+                createOffscreenFrameOutput();
                 createCameraUbos();
                 createLightsUbos();
                 createShadowMapUbos();
@@ -2883,6 +2890,7 @@ namespace threepp {
 
             // TAA resolve subsystem owns its pipeline/layout/sampler/images.
             taa_.reset();
+            destroyImage2D(ctx->allocator(), d, offscreenFrameOutput_);
         }
 
         void destroyRenderFinishedSemaphores() {
@@ -2932,6 +2940,73 @@ namespace threepp {
                 check(vkCreateFence(ctx->device(), &fci, nullptr, &inFlight[i]), "vkCreateFence");
             }
             createRenderFinishedSemaphoresForSwapchain();
+        }
+
+        void createOffscreenFrameOutput() {
+            if (offscreenFrameOutput_.image != VK_NULL_HANDLE) {
+                destroyImage2D(ctx->allocator(), ctx->device(), offscreenFrameOutput_);
+            }
+
+            const auto extent = ctx->swapchainExtent();
+            if (extent.width == 0 || extent.height == 0) return;
+
+            offscreenFrameOutput_.width = extent.width;
+            offscreenFrameOutput_.height = extent.height;
+            offscreenFrameOutput_.format = ctx->swapchainFormat();
+
+            VkImageCreateInfo ici{};
+            ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            ici.imageType = VK_IMAGE_TYPE_2D;
+            ici.format = offscreenFrameOutput_.format;
+            ici.extent = {extent.width, extent.height, 1};
+            ici.mipLevels = 1;
+            ici.arrayLayers = 1;
+            ici.samples = VK_SAMPLE_COUNT_1_BIT;
+            ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+            ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+            VmaAllocationCreateInfo aci{};
+            aci.usage = VMA_MEMORY_USAGE_AUTO;
+            check(vmaCreateImage(ctx->allocator(), &ici, &aci,
+                                 &offscreenFrameOutput_.image,
+                                 &offscreenFrameOutput_.alloc, nullptr),
+                  "vmaCreateImage(offscreen frame output)");
+
+            VkImageViewCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = offscreenFrameOutput_.image;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = offscreenFrameOutput_.format;
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            check(vkCreateImageView(ctx->device(), &vci, nullptr,
+                                    &offscreenFrameOutput_.view),
+                  "vkCreateImageView(offscreen frame output)");
+            ctx->setObjectName(offscreenFrameOutput_.image, "offscreenFrameOutput");
+            ctx->setObjectName(offscreenFrameOutput_.view, "offscreenFrameOutputView");
+        }
+
+        [[nodiscard]] VkImage frameOutputImage(uint32_t imageIndex) const {
+            return frameTargetsSwapchain_
+                    ? ctx->swapchainImages()[imageIndex]
+                    : offscreenFrameOutput_.image;
+        }
+
+        [[nodiscard]] VkImageView frameOutputView(uint32_t imageIndex) const {
+            return frameTargetsSwapchain_
+                    ? ctx->swapchainImageViews()[imageIndex]
+                    : offscreenFrameOutput_.view;
+        }
+
+        [[nodiscard]] VkExtent2D frameOutputExtent() const {
+            return frameTargetsSwapchain_
+                    ? ctx->swapchainExtent()
+                    : VkExtent2D{offscreenFrameOutput_.width, offscreenFrameOutput_.height};
         }
 
         // Allocate, begin, return a one-shot command buffer.
@@ -3082,7 +3157,7 @@ namespace threepp {
                                                    VkImageLayout oldLayout,
                                                    VkPipelineStageFlags2 srcStage,
                                                    VkAccessFlags2 srcAccess) const {
-            transitionImage(cb, ctx->swapchainImages()[imageIndex],
+            transitionImage(cb, frameOutputImage(imageIndex),
                             oldLayout, VK_IMAGE_LAYOUT_GENERAL,
                             srcStage, srcAccess,
                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
@@ -3101,14 +3176,14 @@ namespace threepp {
                                      VkImageLayout oldLayout,
                                      VkPipelineStageFlags2 srcStage,
                                      VkAccessFlags2 srcAccess) {
-            const VkExtent2D ext = ctx->swapchainExtent();
+            const VkExtent2D ext = frameOutputExtent();
             const VkRect2D rect = activeScissorRect(ext);
             if (rect.extent.width == 0 || rect.extent.height == 0) {
                 transitionDefaultFramebufferToGeneral(cb, imageIndex, oldLayout, srcStage, srcAccess);
                 return;
             }
 
-            const VkImage image = ctx->swapchainImages()[imageIndex];
+            const VkImage image = frameOutputImage(imageIndex);
             const VkClearColorValue clearValue = encodedClearColorValue();
             if (coversFullExtent(rect, ext)) {
                 transitionImage(cb, image,
@@ -3140,7 +3215,7 @@ namespace threepp {
 
             VkRenderingAttachmentInfo colorAtt{};
             colorAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-            colorAtt.imageView = ctx->swapchainImageViews()[imageIndex];
+            colorAtt.imageView = frameOutputView(imageIndex);
             colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             colorAtt.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
             colorAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -3191,7 +3266,7 @@ namespace threepp {
             depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
             depthAtt.clearValue.depthStencil = {0.0f, 0u};
 
-            const VkExtent2D ext = ctx->swapchainExtent();
+            const VkExtent2D ext = frameOutputExtent();
             VkRenderingInfo ri{};
             ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
             ri.renderArea.offset = {0, 0};
@@ -10652,7 +10727,7 @@ namespace threepp {
                                      msaaImage, msaaLayout);
                 }
             } else {
-                VkImage image = ctx->swapchainImages()[imageIndex];
+                VkImage image = frameOutputImage(imageIndex);
                 oldSwapLayout = swapchainFrameLayout_;
                 toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
                 toColor.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
@@ -10680,7 +10755,7 @@ namespace threepp {
 
                 VkRenderingAttachmentInfo color{};
                 color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                color.imageView = ctx->swapchainImageViews()[imageIndex];
+                color.imageView = frameOutputView(imageIndex);
                 color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                 color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
                 color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
@@ -10937,7 +11012,7 @@ namespace threepp {
             }
             if (src == VK_NULL_HANDLE) return;
 
-            VkImage dst = ctx->swapchainImages()[imageIndex];
+            VkImage dst = frameOutputImage(imageIndex);
 
             // Transition src to TRANSFER_SRC_OPTIMAL, dst (already in GENERAL
             // from raygen path's preBarriers) to TRANSFER_DST_OPTIMAL.
@@ -10983,7 +11058,7 @@ namespace threepp {
             depPre.pImageMemoryBarriers = pre;
             vkCmdPipelineBarrier2(cb, &depPre);
 
-            const VkExtent2D ext = ctx->swapchainExtent();
+            const VkExtent2D ext = frameOutputExtent();
             VkImageBlit blit{};
             blit.srcSubresource.aspectMask = toSrc.subresourceRange.aspectMask;
             blit.srcSubresource.layerCount = 1;
@@ -11851,18 +11926,18 @@ namespace threepp {
                                                    defaultFramebufferSamples_, activeLayer_);
             const bool hasColor = rt.color.image != VK_NULL_HANDLE;
             if (hasColor) {
-            const VkExtent2D ext = ctx->swapchainExtent();
+            const VkExtent2D ext = frameOutputExtent();
             const auto activeMip = static_cast<uint32_t>(std::max(0, activeMipmapLevel_));
             const auto activeLayer = rt.key.cube
                     ? static_cast<uint32_t>(std::max(0, activeCubeFace_))
                     : static_cast<uint32_t>(std::max(0, activeLayer_));
-            const uint32_t srcW = std::min(rt.color.width, ext.width);
-            const uint32_t srcH = std::min(rt.color.height, ext.height);
+            const uint32_t srcW = ext.width;
+            const uint32_t srcH = ext.height;
             const uint32_t dstW = std::max(1u, rt.color.width >> activeMip);
             const uint32_t dstH = std::max(1u, rt.color.height >> activeMip);
             if (srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0) return;
 
-            const VkImage src = ctx->swapchainImages()[frameImageIndex_];
+            const VkImage src = frameOutputImage(frameImageIndex_);
             const VkImageLayout oldSwapLayout = swapchainFrameLayout_;
             transitionImage(cb, src,
                             oldSwapLayout, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
@@ -11909,7 +11984,7 @@ namespace threepp {
                             1,
                             activeLayer);
 
-            if (activeMip == 0) {
+            if (activeMip == 0 && srcW == dstW && srcH == dstH) {
                 VkImageCopy region{};
                 region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
                 region.srcSubresource.layerCount = 1;
@@ -12059,9 +12134,13 @@ namespace threepp {
             if ((wantsDepthCopy || wantsStencilCopy) && rt.depth.image != VK_NULL_HANDLE &&
                 rasterGbufs[currentFrame].depth.image != VK_NULL_HANDLE) {
                 auto& srcDepth = rasterGbufs[currentFrame].depth;
-                const uint32_t depthW = std::min(rt.depth.width, srcDepth.width);
-                const uint32_t depthH = std::min(rt.depth.height, srcDepth.height);
-                if (depthW == 0 || depthH == 0) return;
+                const uint32_t srcDepthW = srcDepth.width;
+                const uint32_t srcDepthH = srcDepth.height;
+                const uint32_t dstDepthW = rt.depth.width;
+                const uint32_t dstDepthH = rt.depth.height;
+                const uint32_t copyDepthW = std::min(dstDepthW, srcDepthW);
+                const uint32_t copyDepthH = std::min(dstDepthH, srcDepthH);
+                if (copyDepthW == 0 || copyDepthH == 0) return;
                 const auto depthLayer = rt.depth.arrayLayers > 1
                         ? (rt.key.cube
                                   ? static_cast<uint32_t>(std::max(0, activeCubeFace_))
@@ -12099,7 +12178,7 @@ namespace threepp {
 
                 if (wantsDepthCopy) {
                     if (srcDepth.format != rt.depth.format) {
-                        const VkDeviceSize depthBytes = static_cast<VkDeviceSize>(depthW) * depthH * sizeof(float);
+                        const VkDeviceSize depthBytes = static_cast<VkDeviceSize>(copyDepthW) * copyDepthH * sizeof(float);
                         if (rt.depthStencilCopyBuffer.handle == VK_NULL_HANDLE ||
                             rt.depthStencilCopyBuffer.size < depthBytes) {
                             if (rt.depthStencilCopyBuffer.handle != VK_NULL_HANDLE) {
@@ -12115,7 +12194,7 @@ namespace threepp {
                         VkBufferImageCopy toBuffer{};
                         toBuffer.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
                         toBuffer.imageSubresource.layerCount = 1;
-                        toBuffer.imageExtent = {depthW, depthH, 1};
+                        toBuffer.imageExtent = {copyDepthW, copyDepthH, 1};
                         vkCmdCopyImageToBuffer(cb,
                                                srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                                rt.depthStencilCopyBuffer.handle, 1, &toBuffer);
@@ -12141,23 +12220,38 @@ namespace threepp {
                         toDepth.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
                         toDepth.imageSubresource.baseArrayLayer = depthLayer;
                         toDepth.imageSubresource.layerCount = 1;
-                        toDepth.imageExtent = {depthW, depthH, 1};
+                        toDepth.imageExtent = {copyDepthW, copyDepthH, 1};
                         vkCmdCopyBufferToImage(cb,
                                                rt.depthStencilCopyBuffer.handle,
                                                rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                                1, &toDepth);
-                    } else {
+                    } else if (srcDepthW == dstDepthW && srcDepthH == dstDepthH) {
                         VkImageCopy depthRegion{};
                         depthRegion.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
                         depthRegion.srcSubresource.layerCount = 1;
                         depthRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
                         depthRegion.dstSubresource.baseArrayLayer = depthLayer;
                         depthRegion.dstSubresource.layerCount = 1;
-                        depthRegion.extent = {depthW, depthH, 1};
+                        depthRegion.extent = {srcDepthW, srcDepthH, 1};
                         vkCmdCopyImage(cb,
                                        srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                        rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                        1, &depthRegion);
+                    } else {
+                        VkImageBlit depthBlit{};
+                        depthBlit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                        depthBlit.srcSubresource.layerCount = 1;
+                        depthBlit.srcOffsets[1] = {static_cast<int32_t>(srcDepthW),
+                                                   static_cast<int32_t>(srcDepthH), 1};
+                        depthBlit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                        depthBlit.dstSubresource.baseArrayLayer = depthLayer;
+                        depthBlit.dstSubresource.layerCount = 1;
+                        depthBlit.dstOffsets[1] = {static_cast<int32_t>(dstDepthW),
+                                                   static_cast<int32_t>(dstDepthH), 1};
+                        vkCmdBlitImage(cb,
+                                       srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                       1, &depthBlit, VK_FILTER_NEAREST);
                     }
                 }
 
@@ -12171,7 +12265,7 @@ namespace threepp {
                     stencilRegion.dstSubresource.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
                     stencilRegion.dstSubresource.baseArrayLayer = depthLayer;
                     stencilRegion.dstSubresource.layerCount = 1;
-                    stencilRegion.extent = {depthW, depthH, 1};
+                    stencilRegion.extent = {copyDepthW, copyDepthH, 1};
                     vkCmdCopyImage(cb,
                                    srcDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                    rt.depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -12226,7 +12320,7 @@ namespace threepp {
                                             std::max(0, static_cast<int32_t>(ext.height) - static_cast<int32_t>(copyH)));
 
             VkCommandBuffer cb = cmdBuffers[currentFrame];
-            VkImage src = ctx->swapchainImages()[frameImageIndex_];
+            VkImage src = frameOutputImage(frameImageIndex_);
             VkImageLayout srcOldLayout = VK_IMAGE_LAYOUT_GENERAL;
             uint32_t srcLayer = 0;
             if (currentRenderTarget_) {
@@ -18416,9 +18510,11 @@ namespace threepp {
         void recreateSwapchainAndDescriptors() {
             ctx->recreateSwapchain();
             createRenderFinishedSemaphoresForSwapchain();
+            createOffscreenFrameOutput();
             reallocateRenderExtentResources();
             size = WindowSize{static_cast<int>(ctx->swapchainExtent().width),
                               static_cast<int>(ctx->swapchainExtent().height)};
+            frameWaitsForAcquire_ = false;
         }
 
         // Runtime render-scale change. Reallocates every render-extent
@@ -18969,7 +19065,7 @@ namespace threepp {
             // ignored and we fall through to the full PT path.
             if (eventsOnlyMode_ && eventCamEnabled_ &&
                 rasterGbufPipeline != VK_NULL_HANDLE) {
-                const VkImage swap = ctx->swapchainImages()[imageIndex];
+                const VkImage swap = frameOutputImage(imageIndex);
 
                 // UNDEFINED → GENERAL so vkCmdClearColorImage can write it,
                 // and so the downstream sprite overlay + ImGui pass see the
@@ -19045,7 +19141,7 @@ namespace threepp {
             }
             // ── End events-only render mode ─────────────────────────────────
 
-            const VkImage img = ctx->swapchainImages()[imageIndex];
+            const VkImage img = frameOutputImage(imageIndex);
 
             // UNDEFINED -> GENERAL. Swapchain is now written by either the
             // TAA compute dispatch (post-denoise), the denoise compute pass
@@ -19440,11 +19536,17 @@ namespace threepp {
                 taaPrevTimeSec_ = now;
             }
             if (taaBlendAlpha_ >= 1.0f && sharpenStrength_ <= 0.0f) {
-                taa_->recordPresentInput(cb, currentFrame, imageIndex);
+                taa_->recordPresentInput(cb, currentFrame, imageIndex,
+                                         frameOutputImage(imageIndex),
+                                         frameOutputView(imageIndex),
+                                         frameOutputExtent());
                 taaPrevTimeSec_ = -1.0;
             } else {
                 gpuTimings_->begin(cb, TP_TAA, currentFrame);
                 taa_->recordResolve(cb, currentFrame, imageIndex,
+                                    frameOutputImage(imageIndex),
+                                    frameOutputView(imageIndex),
+                                    frameOutputExtent(),
                                     regionRenderExt_.width, regionRenderExt_.height,
                                     regionSwapExt_.width, regionSwapExt_.height, effAlpha, taaDtFrames,
                                     sharpenStrength_ > 0.0f, sharpenStrength_,
@@ -19534,7 +19636,7 @@ namespace threepp {
                     colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
                     colorAtt.imageView   = useOverlayMsaa
                             ? rasterGbufs[currentFrame].overlayMsaaColor.view
-                            : ctx->swapchainImageViews()[imageIndex];
+                            : frameOutputView(imageIndex);
                     colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                     colorAtt.loadOp      = useOverlayMsaa ? VK_ATTACHMENT_LOAD_OP_CLEAR
                                                           : VK_ATTACHMENT_LOAD_OP_LOAD;
@@ -19726,7 +19828,7 @@ namespace threepp {
                             dashed = dynamic_cast<LineDashedMaterial*>(matPtr.get());
                             if (le.isPoints) {
                                 if (auto* ms = dynamic_cast<MaterialWithSize*>(matPtr.get())) {
-                                    pcW = std::max(1.0f, ms->size);
+                                    pcW = ms->size;
                                     pointSizeAttenuation = ms->sizeAttenuation && currCameraPerspective_;
                                 } else {
                                     pcW = 3.0f;// sensible default for sizeless materials
@@ -20118,7 +20220,7 @@ namespace threepp {
 
                         VkRenderingAttachmentInfo compositeColor{};
                         compositeColor.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-                        compositeColor.imageView   = ctx->swapchainImageViews()[imageIndex];
+                        compositeColor.imageView   = frameOutputView(imageIndex);
                         compositeColor.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
                         compositeColor.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
                         compositeColor.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
@@ -20186,7 +20288,7 @@ namespace threepp {
                 sceneCaptureBufH_ = ext.height;
             }
 
-            const VkImage img = ctx->swapchainImages()[imageIndex];
+            const VkImage img = frameOutputImage(imageIndex);
 
             VkImageMemoryBarrier toSrc{};
             toSrc.sType                       = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -20568,6 +20670,34 @@ namespace threepp {
             gpuTimings_->beginFrame(cb, currentFrame);
         }
 
+        bool acquireFrameImage() {
+            if (needsResize) {
+                recreateSwapchainAndDescriptors();
+                needsResize = false;
+            }
+            if (!frameTargetsSwapchain_) {
+                frameImageIndex_ = 0;
+                frameWaitsForAcquire_ = false;
+                return true;
+            }
+
+            uint32_t imageIndex = 0;
+            const auto acq = vkAcquireNextImageKHR(ctx->device(), ctx->swapchain(), UINT64_MAX,
+                                                   imageAvailable[currentFrame], VK_NULL_HANDLE,
+                                                   &imageIndex);
+            if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
+                recreateSwapchainAndDescriptors();
+                return false;
+            }
+            if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
+                check(acq, "vkAcquireNextImageKHR");
+            }
+
+            frameImageIndex_ = imageIndex;
+            frameWaitsForAcquire_ = true;
+            return true;
+        }
+
         // Acquire next swapchain image, run all per-frame UBO / descriptor
         // uploads, open the cmd buffer, and record the full PT body. On exit,
         // the swapchain image is in GENERAL and the cmd buffer is open;
@@ -20615,21 +20745,11 @@ namespace threepp {
                 }
             }
 
-            uint32_t imageIndex = 0;
-            VkResult acq = VK_SUCCESS;
             {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.vkAcquireNextImageKHR");
-                acq = vkAcquireNextImageKHR(d, ctx->swapchain(), UINT64_MAX,
-                                            imageAvailable[currentFrame], VK_NULL_HANDLE, &imageIndex);
+                if (!acquireFrameImage()) return false;
             }
-            if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
-                recreateSwapchainAndDescriptors();
-                return false;
-            }
-            if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
-                check(acq, "vkAcquireNextImageKHR");
-            }
-            frameImageIndex_ = imageIndex;
+            const uint32_t imageIndex = frameImageIndex_;
 
             {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.frameUploads");
@@ -20824,9 +20944,11 @@ namespace threepp {
             {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordScreenSpaceSprites");
                 overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                     frameOutputImage(frameImageIndex_),
+                                     frameOutputView(frameImageIndex_), frameOutputExtent(),
                                      scene, *screenSpaceCam_, /*screenSpaceOnly=*/true,
                                      0, 0, 0, 0, false,
-                                     swapchainFrameLayout_, swapchainFrameLayout_);
+                                     swapchainFrameLayout_, swapchainFrameLayout_, linearOutput_);
             }
             return true;
         }
@@ -20840,17 +20962,8 @@ namespace threepp {
             vkWaitForFences(d, 1, &inFlight[currentFrame], VK_TRUE, UINT64_MAX);
             gpuTimings_->readBack(currentFrame, pendingCpuEnsureSceneMs_);
 
-            uint32_t imageIndex = 0;
-            VkResult acq = vkAcquireNextImageKHR(d, ctx->swapchain(), UINT64_MAX,
-                                                 imageAvailable[currentFrame], VK_NULL_HANDLE, &imageIndex);
-            if (acq == VK_ERROR_OUT_OF_DATE_KHR) {
-                recreateSwapchainAndDescriptors();
-                return false;
-            }
-            if (acq != VK_SUCCESS && acq != VK_SUBOPTIMAL_KHR) {
-                check(acq, "vkAcquireNextImageKHR");
-            }
-            frameImageIndex_ = imageIndex;
+            if (!acquireFrameImage()) return false;
+            const uint32_t imageIndex = frameImageIndex_;
 
             vkResetFences(d, 1, &inFlight[currentFrame]);
             vkResetCommandBuffer(cmdBuffers[currentFrame], 0);
@@ -20881,12 +20994,13 @@ namespace threepp {
 
             const uint32_t imageIndex = frameImageIndex_;
             VkCommandBuffer cb = cmdBuffers[currentFrame];
+            const bool present = frameTargetsSwapchain_;
             if (imageIndex >= renderFinishedByImage_.size()) {
                 throw std::runtime_error("VulkanRenderer swapchain image index exceeds present semaphore count");
             }
             const VkSemaphore presentReady = renderFinishedByImage_[imageIndex];
 
-            {
+            if (present) {
                 THREEPP_VK_TRACE_SCOPE("endFrame.recordOverlayAndPresentTransition");
                 recordOverlayAndPresentTransition(cb, imageIndex);
             }
@@ -20902,7 +21016,7 @@ namespace threepp {
             VkSemaphoreSubmitInfo waitInfo{};
             waitInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
             waitInfo.semaphore = imageAvailable[currentFrame];
-            waitInfo.stageMask = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+            waitInfo.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
 
             VkSemaphoreSubmitInfo signalInfo{};
             signalInfo.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO;
@@ -20915,37 +21029,39 @@ namespace threepp {
 
             VkSubmitInfo2 submit{};
             submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2;
-            submit.waitSemaphoreInfoCount = 1;
-            submit.pWaitSemaphoreInfos = &waitInfo;
+            submit.waitSemaphoreInfoCount = frameWaitsForAcquire_ ? 1u : 0u;
+            submit.pWaitSemaphoreInfos = frameWaitsForAcquire_ ? &waitInfo : nullptr;
             submit.commandBufferInfoCount = 1;
             submit.pCommandBufferInfos = &cbInfo;
-            submit.signalSemaphoreInfoCount = 1;
-            submit.pSignalSemaphoreInfos = &signalInfo;
+            submit.signalSemaphoreInfoCount = present ? 1u : 0u;
+            submit.pSignalSemaphoreInfos = present ? &signalInfo : nullptr;
             {
                 THREEPP_VK_TRACE_SCOPE("endFrame.vkQueueSubmit2");
                 check(vkQueueSubmit2(ctx->graphicsQueue(), 1, &submit, inFlight[currentFrame]),
                       "vkQueueSubmit2");
             }
 
-            VkPresentInfoKHR pi{};
-            pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-            pi.waitSemaphoreCount = 1;
-            pi.pWaitSemaphores = &presentReady;
-            VkSwapchainKHR sc = ctx->swapchain();
-            pi.swapchainCount = 1;
-            pi.pSwapchains = &sc;
-            pi.pImageIndices = &imageIndex;
+            if (present) {
+                VkPresentInfoKHR pi{};
+                pi.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
+                pi.waitSemaphoreCount = 1;
+                pi.pWaitSemaphores = &presentReady;
+                VkSwapchainKHR sc = ctx->swapchain();
+                pi.swapchainCount = 1;
+                pi.pSwapchains = &sc;
+                pi.pImageIndices = &imageIndex;
 
-            VkResult pr = VK_SUCCESS;
-            {
-                THREEPP_VK_TRACE_SCOPE("endFrame.vkQueuePresentKHR");
-                pr = vkQueuePresentKHR(ctx->presentQueue(), &pi);
-            }
-            if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR || needsResize) {
-                needsResize = false;
-                recreateSwapchainAndDescriptors();
-            } else if (pr != VK_SUCCESS) {
-                check(pr, "vkQueuePresentKHR");
+                VkResult pr = VK_SUCCESS;
+                {
+                    THREEPP_VK_TRACE_SCOPE("endFrame.vkQueuePresentKHR");
+                    pr = vkQueuePresentKHR(ctx->presentQueue(), &pi);
+                }
+                if (pr == VK_ERROR_OUT_OF_DATE_KHR || pr == VK_SUBOPTIMAL_KHR || needsResize) {
+                    needsResize = false;
+                    recreateSwapchainAndDescriptors();
+                } else if (pr != VK_SUCCESS) {
+                    check(pr, "vkQueuePresentKHR");
+                }
             }
 
             // Cap to keep `subIdx = sampleIndex * spp + s` (raygen.rgen)
@@ -20957,8 +21073,12 @@ namespace threepp {
             // toward biased noise. 16M ≈ 75 hours at 60 fps, no longer reachable.
             if (sampleIndex < (1u << 24)) ++sampleIndex;
 
-            currentFrame  = (currentFrame + 1) % kFramesInFlight;
-            frameState_   = FrameState::Idle;
+            previousFrameTargetKnown_ = true;
+            previousFrameTargetsSwapchain_ = present;
+            currentFrame = (currentFrame + 1) % kFramesInFlight;
+            frameState_ = FrameState::Idle;
+            frameWaitsForAcquire_ = false;
+            frameTargetsSwapchain_ = false;
         }
 
         // State-machine dispatcher for VulkanRenderer::render(). First call
@@ -20970,6 +21090,7 @@ namespace threepp {
         void renderFrame(Object3D& scene, Camera& camera) {
             THREEPP_VK_TRACE_SCOPE("renderFrame");
             const bool isOrtho = camera.is<OrthographicCamera>();
+            const bool targetsSwapchain = currentRenderTarget_ == nullptr;
             const bool orthoDepthOverlayToRenderTarget =
                     isOrtho &&
                     currentRenderTarget_ != nullptr &&
@@ -20980,10 +21101,25 @@ namespace threepp {
                     !orthoDepthOverlayToRenderTarget &&
                     sceneHasVisibleCustomShaderMaterials(scene);
 
+            if (frameState_ != FrameState::Idle && frameTargetsSwapchain_ != targetsSwapchain) {
+                endFrame();
+                renderFrame(scene, camera);
+                return;
+            }
+
             if (frameState_ == FrameState::Idle) {
+                if (previousFrameTargetKnown_ &&
+                    previousFrameTargetsSwapchain_ != targetsSwapchain) {
+                    taa_->invalidateHistory();
+                    taaPrevTimeSec_ = -1.0;
+                }
+                frameTargetsSwapchain_ = targetsSwapchain;
                 const bool perspectiveViewportComposition = shouldStartPerspectiveViewportComposition(camera);
                 if ((isOrtho && !orthoNeedsFullFrame) || perspectiveViewportComposition) {
-                    if (!beginFrameOrthoOnly()) return;
+                    if (!beginFrameOrthoOnly()) {
+                        frameTargetsSwapchain_ = false;
+                        return;
+                    }
                     frameState_ = perspectiveViewportComposition
                                           ? FrameState::RecordingPostPT
                                           : FrameState::RecordingOrthoOnly;
@@ -20993,18 +21129,25 @@ namespace threepp {
                     const VkRect2D viewportRect = activeViewportRect(ctx->swapchainExtent());
                     if (viewportRect.extent.width > 0 && viewportRect.extent.height > 0) {
                         overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                             frameOutputImage(frameImageIndex_),
+                                             frameOutputView(frameImageIndex_), frameOutputExtent(),
                                              scene, camera, /*screenSpaceOnly=*/false,
                                              static_cast<uint32_t>(viewportRect.offset.x),
                                              static_cast<uint32_t>(viewportRect.offset.y),
                                              viewportRect.extent.width,
                                              viewportRect.extent.height,
-                                             /*regionAsViewport=*/true);
+                                             /*regionAsViewport=*/true,
+                                             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL,
+                                             linearOutput_);
                     }
                     if (currentRenderTarget_) {
                         recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
                     }
                 } else {
-                    if (!beginFrameForPT(scene, camera)) return;
+                    if (!beginFrameForPT(scene, camera)) {
+                        frameTargetsSwapchain_ = false;
+                        return;
+                    }
                     frameState_ = FrameState::RecordingPostPT;
                 }
                 return;
@@ -21061,8 +21204,11 @@ namespace threepp {
                         clearAlpha = savedClearAlpha;
                     }
                     overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                         frameOutputImage(frameImageIndex_),
+                                         frameOutputView(frameImageIndex_), frameOutputExtent(),
                                          scene, camera, /*screenSpaceOnly=*/false, rx, ry, rw, rh,
-                                         appendViewport, swapchainFrameLayout_, swapchainFrameLayout_);
+                                         appendViewport, swapchainFrameLayout_, swapchainFrameLayout_,
+                                         linearOutput_);
                     return;
                 }
                 // User issued a second full-frame perspective render — finalize
@@ -21078,13 +21224,15 @@ namespace threepp {
             const VkRect2D viewportRect = activeViewportRect(ctx->swapchainExtent());
             if (viewportRect.extent.width > 0 && viewportRect.extent.height > 0) {
                 overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
+                                     frameOutputImage(frameImageIndex_),
+                                     frameOutputView(frameImageIndex_), frameOutputExtent(),
                                      scene, camera, /*screenSpaceOnly=*/false,
                                      static_cast<uint32_t>(viewportRect.offset.x),
                                      static_cast<uint32_t>(viewportRect.offset.y),
                                      viewportRect.extent.width,
                                      viewportRect.extent.height,
                                      /*regionAsViewport=*/true,
-                                     swapchainFrameLayout_, swapchainFrameLayout_);
+                                     swapchainFrameLayout_, swapchainFrameLayout_, linearOutput_);
             }
             if (currentRenderTarget_) {
                 recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
@@ -21172,6 +21320,7 @@ namespace threepp {
         // can flip toneMapping / toneMappingExposure freely between frames.
         pimpl_->toneMapping_         = toneMapping;
         pimpl_->toneMappingExposure_ = toneMappingExposure;
+        pimpl_->linearOutput_        = outputColorSpace == LinearSRGBColorSpace;
         pimpl_->autoClear_           = autoClear;
         pimpl_->autoClearColor_      = autoClearColor;
         pimpl_->autoClearDepth_      = autoClearDepth;

@@ -589,6 +589,9 @@ namespace threepp::vulkan {
     void TaaResolve::recordResolve(VkCommandBuffer cb,
                                    uint32_t frame,
                                    uint32_t imageIndex,
+                                   VkImage outputImage,
+                                   VkImageView outputView,
+                                   VkExtent2D outputExtent,
                                    uint32_t inWidth,
                                    uint32_t inHeight,
                                    uint32_t outWidth,
@@ -719,7 +722,7 @@ namespace threepp::vulkan {
         swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        swapToColor.image = ctx_.swapchainImages()[imageIndex];
+        swapToColor.image = outputImage;
         swapToColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         swapToColor.subresourceRange.levelCount = 1;
         swapToColor.subresourceRange.layerCount = 1;
@@ -734,12 +737,12 @@ namespace threepp::vulkan {
 
         VkRenderingAttachmentInfo colorAtt{};
         colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAtt.imageView   = ctx_.swapchainImageViews()[imageIndex];
+        colorAtt.imageView   = outputView;
         colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
 
-        const VkExtent2D presentExtent = ctx_.swapchainExtent();
+        const VkExtent2D presentExtent = outputExtent;
         VkRenderingInfo ri{};
         ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         ri.renderArea.offset = {0, 0};
@@ -767,7 +770,9 @@ namespace threepp::vulkan {
         historyValid_ = true;
     }
 
-    void TaaResolve::recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex) {
+    void TaaResolve::recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
+                                        VkImage outputImage, VkImageView outputView,
+                                        VkExtent2D outputExtent) {
         const uint32_t descIdx = frame * imageCount_ + imageIndex;
 
         VkMemoryBarrier2 presentReadBar{};
@@ -787,7 +792,7 @@ namespace threepp::vulkan {
         swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        swapToColor.image = ctx_.swapchainImages()[imageIndex];
+        swapToColor.image = outputImage;
         swapToColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         swapToColor.subresourceRange.levelCount = 1;
         swapToColor.subresourceRange.layerCount = 1;
@@ -802,12 +807,12 @@ namespace threepp::vulkan {
 
         VkRenderingAttachmentInfo colorAtt{};
         colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-        colorAtt.imageView   = ctx_.swapchainImageViews()[imageIndex];
+        colorAtt.imageView   = outputView;
         colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
         colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
 
-        const VkExtent2D presentExtent = ctx_.swapchainExtent();
+        const VkExtent2D presentExtent = outputExtent;
         VkRenderingInfo ri{};
         ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         ri.renderArea.offset = {0, 0};
