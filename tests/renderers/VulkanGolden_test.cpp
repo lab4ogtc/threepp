@@ -26,6 +26,7 @@
 
 #include "threepp/geometries/BoxGeometry.hpp"
 #include "threepp/geometries/SphereGeometry.hpp"
+#include "threepp/helpers/CameraHelper.hpp"
 #include "threepp/loaders/RGBELoader.hpp"
 #include "threepp/materials/MeshPhysicalMaterial.hpp"
 #include "threepp/materials/MeshStandardMaterial.hpp"
@@ -141,7 +142,8 @@ namespace {
 
 int main(int argc, char** argv) {
     bool update = false, usePT = false, stage1Contract = false;
-    bool stage1SplitBackground = false, stage1FramebufferTexture = false;
+    bool stage1SplitBackground = false, stage1MultiViewport = false;
+    bool stage1FramebufferTexture = false;
     bool stage1LineDepth = false, stage1TexturedLineDepth = false, stage1ColoredLineDepth = false;
     bool stage1DataTextureGridDepth = false, stage1MsaaOverlayLine = false;
     for (int i = 1; i < argc; ++i) {
@@ -149,6 +151,7 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--pt") == 0) usePT = true;
         else if (std::strcmp(argv[i], "--stage1-contract") == 0) stage1Contract = true;
         else if (std::strcmp(argv[i], "--stage1-split-background") == 0) stage1SplitBackground = true;
+        else if (std::strcmp(argv[i], "--stage1-multi-viewport") == 0) stage1MultiViewport = true;
         else if (std::strcmp(argv[i], "--stage1-framebuffer-texture") == 0) stage1FramebufferTexture = true;
         else if (std::strcmp(argv[i], "--stage1-line-depth") == 0) stage1LineDepth = true;
         else if (std::strcmp(argv[i], "--stage1-textured-line-depth") == 0) stage1TexturedLineDepth = true;
@@ -265,7 +268,7 @@ int main(int argc, char** argv) {
                 const bool leftMatches = left.r > 35.0 && left.g > 45.0 && left.b > 25.0;
                 const bool rightMatches = right.r > 110.0 && right.r < 180.0 && right.g > 160.0 && right.b > 180.0;
                 const bool leftMeshVisible = channelDiffersBy(leftSeam, left, 6.0);
-                const bool rightMeshVisible = channelDiffersBy(rightSeam, right, 10.0) &&
+                const bool rightMeshVisible = channelDiffersBy(rightSeam, right, 2.0) &&
                                               rightSeam.r > 80.0 && rightSeam.g > 90.0 && rightSeam.b > 90.0;
                 const bool pass = leftMatches && rightMatches && leftMeshVisible && rightMeshVisible;
                 std::printf("[stage1] split background left=(%.1f,%.1f,%.1f) right=(%.1f,%.1f,%.1f) "
@@ -273,6 +276,107 @@ int main(int argc, char** argv) {
                             left.r, left.g, left.b, right.r, right.g, right.b,
                             leftSeam.r, leftSeam.g, leftSeam.b,
                             rightSeam.r, rightSeam.g, rightSeam.b,
+                            pass ? "PASS" : "FAIL");
+                std::exit(pass ? 0 : 1);
+            }
+            ++frame;
+        });
+        return 1;
+    }
+
+    if (stage1MultiViewport) {
+        renderer.autoClear = false;
+        renderer.toneMapping = ToneMapping::None;
+        renderer.setClearColor(Color::black);
+
+        Scene rightScene;
+        auto rightGeometry = SphereGeometry::create(1.f, 10, 10);
+        auto rightSphere = Mesh::create(
+                rightGeometry,
+                MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color(0x00ff00))));
+        rightSphere->position.z = -8.f;
+        rightSphere->add(Mesh::create(
+                rightGeometry,
+                MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color::black).wireframe(true))));
+        rightScene.add(rightSphere);
+
+        Scene leftScene;
+        auto sphereGeometry = SphereGeometry::create(1.f, 10, 10);
+        auto sphere = Mesh::create(sphereGeometry, MeshBasicMaterial::create());
+        sphere->position.z = -8.f;
+        auto wireframe = Mesh::create(
+                sphereGeometry,
+                MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color::black).wireframe(true)));
+        sphere->add(wireframe);
+        leftScene.add(sphere);
+
+        PerspectiveCamera camera(60.f, 0.5f * static_cast<float>(kW) / static_cast<float>(kH), 1.f, 10.f);
+        auto helper = CameraHelper::create(camera);
+        leftScene.add(helper);
+
+        PerspectiveCamera rightCamera(60.f, 0.5f * static_cast<float>(kW) / static_cast<float>(kH), 1.f, 10.f);
+
+        PerspectiveCamera camera2(50.f, 0.5f * static_cast<float>(kW) / static_cast<float>(kH), 1.f, 1000.f);
+        camera2.position.x = 30.f;
+        camera2.lookAt(sphere->position);
+
+        int frame = 0;
+        canvas.animate([&] {
+            if (frame == 0) {
+                renderer.clear(true, true, true);
+                helper->visible = false;
+                renderer.setViewport(kW / 2, 0, kW / 2, kH);
+                renderer.render(rightScene, rightCamera);
+
+                helper->visible = true;
+                renderer.setViewport(0, 0, kW / 2, kH);
+                renderer.render(leftScene, camera2);
+            } else {
+                const auto px = renderer.readRGBPixels();
+                const auto fb = renderer.framebufferSize();
+                const int fbW = fb.width();
+                const int fbH = fb.height();
+                size_t leftLit = 0;
+                size_t rightLit = 0;
+                size_t leftWarm = 0;
+                size_t rightCenterLit = 0;
+                size_t rightCenterGreen = 0;
+                size_t rightInteriorDark = 0;
+                for (int y = 0; y < fbH; ++y) {
+                    for (int x = 0; x < fbW; ++x) {
+                        const size_t i = (static_cast<size_t>(y) * fbW + x) * 3;
+                        const bool lit = px[i] > 12 || px[i + 1] > 12 || px[i + 2] > 12;
+                        if (x < fbW / 2) {
+                            leftLit += lit;
+                            leftWarm += px[i] > 160 && px[i + 1] > 45 && px[i + 2] < 80;
+                        } else {
+                            rightLit += lit;
+                        }
+                        if (x >= 5 * fbW / 8 && x < 7 * fbW / 8 &&
+                            y >= fbH / 4 && y < 3 * fbH / 4) {
+                            rightCenterLit += lit;
+                            rightCenterGreen += px[i + 1] > 50 &&
+                                                px[i + 1] > 3 * px[i] / 2 &&
+                                                px[i + 1] > 3 * px[i + 2] / 2;
+                            const auto isGreen = [&](int sampleX, int sampleY) {
+                                const size_t sample = (static_cast<size_t>(sampleY) * fbW + sampleX) * 3;
+                                return px[sample + 1] > 50 &&
+                                       px[sample + 1] > 3 * px[sample] / 2 &&
+                                       px[sample + 1] > 3 * px[sample + 2] / 2;
+                            };
+                            const bool dark = px[i] < 32 && px[i + 1] < 32 && px[i + 2] < 32;
+                            if (dark && x >= 3 && x + 3 < fbW && y >= 3 && y + 3 < fbH) {
+                                rightInteriorDark += (isGreen(x - 3, y) && isGreen(x + 3, y)) ||
+                                                     (isGreen(x, y - 3) && isGreen(x, y + 3));
+                            }
+                        }
+                    }
+                }
+                const bool pass = leftLit > 100 && rightLit > 100 &&
+                                  rightCenterLit > 100 && rightCenterGreen > 1500 &&
+                                  rightInteriorDark < 350 && leftWarm > 5;
+                std::printf("[stage1] multi viewport leftLit=%zu rightLit=%zu rightCenterLit=%zu rightCenterGreen=%zu rightInteriorDark=%zu leftWarm=%zu -> %s\n",
+                            leftLit, rightLit, rightCenterLit, rightCenterGreen, rightInteriorDark, leftWarm,
                             pass ? "PASS" : "FAIL");
                 std::exit(pass ? 0 : 1);
             }

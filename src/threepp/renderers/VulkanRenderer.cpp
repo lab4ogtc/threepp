@@ -3016,12 +3016,14 @@ namespace threepp {
 
             const int fbW = static_cast<int>(ext.width);
             const int fbH = static_cast<int>(ext.height);
-            const int vx = std::clamp(static_cast<int>(std::floor(viewport.x)), 0, fbW);
-            const int vyBottom = std::clamp(static_cast<int>(std::floor(viewport.y)), 0, fbH);
+            const float scaleX = size.width() > 0 ? static_cast<float>(fbW) / static_cast<float>(size.width()) : 1.f;
+            const float scaleY = size.height() > 0 ? static_cast<float>(fbH) / static_cast<float>(size.height()) : 1.f;
+            const int vx = std::clamp(static_cast<int>(std::floor(viewport.x * scaleX)), 0, fbW);
+            const int vyBottom = std::clamp(static_cast<int>(std::floor(viewport.y * scaleY)), 0, fbH);
             const int maxW = std::max(0, fbW - vx);
             const int maxH = std::max(0, fbH - vyBottom);
-            const int vw = std::clamp(static_cast<int>(std::ceil(viewport.z)), 0, maxW);
-            const int vh = std::clamp(static_cast<int>(std::ceil(viewport.w)), 0, maxH);
+            const int vw = std::clamp(static_cast<int>(std::ceil(viewport.z * scaleX)), 0, maxW);
+            const int vh = std::clamp(static_cast<int>(std::ceil(viewport.w * scaleY)), 0, maxH);
             const int vyTop = fbH - vyBottom - vh;
             return VkRect2D{{vx, vyTop}, {static_cast<uint32_t>(vw), static_cast<uint32_t>(vh)}};
         }
@@ -20979,14 +20981,15 @@ namespace threepp {
                     sceneHasVisibleCustomShaderMaterials(scene);
 
             if (frameState_ == FrameState::Idle) {
-                if (isOrtho && !orthoNeedsFullFrame) {
+                const bool perspectiveViewportComposition = shouldStartPerspectiveViewportComposition(camera);
+                if ((isOrtho && !orthoNeedsFullFrame) || perspectiveViewportComposition) {
                     if (!beginFrameOrthoOnly()) return;
-                    frameState_ = FrameState::RecordingOrthoOnly;
-                    // Standalone 2D render: draw the ortho overlay (Sprites +
-                    // Line/LineSegments) now, so a single render(scene, orthoCam)
-                    // call produces output. The HUD pattern (a perspective render
-                    // first, then ortho) instead reaches recordOrthoOverlay via the
-                    // frame-already-in-flight path below.
+                    frameState_ = perspectiveViewportComposition
+                                          ? FrameState::RecordingPostPT
+                                          : FrameState::RecordingOrthoOnly;
+                    // Raster composition path: standalone ortho/HUD rendering and
+                    // GL-style perspective multi-viewport rendering both draw the
+                    // supplied scene directly into the active viewport.
                     const VkRect2D viewportRect = activeViewportRect(ctx->swapchainExtent());
                     if (viewportRect.extent.width > 0 && viewportRect.extent.height > 0) {
                         overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
@@ -21015,13 +21018,27 @@ namespace threepp {
                 // open frame, beside the primary PT pane — without touching the
                 // PT accumulation/TLAS state. Without a scissor, fall back to the
                 // old behavior (finalize the prior frame, restart for this one).
-                if (scissorTest && scissor.z >= 1.f && scissor.w >= 1.f) {
-                    const VkExtent2D full = ctx->swapchainExtent();
-                    const uint32_t rx = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.x), 0, static_cast<int>(full.width)));
-                    const uint32_t rw = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.z), 1, static_cast<int>(full.width) - static_cast<int>(rx)));
-                    const uint32_t rh = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(full.height)));
-                    const int      syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(full.height) - static_cast<int>(rh));
-                    const uint32_t ry = static_cast<uint32_t>(static_cast<int>(full.height) - (syB + static_cast<int>(rh)));
+                const VkExtent2D full = ctx->swapchainExtent();
+                const VkRect2D viewportRect = activeViewportRect(full);
+                const bool appendViewport = isPerspectiveViewportComposition(camera);
+                const bool appendScissor = scissorTest && scissor.z >= 1.f && scissor.w >= 1.f;
+                if (appendViewport || appendScissor) {
+                    uint32_t rx;
+                    uint32_t ry;
+                    uint32_t rw;
+                    uint32_t rh;
+                    if (appendViewport) {
+                        rx = static_cast<uint32_t>(viewportRect.offset.x);
+                        ry = static_cast<uint32_t>(viewportRect.offset.y);
+                        rw = viewportRect.extent.width;
+                        rh = viewportRect.extent.height;
+                    } else {
+                        rx = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.x), 0, static_cast<int>(full.width)));
+                        rw = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.z), 1, static_cast<int>(full.width) - static_cast<int>(rx)));
+                        rh = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(full.height)));
+                        const int syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(full.height) - static_cast<int>(rh));
+                        ry = static_cast<uint32_t>(static_cast<int>(full.height) - (syB + static_cast<int>(rh)));
+                    }
                     if (autoClear_ && (autoClearColor_ || autoClearDepth_ || autoClearStencil_)) {
                         const Color savedClearColor = clearColor;
                         const float savedClearAlpha = clearAlpha;
@@ -21045,7 +21062,7 @@ namespace threepp {
                     }
                     overlayPass_->record(cmdBuffers[currentFrame], currentFrame, frameImageIndex_,
                                          scene, camera, /*screenSpaceOnly=*/false, rx, ry, rw, rh,
-                                         false, swapchainFrameLayout_, swapchainFrameLayout_);
+                                         appendViewport, swapchainFrameLayout_, swapchainFrameLayout_);
                     return;
                 }
                 // User issued a second full-frame perspective render — finalize
@@ -21101,9 +21118,22 @@ namespace threepp {
         }
 
         bool willAppendPerspectiveOverlayOnly(const Camera& camera) const {
-            return !camera.is<OrthographicCamera>() &&
-                   frameState_ != FrameState::Idle &&
-                   scissorTest && scissor.z >= 1.f && scissor.w >= 1.f;
+            if (camera.is<OrthographicCamera>() || frameState_ == FrameState::Idle) return false;
+            if (scissorTest && scissor.z >= 1.f && scissor.w >= 1.f) return true;
+            return isPerspectiveViewportComposition(camera);
+        }
+
+        bool isPerspectiveViewportComposition(const Camera& camera) const {
+            if (camera.is<OrthographicCamera>() || autoClear_ || currentRenderTarget_ != nullptr) return false;
+            const VkExtent2D full = ctx->swapchainExtent();
+            const VkRect2D rect = activeViewportRect(full);
+            return rect.extent.width > 0 && rect.extent.height > 0 &&
+                   !coversFullExtent(rect, full);
+        }
+
+        bool shouldStartPerspectiveViewportComposition(const Camera& camera) const {
+            return frameState_ == FrameState::Idle && pendingClearColor_ &&
+                   isPerspectiveViewportComposition(camera);
         }
     };
 
@@ -21183,6 +21213,8 @@ namespace threepp {
         // it: an orthographic camera appended to an already-open default-frame
         // overlay walks its scene directly and must not clobber the main scene.
         const bool skipSceneBuildForOverlayOnly = pimpl_->willAppendPerspectiveOverlayOnly(camera);
+        const bool startPerspectiveViewportComposition =
+                pimpl_->shouldStartPerspectiveViewportComposition(camera);
         const bool orthoDepthOverlayToRenderTarget =
                 camera.is<OrthographicCamera>() &&
                 pimpl_->currentRenderTarget_ != nullptr &&
@@ -21203,6 +21235,7 @@ namespace threepp {
         const bool needsSceneBuild =
                 (!camera.is<OrthographicCamera>() || orthoNeedsFullFrame) &&
                 !skipSceneBuildForOverlayOnly &&
+                !startPerspectiveViewportComposition &&
                 !skipSceneBuildForOrthoHud;
         if (needsSceneBuild && pimpl_->frameState_ != Impl::FrameState::Idle) {
             pimpl_->endFrame();

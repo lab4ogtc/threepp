@@ -118,6 +118,7 @@ namespace threepp::vulkan {
         void createOrthoLinePipelines();
         void createOrthoPointPipeline();
         void createTexturedMeshPipeline();
+        Image2D& ensureDepthImage(uint32_t frame, uint32_t width, uint32_t height);
 
         // Cache helpers — called from record() on each draw.
         const SpriteAtlasRec* ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp);
@@ -138,7 +139,7 @@ namespace threepp::vulkan {
         VkPipelineLayout      spritePipelineLayout_  = VK_NULL_HANDLE;
         VkPipeline            overlaySpritePipeline_ = VK_NULL_HANDLE;
 
-        // Ortho line / mesh pipelines (overlay.vert/frag, depth-off)
+        // Ortho line / mesh pipelines (overlay.vert/frag, shared depth attachment)
         VkPipelineLayout orthoLinePipelineLayout_      = VK_NULL_HANDLE;
         VkPipeline       orthoLineListPipeline_        = VK_NULL_HANDLE;
         VkPipeline       orthoLineStripPipeline_       = VK_NULL_HANDLE;
@@ -147,16 +148,18 @@ namespace threepp::vulkan {
         VkPipeline       orthoLineColoredListPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoLineColoredStripPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoMeshPipeline_            = VK_NULL_HANDLE;
+        VkPipeline       orthoMeshDepthOnlyPipeline_   = VK_NULL_HANDLE;
         VkPipeline       orthoMeshTransparentPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoTexturedMeshPipeline_    = VK_NULL_HANDLE;
         VkPipeline       orthoDepthTextureMeshPipeline_ = VK_NULL_HANDLE;
 
         // Ortho point pipeline (overlay_point.vert/frag, POINT_LIST, pos+color
-        // vertex bindings, depth-off). Reuses orthoLinePipelineLayout_.
+        // vertex bindings, depth-tested). Reuses orthoLinePipelineLayout_.
         VkPipeline       orthoPointListPipeline_       = VK_NULL_HANDLE;
 
         // Per-frame descriptor pools reset at the top of each record() call.
         std::vector<VkDescriptorPool> spriteDescPools_;
+        std::vector<Image2D> overlayDepthImages_;
 
         // Texture + geometry caches
         std::unordered_map<const Texture*,        SpriteAtlasRec> spriteAtlasCache_;

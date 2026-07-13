@@ -160,6 +160,7 @@ OverlayPass::OverlayPass(VulkanContext& ctx, uint32_t framesInFlight,
       uploadFn_(std::move(uploadFn)),
       externalImageFn_(std::move(externalImageFn)) {
     spriteDescPools_.resize(framesInFlight_, VK_NULL_HANDLE);
+    overlayDepthImages_.resize(framesInFlight_);
 }
 
 OverlayPass::~OverlayPass() {
@@ -173,12 +174,14 @@ OverlayPass::~OverlayPass() {
     if (orthoLineColoredListPipeline_) vkDestroyPipeline(d, orthoLineColoredListPipeline_, nullptr);
     if (orthoLineColoredStripPipeline_) vkDestroyPipeline(d, orthoLineColoredStripPipeline_, nullptr);
     if (orthoMeshPipeline_)         vkDestroyPipeline(d, orthoMeshPipeline_, nullptr);
+    if (orthoMeshDepthOnlyPipeline_) vkDestroyPipeline(d, orthoMeshDepthOnlyPipeline_, nullptr);
     if (orthoMeshTransparentPipeline_) vkDestroyPipeline(d, orthoMeshTransparentPipeline_, nullptr);
     if (orthoTexturedMeshPipeline_) vkDestroyPipeline(d, orthoTexturedMeshPipeline_, nullptr);
     if (orthoDepthTextureMeshPipeline_) vkDestroyPipeline(d, orthoDepthTextureMeshPipeline_, nullptr);
     if (orthoPointListPipeline_)    vkDestroyPipeline(d, orthoPointListPipeline_, nullptr);
     if (orthoLinePipelineLayout_)   vkDestroyPipelineLayout(d, orthoLinePipelineLayout_, nullptr);
     if (spriteDescSetLayout_)       vkDestroyDescriptorSetLayout(d, spriteDescSetLayout_, nullptr);
+    for (auto& depth : overlayDepthImages_) destroyImage2D(ctx_.allocator(), d, depth);
     for (auto& pool : spriteDescPools_) {
         if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
     }
@@ -210,6 +213,48 @@ OverlayPass::~OverlayPass() {
         destroyWireframeRec(ctx_.allocator(), rec);
     }
     wireframeGeomCache_.clear();
+}
+
+Image2D& OverlayPass::ensureDepthImage(uint32_t frame, uint32_t width, uint32_t height) {
+    auto& depth = overlayDepthImages_.at(frame);
+    if (depth.image != VK_NULL_HANDLE && depth.width == width && depth.height == height) return depth;
+
+    if (depth.image != VK_NULL_HANDLE) {
+        check(vkDeviceWaitIdle(ctx_.device()), "vkDeviceWaitIdle(overlay depth resize)");
+        destroyImage2D(ctx_.allocator(), ctx_.device(), depth);
+    }
+
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_D32_SFLOAT;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    check(vmaCreateImage(ctx_.allocator(), &ici, &aci, &depth.image, &depth.alloc, nullptr),
+          "vmaCreateImage(overlay depth)");
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = depth.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = ici.format;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    check(vkCreateImageView(ctx_.device(), &vci, nullptr, &depth.view),
+          "vkCreateImageView(overlay depth)");
+    depth.width = width;
+    depth.height = height;
+    depth.format = ici.format;
+    return depth;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -280,11 +325,11 @@ void OverlayPass::createOrthoLinePipelines() {
     ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    // No depth attachment in the ortho overlay pass → depth test off.
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_FALSE;
+    ds.depthTestEnable  = VK_TRUE;
     ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState cbas{};
     cbas.blendEnable    = VK_FALSE;
@@ -319,7 +364,7 @@ void OverlayPass::createOrthoLinePipelines() {
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat   = VK_FORMAT_UNDEFINED;// color-only pass
+    prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -438,16 +483,29 @@ void OverlayPass::createOrthoLinePipelines() {
           "vkCreateGraphicsPipelines(orthoLineColoredStrip)");
 
     // Identical state to the line pipelines (position-only input,
-    // depth off, CULL_NONE, same layout) but TRIANGLE_LIST topology;
+    // shared depth attachment, CULL_NONE, same layout) but TRIANGLE_LIST topology;
     // the transparent variant adds standard src-alpha blending.
     VkPipelineInputAssemblyStateCreateInfo iaTri = iaList;
     iaTri.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
     VkGraphicsPipelineCreateInfo gpciMesh = gpci;
     gpciMesh.pInputAssemblyState = &iaTri;
+    VkPipelineDepthStencilStateCreateInfo meshDs = ds;
+    meshDs.depthWriteEnable = VK_TRUE;
+    gpciMesh.pDepthStencilState = &meshDs;
     check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMesh, nullptr,
                                     &orthoMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoMesh)");
+
+    VkPipelineColorBlendAttachmentState depthOnlyAttachment = cbas;
+    depthOnlyAttachment.colorWriteMask = 0;
+    VkPipelineColorBlendStateCreateInfo depthOnlyBlend = cb;
+    depthOnlyBlend.pAttachments = &depthOnlyAttachment;
+    VkGraphicsPipelineCreateInfo gpciDepthOnly = gpciMesh;
+    gpciDepthOnly.pColorBlendState = &depthOnlyBlend;
+    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciDepthOnly, nullptr,
+                                    &orthoMeshDepthOnlyPipeline_),
+          "vkCreateGraphicsPipelines(orthoMeshDepthOnly)");
 
     VkPipelineColorBlendAttachmentState cbasT = cbas;
     cbasT.blendEnable         = VK_TRUE;
@@ -461,6 +519,7 @@ void OverlayPass::createOrthoLinePipelines() {
     cbT.pAttachments = &cbasT;
     VkGraphicsPipelineCreateInfo gpciMeshT = gpciMesh;
     gpciMeshT.pColorBlendState = &cbT;
+    gpciMeshT.pDepthStencilState = &ds;
     check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshT, nullptr,
                                     &orthoMeshTransparentPipeline_),
           "vkCreateGraphicsPipelines(orthoMeshTransparent)");
@@ -541,8 +600,9 @@ void OverlayPass::createOrthoPointPipeline() {
 
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_FALSE;
+    ds.depthTestEnable  = VK_TRUE;
     ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState cbas{};
     cbas.blendEnable    = VK_FALSE;
@@ -564,7 +624,7 @@ void OverlayPass::createOrthoPointPipeline() {
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat   = VK_FORMAT_UNDEFINED;
+    prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -726,14 +786,15 @@ void OverlayPass::createSpriteOverlayPipeline() {
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates    = dynStates;
 
-    // Dynamic rendering — color attachment only, no depth attachment.
-    // HUD draws after the existing overlay pass so the swapchain has
+    // HUD keeps depth testing disabled but remains compatible with the shared
+    // depth attachment. It draws after the existing overlay pass so the swapchain has
     // already been transitioned through COLOR_ATTACHMENT_OPTIMAL.
     const VkFormat colorFmt = ctx_.swapchainFormat();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFmt;
+    prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -836,8 +897,9 @@ void OverlayPass::createTexturedMeshPipeline() {
 
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable = VK_FALSE;
+    ds.depthTestEnable = VK_TRUE;
     ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState cbas{};
     cbas.blendEnable = VK_TRUE;
@@ -865,6 +927,7 @@ void OverlayPass::createTexturedMeshPipeline() {
     prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount = 1;
     prci.pColorAttachmentFormats = &colorFmt;
+    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -1778,6 +1841,29 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     }
 
     const VkExtent2D ext = ctx_.swapchainExtent();
+    auto& depthImage = ensureDepthImage(frame, ext.width, ext.height);
+
+    VkImageMemoryBarrier2 toDepth{};
+    toDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toDepth.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    toDepth.srcAccessMask = VK_ACCESS_2_NONE;
+    toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toDepth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toDepth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    toDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepth.image = depthImage.image;
+    toDepth.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    toDepth.subresourceRange.levelCount = 1;
+    toDepth.subresourceRange.layerCount = 1;
+    VkDependencyInfo depthDependency{};
+    depthDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    depthDependency.imageMemoryBarrierCount = 1;
+    depthDependency.pImageMemoryBarriers = &toDepth;
+    vkCmdPipelineBarrier2(cb, &depthDependency);
 
     // 在 swapchain 上开启动态 render pass。Perspective 帧经过 TAA present
     // 后已经是 COLOR_ATTACHMENT；ortho-only 帧保持旧的 GENERAL 默认值。
@@ -1815,6 +1901,13 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
     colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depthAtt{};
+    depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAtt.imageView = depthImage.view;
+    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAtt.clearValue.depthStencil = {1.f, 0};
     VkRenderingInfo ri{};
     ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     ri.renderArea.offset = {0, 0};
@@ -1822,6 +1915,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &colorAtt;
+    ri.pDepthAttachment = &depthAtt;
     vkCmdBeginRendering(cb, &ri);
 
     // 默认匹配 GL scissor 语义：viewport 保持整帧，region 只裁剪写入像素。
@@ -1863,6 +1957,33 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             float mvp[16];
             float color[4];
         };
+
+        // 线框本身不会覆盖三角形内部，因此先用原始三角形仅写深度，
+        // 后续线段才能被同一 Mesh 的正面正确遮挡。
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, orthoMeshDepthOnlyPipeline_);
+        for (const auto& md : meshDraws) {
+            if (!md.wireframe) continue;
+            auto* rec = ensureLineGeometryUploaded(md.mesh->geometry().get());
+            if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+
+            Matrix4 mvp;
+            mvp.multiplyMatrices(cvp, md.world);
+            MeshPC pc{};
+            std::memcpy(pc.mvp, mvp.elements.data(), 64);
+            vkCmdPushConstants(cb, orthoLinePipelineLayout_,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+            VkBuffer vertexBuffer = rec->vertex.handle;
+            VkDeviceSize vertexOffset = 0;
+            vkCmdBindVertexBuffers(cb, 0, 1, &vertexBuffer, &vertexOffset);
+            if (rec->index.handle != VK_NULL_HANDLE) {
+                vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, rec->indexCount, 1, 0, 0, 0);
+            } else {
+                vkCmdDraw(cb, rec->vertexCount, 1, 0, 0);
+            }
+        }
+
         VkPipeline curMesh = VK_NULL_HANDLE;
         for (const auto& md : meshDraws) {
             if (md.map && !md.wireframe) continue;
@@ -2094,7 +2215,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     }
 
     // ── Line / LineSegments overlay ─────────────────────────────────
-    // Drawn after the sprites in the same color-only pass, so boxes /
+    // Drawn after the sprites in the same color/depth pass, so boxes /
     // gizmos land on top of any image sprite.
     if (!lineDraws.empty()) {
         if (orthoLineListPipeline_ == VK_NULL_HANDLE) createOrthoLinePipelines();
