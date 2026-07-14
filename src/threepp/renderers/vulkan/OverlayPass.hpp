@@ -32,6 +32,7 @@
 namespace threepp {
     class Object3D;
     class Camera;
+    class InstancedMesh;
 }
 
 namespace threepp::vulkan {
@@ -115,6 +116,21 @@ namespace threepp::vulkan {
             unsigned int indexVersion = 0;
         };
 
+        struct InstancedMeshRec {
+            Buffer matrix;
+            Buffer color;
+            unsigned int matrixVersion = ~0u;
+            unsigned int colorVersion = ~0u;
+            unsigned int meshId = 0;
+            uint32_t capacity = 0;
+            uint64_t lastTouch = 0;
+        };
+
+        struct RetiredInstancedBuffer {
+            Buffer buffer;
+            uint64_t retireFrame = 0;
+        };
+
         // Lazy pipeline setup — called from record() on first use.
         void createSpriteOverlayPipeline();
         void createOrthoLinePipelines();
@@ -126,6 +142,7 @@ namespace threepp::vulkan {
         const SpriteAtlasRec* ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp);
         const SpriteGeomRec*  ensureSpriteGeometryUploaded(const BufferGeometry* geom);
         const TexturedMeshGeomRec* ensureTexturedMeshGeometryUploaded(const BufferGeometry* geom);
+        const InstancedMeshRec*    ensureInstancedMeshUploaded(const InstancedMesh* mesh);
         LineRec*              ensureLineGeometryUploaded(const BufferGeometry* geom);
         WireframeRec*         ensureWireframeGeometryUploaded(const BufferGeometry* geom);
 
@@ -150,6 +167,8 @@ namespace threepp::vulkan {
         VkPipeline       orthoLineColoredListPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoLineColoredStripPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoMeshPipeline_            = VK_NULL_HANDLE;
+        VkPipeline       orthoMeshColoredPipeline_     = VK_NULL_HANDLE;
+        VkPipeline       orthoMeshInstancedPipeline_   = VK_NULL_HANDLE;
         VkPipeline       orthoMeshDepthOnlyPipeline_   = VK_NULL_HANDLE;
         VkPipeline       orthoMeshTransparentPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoTexturedMeshPipeline_    = VK_NULL_HANDLE;
@@ -167,6 +186,8 @@ namespace threepp::vulkan {
         std::unordered_map<const Texture*,        SpriteAtlasRec> spriteAtlasCache_;
         std::unordered_map<const BufferGeometry*, SpriteGeomRec>  spriteGeomCache_;
         std::unordered_map<const BufferGeometry*, TexturedMeshGeomRec> texturedMeshGeomCache_;
+        std::unordered_map<const InstancedMesh*, InstancedMeshRec> instancedMeshCache_;
+        std::vector<RetiredInstancedBuffer> retiredInstancedBuffers_;
         std::unordered_map<const BufferGeometry*, LineRec> lineGeomCache_;
         std::unordered_map<const BufferGeometry*, WireframeRec> wireframeGeomCache_;
         uint64_t overlayFrameCounter_ = 0;

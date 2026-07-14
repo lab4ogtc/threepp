@@ -101,6 +101,14 @@ if (THREEPP_WITH_VULKAN AND THREEPP_WITH_GLFW)
     set_tests_properties(LidarGLParityRuntime_test LidarVulkanParityRuntime_test PROPERTIES
             SKIP_RETURN_CODE 42)
 
+    add_executable(VulkanPerspectiveViewportRuntime_test VulkanPerspectiveViewportRuntime_test.cpp)
+    target_link_libraries(VulkanPerspectiveViewportRuntime_test PRIVATE threepp)
+    target_include_directories(VulkanPerspectiveViewportRuntime_test PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    add_test(NAME VulkanPerspectiveViewportRuntime_test COMMAND VulkanPerspectiveViewportRuntime_test)
+    set_tests_properties(VulkanPerspectiveViewportRuntime_test PROPERTIES
+            SKIP_RETURN_CODE 42
+            FAIL_REGULAR_EXPRESSION "\\[Vulkan\\]")
+
     add_executable(VulkanRenderTargetRuntime_test VulkanRenderTargetRuntime_test.cpp)
     target_link_libraries(VulkanRenderTargetRuntime_test PRIVATE threepp)
     add_test(NAME VulkanRenderTargetRuntime_test COMMAND VulkanRenderTargetRuntime_test)

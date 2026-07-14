@@ -1216,6 +1216,10 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_color.frag"
         kOverlayColorFragSpv
         _overlay_color_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_instanced.vert"
+        kOverlayInstancedVertSpv
+        _overlay_instanced_vert_spv_h)
     # Overlay variant for Points objects — POINT_LIST topology, writes
     # gl_PointSize from the push constant, discards fragments outside
     # a unit-radius disk for round LIDAR-style dots.

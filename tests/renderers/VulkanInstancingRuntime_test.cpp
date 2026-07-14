@@ -100,7 +100,7 @@ int main() {
             const auto framebuffer = renderer.readRGBPixels();
             const auto left = countColors(framebuffer, 160, 0, 75, 40, 120);
             const auto right = countColors(framebuffer, 160, 85, 160, 40, 120);
-            const auto top = countColors(framebuffer, 160, 45, 115, 0, 55);
+            const auto top = countColors(framebuffer, 160, 55, 105, 0, 55);
             if (frame == 5) {
                 const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
                                   left.red > 300 && left.blue < 100 &&

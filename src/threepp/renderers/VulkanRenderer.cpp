@@ -21274,7 +21274,9 @@ namespace threepp {
                 // old behavior (finalize the prior frame, restart for this one).
                 const VkExtent2D full = ctx->swapchainExtent();
                 const VkRect2D viewportRect = activeViewportRect(full);
-                const bool appendViewport = isPerspectiveViewportComposition(camera);
+                const bool appendViewport = viewportRect.extent.width > 0 &&
+                                            viewportRect.extent.height > 0 &&
+                                            !coversFullExtent(viewportRect, full);
                 const bool appendScissor = scissorTest && scissor.z >= 1.f && scissor.w >= 1.f;
                 if (appendViewport || appendScissor) {
                     uint32_t rx;
@@ -21383,7 +21385,7 @@ namespace threepp {
         }
 
         bool isPerspectiveViewportComposition(const Camera& camera) const {
-            if (camera.is<OrthographicCamera>() || autoClear_ || currentRenderTarget_ != nullptr) return false;
+            if (camera.is<OrthographicCamera>() || currentRenderTarget_ != nullptr) return false;
             const VkExtent2D full = ctx->swapchainExtent();
             const VkRect2D rect = activeViewportRect(full);
             return rect.extent.width > 0 && rect.extent.height > 0 &&
@@ -21391,8 +21393,7 @@ namespace threepp {
         }
 
         bool shouldStartPerspectiveViewportComposition(const Camera& camera) const {
-            return frameState_ == FrameState::Idle && pendingClearColor_ &&
-                   isPerspectiveViewportComposition(camera);
+            return frameState_ == FrameState::Idle && isPerspectiveViewportComposition(camera);
         }
     };
 

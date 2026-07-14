@@ -15,6 +15,7 @@
 #include "threepp/objects/Line.hpp"
 #include "threepp/objects/LineLoop.hpp"
 #include "threepp/objects/LineSegments.hpp"
+#include "threepp/objects/InstancedMesh.hpp"
 #include "threepp/objects/Mesh.hpp"
 #include "threepp/objects/Points.hpp"
 #include "threepp/objects/Sprite.hpp"
@@ -28,6 +29,7 @@
 #include "threepp/renderers/vulkan/shaders/overlay_dashed.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_color.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_color.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_instanced.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_point.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_point.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.frag.spv.h"
@@ -174,6 +176,8 @@ OverlayPass::~OverlayPass() {
     if (orthoLineColoredListPipeline_) vkDestroyPipeline(d, orthoLineColoredListPipeline_, nullptr);
     if (orthoLineColoredStripPipeline_) vkDestroyPipeline(d, orthoLineColoredStripPipeline_, nullptr);
     if (orthoMeshPipeline_)         vkDestroyPipeline(d, orthoMeshPipeline_, nullptr);
+    if (orthoMeshColoredPipeline_)  vkDestroyPipeline(d, orthoMeshColoredPipeline_, nullptr);
+    if (orthoMeshInstancedPipeline_) vkDestroyPipeline(d, orthoMeshInstancedPipeline_, nullptr);
     if (orthoMeshDepthOnlyPipeline_) vkDestroyPipeline(d, orthoMeshDepthOnlyPipeline_, nullptr);
     if (orthoMeshTransparentPipeline_) vkDestroyPipeline(d, orthoMeshTransparentPipeline_, nullptr);
     if (orthoTexturedMeshPipeline_) vkDestroyPipeline(d, orthoTexturedMeshPipeline_, nullptr);
@@ -201,6 +205,13 @@ OverlayPass::~OverlayPass() {
         if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
     }
     texturedMeshGeomCache_.clear();
+    for (auto& [mesh, rec] : instancedMeshCache_) {
+        if (rec.matrix.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.matrix);
+        if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+    }
+    instancedMeshCache_.clear();
+    for (auto& rec : retiredInstancedBuffers_) destroyBuffer(ctx_.allocator(), rec.buffer);
+    retiredInstancedBuffers_.clear();
     for (auto& [g, rec] : lineGeomCache_) {
         destroyBuffer(ctx_.allocator(), rec.vertex);
         if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
@@ -497,6 +508,56 @@ void OverlayPass::createOrthoLinePipelines() {
                                     &orthoMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoMesh)");
 
+    VkGraphicsPipelineCreateInfo gpciMeshColored = gpciMesh;
+    gpciMeshColored.pStages = colorStages;
+    gpciMeshColored.pVertexInputState = &colorVi;
+    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshColored, nullptr,
+                                    &orthoMeshColoredPipeline_),
+          "vkCreateGraphicsPipelines(orthoMeshColored)");
+
+    VkShaderModuleCreateInfo ivsmci{};
+    ivsmci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ivsmci.codeSize = sizeof(kOverlayInstancedVertSpv);
+    ivsmci.pCode = kOverlayInstancedVertSpv;
+    VkShaderModule instancedVertModule = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &ivsmci, nullptr, &instancedVertModule),
+          "vkCreateShaderModule(ortho overlay_instanced.vert)");
+
+    VkPipelineShaderStageCreateInfo instancedStages[2] = {colorStages[0], colorStages[1]};
+    instancedStages[0].module = instancedVertModule;
+    VkVertexInputBindingDescription instancedVib[3]{};
+    instancedVib[0] = vib;
+    instancedVib[1].binding = 1;
+    instancedVib[1].stride = 16 * sizeof(float);
+    instancedVib[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    instancedVib[2].binding = 2;
+    instancedVib[2].stride = 3 * sizeof(float);
+    instancedVib[2].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    VkVertexInputAttributeDescription instancedVia[6]{};
+    instancedVia[0] = via;
+    for (uint32_t column = 0; column < 4; ++column) {
+        auto& attr = instancedVia[column + 1];
+        attr.location = column + 1;
+        attr.binding = 1;
+        attr.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attr.offset = column * 4 * sizeof(float);
+    }
+    instancedVia[5].location = 5;
+    instancedVia[5].binding = 2;
+    instancedVia[5].format = VK_FORMAT_R32G32B32_SFLOAT;
+    instancedVia[5].offset = 0;
+    VkPipelineVertexInputStateCreateInfo instancedVi = vi;
+    instancedVi.vertexBindingDescriptionCount = 3;
+    instancedVi.pVertexBindingDescriptions = instancedVib;
+    instancedVi.vertexAttributeDescriptionCount = 6;
+    instancedVi.pVertexAttributeDescriptions = instancedVia;
+    VkGraphicsPipelineCreateInfo gpciMeshInstanced = gpciMesh;
+    gpciMeshInstanced.pStages = instancedStages;
+    gpciMeshInstanced.pVertexInputState = &instancedVi;
+    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshInstanced, nullptr,
+                                    &orthoMeshInstancedPipeline_),
+          "vkCreateGraphicsPipelines(orthoMeshInstanced)");
+
     VkPipelineColorBlendAttachmentState depthOnlyAttachment = cbas;
     depthOnlyAttachment.colorWriteMask = 0;
     VkPipelineColorBlendStateCreateInfo depthOnlyBlend = cb;
@@ -530,6 +591,7 @@ void OverlayPass::createOrthoLinePipelines() {
     vkDestroyShaderModule(ctx_.device(), dashedFragModule, nullptr);
     vkDestroyShaderModule(ctx_.device(), colorVertModule, nullptr);
     vkDestroyShaderModule(ctx_.device(), colorFragModule, nullptr);
+    vkDestroyShaderModule(ctx_.device(), instancedVertModule, nullptr);
 }
 
 void OverlayPass::createOrthoPointPipeline() {
@@ -1321,6 +1383,68 @@ OverlayPass::ensureTexturedMeshGeometryUploaded(const BufferGeometry* geom) {
     return &texturedMeshGeomCache_.emplace(geom, std::move(rec)).first->second;
 }
 
+const OverlayPass::InstancedMeshRec*
+OverlayPass::ensureInstancedMeshUploaded(const InstancedMesh* mesh) {
+    if (!mesh || mesh->count() == 0) return nullptr;
+    const auto* matrices = mesh->instanceMatrix();
+    const auto* colors = mesh->instanceColor();
+    if (!matrices) return nullptr;
+
+    auto retire = [&](Buffer& buffer) {
+        if (buffer.handle == VK_NULL_HANDLE) return;
+        retiredInstancedBuffers_.push_back({buffer, overlayFrameCounter_});
+        buffer = {};
+    };
+
+    auto& rec = instancedMeshCache_[mesh];
+    if (rec.meshId != 0 && rec.meshId != mesh->id) {
+        retire(rec.matrix);
+        retire(rec.color);
+        rec = {};
+    }
+
+    const auto count = static_cast<uint32_t>(mesh->count());
+    const auto matrixBytes = static_cast<VkDeviceSize>(count) * 16 * sizeof(float);
+    const auto colorBytes = static_cast<VkDeviceSize>(count) * 3 * sizeof(float);
+
+    bool resized = false;
+    auto ensureCapacity = [&](Buffer& buffer, VkDeviceSize bytes) {
+        if (buffer.handle != VK_NULL_HANDLE && buffer.size >= bytes) return;
+        retire(buffer);
+        buffer = createBuffer(ctx_.allocator(), ctx_.device(), bytes,
+                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                              VMA_MEMORY_USAGE_AUTO,
+                              VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        resized = true;
+    };
+    ensureCapacity(rec.matrix, matrixBytes);
+    ensureCapacity(rec.color, colorBytes);
+
+    if (resized || rec.matrixVersion != matrices->version) {
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.matrix.alloc, &mapped);
+        std::memcpy(mapped, matrices->array().data(), matrixBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.matrix.alloc);
+    }
+
+    const unsigned int colorVersion = colors ? colors->version : 0u;
+    if (resized || rec.colorVersion != colorVersion) {
+        const std::vector<float> white(colors ? 0u : static_cast<size_t>(count) * 3u, 1.f);
+        const float* source = colors ? colors->array().data() : white.data();
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
+        std::memcpy(mapped, source, colorBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+    }
+
+    rec.matrixVersion = matrices->version;
+    rec.colorVersion = colorVersion;
+    rec.meshId = mesh->id;
+    rec.capacity = std::max(rec.capacity, count);
+    rec.lastTouch = overlayFrameCounter_;
+    return &rec;
+}
+
 LineRec*
 OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
     if (!geom) return nullptr;
@@ -1646,6 +1770,23 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                 ++it;
             }
         }
+        for (auto it = instancedMeshCache_.begin(); it != instancedMeshCache_.end();) {
+            if (it->second.lastTouch < cutoff) {
+                if (it->second.matrix.handle) destroyBuffer(ctx_.allocator(), it->second.matrix);
+                if (it->second.color.handle) destroyBuffer(ctx_.allocator(), it->second.color);
+                it = instancedMeshCache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = retiredInstancedBuffers_.begin(); it != retiredInstancedBuffers_.end();) {
+            if (it->retireFrame < cutoff) {
+                destroyBuffer(ctx_.allocator(), it->buffer);
+                it = retiredInstancedBuffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     // Reset the per-frame descriptor pool before allocating this
@@ -1750,6 +1891,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     // (which would wrongly flatten the path-traced 3D scene's meshes).
     struct OrthoMeshDraw {
         Mesh*   mesh = nullptr;
+        InstancedMesh* instanced = nullptr;
         Matrix4 world;
         Color   color{1.f, 1.f, 1.f};
         std::shared_ptr<Texture> map;
@@ -1760,6 +1902,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         float   opacity = 1.f;
         bool    transparent = false;
         bool    wireframe = false;
+        bool    vertexColors = false;
     };
     std::vector<OrthoMeshDraw> meshDraws;
     if (!screenSpaceOnly) {
@@ -1772,6 +1915,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (!mat) return;
             OrthoMeshDraw md;
             md.mesh = m;
+            md.instanced = dynamic_cast<InstancedMesh*>(m);
             std::memcpy(md.world.elements.data(), m->matrixWorld->elements.data(), 64);
             if (auto* mc = dynamic_cast<MaterialWithColor*>(mat.get())) md.color = mc->color;
             if (auto* mm = dynamic_cast<MaterialWithMap*>(mat.get()); mm && mm->map && g->hasAttribute("uv")) {
@@ -1796,6 +1940,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                 }
             }
             if (auto* mw = dynamic_cast<MaterialWithWireframe*>(mat.get())) md.wireframe = mw->wireframe;
+            md.vertexColors = mat->vertexColors && g->hasAttribute("color");
             md.opacity     = mat->opacity;
             md.transparent = mat->transparent;
             meshDraws.push_back(md);
@@ -1991,9 +2136,15 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (md.map && !md.wireframe) continue;
             LineRec* rec = ensureLineGeometryUploaded(md.mesh->geometry().get());
             if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+            const auto* instanceRec = md.instanced && !md.wireframe
+                                              ? ensureInstancedMeshUploaded(md.instanced)
+                                              : nullptr;
+            if (md.instanced && !md.wireframe && !instanceRec) continue;
 
             VkPipeline want;
             if (md.wireframe)       want = orthoLineListPipeline_;
+            else if (md.instanced)  want = orthoMeshInstancedPipeline_;
+            else if (md.vertexColors) want = orthoMeshColoredPipeline_;
             else if (md.transparent) want = orthoMeshTransparentPipeline_;
             else                    want = orthoMeshPipeline_;
             if (want != curMesh) {
@@ -2013,19 +2164,42 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);
 
-            VkBuffer     vb[1] = {rec->vertex.handle};
-            VkDeviceSize vo[1] = {0};
-            vkCmdBindVertexBuffers(cb, 0, 1, vb, vo);
+            if (instanceRec) {
+                VkBuffer vb[3] = {rec->vertex.handle, instanceRec->matrix.handle, instanceRec->color.handle};
+                VkDeviceSize vo[3] = {0, 0, 0};
+                vkCmdBindVertexBuffers(cb, 0, 3, vb, vo);
+            } else if (md.vertexColors && !md.wireframe) {
+                VkBuffer vb[2] = {rec->vertex.handle, rec->color.handle};
+                VkDeviceSize vo[2] = {0, 0};
+                vkCmdBindVertexBuffers(cb, 0, 2, vb, vo);
+            } else {
+                VkBuffer vb = rec->vertex.handle;
+                VkDeviceSize vo = 0;
+                vkCmdBindVertexBuffers(cb, 0, 1, &vb, &vo);
+            }
             if (md.wireframe) {
                 auto* wrec = ensureWireframeGeometryUploaded(md.mesh->geometry().get());
                 if (!wrec || wrec->index.handle == VK_NULL_HANDLE || wrec->indexCount == 0) continue;
                 vkCmdBindIndexBuffer(cb, wrec->index.handle, 0, VK_INDEX_TYPE_UINT32);
                 vkCmdDrawIndexed(cb, wrec->indexCount, 1, 0, 0, 0);
-            } else if (rec->index.handle != VK_NULL_HANDLE) {
-                vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(cb, rec->indexCount, 1, 0, 0, 0);
             } else {
-                vkCmdDraw(cb, rec->vertexCount, 1, 0, 0);
+                const auto& range = md.mesh->geometry()->drawRange;
+                const uint32_t start = static_cast<uint32_t>(std::max(0, range.start));
+                const bool indexed = rec->index.handle != VK_NULL_HANDLE;
+                const uint32_t sourceCount = indexed ? rec->indexCount : rec->vertexCount;
+                const uint32_t available = sourceCount > start ? sourceCount - start : 0u;
+                const uint32_t count = std::min(
+                        available, static_cast<uint32_t>(std::max(0, range.count)));
+                const uint32_t instanceCount = md.instanced
+                                                       ? static_cast<uint32_t>(md.instanced->count())
+                                                       : 1u;
+                if (count == 0 || instanceCount == 0) continue;
+                if (indexed) {
+                    vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                    vkCmdDrawIndexed(cb, count, instanceCount, start, 0, 0);
+                } else {
+                    vkCmdDraw(cb, count, instanceCount, start, 0);
+                }
             }
         }
     }
