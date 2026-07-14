@@ -2133,7 +2133,9 @@ int main() {
         customShaderTextureScene.add(Mesh::create(makePanel(-0.6f, 0.6f, 0.f), customTextureMaterial));
 
         Scene customShaderDepthScene;
-        customShaderDepthScene.add(Mesh::create(makePanel(-1.2f, -0.45f, 0.f), makeSolidRawShaderMaterial()));
+        customShaderDepthScene.add(Mesh::create(
+                makePanel(-1.2f, -0.45f, 0.f),
+                MeshBasicMaterial::create(MeshBasicMaterial::Params{}.color(Color(0x00ff00)))));
         customShaderDepthScene.add(Mesh::create(makePanel(-1.2f, -0.45f, -0.35f), makeRedRawShaderMaterial()));
         auto customDepthWriteNear = makeSolidRawShaderMaterial();
         customDepthWriteNear->depthWrite = false;

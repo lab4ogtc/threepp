@@ -655,7 +655,7 @@ float shadowMapVis(uint encoded, vec3 worldPos, vec3 normal) {
 
     const vec3 proj = clip.xyz / clip.w;
     const vec2 uv = vec2(proj.x * 0.5 + 0.5, -proj.y * 0.5 + 0.5);
-    const float currentDepth = proj.z - sm.params.x;
+    const float currentDepth = proj.z + sm.params.x;
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 ||
         currentDepth < 0.0 || currentDepth > 1.0) {
         return 1.0;
@@ -3131,7 +3131,8 @@ void main() {
     }
 
     const float NdotV = max(dot(N, V), 1e-4);
-    float specularIntensity = pm.specularIntensity;
+    const bool legacyLambert = pm.sheenRoughness < -1.5;
+    float specularIntensity = legacyLambert ? 0.0 : pm.specularIntensity;
     if (pm.specularTexIndex >= 0) {
         const int  ti = clamp(pm.specularTexIndex, 0, int(kMaxMaterialTextures) - 1);
         const vec2 suv = (pm.uvTransformSpecular * vec3(primUv, 1.0)).xy;
@@ -3260,7 +3261,9 @@ void main() {
     const bool aoOn = (pc.flags & 2u) != 0u;
     if (!aoOn) giSkip = false;// checkerboard only pays off on the RT gather
     vec3 diffInd;
-    if (giSkip) {
+    if (legacyLambert) {
+        diffInd = ambientIrradiance(N);
+    } else if (giSkip) {
         diffInd = vec3(0.0);// unused — the accumulation below carries history
         // ReSTIR reservoirs PING-PONG (read prev fif, write curr): a skipped
         // pixel must still pass its reservoir through, or next frame's read
@@ -3326,7 +3329,8 @@ void main() {
     // (deferred_denoise channel 1) then BLURS this by roughness — the spatial blur
     // IS the gloss — and recombines. Pre-weighted by the spec BRDF × reflBlend so
     // the denoise just blurs + adds. Glass/sheen reflect inline below (excluded).
-    const bool opaqueRefl = (transmission <= 0.0) && (dot(pm.sheenColor, pm.sheenColor) <= 0.0) && !legacyEnvMap;
+    const bool opaqueRefl = !legacyLambert && (transmission <= 0.0) &&
+                            (dot(pm.sheenColor, pm.sheenColor) <= 0.0) && !legacyEnvMap;
     // ── Emitter-specular ESTIMATOR SPLIT by lobe width ──────────────────────
     // specNEET: 0 = near-mirror (the BRDF ray owns emitter spec — tight lobe hits
     // the emitter every frame, no variance, crisp lamp image), 1 = rough (the
@@ -3412,7 +3416,8 @@ void main() {
     }
 
     if (legacyEnvMap) {
-        lit = applyLegacyEnvMap(pm, lit, R, 0.0, specularIntensity);
+        const float legacyEnvIntensity = legacyLambert ? pm.envMapIntensity : specularIntensity;
+        lit = applyLegacyEnvMap(pm, lit, R, 0.0, legacyEnvIntensity);
     }
 
     // ── Refractive glass (any transmissive surface that ISN'T the ocean) ──────

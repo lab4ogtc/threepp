@@ -62,6 +62,7 @@
 #include "threepp/materials/Material.hpp"
 #include "threepp/materials/MeshBasicMaterial.hpp"
 #include "threepp/materials/MeshDepthMaterial.hpp"
+#include "threepp/materials/MeshLambertMaterial.hpp"
 #include "threepp/materials/MeshMatcapMaterial.hpp"
 #include "threepp/materials/MeshNormalMaterial.hpp"
 #include "threepp/materials/MeshToonMaterial.hpp"
@@ -6299,7 +6300,7 @@ namespace threepp {
                         compiled,
                         record.pipelineLayout,
                         colorFormat,
-                        VK_FORMAT_D32_SFLOAT,
+                        VK_FORMAT_D32_SFLOAT_S8_UINT,
                         VK_NULL_HANDLE,
                         colorAttachmentCount,
                         sampleCount);
@@ -6786,6 +6787,11 @@ namespace threepp {
             }
             if (dynamic_cast<MeshToonMaterial*>(mat.get())) {
                 d.sheenRoughness = -1.0f;
+            }
+            // MeshLambert 只有漫反射；复用无 sheen 材质未使用的负值区间，
+            // 避免默认 roughness=0.5 被延迟着色误当成 PBR 镜面材质。
+            if (dynamic_cast<MeshLambertMaterial*>(mat.get())) {
+                d.sheenRoughness = -2.0f;
             }
             // sideMode mirrors threepp::Side {Front=0, Back=1, Double=2}.
             // Chit reads it for the wrong-side pass-through gate; the raster
@@ -9424,8 +9430,11 @@ namespace threepp {
             const uint32_t hi = haltonFrame_ + 1u;
             const float jx = halton_(hi, 2) - 0.5f;
             const float jy = halton_(hi, 3) - 0.5f;
-            const float jClipX = 2.f * jx / float(ext.width);
-            const float jClipY = 2.f * jy / float(ext.height);
+            // 必须与 uploadRasterCameraUbo 使用同一开关；否则 G-buffer 未抖动，
+            // 深度反投影却加了 Halton 偏移，掠射平面会产生巨大的世界坐标误差。
+            const bool rasterJitterEnabled = taaBlendAlpha_ < 1.0f;
+            const float jClipX = rasterJitterEnabled ? 2.f * jx / float(ext.width) : 0.f;
+            const float jClipY = rasterJitterEnabled ? 2.f * jy / float(ext.height) : 0.f;
             data[32] = jClipX;
             data[33] = jClipY;
             // .zw = previous frame's jitter so raygen's hybrid reproject can
@@ -10765,26 +10774,35 @@ namespace threepp {
             }
 
             const bool customShaderMsaa = directRt && directRt->msaaColor.image != VK_NULL_HANDLE;
-            auto& depthImage = customShaderMsaa &&
+            const bool inheritSceneDepth = !directToRenderTarget;
+            auto& depthImage = inheritSceneDepth
+                    ? rasterGbufs[frame].depth
+                    : customShaderMsaa &&
                                        rasterGbufs[frame].customShaderMsaaDepth.image != VK_NULL_HANDLE
-                    ? rasterGbufs[frame].customShaderMsaaDepth
-                    : rasterGbufs[frame].customShaderDepth;
+                              ? rasterGbufs[frame].customShaderMsaaDepth
+                              : rasterGbufs[frame].customShaderDepth;
             VkImageMemoryBarrier2 toDepth{};
             toDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-            toDepth.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-            toDepth.srcAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            toDepth.srcStageMask = inheritSceneDepth
+                    ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                    : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+            toDepth.srcAccessMask = inheritSceneDepth
+                    ? VK_ACCESS_2_MEMORY_READ_BIT
+                    : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
             toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
                                    VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
             toDepth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                     VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-            toDepth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            toDepth.oldLayout = inheritSceneDepth
+                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                    : VK_IMAGE_LAYOUT_UNDEFINED;
+            toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
             toDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             toDepth.image = depthImage.image;
-            toDepth.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            toDepth.subresourceRange.aspectMask = depthBarrierAspect(depthImage.format);
             toDepth.subresourceRange.levelCount = 1;
             toDepth.subresourceRange.layerCount = 1;
             VkDependencyInfo toDepthDep{};
@@ -10796,9 +10814,9 @@ namespace threepp {
             VkRenderingAttachmentInfo depth{};
             depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
             depth.imageView = depthImage.view;
-            depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-            depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            depth.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+            depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            depth.loadOp = inheritSceneDepth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_CLEAR;
+            depth.storeOp = inheritSceneDepth ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE;
             depth.clearValue.depthStencil = {0.f, 0u};
 
             VkRenderingInfo rendering{};
@@ -10944,6 +10962,17 @@ namespace threepp {
             }
 
             vkCmdEndRendering(cb);
+
+            if (inheritSceneDepth) {
+                transitionImage(cb, depthImage.image,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                VK_ACCESS_2_MEMORY_READ_BIT,
+                                depthBarrierAspect(depthImage.format));
+            }
 
             if (directRt) {
                 const auto activeMip = static_cast<uint32_t>(std::max(0, activeMipmapLevel_));
@@ -11177,10 +11206,10 @@ namespace threepp {
         static Matrix4 shadowProjectionToVkDepth(const Matrix4& glProj) {
             Matrix4 out = glProj;
             auto& e = out.elements;
-            e[2]  = 0.5f * e[2]  + 0.5f * e[3];
-            e[6]  = 0.5f * e[6]  + 0.5f * e[7];
-            e[10] = 0.5f * e[10] + 0.5f * e[11];
-            e[14] = 0.5f * e[14] + 0.5f * e[15];
+            e[2]  = 0.5f * e[3]  - 0.5f * e[2];
+            e[6]  = 0.5f * e[7]  - 0.5f * e[6];
+            e[10] = 0.5f * e[11] - 0.5f * e[10];
+            e[14] = 0.5f * e[15] - 0.5f * e[14];
             return out;
         }
 
@@ -13108,7 +13137,7 @@ namespace threepp {
             ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
             ds.depthTestEnable = VK_TRUE;
             ds.depthWriteEnable = VK_TRUE;
-            ds.depthCompareOp = VK_COMPARE_OP_LESS;
+            ds.depthCompareOp = VK_COMPARE_OP_GREATER;
 
             VkPipelineColorBlendStateCreateInfo cb{};
             cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
@@ -13149,7 +13178,7 @@ namespace threepp {
             prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
             createPipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, renderTargetDepthPipeline_,
                            "vkCreateGraphicsPipelines(render target depth)");
-            ds.depthCompareOp = VK_COMPARE_OP_LESS;
+            ds.depthCompareOp = VK_COMPARE_OP_GREATER;
             prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
             createPipeline(VK_PRIMITIVE_TOPOLOGY_LINE_LIST, shadowDepthLineListPipeline_,
                            "vkCreateGraphicsPipelines(shadow depth line list)");
@@ -13172,7 +13201,7 @@ namespace threepp {
                 sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
                 sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
                 sci.compareEnable = VK_TRUE;
-                sci.compareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+                sci.compareOp = VK_COMPARE_OP_GREATER_OR_EQUAL;
                 sci.minLod = 0.0f;
                 sci.maxLod = 0.0f;
                 check(vkCreateSampler(ctx->device(), &sci, nullptr, &shadowCompareSampler_),
@@ -13408,7 +13437,7 @@ namespace threepp {
                 depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
                 depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
                 depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-                depthAtt.clearValue.depthStencil = {1.0f, 0u};
+                depthAtt.clearValue.depthStencil = {0.0f, 0u};
 
                 VkRenderingInfo ri{};
                 ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
@@ -13673,13 +13702,14 @@ namespace threepp {
                                                        N("unjitDepth"),
                                                        defaultFramebufferSamples_);
                 g.customShaderDepth = createAttachmentImage2D(swapExt.width, swapExt.height,
-                                                              VK_FORMAT_D32_SFLOAT,
-                                                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
+                                                              VK_FORMAT_D32_SFLOAT_S8_UINT,
+                                                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                                      VK_IMAGE_USAGE_TRANSFER_DST_BIT,
                                                               VK_IMAGE_ASPECT_DEPTH_BIT,
                                                               N("customShaderDepth"));
                 if (defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT) {
                     g.customShaderMsaaDepth = createAttachmentImage2D(
-                            swapExt.width, swapExt.height, VK_FORMAT_D32_SFLOAT,
+                            swapExt.width, swapExt.height, VK_FORMAT_D32_SFLOAT_S8_UINT,
                             VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT,
                             VK_IMAGE_ASPECT_DEPTH_BIT, N("customShaderMsaaDepth"),
                             defaultFramebufferSamples_);
@@ -19586,6 +19616,7 @@ namespace threepp {
             bloom_->recordDispatch(cb, currentFrame, regionRenderExt_.width, regionRenderExt_.height,
                                    static_cast<uint32_t>(toneMapping_),
                                    exposureBits, envIsBgColor,
+                                   defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT,
                                    bloomIntensity_, bloomThreshold_, bloomClamp_);
             // ── End bloom ──────────────────────────────────────────────────────
 

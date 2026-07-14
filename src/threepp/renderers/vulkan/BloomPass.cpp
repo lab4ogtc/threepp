@@ -342,7 +342,7 @@ namespace threepp::vulkan {
     void BloomPass::recordDispatch(VkCommandBuffer cb, uint32_t frame,
                                    uint32_t width, uint32_t height,
                                    uint32_t toneMapping, uint32_t exposureBits,
-                                   bool bgIsSolidColor, float bloomIntensity,
+                                   bool bgIsSolidColor, bool antialias, float bloomIntensity,
                                    float bloomThreshold, float bloomClamp) {
         auto barrier = [&]() {
             VkMemoryBarrier2 mb{};
@@ -403,7 +403,7 @@ namespace threepp::vulkan {
         uint32_t intensityBits;
         std::memcpy(&intensityBits, &bloomIntensity, sizeof(intensityBits));
         const uint32_t cpc[6] = {toneMapping, exposureBits,
-                                 bgIsSolidColor ? 1u : 0u, intensityBits,
+                                 (bgIsSolidColor ? 1u : 0u) | (antialias ? 2u : 0u), intensityBits,
                                  width, height};
         vkCmdPushConstants(cb, compPipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cpc), cpc);
         vkCmdDispatch(cb, (width + 7u) / 8u, (height + 7u) / 8u, 1);

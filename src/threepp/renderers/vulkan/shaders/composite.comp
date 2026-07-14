@@ -27,7 +27,7 @@ layout(set = 0, binding = 3) uniform writeonly image2D outImage;// TAA input (bg
 layout(push_constant) uniform Pc {
     uint toneMapping;        // matches ToneMapping enum
     uint exposureBits;       // float-bits for exposure
-    uint bgIsSolidColor;     // 1 = solid bg → sky pixels skip tone map
+    uint flags;              // bit0: solid bg；bit1: 单帧 FXAA
     uint bloomIntensityBits; // float; <= 0 disables the bloom add
     uint width;
     uint height;
@@ -75,6 +75,12 @@ vec3 toneMap(vec3 c, uint mode, float exposure) {
     return c;// None / Custom — pass-through
 }
 
+vec3 sampleOutput(vec2 uv, float exposure, float bloomIntensity, bool bypassToneMap) {
+    vec3 color = texture(sceneHdrTex, uv).rgb;
+    if (bloomIntensity > 0.0) color += texture(bloomTex, uv).rgb * bloomIntensity;
+    return bypassToneMap ? color : toneMap(color, pc.toneMapping, exposure);
+}
+
 void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.width) || px.y >= int(pc.height)) return;
@@ -98,9 +104,39 @@ void main() {
     // Solid-color background sky pixels skip tone mapping so the flat bg
     // isn't ACES-desaturated.
     const float skyW = imageLoad(gbufImg, px).w;
-    const bool bypass = (pc.bgIsSolidColor != 0u) && (skyW < 0.5);
-    const vec3 outRgb = bypass
+    const bool bypass = ((pc.flags & 1u) != 0u) && (skyW < 0.5);
+    vec3 outRgb = bypass
             ? color
             : toneMap(color, pc.toneMapping, exposure);
+
+    if ((pc.flags & 2u) != 0u) {
+        const vec2 invSize = 1.0 / vec2(float(pc.width), float(pc.height));
+        const vec3 rgbNW = sampleOutput(uv + vec2(-1.0, -1.0) * invSize, exposure, intensity, bypass);
+        const vec3 rgbNE = sampleOutput(uv + vec2( 1.0, -1.0) * invSize, exposure, intensity, bypass);
+        const vec3 rgbSW = sampleOutput(uv + vec2(-1.0,  1.0) * invSize, exposure, intensity, bypass);
+        const vec3 rgbSE = sampleOutput(uv + vec2( 1.0,  1.0) * invSize, exposure, intensity, bypass);
+        const vec3 luma = vec3(0.299, 0.587, 0.114);
+        const float lumaNW = dot(rgbNW, luma);
+        const float lumaNE = dot(rgbNE, luma);
+        const float lumaSW = dot(rgbSW, luma);
+        const float lumaSE = dot(rgbSE, luma);
+        const float lumaM = dot(outRgb, luma);
+        const float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+        const float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+        if (lumaMax - lumaMin > max(0.0312, lumaMax * 0.125)) {
+            vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)),
+                             (lumaNW + lumaSW) - (lumaNE + lumaSE));
+            const float reduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * 0.03125, 1.0 / 128.0);
+            dir = clamp(dir / (min(abs(dir.x), abs(dir.y)) + reduce), vec2(-8.0), vec2(8.0)) * invSize;
+            const vec3 rgbA = 0.5 * (
+                    sampleOutput(uv + dir * (-1.0 / 6.0), exposure, intensity, bypass) +
+                    sampleOutput(uv + dir * ( 1.0 / 6.0), exposure, intensity, bypass));
+            const vec3 rgbB = rgbA * 0.5 + 0.25 * (
+                    sampleOutput(uv + dir * -0.5, exposure, intensity, bypass) +
+                    sampleOutput(uv + dir *  0.5, exposure, intensity, bypass));
+            const float lumaB = dot(rgbB, luma);
+            outRgb = (lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB;
+        }
+    }
     imageStore(outImage, px, vec4(clamp(outRgb, 0.0, 1.0), 1.0));
 }

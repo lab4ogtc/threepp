@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <unordered_set>
@@ -910,8 +911,12 @@ namespace threepp::vulkan {
 
         if (material.shaderLanguage == ShaderLanguage::GLSL) {
             wgpu::WgpuShaderTranslator translator;
-            const auto translated = translator.translate(
+            const auto vertexShader = std::regex_replace(
                     material.vertexShader,
+                    std::regex(R"(\bgl_Position\.z\s*=\s*gl_Position\.w\s*;)"),
+                    "gl_Position.z = 0.0;");
+            const auto translated = translator.translate(
+                    vertexShader,
                     material.fragmentShader,
                     orderedUniformNames(material),
                     textureNames(material),
