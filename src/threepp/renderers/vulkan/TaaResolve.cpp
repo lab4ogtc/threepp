@@ -138,11 +138,11 @@ namespace threepp::vulkan {
     void TaaResolve::createImages(uint32_t inWidth, uint32_t inHeight,
                                   uint32_t outWidth, uint32_t outHeight) {
         destroyImages();
-        // Input: BGRA8_UNORM at the render extent — matches denoise.comp's
-        // rgba8 output and the swapchain channel order.
+        // Input stays floating-point until the final sRGB presentation pass;
+        // quantizing linear LDR here produces visible bands in dark gradients.
         for (auto& img : inputImagesPP_)
             img = createStorageSampledImage(inWidth, inHeight,
-                                            VK_FORMAT_B8G8R8A8_UNORM,
+                                            VK_FORMAT_R16G16B16A16_SFLOAT,
                                             "vmaCreateImage(taa.input)");
         // History: RGBA16F at the output extent — the running mix() stays
         // sub-quantum precise and the reconstructed full-res image

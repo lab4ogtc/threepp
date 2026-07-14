@@ -133,9 +133,8 @@ namespace threepp::vulkan {
         uint32_t       imageCount_;
         uint32_t       framesInFlight_;
 
-        // Input image per frame-in-flight (denoise's target) — sized to the
-        // path-trace RENDER extent. BGRA8_UNORM to match denoise.comp's
-        // rgba8 output and the swapchain channel order.
+        // Linear LDR input per frame-in-flight at the path-trace render extent.
+        // RGBA16F avoids quantization before the final sRGB presentation pass.
         std::vector<Image2D> inputImagesPP_;
         // History ping-pong — sized to the OUTPUT (swapchain) extent, so it
         // accumulates the temporal upsampler's reconstructed full-res image.

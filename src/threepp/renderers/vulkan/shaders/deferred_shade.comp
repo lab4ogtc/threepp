@@ -705,7 +705,7 @@ float directShadowVis(uint encoded, vec3 worldPos, vec3 normal,
                       vec3 rayOrigin, vec3 rayDir, float rayTMax) {
     const float mapVis = shadowMapVis(encoded, worldPos, normal);
     if (mapVis >= 0.0) return mapVis;
-    return 1.0;
+    return shadowVis(rayOrigin, rayDir, rayTMax);
 }
 
 vec3 vsmShadowDir(vec3 dir, float radius) {

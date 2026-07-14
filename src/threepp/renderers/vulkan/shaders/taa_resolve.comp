@@ -35,12 +35,8 @@ layout(set = 0, binding = 2) uniform sampler2D gbufMotionTex;
 // qualifier, so writing without a format requires
 // shaderStorageImageWriteWithoutFormat. Channel names still map by component.
 layout(set = 0, binding = 3) uniform writeonly image2D taaPresentImage;
-// History storage is rgba16f (not rgba8) so the per-frame mix() result is
-// preserved at sub-quantum precision. With rgba8 history the running average
-// re-quantized every frame and locked into uint8 codes, producing visible
-// iso-luminance bands on smooth specular surfaces. Input/swap stay rgba8
-// because denoise.comp writes binding 1 with rgba8 and that target can be
-// either the TAA input image or the BGRA8 swapchain.
+// Input and history are rgba16f so tone-mapped linear values remain precise
+// until the final sRGB presentation pass; the swapchain alone is rgba8.
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D taaHistoryWriteImg;
 // Mesh-ID rejection: bind both the current frame's IDs and the previous
 // frame's. When the reprojected prev pixel sits on a different mesh than
