@@ -2476,8 +2476,8 @@ int main() {
                 const auto clipLeft = countRegion(framebuffer, 128, 8, 56);
                 const auto clipRight = countRegion(framebuffer, 128, 72, 120);
                 const bool clipPass = framebuffer.size() == expectedReadbackBytes() &&
-                                      clipLeft.green > 3500 &&
-                                      clipRight.green < 500;
+                                      clipLeft.green < 500 &&
+                                      clipRight.green > 3500;
                 std::printf("[phase5] Renderer global clippingPlanes bytes=%zu leftGreen=%d rightGreen=%d rightNonBlack=%d -> %s\n",
                             framebuffer.size(), clipLeft.green, clipRight.green, clipRight.nonBlack,
                             clipPass ? "PASS" : "FAIL");
@@ -2499,8 +2499,8 @@ int main() {
                 const auto localClipLeft = countRegion(framebuffer, 128, 8, 56);
                 const auto localClipRight = countRegion(framebuffer, 128, 72, 120);
                 const bool localClipPass = framebuffer.size() == expectedReadbackBytes() &&
-                                           localClipLeft.green > 3500 &&
-                                           localClipRight.green < 500;
+                                           localClipLeft.green < 500 &&
+                                           localClipRight.green > 3500;
                 std::printf("[phase5] Material local clippingPlanes bytes=%zu leftGreen=%d rightGreen=%d rightNonBlack=%d -> %s\n",
                             framebuffer.size(), localClipLeft.green, localClipRight.green, localClipRight.nonBlack,
                             localClipPass ? "PASS" : "FAIL");
@@ -2544,13 +2544,13 @@ int main() {
                 const auto intersectionLeftBottom = countBox(framebuffer, 128, 8, 56, 72, 120);
                 const auto intersectionRightTop = countBox(framebuffer, 128, 72, 120, 8, 56);
                 const auto intersectionRightBottom = countBox(framebuffer, 128, 72, 120, 72, 120);
-                const auto clippedRightGreen = std::min(intersectionRightTop.green, intersectionRightBottom.green);
-                const auto keptRightGreen = std::max(intersectionRightTop.green, intersectionRightBottom.green);
+                const auto clippedLeftGreen = std::min(intersectionLeftTop.green, intersectionLeftBottom.green);
+                const auto keptLeftGreen = std::max(intersectionLeftTop.green, intersectionLeftBottom.green);
                 const bool intersectionPass = framebuffer.size() == expectedReadbackBytes() &&
-                                              intersectionLeftTop.green > 1800 &&
-                                              intersectionLeftBottom.green > 1800 &&
-                                              clippedRightGreen < 500 &&
-                                              keptRightGreen > 1800;
+                                              intersectionRightTop.green > 1800 &&
+                                              intersectionRightBottom.green > 1800 &&
+                                              clippedLeftGreen < 500 &&
+                                              keptLeftGreen > 1800;
                 std::printf("[phase5] Material local clipIntersection bytes=%zu leftTopGreen=%d leftBottomGreen=%d rightTopGreen=%d rightBottomGreen=%d -> %s\n",
                             framebuffer.size(), intersectionLeftTop.green, intersectionLeftBottom.green,
                             intersectionRightTop.green, intersectionRightBottom.green,

@@ -122,7 +122,7 @@ void main() {
         bool clipped = cam.clipPlaneCount > 0u;
         for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
             if (uint(i) < cam.clipPlaneCount) {
-                clipped = clipped && (dot(vWorldPos, cam.clipPlanes[i].xyz) > cam.clipPlanes[i].w);
+                clipped = clipped && (dot(vWorldPos, cam.clipPlanes[i].xyz) < cam.clipPlanes[i].w);
             }
         }
         if (clipped) {
@@ -131,7 +131,7 @@ void main() {
     } else {
         for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
             if (uint(i) < cam.clipPlaneCount &&
-                dot(vWorldPos, cam.clipPlanes[i].xyz) > cam.clipPlanes[i].w) {
+                dot(vWorldPos, cam.clipPlanes[i].xyz) < cam.clipPlanes[i].w) {
                 discard;
             }
         }
@@ -140,7 +140,7 @@ void main() {
         bool clipped = vLocalClipPlaneCount > 0u;
         for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
             if (uint(i) < vLocalClipPlaneCount) {
-                clipped = clipped && (dot(vWorldPos, vLocalClipPlanes[i].xyz) > vLocalClipPlanes[i].w);
+                clipped = clipped && (dot(vWorldPos, vLocalClipPlanes[i].xyz) < vLocalClipPlanes[i].w);
             }
         }
         if (clipped) {
@@ -149,7 +149,7 @@ void main() {
     } else {
         for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
             if (uint(i) < vLocalClipPlaneCount &&
-                dot(vWorldPos, vLocalClipPlanes[i].xyz) > vLocalClipPlanes[i].w) {
+                dot(vWorldPos, vLocalClipPlanes[i].xyz) < vLocalClipPlanes[i].w) {
                 discard;
             }
         }

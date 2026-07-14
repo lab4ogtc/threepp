@@ -571,7 +571,7 @@ bool materialLocalClipDiscards(MaterialDesc m, vec3 worldPos) {
     const uint localStart = min(m._clipPad0, m.clipPlaneCount);
     for (uint i = 0u; i < 4u; ++i) {
         if (i < localStart &&
-            dot(worldPos, m.clipPlanes[i].xyz) > m.clipPlanes[i].w) {
+            dot(worldPos, m.clipPlanes[i].xyz) < m.clipPlanes[i].w) {
             return true;
         }
     }
@@ -580,14 +580,14 @@ bool materialLocalClipDiscards(MaterialDesc m, vec3 worldPos) {
         bool clipped = true;
         for (uint i = 0u; i < 4u; ++i) {
             if (i >= localStart && i < m.clipPlaneCount) {
-                clipped = clipped && (dot(worldPos, m.clipPlanes[i].xyz) > m.clipPlanes[i].w);
+                clipped = clipped && (dot(worldPos, m.clipPlanes[i].xyz) < m.clipPlanes[i].w);
             }
         }
         return clipped;
     }
     for (uint i = 0u; i < 4u; ++i) {
         if (i >= localStart && i < m.clipPlaneCount &&
-            dot(worldPos, m.clipPlanes[i].xyz) > m.clipPlanes[i].w) {
+            dot(worldPos, m.clipPlanes[i].xyz) < m.clipPlanes[i].w) {
             return true;
         }
     }
