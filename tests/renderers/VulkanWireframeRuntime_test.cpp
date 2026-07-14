@@ -73,9 +73,17 @@ int main() {
         renderer.setClearColor(Color::black);
 
         Scene scene;
-        scene.add(makeWireCube(MeshBasicMaterial::create(
-                                      MeshBasicMaterial::Params{}.color(Color::red)),
-                              -1.45f, 1.f));
+        auto coloredGeometry = BoxGeometry::create(1.1f, 1.1f, 1.1f);
+        const auto position = coloredGeometry->getAttribute<float>("position");
+        auto colors = std::vector<float>(position->count() * 3, 0.f);
+        for (std::size_t i = 0; i < colors.size(); i += 3) colors[i] = 1.f;
+        coloredGeometry->setAttribute("color", FloatBufferAttribute::create(colors, 3));
+        auto coloredMaterial = MeshBasicMaterial::create();
+        coloredMaterial->wireframe = true;
+        coloredMaterial->vertexColors = true;
+        auto coloredCube = Mesh::create(coloredGeometry, coloredMaterial);
+        coloredCube->position.set(-1.45f, 1.f, 0.f);
+        scene.add(coloredCube);
         scene.add(makeWireCube(MeshLambertMaterial::create(
                                       MeshLambertMaterial::Params{}.color(Color(0x00ff00))),
                               0.f, 1.f));

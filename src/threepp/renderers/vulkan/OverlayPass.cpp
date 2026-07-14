@@ -2142,7 +2142,8 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (md.instanced && !md.wireframe && !instanceRec) continue;
 
             VkPipeline want;
-            if (md.wireframe)       want = orthoLineListPipeline_;
+            if (md.wireframe && md.vertexColors) want = orthoLineColoredListPipeline_;
+            else if (md.wireframe)  want = orthoLineListPipeline_;
             else if (md.instanced)  want = orthoMeshInstancedPipeline_;
             else if (md.vertexColors) want = orthoMeshColoredPipeline_;
             else if (md.transparent) want = orthoMeshTransparentPipeline_;
@@ -2168,7 +2169,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                 VkBuffer vb[3] = {rec->vertex.handle, instanceRec->matrix.handle, instanceRec->color.handle};
                 VkDeviceSize vo[3] = {0, 0, 0};
                 vkCmdBindVertexBuffers(cb, 0, 3, vb, vo);
-            } else if (md.vertexColors && !md.wireframe) {
+            } else if (md.vertexColors) {
                 VkBuffer vb[2] = {rec->vertex.handle, rec->color.handle};
                 VkDeviceSize vo[2] = {0, 0};
                 vkCmdBindVertexBuffers(cb, 0, 2, vb, vo);

@@ -19826,6 +19826,7 @@ namespace threepp {
                         Color color(1.f, 1.f, 1.f);
                         float opacity = 1.0f;
                         bool wireframe = false;
+                        bool vertexColors = false;
                         bool transparent = false;
                         bool depthTest = true;
                         if (auto* m = en.mesh->material().get()) {
@@ -19836,6 +19837,7 @@ namespace threepp {
                                 wireframe = mw->wireframe;
                             }
                             opacity     = m->opacity;
+                            vertexColors = m->vertexColors;
                             transparent = m->transparent;
                             depthTest   = m->depthTest;
                         }
@@ -19844,7 +19846,13 @@ namespace threepp {
                         // typically opaque even when material.transparent
                         // is incidentally true.
                         VkPipeline want;
-                        if (wireframe) {
+                        const BlasRecord* rec = resolveBlasForEntry(en);
+                        if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+                        const bool coloredWireframe = wireframe && vertexColors &&
+                                                      rec->color.handle != VK_NULL_HANDLE;
+                        if (coloredWireframe) {
+                            want = depthTest ? overlayLineListColoredPipeline : overlayLineListColoredNoDepthPipeline;
+                        } else if (wireframe) {
                             want = depthTest ? overlayLineListPipeline : overlayLineListNoDepthPipeline;
                         } else if (transparent) {
                             want = depthTest ? overlayBasicTransparentPipeline : overlayBasicTransparentNoDepthPipeline;
@@ -19855,9 +19863,6 @@ namespace threepp {
                             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
                             curPipeline = want;
                         }
-
-                        const BlasRecord* rec = resolveBlasForEntry(en);
-                        if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
                         Matrix4 model;
                         std::memcpy(model.elements.data(), en.worldMatrix.data(), 64);
@@ -19878,9 +19883,9 @@ namespace threepp {
                                                    VK_SHADER_STAGE_FRAGMENT_BIT,
                                            0, sizeof(pc), &pc);
 
-                        VkBuffer     vbufs[1] = {rec->vertex.handle};
-                        VkDeviceSize voffs[1] = {0};
-                        vkCmdBindVertexBuffers(cb, 0, 1, vbufs, voffs);
+                        VkBuffer     vbufs[2] = {rec->vertex.handle, rec->color.handle};
+                        VkDeviceSize voffs[2] = {0, 0};
+                        vkCmdBindVertexBuffers(cb, 0, coloredWireframe ? 2 : 1, vbufs, voffs);
                         if (wireframe) {
                             auto* wrec = ensureWireframeGeometryUploaded(en.mesh->geometry().get());
                             if (!wrec || wrec->index.handle == VK_NULL_HANDLE || wrec->indexCount == 0) {
