@@ -57,6 +57,7 @@
 #include "threepp/lights/HemisphereLight.hpp"
 #include "threepp/lights/PointLight.hpp"
 #include "threepp/lights/RectAreaLight.hpp"
+#include "threepp/lights/ltc/ltc_data.hpp"
 #include "threepp/lights/SpotLight.hpp"
 #include "threepp/materials/LineDashedMaterial.hpp"
 #include "threepp/materials/Material.hpp"
@@ -2401,6 +2402,7 @@ namespace threepp {
                 THREEPP_VK_TRACE_SCOPE("Impl.defaultTextures");
                 createTextureSampler();
                 createDefaultMaterialTexture();
+                createLtcTextures();
             }
             // RT descriptor/pipeline layout only. Actual RT pipelines/SBTs stay
             // behind the render-mode gate and are built lazily by render().
@@ -15998,6 +16000,21 @@ namespace threepp {
                     "materialTexture[0] (default white)");
             materialTextures.push_back(tex);
             materialTextureOwned_.push_back(true);
+        }
+
+        void createLtcTextures() {
+            const auto add = [&](const auto& data, const char* name) {
+                materialTextures.push_back(createSampledImage2D(
+                        ltc::LUT_SIZE, ltc::LUT_SIZE, VK_FORMAT_R32G32B32A32_SFLOAT,
+                        data.data(), data.size() * sizeof(float),
+                        VK_FILTER_LINEAR,
+                        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+                        name));
+                materialTextureOwned_.push_back(true);
+            };
+            add(ltc::LTC_MAT_1, "materialTexture[1] (LTC matrix)");
+            add(ltc::LTC_MAT_2, "materialTexture[2] (LTC magnitude)");
         }
 
         // GPU skinning pipeline moved into vulkan/SkinningPipeline.{hpp,cpp}.
