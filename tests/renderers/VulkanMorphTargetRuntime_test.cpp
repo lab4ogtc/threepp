@@ -32,6 +32,21 @@ namespace {
         return out;
     }
 
+    int countWhiteRegion(const std::vector<unsigned char>& px, int width,
+                         int x0, int x1) {
+        int out = 0;
+        int y0 = 0;
+        int y1 = width;
+        vt::scaleBox(x0, x1, y0, y1);
+        for (int y = y0; y < y1; ++y) {
+            for (int x = x0; x < x1; ++x) {
+                const auto i = vt::rgbIndex(x, y);
+                if (px[i] > 220 && px[i + 1] > 220 && px[i + 2] > 220) ++out;
+            }
+        }
+        return out;
+    }
+
 }// namespace
 
 int main() {
@@ -86,8 +101,16 @@ int main() {
         auto mesh = Mesh::create(geometry, material);
         mesh->morphTargetInfluences().push_back(1.f);
 
+        auto pointsMaterial = PointsMaterial::create();
+        pointsMaterial->size = 8.f;
+        pointsMaterial->sizeAttenuation = false;
+        pointsMaterial->morphTargets = true;
+        auto points = Points::create(geometry, pointsMaterial);
+        points->morphTargetInfluences().push_back(1.f);
+
         Scene scene;
         scene.add(mesh);
+        scene.add(points);
 
         PerspectiveCamera camera(45.f, 1.f, 0.1f, 100.f);
         camera.position.z = 3.f;
@@ -104,10 +127,14 @@ int main() {
             const auto framebuffer = renderer.readRGBPixels();
             const int leftRed = countRedRegion(framebuffer, 128, 0, 64);
             const int rightRed = countRedRegion(framebuffer, 128, 64, 128);
+            const int leftWhite = countWhiteRegion(framebuffer, 128, 0, 64);
+            const int rightWhite = countWhiteRegion(framebuffer, 128, 64, 128);
             const bool pass = vt::hasExpectedRgbSize(framebuffer) &&
-                              rightRed > 800 && leftRed < 300;
-            std::printf("[phase4] MorphTarget rightRed=%d leftRed=%d bytes=%zu -> %s\n",
-                        rightRed, leftRed, framebuffer.size(), pass ? "PASS" : "FAIL");
+                              rightRed > 800 && leftRed < 300 &&
+                              rightWhite > 40 && leftWhite < 10;
+            std::printf("[phase4] MorphTarget rightRed=%d leftRed=%d rightWhite=%d leftWhite=%d bytes=%zu -> %s\n",
+                        rightRed, leftRed, rightWhite, leftWhite,
+                        framebuffer.size(), pass ? "PASS" : "FAIL");
             std::exit(pass ? 0 : 1);
         });
     } catch (const std::exception& e) {

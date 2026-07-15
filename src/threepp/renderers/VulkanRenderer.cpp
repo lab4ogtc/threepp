@@ -4409,10 +4409,10 @@ namespace threepp {
             return m.geometry()->getMorphAttributes().count("position") > 0;
         }
 
-        static void cpuMorphBlend(Mesh& mesh,
+        static void cpuMorphBlend(Object3D& object,
+                                  const BufferGeometry& geom,
                                   std::vector<float>& outPos,
                                   std::vector<float>& outNorm) {
-            const auto& geom = *mesh.geometry();
             auto* posAttr = geom.getAttribute<float>("position");
             auto* nrmAttr = geom.getAttribute<float>("normal");
             if (!posAttr) return;
@@ -4437,7 +4437,7 @@ namespace threepp {
             auto nrmIt = morphAttrsMap.find("normal");
             if (nrmIt != morphAttrsMap.end()) morphNrm = &nrmIt->second;
 
-            auto* morphObj = mesh.as<ObjectWithMorphTargetInfluences>();
+            auto* morphObj = dynamic_cast<ObjectWithMorphTargetInfluences*>(&object);
             if (!morphObj) return;
             const auto& influences = morphObj->morphTargetInfluences();
 
@@ -4518,7 +4518,7 @@ namespace threepp {
         }
 
         void refreshMorphedBlas(Mesh& mesh, MorphedMeshState& st) {
-            cpuMorphBlend(mesh, st.blendedPositions, st.blendedNormals);
+            cpuMorphBlend(mesh, *mesh.geometry(), st.blendedPositions, st.blendedNormals);
             if (st.blendedPositions.empty() || !st.blas) return;
 
             void* mapped = nullptr;
@@ -15347,12 +15347,13 @@ namespace threepp {
 
         // Line geometry cache shared between the ortho overlay (via
         // OverlayPass::record) and the 3D hybrid overlay
-        // (recordCommandBuffer's line-draw section). Keyed on raw
-        // BufferGeometry*; geomId in LineRec guards against recycled-
-        // pointer aliasing. Counter bumped each frame by the 3D overlay
+        // (recordCommandBuffer's line-draw section). Usually keyed on raw
+        // BufferGeometry*; morphed Points use their object pointer so shared
+        // geometry can carry different influences. geomId in LineRec guards
+        // against recycled-pointer aliasing. Counter bumped by the 3D overlay
         // path; stale eviction intentionally omitted here (3D overlay
         // objects are persistent scene objects, not transient geometry).
-        std::unordered_map<const BufferGeometry*, vulkan::LineRec> lineGeomCache_;
+        std::unordered_map<const void*, vulkan::LineRec> lineGeomCache_;
         std::unordered_map<const BufferGeometry*, vulkan::WireframeRec> wireframeGeomCache_;
         uint64_t overlayFrameCounter_ = 0;// lastTouch reference for lineGeomCache_ entries
 
@@ -15436,7 +15437,7 @@ namespace threepp {
             return &rec.loopRanges.back();
         }
 
-        // Lazy-upload Line / LineSegments geometry into a host-visible
+        // Lazy-upload Line / LineSegments / Points geometry into a host-visible
         // vertex (+ optional index) buffer pair. Returns nullptr if the
         // geometry has no usable position attribute. Cached by raw pointer
         // — first call allocates + writes, subsequent calls compare the
@@ -15446,10 +15447,15 @@ namespace threepp {
         // refreshSkinnedBlas pattern — a write-during-read race for that
         // one frame is benign because the per-pixel result blends sub-
         // pixel anyway).
-        vulkan::LineRec* ensureLineGeometryUploaded(const BufferGeometry* geom) {
+        vulkan::LineRec* ensureLineGeometryUploaded(const BufferGeometry* geom,
+                                                    const void* cacheKey = nullptr,
+                                                    const std::vector<float>* positionOverride = nullptr) {
             if (!geom) return nullptr;
             auto posAttr = geom->getAttribute<float>("position");
             if (!posAttr || posAttr->count() == 0) return nullptr;
+            if (positionOverride && positionOverride->size() != posAttr->array().size()) return nullptr;
+            const auto& posArr = positionOverride ? *positionOverride : posAttr->array();
+            const auto* key = cacheKey ? cacheKey : geom;
             auto* idxAttr = geom->getIndex();
             // Optional per-vertex color, used by AxesHelper-style overlays.
             const auto colAttr = geom->hasAttribute("color")
@@ -15504,7 +15510,7 @@ namespace threepp {
                 rec.colorIsFallback = true;
             };
 
-            auto it = lineGeomCache_.find(geom);
+            auto it = lineGeomCache_.find(key);
             if (it != lineGeomCache_.end() && it->second.geomId != geom->id) {
                 // Recycled pointer: this address was a DIFFERENT geometry whose
                 // buffers we still hold. Retire them and re-upload from scratch
@@ -15520,7 +15526,7 @@ namespace threepp {
             if (it != lineGeomCache_.end()) {
                 auto& rec = it->second;
                 rec.lastTouch = overlayFrameCounter_;
-                if (rec.positionVersion == posVer &&
+                if (!positionOverride && rec.positionVersion == posVer &&
                     rec.indexVersion    == idxVer &&
                     rec.colorVersion    == colVer &&
                     rec.colorIsFallback == !hasColorAttr &&
@@ -15529,7 +15535,6 @@ namespace threepp {
                 }
                 // Re-upload paths.
                 destroyLineLoopRanges(rec.loopRanges);
-                const auto& posArr = posAttr->array();
                 const VkDeviceSize vbBytes = posArr.size() * sizeof(float);
                 if (vbBytes > rec.vertex.size) {
                     destroyBuffer(ctx->allocator(), rec.vertex);
@@ -15593,7 +15598,6 @@ namespace threepp {
             }
 
             // First-time upload.
-            const auto& posArr = posAttr->array();
             vulkan::LineRec rec{};
             rec.vertexCount     = static_cast<uint32_t>(posAttr->count());
             rec.positionVersion = posVer;
@@ -15641,7 +15645,7 @@ namespace threepp {
                 vmaUnmapMemory(ctx->allocator(), rec.lineDistance.alloc);
             }
 
-            return &lineGeomCache_.emplace(geom, std::move(rec)).first->second;
+            return &lineGeomCache_.emplace(key, std::move(rec)).first->second;
         }
 
         vulkan::WireframeRec* ensureWireframeGeometryUploaded(const BufferGeometry* geom) {
@@ -19954,7 +19958,19 @@ namespace threepp {
                             matPtr  = le.line->material();
                         }
                         if (!geomPtr) continue;
-                        vulkan::LineRec* lrec = ensureLineGeometryUploaded(geomPtr.get());
+                        std::vector<float> morphedPositions;
+                        std::vector<float> morphedNormals;
+                        const std::vector<float>* positionOverride = nullptr;
+                        if (le.isPoints && matPtr) {
+                            auto* morphMaterial = matPtr->as<MaterialWithMorphTargets>();
+                            if (morphMaterial && morphMaterial->morphTargets &&
+                                geomPtr->getMorphAttributes().contains("position")) {
+                                cpuMorphBlend(*le.points, *geomPtr, morphedPositions, morphedNormals);
+                                if (!morphedPositions.empty()) positionOverride = &morphedPositions;
+                            }
+                        }
+                        vulkan::LineRec* lrec = ensureLineGeometryUploaded(
+                                geomPtr.get(), positionOverride ? le.points : nullptr, positionOverride);
                         if (!lrec || lrec->vertex.handle == VK_NULL_HANDLE) continue;
 
                         Color color(1.f, 1.f, 1.f);
