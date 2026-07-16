@@ -169,7 +169,6 @@ namespace threepp::vulkan {
         VkPipeline       orthoMeshPipeline_            = VK_NULL_HANDLE;
         VkPipeline       orthoMeshColoredPipeline_     = VK_NULL_HANDLE;
         VkPipeline       orthoMeshInstancedPipeline_   = VK_NULL_HANDLE;
-        VkPipeline       orthoMeshDepthOnlyPipeline_   = VK_NULL_HANDLE;
         VkPipeline       orthoMeshTransparentPipeline_ = VK_NULL_HANDLE;
         VkPipeline       orthoTexturedMeshPipeline_    = VK_NULL_HANDLE;
         VkPipeline       orthoDepthTextureMeshPipeline_ = VK_NULL_HANDLE;

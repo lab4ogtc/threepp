@@ -189,6 +189,14 @@ void main() {
     // Halton jitter sequence is the anti-aliasing now (TSR), not FXAA.
     const vec3 curr = texture(taaInputTex, uvIn).rgb;
 
+    // alpha == 1 表示关闭 TAA。局部分屏仍需经过该 pass 完成裁剪呈现，
+    // 但必须严格绕过历史重投影和 antiFlicker 对 alpha 的再次缩放。
+    if (pc.blendAlpha >= 1.0) {
+        if (pc.writeSwap != 0u) imageStore(taaPresentImage, dstPx, vec4(curr, 1.0));
+        imageStore(taaHistoryWriteImg, dstPx, vec4(curr, 0.0));
+        return;
+    }
+
     // Reproject prev frame via gbuffer motion vec. Motion is in GL-NDC delta
     // (Y-up); convert UV → GL-NDC → add motion → back to screen UV.
     vec2 motionGL = texture(gbufMotionTex, uvIn).rg;

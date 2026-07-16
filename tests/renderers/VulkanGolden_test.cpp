@@ -250,16 +250,11 @@ int main(int argc, char** argv) {
         camera.updateProjectionMatrix();
         camera.updateMatrixWorld();
 
+        renderer.setScissorTest(true);
+        bool allFramesPass = true;
         int frame = 0;
         canvas.animate([&] {
-            if (frame == 0) {
-                renderer.setScissorTest(true);
-                renderer.setScissor(0, 0, kW / 2, kH);
-                renderer.render(sceneLeft, camera);
-
-                renderer.setScissor(kW / 2, 0, kW / 2, kH);
-                renderer.render(sceneRight, camera);
-            } else {
+            if (frame > 0) {
                 const std::vector<unsigned char> px = renderer.readRGBPixels();
                 const auto left = meanRect(px, kW, 12, 12, 56, 56);
                 const auto right = meanRect(px, kW, kW - 68, 12, 56, 56);
@@ -271,14 +266,21 @@ int main(int argc, char** argv) {
                 const bool rightMeshVisible = channelDiffersBy(rightSeam, right, 2.0) &&
                                               rightSeam.r > 80.0 && rightSeam.g > 90.0 && rightSeam.b > 90.0;
                 const bool pass = leftMatches && rightMatches && leftMeshVisible && rightMeshVisible;
-                std::printf("[stage1] split background left=(%.1f,%.1f,%.1f) right=(%.1f,%.1f,%.1f) "
+                allFramesPass = allFramesPass && pass;
+                std::printf("[stage1] split background frame=%d left=(%.1f,%.1f,%.1f) right=(%.1f,%.1f,%.1f) "
                             "leftSeam=(%.1f,%.1f,%.1f) rightSeam=(%.1f,%.1f,%.1f) -> %s\n",
-                            left.r, left.g, left.b, right.r, right.g, right.b,
+                            frame - 1, left.r, left.g, left.b, right.r, right.g, right.b,
                             leftSeam.r, leftSeam.g, leftSeam.b,
                             rightSeam.r, rightSeam.g, rightSeam.b,
                             pass ? "PASS" : "FAIL");
-                std::exit(pass ? 0 : 1);
+                if (frame == 4) std::exit(allFramesPass ? 0 : 1);
             }
+
+            renderer.setScissor(0, 0, kW / 2, kH);
+            renderer.render(sceneLeft, camera);
+
+            renderer.setScissor(kW / 2, 0, kW / 2, kH);
+            renderer.render(sceneRight, camera);
             ++frame;
         });
         return 1;

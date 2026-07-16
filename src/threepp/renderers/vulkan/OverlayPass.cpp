@@ -8,6 +8,7 @@
 #include "threepp/core/InterleavedBufferAttribute.hpp"
 #include "threepp/core/Object3D.hpp"
 #include "threepp/materials/LineDashedMaterial.hpp"
+#include "threepp/materials/MeshStandardMaterial.hpp"
 #include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/materials/interfaces.hpp"
 #include "threepp/math/Matrix4.hpp"
@@ -178,7 +179,6 @@ OverlayPass::~OverlayPass() {
     if (orthoMeshPipeline_)         vkDestroyPipeline(d, orthoMeshPipeline_, nullptr);
     if (orthoMeshColoredPipeline_)  vkDestroyPipeline(d, orthoMeshColoredPipeline_, nullptr);
     if (orthoMeshInstancedPipeline_) vkDestroyPipeline(d, orthoMeshInstancedPipeline_, nullptr);
-    if (orthoMeshDepthOnlyPipeline_) vkDestroyPipeline(d, orthoMeshDepthOnlyPipeline_, nullptr);
     if (orthoMeshTransparentPipeline_) vkDestroyPipeline(d, orthoMeshTransparentPipeline_, nullptr);
     if (orthoTexturedMeshPipeline_) vkDestroyPipeline(d, orthoTexturedMeshPipeline_, nullptr);
     if (orthoDepthTextureMeshPipeline_) vkDestroyPipeline(d, orthoDepthTextureMeshPipeline_, nullptr);
@@ -557,16 +557,6 @@ void OverlayPass::createOrthoLinePipelines() {
     check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshInstanced, nullptr,
                                     &orthoMeshInstancedPipeline_),
           "vkCreateGraphicsPipelines(orthoMeshInstanced)");
-
-    VkPipelineColorBlendAttachmentState depthOnlyAttachment = cbas;
-    depthOnlyAttachment.colorWriteMask = 0;
-    VkPipelineColorBlendStateCreateInfo depthOnlyBlend = cb;
-    depthOnlyBlend.pAttachments = &depthOnlyAttachment;
-    VkGraphicsPipelineCreateInfo gpciDepthOnly = gpciMesh;
-    gpciDepthOnly.pColorBlendState = &depthOnlyBlend;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciDepthOnly, nullptr,
-                                    &orthoMeshDepthOnlyPipeline_),
-          "vkCreateGraphicsPipelines(orthoMeshDepthOnly)");
 
     VkPipelineColorBlendAttachmentState cbasT = cbas;
     cbasT.blendEnable         = VK_TRUE;
@@ -1940,6 +1930,10 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                 }
             }
             if (auto* mw = dynamic_cast<MaterialWithWireframe*>(mat.get())) md.wireframe = mw->wireframe;
+            // ponytail: 透视叠加暂未上传线框法线；先匹配 Standard 漫反射的 Lambert 能量归一化。
+            if (md.wireframe && dynamic_cast<MeshStandardMaterial*>(mat.get())) {
+                md.color.multiplyScalar(0.318309886f);
+            }
             md.vertexColors = mat->vertexColors && g->hasAttribute("color");
             md.opacity     = mat->opacity;
             md.transparent = mat->transparent;
@@ -2104,32 +2098,6 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             float mvp[16];
             float color[4];
         };
-
-        // 线框本身不会覆盖三角形内部，因此先用原始三角形仅写深度，
-        // 后续线段才能被同一 Mesh 的正面正确遮挡。
-        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, orthoMeshDepthOnlyPipeline_);
-        for (const auto& md : meshDraws) {
-            if (!md.wireframe) continue;
-            auto* rec = ensureLineGeometryUploaded(md.mesh->geometry().get());
-            if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
-
-            Matrix4 mvp;
-            mvp.multiplyMatrices(cvp, md.world);
-            MeshPC pc{};
-            std::memcpy(pc.mvp, mvp.elements.data(), 64);
-            vkCmdPushConstants(cb, orthoLinePipelineLayout_,
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, sizeof(pc), &pc);
-            VkBuffer vertexBuffer = rec->vertex.handle;
-            VkDeviceSize vertexOffset = 0;
-            vkCmdBindVertexBuffers(cb, 0, 1, &vertexBuffer, &vertexOffset);
-            if (rec->index.handle != VK_NULL_HANDLE) {
-                vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(cb, rec->indexCount, 1, 0, 0, 0);
-            } else {
-                vkCmdDraw(cb, rec->vertexCount, 1, 0, 0);
-            }
-        }
 
         VkPipeline curMesh = VK_NULL_HANDLE;
         for (const auto& md : meshDraws) {

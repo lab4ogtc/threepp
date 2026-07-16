@@ -735,14 +735,18 @@ namespace threepp::vulkan {
         presentDep.pImageMemoryBarriers = &swapToColor;
         vkCmdPipelineBarrier2(cb, &presentDep);
 
+        const VkExtent2D presentExtent = outputExtent;
+        const bool fullPresent = dstX == 0 && dstY == 0 &&
+                                 outWidth >= presentExtent.width &&
+                                 outHeight >= presentExtent.height;
         VkRenderingAttachmentInfo colorAtt{};
         colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
         colorAtt.imageView   = outputView;
         colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAtt.loadOp      = fullPresent ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                           : VK_ATTACHMENT_LOAD_OP_LOAD;
         colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
 
-        const VkExtent2D presentExtent = outputExtent;
         VkRenderingInfo ri{};
         ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
         ri.renderArea.offset = {0, 0};
@@ -756,7 +760,14 @@ namespace threepp::vulkan {
                       static_cast<float>(presentExtent.width),
                       static_cast<float>(presentExtent.height),
                       0.f, 1.f};
-        VkRect2D sc{{0, 0}, presentExtent};
+        const uint32_t presentWidth = dstX < presentExtent.width
+                                              ? std::min(outWidth, presentExtent.width - dstX)
+                                              : 0u;
+        const uint32_t presentHeight = dstY < presentExtent.height
+                                               ? std::min(outHeight, presentExtent.height - dstY)
+                                               : 0u;
+        VkRect2D sc{{static_cast<int32_t>(dstX), static_cast<int32_t>(dstY)},
+                    {presentWidth, presentHeight}};
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipe_);
         const VkDescriptorSet presentSet = sharpen ? presentSharpenSets_[descIdx]
                                                    : presentSets_[descIdx];

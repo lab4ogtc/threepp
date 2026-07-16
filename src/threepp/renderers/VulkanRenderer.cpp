@@ -3079,12 +3079,14 @@ namespace threepp {
 
             const int fbW = static_cast<int>(ext.width);
             const int fbH = static_cast<int>(ext.height);
-            const int sx = std::clamp(static_cast<int>(std::floor(scissor.x)), 0, fbW);
-            const int syBottom = std::clamp(static_cast<int>(std::floor(scissor.y)), 0, fbH);
+            const float scaleX = size.width() > 0 ? static_cast<float>(fbW) / static_cast<float>(size.width()) : 1.f;
+            const float scaleY = size.height() > 0 ? static_cast<float>(fbH) / static_cast<float>(size.height()) : 1.f;
+            const int sx = std::clamp(static_cast<int>(std::floor(scissor.x * scaleX)), 0, fbW);
+            const int syBottom = std::clamp(static_cast<int>(std::floor(scissor.y * scaleY)), 0, fbH);
             const int maxW = std::max(0, fbW - sx);
             const int maxH = std::max(0, fbH - syBottom);
-            const int sw = std::clamp(static_cast<int>(std::ceil(scissor.z)), 0, maxW);
-            const int sh = std::clamp(static_cast<int>(std::ceil(scissor.w)), 0, maxH);
+            const int sw = std::clamp(static_cast<int>(std::floor(scissor.z * scaleX)), 0, maxW);
+            const int sh = std::clamp(static_cast<int>(std::floor(scissor.w * scaleY)), 0, maxH);
             const int syTop = fbH - syBottom - sh;
             return VkRect2D{{sx, syTop}, {static_cast<uint32_t>(sw), static_cast<uint32_t>(sh)}};
         }
@@ -18702,18 +18704,10 @@ namespace threepp {
                 regionDstY_ = 0;
                 if (scissorTest && scissor.z >= 1.f && scissor.w >= 1.f &&
                     fullSwap.width > 0 && fullSwap.height > 0) {
-                    // Cap sx at width-1 (not width) so the sw clamp below always
-                    // has hi = width-sx >= 1; a degenerate scissor.x >= width
-                    // would otherwise make std::clamp(.., 1, 0) — lo > hi is UB.
-                    const int sx  = std::clamp(static_cast<int>(scissor.x), 0, static_cast<int>(fullSwap.width) - 1);
-                    const int sw  = std::clamp(static_cast<int>(scissor.z), 1, static_cast<int>(fullSwap.width) - sx);
-                    const int sh  = std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(fullSwap.height));
-                    const int syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(fullSwap.height) - sh);
-                    regionSwapExt_ = {static_cast<uint32_t>(sw), static_cast<uint32_t>(sh)};
-                    regionDstX_    = sx;
-                    // GL scissor y is from the bottom; the swapchain image is
-                    // top-left origin → flip. Full-height panes map to 0.
-                    regionDstY_    = static_cast<int>(fullSwap.height) - (syB + sh);
+                    const VkRect2D rect = activeScissorRect(fullSwap);
+                    regionSwapExt_ = rect.extent;
+                    regionDstX_ = rect.offset.x;
+                    regionDstY_ = rect.offset.y;
                 }
             }
 
@@ -19679,7 +19673,10 @@ namespace threepp {
                 }
                 taaPrevTimeSec_ = now;
             }
-            if (taaBlendAlpha_ >= 1.0f && sharpenStrength_ <= 0.0f) {
+            const bool fullTaaRegion = regionDstX_ == 0 && regionDstY_ == 0 &&
+                                       regionSwapExt_.width == ext.width &&
+                                       regionSwapExt_.height == ext.height;
+            if (taaBlendAlpha_ >= 1.0f && sharpenStrength_ <= 0.0f && fullTaaRegion) {
                 taa_->recordPresentInput(cb, currentFrame, imageIndex,
                                          frameOutputImage(imageIndex),
                                          frameOutputView(imageIndex),
@@ -21358,12 +21355,13 @@ namespace threepp {
                         rw = viewportRect.extent.width;
                         rh = viewportRect.extent.height;
                     } else {
-                        rx = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.x), 0, static_cast<int>(full.width)));
-                        rw = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.z), 1, static_cast<int>(full.width) - static_cast<int>(rx)));
-                        rh = static_cast<uint32_t>(std::clamp(static_cast<int>(scissor.w), 1, static_cast<int>(full.height)));
-                        const int syB = std::clamp(static_cast<int>(scissor.y), 0, static_cast<int>(full.height) - static_cast<int>(rh));
-                        ry = static_cast<uint32_t>(static_cast<int>(full.height) - (syB + static_cast<int>(rh)));
+                        const VkRect2D rect = activeScissorRect(full);
+                        rx = static_cast<uint32_t>(rect.offset.x);
+                        ry = static_cast<uint32_t>(rect.offset.y);
+                        rw = rect.extent.width;
+                        rh = rect.extent.height;
                     }
+                    if (rw == 0 || rh == 0) return;
                     if (autoClear_ && (autoClearColor_ || autoClearDepth_ || autoClearStencil_)) {
                         const Color savedClearColor = clearColor;
                         const float savedClearAlpha = clearAlpha;

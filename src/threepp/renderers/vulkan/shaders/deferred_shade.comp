@@ -68,7 +68,8 @@ vec3 ambientIrradiance(vec3 N) {
         const float w = dot(N, normalize(lights.hemiLights[i].direction)) * 0.5 + 0.5;
         c += mix(lights.hemiLights[i].groundColor, lights.hemiLights[i].skyColor, clamp(w, 0.0, 1.0));
     }
-    return c;
+    // 与 GL 的 BRDF_Diffuse_Lambert 保持一致：辐照度转换为漫反射出射亮度。
+    return c * 0.3183098861837907;
 }
 
 layout(set = 0, binding = 2) uniform sampler2D  envTex;        // prefiltered PMREM mip chain
