@@ -753,18 +753,17 @@ struct GLRenderer::Impl {
         caps.logarithmicDepthBuffer = glCaps.logarithmicDepthBuffer;
         caps.maxVertexUniforms = glCaps.maxVertexUniforms;
 
-        // Resolve envMap through the PMREM pipeline BEFORE building program parameters.
-        // Mirrors three.js WebGLPrograms, which calls cubeuvmaps.get() inline when reading
-        // material.envMap — so parameters.envMapMode reflects the *resolved* mapping
-        // (e.g. CubeUVReflection for equirect sources), not the source equirect mapping.
+        // Physical materials use PMREM; generic shader materials (including the
+        // background cube) must keep a cubemap so their sampler type still matches.
         materialProperties->environment = material->is<MeshStandardMaterial>() ? scene->environment.get() : nullptr;
         materialProperties->fog = scene->fog;
         auto materialWithEnvMap = material->as<MaterialWithEnvMap>();
-        if (materialWithEnvMap && materialWithEnvMap->envMap) {
-            materialProperties->envMap = cubemaps.getPMREM(materialWithEnvMap->envMap.get());
-        } else {
-            materialProperties->envMap = cubemaps.getPMREM(materialProperties->environment);
-        }
+        auto* envMap = materialWithEnvMap && materialWithEnvMap->envMap
+                               ? materialWithEnvMap->envMap.get()
+                               : materialProperties->environment;
+        materialProperties->envMap = material->is<MeshStandardMaterial>()
+                                             ? cubemaps.getPMREM(envMap)
+                                             : cubemaps.get(envMap);
 
         const auto outputColorSpace = activeOutputColorSpace(scope, _currentRenderTarget);
         auto parameters = gl::GLPrograms::getParameters(scope, shadowCfg, caps, clipping, material, lights.state, shadowsArray.size(), scene, object, materialProperties->envMap, outputColorSpace);
@@ -894,7 +893,9 @@ struct GLRenderer::Impl {
         Texture* envMap;
         auto materialWithEnvMap = material->as<MaterialWithEnvMap>();
         if (materialWithEnvMap && materialWithEnvMap->envMap) {
-            envMap = cubemaps.getPMREM(materialWithEnvMap->envMap.get());
+            envMap = isMeshStandardMaterial
+                             ? cubemaps.getPMREM(materialWithEnvMap->envMap.get())
+                             : cubemaps.get(materialWithEnvMap->envMap.get());
         } else {
             envMap = cubemaps.getPMREM(environment.get());
         }

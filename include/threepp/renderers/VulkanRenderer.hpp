@@ -301,10 +301,10 @@ namespace threepp {
         void setDeferredAO(bool enabled);
         [[nodiscard]] bool deferredAO() const;
 
-        // RasterFirst optional ray-query accents: screen-visible scene
-        // reflections, glass/transmission tracing and water reflection tracing.
-        // OFF by default so the default Vulkan path matches GL-style raster
-        // lighting plus shadow maps. AO/GI and ReSTIR keep their own toggles.
+        // RasterFirst optional ray-query accents: screen-visible scene and water
+        // reflections. OFF by default; transmissive materials still enable the
+        // scene rays required for correct glass reflection/refraction. AO/GI and
+        // ReSTIR keep their own toggles.
         void setDeferredRayAccents(bool enabled);
         [[nodiscard]] bool deferredRayAccents() const;
 

@@ -19591,7 +19591,9 @@ namespace threepp {
                                                fireflyClamp_,
                                                oceanFineTileSize, oceanFoamTileSize,
                                                denoiseEnabled_, restirDIEnabled_,
-                                               deferredRayAccents_,
+                                               // Transmission requires scene rays for the objects
+                                               // behind and reflected by the glass surface.
+                                               deferredRayAccents_ || sceneHasGlass_,
                                                envIsBgColor,
                                                deferredVolDensity_, deferredVolAniso_,
                                                deferredStarIntensity_,

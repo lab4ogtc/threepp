@@ -2683,14 +2683,22 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                 transmitColor = behind * tint;
             }
         } else {
-            // SOLID glass (closed mesh): full 2-interface refraction → the
-            // inverted, magnified background a real glass ball shows. Beer-Lambert
-            // over the ACTUAL in-glass distance → deeper tint through the centre.
+            // SOLID glass (closed mesh): keep the first-interface refraction used
+            // by MeshPhysicalMaterial transmission. The interior query finds a safe
+            // exit point and the actual travel distance, but must not bend the ray a
+            // second time: GL transmission projects this first refracted ray into
+            // the backdrop, so a second interface flips the image inside spheres.
             vec3 dIn = refract(-V, Ns, 1.0 / ior);
             if (dot(dIn, dIn) < 1e-6) {
                 transmitColor = reflectColor;// TIR at the front face
             } else {
                 dIn = normalize(dIn);
+                // Match GL's screen-space transmission lookup: it projects a
+                // virtual exit point and samples the backdrop along the camera ray
+                // through that point. Sampling the environment along dIn directly
+                // rotates the image by 180 degrees across a curved surface.
+                const vec3 camPos = (cam.viewInverse * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+                const vec3 backdropDir = normalize(P + dIn * pm.thickness - camPos);
                 vec3 exitP, exitN; float inDist; bool exitMiss, blockedInside;
                 vec3  overC = vec3(0.0);
                 float overT = 1.0;
@@ -2698,7 +2706,7 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                                    exitP, exitN, inDist, exitMiss, blockedInside, overC, overT);
                 vec3 dOut;
                 if (exitMiss) {
-                    dOut = dIn; inDist = 0.0;// open/odd geometry — straight through
+                    dOut = backdropDir; inDist = 0.0;// open/odd geometry — GL-style backdrop direction
                 } else if (blockedInside) {
                     // Opaque content inside the volume: stop the refraction at
                     // it. Back the origin off so the behind-ray re-hits the
@@ -2708,11 +2716,7 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                     dOut  = dIn;
                     exitP = exitP - dIn * (4.0 * SHADOW_EPS);
                 } else {
-                    vec3 nb = exitN;
-                    if (dot(nb, dIn) < 0.0) nb = -nb;           // orient outward
-                    vec3 o = refract(dIn, -nb, ior);            // glass→air
-                    dOut = (dot(o, o) < 1e-6) ? reflect(dIn, nb)// TIR → internal reflect
-                                              : normalize(o);
+                    dOut = backdropDir;
                 }
                 const vec3 behind = traceAccentRadiance(exitP + dOut * SHADOW_EPS, dOut, doShadows, maxLod, missLod, seed,
                                                         /*cheapHits=*/false);// refracted content is sharp
