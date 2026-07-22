@@ -204,7 +204,7 @@ namespace threepp::water {
             cpci.layout = layout;
 
             VkPipeline p = VK_NULL_HANDLE;
-            check(vkCreateComputePipelines(ctx.device(), ctx.pipelineCache(), 1, &cpci, nullptr, &p),
+            check(ctx.createComputePipeline(cpci, &p),
                   "vkCreateComputePipelines");
             return p;
         }

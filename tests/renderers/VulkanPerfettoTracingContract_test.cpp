@@ -48,3 +48,34 @@ TEST_CASE("Vulkan custom ShaderMaterial pipeline cache is checked before compili
     CHECK(key < cacheLoop);
     CHECK(cacheLoop < compiler);
 }
+
+TEST_CASE("Vulkan pipeline creation uses the two-tier cache policy") {
+    const auto root = std::filesystem::path{PROJECT_SOURCE_DIR};
+    const auto header = readFile(root / "src/threepp/renderers/vulkan/VulkanContext.hpp");
+    const auto source = readFile(root / "src/threepp/renderers/vulkan/VulkanContext.cpp");
+    const auto renderer = readFile(root / "src/threepp/renderers/VulkanRenderer.cpp");
+
+    CHECK(header.find("createGraphicsPipeline") != std::string::npos);
+    CHECK(header.find("createComputePipeline") != std::string::npos);
+    CHECK(header.find("createRayTracingPipeline") != std::string::npos);
+    CHECK(source.find("THREEPP_VULKAN_PIPELINE_MODE") != std::string::npos);
+    CHECK(source.find("pipelineCreationCacheControl") != std::string::npos);
+    CHECK(source.find("VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT") != std::string::npos);
+    CHECK(source.find("VK_PIPELINE_COMPILE_REQUIRED") != std::string::npos);
+    CHECK(source.find("VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT") != std::string::npos);
+
+    const auto cacheOnly = source.find(
+            "cached.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT");
+    const auto compileRequired = source.find("result != VK_PIPELINE_COMPILE_REQUIRED", cacheOnly);
+    const auto fastFallback = source.find(
+            "info.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT", compileRequired);
+    REQUIRE(cacheOnly != std::string::npos);
+    REQUIRE(compileRequired != std::string::npos);
+    REQUIRE(fastFallback != std::string::npos);
+    CHECK(cacheOnly < compileRequired);
+    CHECK(compileRequired < fastFallback);
+
+    CHECK(renderer.find("vkCreateGraphicsPipelines(ctx->device()") == std::string::npos);
+    CHECK(renderer.find("vkCreateComputePipelines(ctx->device()") == std::string::npos);
+    CHECK(renderer.find("ctx->rt().createRayTracingPipelines") == std::string::npos);
+}

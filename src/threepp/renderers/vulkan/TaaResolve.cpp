@@ -243,8 +243,7 @@ namespace threepp::vulkan {
         cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpci.stage  = stage;
         cpci.layout = pipelineLayout_;
-        check(vkCreateComputePipelines(ctx_.device(), ctx_.pipelineCache(),
-                                       1, &cpci, nullptr, &pipeline_),
+        check(ctx_.createComputePipeline(cpci, &pipeline_),
               "vkCreateComputePipelines(taa)");
         vkDestroyShaderModule(ctx_.device(), mod, nullptr);
 
@@ -296,8 +295,7 @@ namespace threepp::vulkan {
             rcpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
             rcpci.stage  = rstage;
             rcpci.layout = rcasPipeLayout_;
-            check(vkCreateComputePipelines(ctx_.device(), ctx_.pipelineCache(), 1, &rcpci,
-                                           nullptr, &rcasPipe_),
+            check(ctx_.createComputePipeline(rcpci, &rcasPipe_),
                   "vkCreateComputePipelines(rcas)");
             vkDestroyShaderModule(ctx_.device(), rmod, nullptr);
         }
@@ -401,8 +399,7 @@ namespace threepp::vulkan {
             gpci.pColorBlendState    = &cb;
             gpci.pDynamicState       = &dyn;
             gpci.layout              = presentPipeLayout_;
-            check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1,
-                                            &gpci, nullptr, &presentPipe_),
+            check(ctx_.createGraphicsPipeline(gpci, &presentPipe_),
                   "vkCreateGraphicsPipelines(taa.present)");
 
             vkDestroyShaderModule(ctx_.device(), vert, nullptr);

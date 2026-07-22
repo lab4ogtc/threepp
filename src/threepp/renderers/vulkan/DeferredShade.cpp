@@ -131,7 +131,7 @@ namespace threepp::vulkan {
         cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpci.stage  = stage;
         cpci.layout = pipeLayout_;
-        check(vkCreateComputePipelines(d, ctx_.pipelineCache(), 1, &cpci, nullptr, &pipe_),
+        check(ctx_.createComputePipeline(cpci, &pipe_),
               "vkCreateComputePipelines(deferred_shade)");
 
         // Second pipeline — spatial denoise + recombine — shares the descriptor
@@ -144,7 +144,7 @@ namespace threepp::vulkan {
         check(vkCreateShaderModule(d, &smciD, nullptr, &modD), "vkCreateShaderModule(deferred_denoise)");
         VkComputePipelineCreateInfo cpciD = cpci;
         cpciD.stage.module = modD;
-        check(vkCreateComputePipelines(d, ctx_.pipelineCache(), 1, &cpciD, nullptr, &denoisePipe_),
+        check(ctx_.createComputePipeline(cpciD, &denoisePipe_),
               "vkCreateComputePipelines(deferred_denoise)");
 
         vkDestroyShaderModule(d, mod, nullptr);

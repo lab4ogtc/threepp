@@ -6300,12 +6300,11 @@ namespace threepp {
                         ctx->device(),
                         record.descriptorSetLayout);
                 record.pipeline = vulkan::createVulkanShaderMaterialDynamicGraphicsPipeline(
-                        ctx->device(),
+                        *ctx,
                         compiled,
                         record.pipelineLayout,
                         colorFormat,
                         VK_FORMAT_D32_SFLOAT_S8_UINT,
-                        VK_NULL_HANDLE,
                         colorAttachmentCount,
                         sampleCount);
             } catch (...) {
@@ -10325,7 +10324,7 @@ namespace threepp {
 
             VkPipeline pipeline = VK_NULL_HANDLE;
             try {
-                check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr, &pipeline),
+                check(ctx->createGraphicsPipeline(gpci, &pipeline),
                       "vkCreateGraphicsPipelines(rasterGbufStencil)");
             } catch (...) {
                 vkDestroyShaderModule(ctx->device(), fragModule, nullptr);
@@ -13174,7 +13173,7 @@ namespace threepp {
             gpci.layout = shadowDepthPipelineLayout_;
             const auto createPipeline = [&](VkPrimitiveTopology topology, VkPipeline& pipeline, const char* label) {
                 ia.topology = topology;
-                check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr, &pipeline), label);
+                check(ctx->createGraphicsPipeline(gpci, &pipeline), label);
             };
             createPipeline(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, shadowDepthPipeline_,
                            "vkCreateGraphicsPipelines(shadow depth)");
@@ -13985,8 +13984,7 @@ namespace threepp {
             gpci.pColorBlendState    = &cb;
             gpci.pDynamicState       = &dyn;
             gpci.layout              = overlayCompositePipelineLayout_;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
-                                            &overlayCompositePipeline_),
+            check(ctx->createGraphicsPipeline(gpci, &overlayCompositePipeline_),
                   "vkCreateGraphicsPipelines(overlayComposite)");
 
             vkDestroyShaderModule(ctx->device(), vert, nullptr);
@@ -14235,8 +14233,7 @@ namespace threepp {
             gpci.layout              = rasterPipelineLayout;
             gpci.renderPass          = rasterGbufRenderPass;
             gpci.subpass             = 0;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
-                                            &rasterGbufPipeline),
+            check(ctx->createGraphicsPipeline(gpci, &rasterGbufPipeline),
                   "vkCreateGraphicsPipelines(rasterGbuf)");
 
             vkDestroyShaderModule(ctx->device(), vertModule, nullptr);
@@ -14284,16 +14281,14 @@ namespace threepp {
             gpciInd.pStages           = stagesInd;
             gpciInd.pVertexInputState = &viInd;
 
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciInd, nullptr,
-                                            &rasterGbufIndirectPipeline),
+            check(ctx->createGraphicsPipeline(gpciInd, &rasterGbufIndirectPipeline),
                   "vkCreateGraphicsPipelines(rasterGbufIndirect)");
 
             VkPipelineDepthStencilStateCreateInfo dsNoDepthWrite = ds;
             dsNoDepthWrite.depthWriteEnable = VK_FALSE;
             VkGraphicsPipelineCreateInfo gpciNoDepthWrite = gpciInd;
             gpciNoDepthWrite.pDepthStencilState = &dsNoDepthWrite;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciNoDepthWrite, nullptr,
-                                            &rasterGbufNoDepthWritePipeline),
+            check(ctx->createGraphicsPipeline(gpciNoDepthWrite, &rasterGbufNoDepthWritePipeline),
                   "vkCreateGraphicsPipelines(rasterGbufNoDepthWrite)");
 
             VkPipelineDepthStencilStateCreateInfo dsNoDepth = ds;
@@ -14301,8 +14296,7 @@ namespace threepp {
             dsNoDepth.depthWriteEnable = VK_FALSE;
             VkGraphicsPipelineCreateInfo gpciNoDepth = gpciInd;
             gpciNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciNoDepth, nullptr,
-                                            &rasterGbufNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciNoDepth, &rasterGbufNoDepthPipeline),
                   "vkCreateGraphicsPipelines(rasterGbufNoDepth)");
 
             // Decal variant (same shaders/layout/render pass): blend-decal
@@ -14347,8 +14341,7 @@ namespace threepp {
             gpciDecal.pStages            = stagesDecal;
             gpciDecal.pDepthStencilState = &dsDecal;
             gpciDecal.pColorBlendState   = &cbDecal;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDecal, nullptr,
-                                            &rasterGbufDecalPipeline),
+            check(ctx->createGraphicsPipeline(gpciDecal, &rasterGbufDecalPipeline),
                   "vkCreateGraphicsPipelines(rasterGbufDecal)");
 
             vkDestroyShaderModule(ctx->device(), vertIndirectModule, nullptr);
@@ -14514,13 +14507,11 @@ namespace threepp {
             rsBasic.cullMode    = VK_CULL_MODE_BACK_BIT;
             VkGraphicsPipelineCreateInfo gpciBasic = gpci;
             gpciBasic.pRasterizationState = &rsBasic;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasic, nullptr,
-                                            &overlayBasicPipeline),
+            check(ctx->createGraphicsPipeline(gpciBasic, &overlayBasicPipeline),
                   "vkCreateGraphicsPipelines(overlayBasic)");
             VkGraphicsPipelineCreateInfo gpciBasicNoDepth = gpciBasic;
             gpciBasicNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicNoDepth, nullptr,
-                                            &overlayBasicNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciBasicNoDepth, &overlayBasicNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayBasicNoDepth)");
 
             // Alpha-blended fill variant. Standard "non-premultiplied" alpha:
@@ -14548,13 +14539,11 @@ namespace threepp {
             cbBlend.pAttachments    = &cbasBlend;
             VkGraphicsPipelineCreateInfo gpciBasicTr = gpciBasic;
             gpciBasicTr.pColorBlendState = &cbBlend;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicTr, nullptr,
-                                            &overlayBasicTransparentPipeline),
+            check(ctx->createGraphicsPipeline(gpciBasicTr, &overlayBasicTransparentPipeline),
                   "vkCreateGraphicsPipelines(overlayBasicTransparent)");
             VkGraphicsPipelineCreateInfo gpciBasicTrNoDepth = gpciBasicTr;
             gpciBasicTrNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciBasicTrNoDepth, nullptr,
-                                            &overlayBasicTransparentNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciBasicTrNoDepth, &overlayBasicTransparentNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayBasicTransparentNoDepth)");
 
             // Line / LineSegments pipelines. Same overlay shaders, same
@@ -14574,13 +14563,11 @@ namespace threepp {
             gpciLineList.pInputAssemblyState = &iaLineList;
             gpciLineList.pRasterizationState = &rsLine;
             gpciLineList.pColorBlendState = &cbBlend;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineList, nullptr,
-                                            &overlayLineListPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineList, &overlayLineListPipeline),
                   "vkCreateGraphicsPipelines(overlayLineList)");
             VkGraphicsPipelineCreateInfo gpciLineListNoDepth = gpciLineList;
             gpciLineListNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListNoDepth, nullptr,
-                                            &overlayLineListNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineListNoDepth, &overlayLineListNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayLineListNoDepth)");
 
             VkPipelineInputAssemblyStateCreateInfo iaLineStrip{};
@@ -14590,13 +14577,11 @@ namespace threepp {
             gpciLineStrip.pInputAssemblyState = &iaLineStrip;
             gpciLineStrip.pRasterizationState = &rsLine;
             gpciLineStrip.pColorBlendState = &cbBlend;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStrip, nullptr,
-                                            &overlayLineStripPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineStrip, &overlayLineStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStrip)");
             VkGraphicsPipelineCreateInfo gpciLineStripNoDepth = gpciLineStrip;
             gpciLineStripNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripNoDepth, nullptr,
-                                            &overlayLineStripNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineStripNoDepth, &overlayLineStripNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStripNoDepth)");
 
             VkShaderModuleCreateInfo dvsmci{};
@@ -14637,24 +14622,20 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciDashedList = gpciLineList;
             gpciDashedList.pStages = dashedStages;
             gpciDashedList.pVertexInputState = &dashedVi;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedList, nullptr,
-                                            &overlayLineDashedListPipeline),
+            check(ctx->createGraphicsPipeline(gpciDashedList, &overlayLineDashedListPipeline),
                   "vkCreateGraphicsPipelines(overlayLineDashedList)");
             VkGraphicsPipelineCreateInfo gpciDashedListNoDepth = gpciDashedList;
             gpciDashedListNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedListNoDepth, nullptr,
-                                            &overlayLineDashedListNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciDashedListNoDepth, &overlayLineDashedListNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayLineDashedListNoDepth)");
             VkGraphicsPipelineCreateInfo gpciDashedStrip = gpciLineStrip;
             gpciDashedStrip.pStages = dashedStages;
             gpciDashedStrip.pVertexInputState = &dashedVi;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedStrip, nullptr,
-                                            &overlayLineDashedStripPipeline),
+            check(ctx->createGraphicsPipeline(gpciDashedStrip, &overlayLineDashedStripPipeline),
                   "vkCreateGraphicsPipelines(overlayLineDashedStrip)");
             VkGraphicsPipelineCreateInfo gpciDashedStripNoDepth = gpciDashedStrip;
             gpciDashedStripNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciDashedStripNoDepth, nullptr,
-                                            &overlayLineDashedStripNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciDashedStripNoDepth, &overlayLineDashedStripNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayLineDashedStripNoDepth)");
 
             // ── Colored line pipelines ──────────────────────────────────────
@@ -14713,26 +14694,22 @@ namespace threepp {
             gpciLineListColored.stageCount        = 2;
             gpciLineListColored.pStages           = cStages;
             gpciLineListColored.pVertexInputState = &cvi;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListColored, nullptr,
-                                            &overlayLineListColoredPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineListColored, &overlayLineListColoredPipeline),
                   "vkCreateGraphicsPipelines(overlayLineListColored)");
             VkGraphicsPipelineCreateInfo gpciLineListColoredNoDepth = gpciLineListColored;
             gpciLineListColoredNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineListColoredNoDepth, nullptr,
-                                            &overlayLineListColoredNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineListColoredNoDepth, &overlayLineListColoredNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayLineListColoredNoDepth)");
 
             VkGraphicsPipelineCreateInfo gpciLineStripColored = gpciLineStrip;
             gpciLineStripColored.stageCount        = 2;
             gpciLineStripColored.pStages           = cStages;
             gpciLineStripColored.pVertexInputState = &cvi;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripColored, nullptr,
-                                            &overlayLineStripColoredPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineStripColored, &overlayLineStripColoredPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStripColored)");
             VkGraphicsPipelineCreateInfo gpciLineStripColoredNoDepth = gpciLineStripColored;
             gpciLineStripColoredNoDepth.pDepthStencilState = &dsNoDepth;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciLineStripColoredNoDepth, nullptr,
-                                            &overlayLineStripColoredNoDepthPipeline),
+            check(ctx->createGraphicsPipeline(gpciLineStripColoredNoDepth, &overlayLineStripColoredNoDepthPipeline),
                   "vkCreateGraphicsPipelines(overlayLineStripColoredNoDepth)");
 
             // ── Point list pipeline ─────────────────────────────────────────
@@ -14775,8 +14752,7 @@ namespace threepp {
             gpciPointList.pStages           = pStages;
             gpciPointList.pVertexInputState = &cvi;
             gpciPointList.pInputAssemblyState = &iaPointList;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciPointList, nullptr,
-                                            &overlayPointListPipeline),
+            check(ctx->createGraphicsPipeline(gpciPointList, &overlayPointListPipeline),
                   "vkCreateGraphicsPipelines(overlayPointList)");
 
             VkDescriptorSetLayoutBinding pointBindings[2]{};
@@ -14834,9 +14810,7 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciPointTextured = gpciPointList;
             gpciPointTextured.pStages = ptStages;
             gpciPointTextured.layout  = overlayPointPipelineLayout_;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1,
-                                            &gpciPointTextured, nullptr,
-                                            &overlayPointListTexturedPipeline),
+            check(ctx->createGraphicsPipeline(gpciPointTextured, &overlayPointListTexturedPipeline),
                   "vkCreateGraphicsPipelines(overlayPointTextured)");
 
             vkDestroyShaderModule(ctx->device(), vertModule, nullptr);
@@ -14962,8 +14936,7 @@ namespace threepp {
                 dgpci.pColorBlendState    = &dcb;
                 dgpci.pDynamicState       = &ddyn;
                 dgpci.layout              = rasterPipelineLayout;
-                check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &dgpci, nullptr,
-                                                &overlayDepthPrepassPipeline),
+                check(ctx->createGraphicsPipeline(dgpci, &overlayDepthPrepassPipeline),
                       "vkCreateGraphicsPipelines(overlayDepthPrepass)");
 
                 vkDestroyShaderModule(ctx->device(), dvert, nullptr);
@@ -15134,8 +15107,7 @@ namespace threepp {
             gpci.pColorBlendState    = &cbAlpha;
             gpci.pDynamicState       = &dyn;
             gpci.layout              = particlePipelineLayout_;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
-                                            &particlePipelineNormal_),
+            check(ctx->createGraphicsPipeline(gpci, &particlePipelineNormal_),
                   "vkCreateGraphicsPipelines(particleNormal)");
 
             // ── Additive variant: src·srcAlpha + dst, depth-test OFF ───────────
@@ -15152,8 +15124,7 @@ namespace threepp {
             VkGraphicsPipelineCreateInfo gpciAdd = gpci;
             gpciAdd.pDepthStencilState = &dsAdd;
             gpciAdd.pColorBlendState   = &cbAdd;
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpciAdd, nullptr,
-                                            &particlePipelineAdditive_),
+            check(ctx->createGraphicsPipeline(gpciAdd, &particlePipelineAdditive_),
                   "vkCreateGraphicsPipelines(particleAdditive)");
 
             vkDestroyShaderModule(ctx->device(), vert, nullptr);
@@ -15307,8 +15278,7 @@ namespace threepp {
             gpci.pColorBlendState    = &cb;
             gpci.pDynamicState       = &dyn;
             gpci.layout              = particlePipelineLayout_;// 128B SpritePC + set-0 sampler
-            check(vkCreateGraphicsPipelines(ctx->device(), ctx->pipelineCache(), 1, &gpci, nullptr,
-                                            &spriteWorldPipeline_),
+            check(ctx->createGraphicsPipeline(gpci, &spriteWorldPipeline_),
                   "vkCreateGraphicsPipelines(spriteWorld)");
 
             vkDestroyShaderModule(ctx->device(), vert, nullptr);
@@ -17653,9 +17623,7 @@ namespace threepp {
             const uint32_t idx = rtVariantIndex(useSer, restirDISpec);
             {
                 THREEPP_VK_TRACE_SCOPE("buildSingleRtVariant.vkCreateRayTracingPipelinesKHR");
-                check(ctx->rt().createRayTracingPipelines(
-                              ctx->device(), VK_NULL_HANDLE, ctx->pipelineCache(),
-                              1, &rci, nullptr, &rtVariants_[idx].pipeline),
+                check(ctx->createRayTracingPipeline(rci, &rtVariants_[idx].pipeline),
                       "vkCreateRayTracingPipelinesKHR (single)");
             }
             {
@@ -20566,7 +20534,7 @@ namespace threepp {
             cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
             cpci.stage  = ssci;
             cpci.layout = eventShadePipelineLayout_;
-            check(vkCreateComputePipelines(ctx->device(), ctx->pipelineCache(), 1, &cpci, nullptr, &eventShadePipeline_),
+            check(ctx->createComputePipeline(cpci, &eventShadePipeline_),
                   "vkCreateComputePipelines(event_shade)");
             vkDestroyShaderModule(ctx->device(), mod, nullptr);
 

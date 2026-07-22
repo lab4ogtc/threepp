@@ -87,9 +87,7 @@ namespace threepp::vulkan {
         rci.maxPipelineRayRecursionDepth = 1; // loop in raygen, no nested traces
         rci.layout = sharedLayout_;           // shared with main RT pipeline
 
-        check(ctx_.rt().createRayTracingPipelines(
-                      ctx_.device(), VK_NULL_HANDLE, VK_NULL_HANDLE,
-                      1, &rci, nullptr, &emitPipeline_),
+        check(ctx_.createRayTracingPipeline(rci, &emitPipeline_),
               "vkCreateRayTracingPipelinesKHR(photon)");
 
         vkDestroyShaderModule(ctx_.device(), rgenMod, nullptr);

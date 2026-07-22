@@ -347,7 +347,7 @@ int main(int argc, char** argv) {
             const auto path = fs::path(PROJECT_FOLDER) / "aaa_caps" / shotPath;
             renderer.writeFramebuffer(path);
             std::cout << "wrote " << path.string() << std::endl;
-            std::exit(0);
+            canvas.close();
         }
     });
 

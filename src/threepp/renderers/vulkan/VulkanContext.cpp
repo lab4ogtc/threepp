@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -73,6 +75,47 @@ namespace threepp::vulkan {
             }
         }
 
+        enum class PipelineCreationOutcome {
+            optimizedCacheHit,
+            fastFallback,
+            prewarmOptimized,
+        };
+
+        template<class CreateInfo, class Create>
+        VkResult createPipelineWithPolicy(CreateInfo info,
+                                          bool prewarm,
+                                          bool cacheControlSupported,
+                                          VkPipeline* pipeline,
+                                          PipelineCreationOutcome& outcome,
+                                          Create&& create) {
+            constexpr VkPipelineCreateFlags policyFlags =
+                    VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT |
+                    VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            info.flags &= ~policyFlags;
+
+            if (prewarm) {
+                const auto result = create(info, pipeline);
+                if (result == VK_SUCCESS) outcome = PipelineCreationOutcome::prewarmOptimized;
+                return result;
+            }
+
+            if (cacheControlSupported) {
+                auto cached = info;
+                cached.flags |= VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT;
+                const auto result = create(cached, pipeline);
+                if (result == VK_SUCCESS) {
+                    outcome = PipelineCreationOutcome::optimizedCacheHit;
+                    return result;
+                }
+                if (result != VK_PIPELINE_COMPILE_REQUIRED) return result;
+            }
+
+            info.flags |= VK_PIPELINE_CREATE_DISABLE_OPTIMIZATION_BIT;
+            const auto result = create(info, pipeline);
+            if (result == VK_SUCCESS) outcome = PipelineCreationOutcome::fastFallback;
+            return result;
+        }
+
     }// namespace
 
     VulkanContext::VulkanContext(GLFWwindow* window, bool enableRayTracing, bool vsync)
@@ -88,6 +131,8 @@ namespace threepp::vulkan {
         const bool enableValidation = false;
 #endif
         rayTracingEnabled_ = enableRayTracing;
+        const auto* pipelineMode = std::getenv("THREEPP_VULKAN_PIPELINE_MODE");
+        prewarmPipelines_ = pipelineMode && std::strcmp(pipelineMode, "prewarm") == 0;
 
         createInstance(enableValidation);
         if (enableValidation) createDebugMessenger();
@@ -102,6 +147,10 @@ namespace threepp::vulkan {
 
     VulkanContext::~VulkanContext() {
         if (device_ != VK_NULL_HANDLE) vkDeviceWaitIdle(device_);
+
+        std::cerr << "[VulkanContext] pipeline creation: optimized-cache-hit="
+                  << optimizedCacheHits_ << ", fast-fallback=" << fastFallbacks_
+                  << ", prewarm-optimized=" << prewarmOptimized_ << "\n";
 
         destroySwapchainResources();
 
@@ -185,8 +234,22 @@ namespace threepp::vulkan {
         if (vkGetPipelineCacheData(device_, pipelineCache_, &sz, nullptr) != VK_SUCCESS || sz == 0) return;
         std::vector<char> data(sz);
         if (vkGetPipelineCacheData(device_, pipelineCache_, &sz, data.data()) != VK_SUCCESS) return;
+        data.resize(sz);
         const auto path = pipelineCachePath();
         if (path.empty()) return;
+
+        std::error_code ec;
+        if (std::filesystem::file_size(path, ec) == data.size()) {
+            std::ifstream existing(path, std::ios::binary);
+            if (existing && std::equal(std::istreambuf_iterator<char>(existing),
+                                       std::istreambuf_iterator<char>(),
+                                       data.begin(), data.end())) {
+                std::cout << "[VulkanContext] pipeline cache: unchanged "
+                          << path.string() << std::endl;
+                return;
+            }
+        }
+
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
         if (f) {
             f.write(data.data(), static_cast<std::streamsize>(sz));
@@ -291,6 +354,18 @@ namespace threepp::vulkan {
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(physicalDevice_, &props);
         std::cerr << "[VulkanContext] picked GPU: " << props.deviceName << "\n";
+
+        VkPhysicalDeviceVulkan13Features f13{};
+        f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &f13;
+        vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
+        pipelineCreationCacheControlSupported_ =
+                f13.pipelineCreationCacheControl == VK_TRUE;
+        std::cerr << "[VulkanContext] pipeline creation cache control: "
+                  << (pipelineCreationCacheControlSupported_ ? "enabled" : "unavailable")
+                  << ", mode=" << (prewarmPipelines_ ? "prewarm" : "interactive") << "\n";
 
         if (rayTracingEnabled_) {
             rtPipelineProperties_.sType =
@@ -422,6 +497,8 @@ namespace threepp::vulkan {
         f13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
         f13.dynamicRendering = VK_TRUE;
         f13.synchronization2 = VK_TRUE;
+        f13.pipelineCreationCacheControl =
+                pipelineCreationCacheControlSupported_ ? VK_TRUE : VK_FALSE;
         // Shaders are compiled with glslangValidator --target-env vulkan1.3,
         // which lowers `discard` (e.g. overlay_point.frag's round-point cutout)
         // to OpDemoteToHelperInvocation rather than OpKill. That op needs the
@@ -548,6 +625,58 @@ namespace threepp::vulkan {
             load("vkGetRayTracingShaderGroupHandlesKHR", reinterpret_cast<void**>(&rt_.getRayTracingShaderGroupHandles));
             load("vkCmdTraceRaysKHR",                    reinterpret_cast<void**>(&rt_.cmdTraceRays));
         }
+    }
+
+    VkResult VulkanContext::createGraphicsPipeline(const VkGraphicsPipelineCreateInfo& info,
+                                                   VkPipeline* pipeline) {
+        PipelineCreationOutcome outcome{};
+        const auto result = createPipelineWithPolicy(
+                info, prewarmPipelines_, pipelineCreationCacheControlSupported_, pipeline, outcome,
+                [this](const auto& createInfo, VkPipeline* output) {
+                    return vkCreateGraphicsPipelines(
+                            device_, pipelineCache_, 1, &createInfo, nullptr, output);
+                });
+        if (result == VK_SUCCESS) {
+            if (outcome == PipelineCreationOutcome::optimizedCacheHit) ++optimizedCacheHits_;
+            else if (outcome == PipelineCreationOutcome::fastFallback) ++fastFallbacks_;
+            else ++prewarmOptimized_;
+        }
+        return result;
+    }
+
+    VkResult VulkanContext::createComputePipeline(const VkComputePipelineCreateInfo& info,
+                                                  VkPipeline* pipeline) {
+        PipelineCreationOutcome outcome{};
+        const auto result = createPipelineWithPolicy(
+                info, prewarmPipelines_, pipelineCreationCacheControlSupported_, pipeline, outcome,
+                [this](const auto& createInfo, VkPipeline* output) {
+                    return vkCreateComputePipelines(
+                            device_, pipelineCache_, 1, &createInfo, nullptr, output);
+                });
+        if (result == VK_SUCCESS) {
+            if (outcome == PipelineCreationOutcome::optimizedCacheHit) ++optimizedCacheHits_;
+            else if (outcome == PipelineCreationOutcome::fastFallback) ++fastFallbacks_;
+            else ++prewarmOptimized_;
+        }
+        return result;
+    }
+
+    VkResult VulkanContext::createRayTracingPipeline(
+            const VkRayTracingPipelineCreateInfoKHR& info,
+            VkPipeline* pipeline) {
+        PipelineCreationOutcome outcome{};
+        const auto result = createPipelineWithPolicy(
+                info, prewarmPipelines_, pipelineCreationCacheControlSupported_, pipeline, outcome,
+                [this](const auto& createInfo, VkPipeline* output) {
+                    return rt_.createRayTracingPipelines(
+                            device_, VK_NULL_HANDLE, pipelineCache_, 1, &createInfo, nullptr, output);
+                });
+        if (result == VK_SUCCESS) {
+            if (outcome == PipelineCreationOutcome::optimizedCacheHit) ++optimizedCacheHits_;
+            else if (outcome == PipelineCreationOutcome::fastFallback) ++fastFallbacks_;
+            else ++prewarmOptimized_;
+        }
+        return result;
     }
 
     namespace {

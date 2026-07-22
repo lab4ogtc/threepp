@@ -2707,7 +2707,8 @@ int main(int argc, char** argv) {
             const auto path = std::filesystem::path(PROJECT_FOLDER) / "aaa_caps" / shotPath;
             renderer.writeFramebuffer(path);// creates parent dirs; throws on failure
             std::printf("wrote %s\n", path.string().c_str());
-            std::exit(0);
+            canvas.close();
+            return;
         }
 
         // ── LIDAR scan + visualisation update ─────────────────────────────

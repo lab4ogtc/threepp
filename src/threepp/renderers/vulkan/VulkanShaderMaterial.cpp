@@ -1,5 +1,7 @@
 #include "threepp/renderers/vulkan/VulkanShaderMaterial.hpp"
 
+#include "VulkanContext.hpp"
+
 #include "threepp/renderers/wgpu/WgpuShaderTranslator.hpp"
 
 #include <algorithm>
@@ -453,7 +455,8 @@ namespace {
             VkFormat dynamicDepthFormat,
             std::uint32_t dynamicColorAttachmentCount,
             VkSampleCountFlagBits sampleCount,
-            VkPipelineCache pipelineCache) {
+            VkPipelineCache pipelineCache,
+            threepp::vulkan::VulkanContext* context = nullptr) {
         if (!compiled.success() || compiled.vertexEntryPoint.empty() || compiled.fragmentEntryPoint.empty()) {
             throw std::runtime_error("Vulkan ShaderMaterial graphics pipeline requires compiled vertex and fragment SPIR-V");
         }
@@ -554,7 +557,11 @@ namespace {
         }
 
         VkPipeline pipeline = VK_NULL_HANDLE;
-        if (vkCreateGraphicsPipelines(device, pipelineCache, 1, &info, nullptr, &pipeline) != VK_SUCCESS) {
+        const auto result = context
+                                    ? context->createGraphicsPipeline(info, &pipeline)
+                                    : vkCreateGraphicsPipelines(
+                                              device, pipelineCache, 1, &info, nullptr, &pipeline);
+        if (result != VK_SUCCESS) {
             vkDestroyShaderModule(device, vertexModule.module, nullptr);
             vertexModule.module = VK_NULL_HANDLE;
             vkDestroyShaderModule(device, fragmentModule.module, nullptr);
@@ -801,6 +808,27 @@ namespace threepp::vulkan {
                 colorAttachmentCount,
                 sampleCount,
                 pipelineCache);
+    }
+
+    VkPipeline createVulkanShaderMaterialDynamicGraphicsPipeline(
+            VulkanContext& context,
+            const VulkanCompiledShaderMaterial& compiled,
+            VkPipelineLayout pipelineLayout,
+            VkFormat colorFormat,
+            VkFormat depthFormat,
+            std::uint32_t colorAttachmentCount,
+            VkSampleCountFlagBits sampleCount) {
+        return createShaderMaterialGraphicsPipeline(
+                context.device(),
+                compiled,
+                pipelineLayout,
+                VK_NULL_HANDLE,
+                colorFormat,
+                depthFormat,
+                colorAttachmentCount,
+                sampleCount,
+                context.pipelineCache(),
+                &context);
     }
 
     void recordVulkanShaderMaterialDraw(

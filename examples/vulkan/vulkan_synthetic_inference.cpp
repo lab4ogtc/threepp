@@ -272,7 +272,7 @@ int main(int argc, char** argv) {
             renderer.writeFramebuffer(shotPath);
             std::printf("wrote %s (avg detect %.1f ms over %d runs)\n",
                         shotPath.c_str(), inferMsAvg / float(inferCount), inferCount);
-            std::exit(0);
+            canvas.close();
         }
         ++frame;
     });

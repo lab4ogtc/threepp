@@ -194,7 +194,7 @@ static int runDetection(Canvas& canvas, VulkanRenderer& renderer, rfdetr::RfDetr
         if (!shotPath.empty() && ++shotFrame >= 5) {
             renderer.writeFramebuffer(shotPath);
             std::cout << "wrote " << shotPath << "\n";
-            std::exit(0);
+            canvas.close();
         }
     });
     return 0;

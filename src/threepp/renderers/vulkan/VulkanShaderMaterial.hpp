@@ -14,6 +14,8 @@
 
 namespace threepp::vulkan {
 
+    class VulkanContext;
+
     struct VulkanShaderMaterialKey {
         ShaderLanguage language = ShaderLanguage::GLSL;
         std::size_t hash = 0;
@@ -176,6 +178,15 @@ namespace threepp::vulkan {
             VkPipelineCache pipelineCache = VK_NULL_HANDLE,
             std::uint32_t colorAttachmentCount = 1,
             VkSampleCountFlagBits sampleCount = VK_SAMPLE_COUNT_1_BIT);
+
+    VkPipeline createVulkanShaderMaterialDynamicGraphicsPipeline(
+            VulkanContext& context,
+            const VulkanCompiledShaderMaterial& compiled,
+            VkPipelineLayout pipelineLayout,
+            VkFormat colorFormat,
+            VkFormat depthFormat,
+            std::uint32_t colorAttachmentCount,
+            VkSampleCountFlagBits sampleCount);
 
     /**
      * 录制 ShaderMaterial draw 所需的最小 Vulkan 命令。

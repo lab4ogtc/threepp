@@ -391,14 +391,12 @@ void OverlayPass::createOrthoLinePipelines() {
     gpci.pColorBlendState    = &cb;
     gpci.pDynamicState       = &dyn;
     gpci.layout              = orthoLinePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &orthoLineListPipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &orthoLineListPipeline_),
           "vkCreateGraphicsPipelines(orthoLineList)");
 
     VkGraphicsPipelineCreateInfo gpciStrip = gpci;
     gpciStrip.pInputAssemblyState = &iaStrip;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciStrip, nullptr,
-                                    &orthoLineStripPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciStrip, &orthoLineStripPipeline_),
           "vkCreateGraphicsPipelines(orthoLineStrip)");
 
     VkShaderModuleCreateInfo dvsmci{};
@@ -438,13 +436,11 @@ void OverlayPass::createOrthoLinePipelines() {
     VkGraphicsPipelineCreateInfo gpciDashedList = gpci;
     gpciDashedList.pStages = dashedStages;
     gpciDashedList.pVertexInputState = &dashedVi;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciDashedList, nullptr,
-                                    &orthoLineDashedListPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciDashedList, &orthoLineDashedListPipeline_),
           "vkCreateGraphicsPipelines(orthoLineDashedList)");
     VkGraphicsPipelineCreateInfo gpciDashedStrip = gpciDashedList;
     gpciDashedStrip.pInputAssemblyState = &iaStrip;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciDashedStrip, nullptr,
-                                    &orthoLineDashedStripPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciDashedStrip, &orthoLineDashedStripPipeline_),
           "vkCreateGraphicsPipelines(orthoLineDashedStrip)");
 
     VkShaderModuleCreateInfo cvsmci{};
@@ -484,13 +480,11 @@ void OverlayPass::createOrthoLinePipelines() {
     VkGraphicsPipelineCreateInfo gpciColorList = gpci;
     gpciColorList.pStages = colorStages;
     gpciColorList.pVertexInputState = &colorVi;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciColorList, nullptr,
-                                    &orthoLineColoredListPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciColorList, &orthoLineColoredListPipeline_),
           "vkCreateGraphicsPipelines(orthoLineColoredList)");
     VkGraphicsPipelineCreateInfo gpciColorStrip = gpciColorList;
     gpciColorStrip.pInputAssemblyState = &iaStrip;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciColorStrip, nullptr,
-                                    &orthoLineColoredStripPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciColorStrip, &orthoLineColoredStripPipeline_),
           "vkCreateGraphicsPipelines(orthoLineColoredStrip)");
 
     // Identical state to the line pipelines (position-only input,
@@ -504,15 +498,13 @@ void OverlayPass::createOrthoLinePipelines() {
     VkPipelineDepthStencilStateCreateInfo meshDs = ds;
     meshDs.depthWriteEnable = VK_TRUE;
     gpciMesh.pDepthStencilState = &meshDs;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMesh, nullptr,
-                                    &orthoMeshPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciMesh, &orthoMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoMesh)");
 
     VkGraphicsPipelineCreateInfo gpciMeshColored = gpciMesh;
     gpciMeshColored.pStages = colorStages;
     gpciMeshColored.pVertexInputState = &colorVi;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshColored, nullptr,
-                                    &orthoMeshColoredPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciMeshColored, &orthoMeshColoredPipeline_),
           "vkCreateGraphicsPipelines(orthoMeshColored)");
 
     VkShaderModuleCreateInfo ivsmci{};
@@ -554,8 +546,7 @@ void OverlayPass::createOrthoLinePipelines() {
     VkGraphicsPipelineCreateInfo gpciMeshInstanced = gpciMesh;
     gpciMeshInstanced.pStages = instancedStages;
     gpciMeshInstanced.pVertexInputState = &instancedVi;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshInstanced, nullptr,
-                                    &orthoMeshInstancedPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciMeshInstanced, &orthoMeshInstancedPipeline_),
           "vkCreateGraphicsPipelines(orthoMeshInstanced)");
 
     VkPipelineColorBlendAttachmentState cbasT = cbas;
@@ -571,8 +562,7 @@ void OverlayPass::createOrthoLinePipelines() {
     VkGraphicsPipelineCreateInfo gpciMeshT = gpciMesh;
     gpciMeshT.pColorBlendState = &cbT;
     gpciMeshT.pDepthStencilState = &ds;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshT, nullptr,
-                                    &orthoMeshTransparentPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciMeshT, &orthoMeshTransparentPipeline_),
           "vkCreateGraphicsPipelines(orthoMeshTransparent)");
 
     vkDestroyShaderModule(ctx_.device(), vertModule, nullptr);
@@ -692,8 +682,7 @@ void OverlayPass::createOrthoPointPipeline() {
     gpci.pColorBlendState    = &cb;
     gpci.pDynamicState       = &dyn;
     gpci.layout              = orthoLinePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &orthoPointListPipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &orthoPointListPipeline_),
           "vkCreateGraphicsPipelines(orthoPointList)");
 
     vkDestroyShaderModule(ctx_.device(), vertModule, nullptr);
@@ -862,8 +851,7 @@ void OverlayPass::createSpriteOverlayPipeline() {
     gpci.pColorBlendState    = &cb;
     gpci.pDynamicState       = &dyn;
     gpci.layout              = spritePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &overlaySpritePipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &overlaySpritePipeline_),
           "vkCreateGraphicsPipelines(overlaySprite)");
 
     vkDestroyShaderModule(ctx_.device(), vert, nullptr);
@@ -995,12 +983,10 @@ void OverlayPass::createTexturedMeshPipeline() {
     gpci.pColorBlendState = &cb;
     gpci.pDynamicState = &dyn;
     gpci.layout = spritePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &orthoTexturedMeshPipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &orthoTexturedMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoTexturedMesh)");
     stages[1].module = depthFrag;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &orthoDepthTextureMeshPipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &orthoDepthTextureMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoDepthTextureMesh)");
 
     vkDestroyShaderModule(ctx_.device(), vert, nullptr);

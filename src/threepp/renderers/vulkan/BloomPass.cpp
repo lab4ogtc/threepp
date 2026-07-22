@@ -137,9 +137,10 @@ namespace threepp::vulkan {
             img = createStorageSampledImage(halfW_, halfH_, "vmaCreateImage(bloom.B)");
     }
 
-    static VkPipeline makeComputePipe(VkDevice d, VkPipelineCache cache, VkPipelineLayout layout,
+    static VkPipeline makeComputePipe(VulkanContext& ctx, VkPipelineLayout layout,
                                       const uint32_t* spv, size_t spvBytes,
                                       const char* label) {
+        const auto d = ctx.device();
         VkShaderModuleCreateInfo smci{};
         smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         smci.codeSize = spvBytes;
@@ -158,7 +159,7 @@ namespace threepp::vulkan {
         cpci.stage  = stage;
         cpci.layout = layout;
         VkPipeline pipe = VK_NULL_HANDLE;
-        check(vkCreateComputePipelines(d, cache, 1, &cpci, nullptr, &pipe), label);
+        check(ctx.createComputePipeline(cpci, &pipe), label);
         vkDestroyShaderModule(d, mod, nullptr);
         return pipe;
     }
@@ -244,11 +245,11 @@ namespace threepp::vulkan {
                   "vkCreatePipelineLayout(composite)");
         }
 
-        downPipe_ = makeComputePipe(d, ctx_.pipelineCache(), bloomPipeLayout_, kBloomDownCompSpv,
+        downPipe_ = makeComputePipe(ctx_, bloomPipeLayout_, kBloomDownCompSpv,
                                     sizeof(kBloomDownCompSpv), "vkCreateComputePipelines(bloom_down)");
-        blurPipe_ = makeComputePipe(d, ctx_.pipelineCache(), bloomPipeLayout_, kBloomBlurCompSpv,
+        blurPipe_ = makeComputePipe(ctx_, bloomPipeLayout_, kBloomBlurCompSpv,
                                     sizeof(kBloomBlurCompSpv), "vkCreateComputePipelines(bloom_blur)");
-        compPipe_ = makeComputePipe(d, ctx_.pipelineCache(), compPipeLayout_, kCompositeCompSpv,
+        compPipe_ = makeComputePipe(ctx_, compPipeLayout_, kCompositeCompSpv,
                                     sizeof(kCompositeCompSpv), "vkCreateComputePipelines(composite)");
     }
 
