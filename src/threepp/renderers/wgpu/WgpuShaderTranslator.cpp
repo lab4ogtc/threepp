@@ -169,6 +169,24 @@ namespace threepp::wgpu {
         out << "layout(std140, set=0, binding=1) uniform LightPlaceholder {\n"
                "    vec4 _lightPad;\n"
                "};\n\n";
+        if (!isVertex && expandedGlsl.find("#if defined( TONE_MAPPING )") != std::string::npos) {
+            auto toneMappingPars = shaders::ShaderChunk::instance().get("tonemapping_pars_fragment");
+            toneMappingPars = std::regex_replace(
+                    toneMappingPars,
+                    std::regex(R"(\buniform\s+float\s+toneMappingExposure\s*;)"),
+                    "#define toneMappingExposure _lightPad.x");
+            out << "#define TONE_MAPPING\n"
+                << toneMappingPars
+                << "\nvec3 toneMapping(vec3 color) {\n"
+                   "    int mode = int(_lightPad.y + 0.5);\n"
+                   "    if (mode == 1) return LinearToneMapping(color);\n"
+                   "    if (mode == 2) return ReinhardToneMapping(color);\n"
+                   "    if (mode == 3) return OptimizedCineonToneMapping(color);\n"
+                   "    if (mode == 4) return ACESFilmicToneMapping(color);\n"
+                   "    if (mode == 6) return NeutralToneMapping(color);\n"
+                   "    return color;\n"
+                   "}\n\n";
+        }
 
         // --- Custom uniforms UBO at binding 2 ---
         // Use the pre-built unified field list so both vertex and fragment stages

@@ -133,9 +133,24 @@ namespace {
     std::vector<std::string> orderedUniformNames(const ShaderMaterial& material) {
         std::vector<std::string> names;
         std::unordered_set<std::string> seen;
+        std::unordered_set<std::string> directlyDeclared;
+        const bool filterDirectlyDeclared =
+                material.shaderLanguage == ShaderLanguage::GLSL && material.uniformLayout.empty();
+        if (filterDirectlyDeclared) {
+            static const std::regex declaration(
+                    R"(\buniform\s+(?:(?:lowp|mediump|highp)\s+)?(?:float|vec[234]|mat[234]|int|bool|ivec[234])\s+(\w+)\s*;)");
+            const auto collect = [&](const std::string& shader) {
+                for (std::sregex_iterator it(shader.begin(), shader.end(), declaration), end; it != end; ++it) {
+                    directlyDeclared.insert((*it)[1].str());
+                }
+            };
+            collect(material.vertexShader);
+            collect(material.fragmentShader);
+        }
 
         const auto appendIfPackable = [&](const std::string& name) {
             if (!seen.insert(name).second) return;
+            if (filterDirectlyDeclared && !directlyDeclared.contains(name)) return;
             const auto* value = findUniformValue(material, name);
             if (!value || isTextureUniformValue(*value)) return;
             names.push_back(name);
@@ -501,7 +516,7 @@ namespace {
         rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
         rs.polygonMode = VK_POLYGON_MODE_FILL;
         rs.cullMode = cullModeForSide(compiled.side);
-        rs.frontFace = VK_FRONT_FACE_CLOCKWISE;
+        rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
         rs.lineWidth = 1.f;
 
         VkPipelineMultisampleStateCreateInfo ms{};

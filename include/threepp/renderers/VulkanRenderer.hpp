@@ -71,6 +71,7 @@ namespace threepp {
         [[nodiscard]] std::vector<unsigned char> readRGBPixels() override;
         void copyFramebufferToTexture(const Vector2& position, Texture& texture, int level = 0) override;
         void copyTextureToImage(Texture& texture) override;
+        [[nodiscard]] bool renderTargetFlipY() const override { return true; }
         std::future<void> copyTextureToImageAsync(Texture& texture) override;
         void copyTexturesToImages(const std::vector<Texture*>& textures) override;
         std::future<void> copyTexturesToImagesAsync(const std::vector<Texture*>& textures) override;

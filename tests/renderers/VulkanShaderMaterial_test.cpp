@@ -364,6 +364,7 @@ void main() {
 uniform float alpha;
 void main() {
     gl_FragColor = vec4(alpha, 0.0, 0.0, 1.0);
+    #include <tonemapping_fragment>
 }
 )";
     material->uniforms["alpha"] = Uniform(0.75f);
@@ -375,6 +376,33 @@ void main() {
     CHECK(compiled.fragmentSpirv.front() == 0x07230203u);
     CHECK(compiled.vertexEntryPoint == "main");
     CHECK(compiled.fragmentEntryPoint == "main");
+}
+
+TEST_CASE("Vulkan ShaderMaterial layout ignores GLSL uniforms absent from the source") {
+    auto material = RawShaderMaterial::create();
+    material->shaderLanguage = ShaderLanguage::GLSL;
+    material->vertexShader = R"(
+uniform mat4 textureMatrix;
+void main() {
+    gl_Position = textureMatrix * vec4(position, 1.0);
+}
+)";
+    material->fragmentShader = R"(
+uniform float alpha;
+void main() {
+    gl_FragColor = vec4(alpha);
+}
+)";
+    material->uniforms["unusedLibraryUniform"] = Uniform(Vector3{});
+    material->uniforms["textureMatrix"] = Uniform(Matrix4{});
+    material->uniforms["alpha"] = Uniform(0.75f);
+
+    const auto layout = vulkan::makeVulkanShaderMaterialLayout(*material);
+
+    REQUIRE(layout.uniforms.size() == 2);
+    CHECK(layout.uniforms[0].name == "alpha");
+    CHECK(layout.uniforms[1].name == "textureMatrix");
+    CHECK(layout.customUniformSize == 80);
 }
 
 TEST_CASE("Vulkan ShaderMaterial compiler treats GLSL instancing as a separate variant") {
@@ -472,6 +500,7 @@ TEST_CASE("Vulkan ShaderMaterial layout plans descriptor bindings and packs expl
 
 TEST_CASE("Vulkan ShaderMaterial layout lowers to Vulkan descriptor and vertex input state") {
     auto material = RawShaderMaterial::create();
+    material->uniformLayout = {"roughness"};
     material->uniforms["roughness"] = Uniform(0.5f);
     auto albedo = Texture::create();
     material->uniforms["albedo"] = Uniform(albedo.get());
@@ -906,6 +935,7 @@ TEST_CASE("Vulkan ShaderMaterial updates image and sampler descriptors on a real
 
 TEST_CASE("Vulkan ShaderMaterial layout builds descriptor writes") {
     auto material = RawShaderMaterial::create();
+    material->uniformLayout = {"roughness"};
     material->uniforms["roughness"] = Uniform(0.5f);
     auto albedo = Texture::create();
     material->uniforms["albedo"] = Uniform(albedo.get());

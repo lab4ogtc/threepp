@@ -243,6 +243,29 @@ int main() {
         auto mrtMsaaQuad = Mesh::create(PlaneGeometry::create(), mrtMsaaMaterial);
         mrtMsaaQuad->scale.set(2, 2, 1);
         mrtMsaaScene.add(mrtMsaaQuad);
+        Scene scaledCustomShaderScene;
+        auto scaledCustomShaderMaterial = RawShaderMaterial::create();
+        scaledCustomShaderMaterial->shaderLanguage = ShaderLanguage::GLSL;
+        scaledCustomShaderMaterial->side = Side::Double;
+        scaledCustomShaderMaterial->depthTest = false;
+        scaledCustomShaderMaterial->depthWrite = false;
+        scaledCustomShaderMaterial->toneMapped = false;
+        scaledCustomShaderMaterial->vertexShader = R"(
+                #version 330 core
+                #define attribute in
+                attribute vec3 position;
+                void main() {
+                    gl_Position = vec4(position.xy * 2.0, 0.0, 1.0);
+                })";
+        scaledCustomShaderMaterial->fragmentShader = R"(
+                #version 330 core
+                void main() {
+                    gl_FragColor = vec4(0.5, 0.5, 0.5, 1.0);
+                    #include <tonemapping_fragment>
+                })";
+        auto scaledCustomShaderQuad = Mesh::create(PlaneGeometry::create(), scaledCustomShaderMaterial);
+        scaledCustomShaderQuad->scale.set(2, 2, 1);
+        scaledCustomShaderScene.add(scaledCustomShaderQuad);
         auto quad = Mesh::create(PlaneGeometry::create(),
                                  MeshBasicMaterial::create(MeshBasicMaterial::Params{}.map(target.texture)));
         quad->scale.set(2, 2, 1);
@@ -529,6 +552,21 @@ int main() {
             renderer.clear();
             renderer.render(greenCaptureScene, camera);
             const auto openFrameSceneCapture = renderer.readSceneRGBPixels();
+            renderer.setRenderScale(0.5f);
+            renderer.toneMapping = ToneMapping::ACESFilmic;
+            renderer.resetAccumulation();
+            renderer.clear();
+            renderer.render(scaledCustomShaderScene, camera);
+            renderer.endFrame();
+            const auto scaledCustomShaderFramebuffer = renderer.readRGBPixels();
+            const int scaledCustomShaderMean = meanByte(scaledCustomShaderFramebuffer);
+            const bool scaledCustomShaderPass =
+                    scaledCustomShaderFramebuffer.size() == 256u * 256u * 3u &&
+                    nearByte(scaledCustomShaderMean, 188, 8);
+            std::printf("[phase2] scaled ShaderMaterial toneMapped=false mean=%d -> %s\n",
+                        scaledCustomShaderMean, scaledCustomShaderPass ? "PASS" : "FAIL");
+            renderer.setRenderScale(1.f);
+            renderer.toneMapping = ToneMapping::None;
             renderer.resetAccumulation();
             renderer.clear();
             renderer.setRenderTarget(&mrtMsaaTarget);
@@ -767,6 +805,7 @@ int main() {
                               depthSensorHit &&
                               depthSensorScaledHit &&
                               rasterLidarHit &&
+                              scaledCustomShaderPass &&
                               mrtMsaaPass;
             std::printf("[phase2] RenderTarget sample+readback+default frame=%d targetBytes=%zu fbBytes=%zu "
                               "defaultSamples=%u rtNativeReady=%d rtMsaaReady=%d targetBright=%d targetRed=%d supportsAsync=%d asyncReadback=%d asyncCallbackPending=%d asyncFuturePending=%d asyncStagingReuses=%llu asyncError=%s pixelAsyncRed=%d subPixelAsyncRed=%d badTypeRejected=%d badFormatRejected=%d framebufferBright=%d framebufferRed=%d framebufferDark=%d sceneCaptureBytes=%zu sceneCaptureBright=%d sceneCaptureRed=%d sceneCaptureDark=%d openFrameSceneCaptureBytes=%zu openFrameSceneCaptureGreen=%d eventVisInto=%zu eventVisVector=%zu eventCount=%zu eventOverflow=%d eventPositive=%zu eventNegative=%zu eventTimestamp=%zu eventTotal=%zu eventTotalPositive=%zu eventTotalNegative=%zu eventTotalTimestamp=%zu eventQuietFrames=%zu eventAnyOverflow=%d eventTime=[%u,%u] eventX=[%u,%u] lidarHit=%d lidarMulti=%d lidarMultiReturn=%d lidarMultiReturnAtmosphere=%d lidarSampled=%d lidarMedium=%d lidarMediumAtmosphere=%d lidarThreshold=%d pathTracedLidar=%d lidarDistance=%.3f lidarMultiReturns=%zu lidarMultiReturnReturns=%zu lidarMultiReturnSlots=[%d/%d %.3f,%d/%d %.3f,%d/%d %.3f] lidarMultiReturnAtmosphereSlots=[%d/%d %.3f,%d/%d %.3f,%d/%d %.3f] lidarSampledReturns=%zu lidarMediumReturns=%zu lidarMediumDistance=%.3f lidarMediumAtmosphereSlot=%d/%d lidarMediumAtmosphereIntensity=%.3f lidarThresholdSlot=%d/%d pathTracedLidarReturns=%zu pathTracedLidarDistance=%.3f depthSensorHit=%d depthPoints=%zu depthAvgZ=%.3f rasterLidarHit=%d rasterLidarPoints=%zu rasterLidarAvgZ=%.3f "

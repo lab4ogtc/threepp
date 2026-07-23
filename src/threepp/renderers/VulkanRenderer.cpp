@@ -6707,7 +6707,11 @@ namespace threepp {
                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                     transformData.data());
 
-            const std::array<float, 4> lightData{};
+            const std::array<float, 4> lightData{
+                    material.toneMapped ? toneMappingExposure_ : 1.f,
+                    static_cast<float>(material.toneMapped ? toneMapping_ : ToneMapping::None),
+                    0.f,
+                    0.f};
             const auto lightBuffer = uploadCustomShaderFrameBuffer(
                     frame,
                     lightData.size() * sizeof(float),
@@ -11180,7 +11184,8 @@ namespace threepp {
                 auto emitDraw = [&](const std::shared_ptr<Material>& material,
                                     uint32_t materialDescIndex,
                                     const std::optional<GeometryGroup>& group) {
-                    if (!material || material->stencilWrite) return;
+                    if (!material || material->stencilWrite ||
+                        dynamic_cast<ShaderMaterial*>(material.get())) return;
                     const VulkanDrawSpan span = resolveVulkanDrawSpan(
                             vcount,
                             geometry ? geometry->drawRange : DrawRange{0, static_cast<int>(vcount)},
@@ -12114,16 +12119,18 @@ namespace threepp {
                 VkCommandBuffer cb,
                 uint32_t imageIndex,
                 uint32_t frame,
-                const Camera& camera) {
+                const Camera& camera,
+                bool forceDefaultFramebuffer = false) {
             if (!hasVisibleCustomShaderMaterials()) return;
 
             const auto swapExtent = ctx->swapchainExtent();
-            const auto directExtent = currentRenderTarget_
-                    ? activeRenderTargetExtent(*currentRenderTarget_)
+            auto* customRenderTarget = forceDefaultFramebuffer ? nullptr : currentRenderTarget_;
+            const auto directExtent = customRenderTarget
+                    ? activeRenderTargetExtent(*customRenderTarget)
                     : VkExtent2D{};
-            const bool directToRenderTarget = currentRenderTarget_ && renderTargets_ &&
-                                              currentRenderTarget_->texture &&
-                                              currentRenderTarget_->texture->format != Format::Depth &&
+            const bool directToRenderTarget = customRenderTarget && renderTargets_ &&
+                                              customRenderTarget->texture &&
+                                              customRenderTarget->texture->format != Format::Depth &&
                                               directExtent.width <= swapExtent.width &&
                                               directExtent.height <= swapExtent.height;
             vulkan::VulkanRenderTargets::Record* directRt = nullptr;
@@ -12132,7 +12139,7 @@ namespace threepp {
             std::vector<VkRenderingAttachmentInfo> colorAttachments;
 
             if (directToRenderTarget) {
-                directRt = &renderTargets_->getOrCreate(*currentRenderTarget_,
+                directRt = &renderTargets_->getOrCreate(*customRenderTarget,
                                                         activeCubeFace_,
                                                         activeMipmapLevel_,
                                                         defaultFramebufferSamples_,
@@ -12243,7 +12250,9 @@ namespace threepp {
                 }
             } else {
                 VkImage image = frameOutputImage(imageIndex);
-                oldSwapLayout = swapchainFrameLayout_;
+                oldSwapLayout = forceDefaultFramebuffer
+                        ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                        : swapchainFrameLayout_;
                 toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
                 toColor.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
                                        VK_PIPELINE_STAGE_2_TRANSFER_BIT |
@@ -12279,41 +12288,102 @@ namespace threepp {
 
             const bool customShaderMsaa = directRt && directRt->msaaColor.image != VK_NULL_HANDLE;
             const bool inheritSceneDepth = !directToRenderTarget;
-            auto& depthImage = inheritSceneDepth
-                    ? rasterGbufs[frame].depth
-                    : customShaderMsaa &&
-                                       rasterGbufs[frame].customShaderMsaaDepth.image != VK_NULL_HANDLE
-                              ? rasterGbufs[frame].customShaderMsaaDepth
-                              : rasterGbufs[frame].customShaderDepth;
-            VkImageMemoryBarrier2 toDepth{};
-            toDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
-            toDepth.srcStageMask = inheritSceneDepth
-                    ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
-                    : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-            toDepth.srcAccessMask = inheritSceneDepth
-                    ? VK_ACCESS_2_MEMORY_READ_BIT
-                    : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
-                              VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-            toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
-                                   VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
-            toDepth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                    VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-            toDepth.oldLayout = inheritSceneDepth
-                    ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
-                    : VK_IMAGE_LAYOUT_UNDEFINED;
-            toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-            toDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            toDepth.image = depthImage.image;
-            toDepth.subresourceRange.aspectMask = depthBarrierAspect(depthImage.format);
-            toDepth.subresourceRange.levelCount = 1;
-            toDepth.subresourceRange.layerCount = 1;
-            VkDependencyInfo toDepthDep{};
-            toDepthDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-            toDepthDep.imageMemoryBarrierCount = 1;
-            toDepthDep.pImageMemoryBarriers = &toDepth;
-            vkCmdPipelineBarrier2(cb, &toDepthDep);
+            auto& sceneDepth = rasterGbufs[frame].depth;
+            const bool scaleSceneDepth = inheritSceneDepth &&
+                                         (sceneDepth.width != swapExtent.width ||
+                                          sceneDepth.height != swapExtent.height);
+            auto& depthImage = scaleSceneDepth
+                    ? rasterGbufs[frame].customShaderDepth
+                    : inheritSceneDepth
+                              ? sceneDepth
+                              : customShaderMsaa &&
+                                                rasterGbufs[frame].customShaderMsaaDepth.image != VK_NULL_HANDLE
+                                        ? rasterGbufs[frame].customShaderMsaaDepth
+                                        : rasterGbufs[frame].customShaderDepth;
+
+            if (scaleSceneDepth) {
+                const auto sceneDepthAspect = depthBarrierAspect(sceneDepth.format);
+                const auto localDepthAspect = depthBarrierAspect(depthImage.format);
+                transitionImage(cb, sceneDepth.image,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                VK_ACCESS_2_MEMORY_READ_BIT,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                sceneDepthAspect);
+                transitionImage(cb, depthImage.image,
+                                VK_IMAGE_LAYOUT_UNDEFINED,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT,
+                                0,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                localDepthAspect);
+
+                VkImageBlit depthBlit{};
+                depthBlit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                depthBlit.srcSubresource.layerCount = 1;
+                depthBlit.srcOffsets[1] = {static_cast<int32_t>(sceneDepth.width),
+                                           static_cast<int32_t>(sceneDepth.height), 1};
+                depthBlit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+                depthBlit.dstSubresource.layerCount = 1;
+                depthBlit.dstOffsets[1] = {static_cast<int32_t>(swapExtent.width),
+                                           static_cast<int32_t>(swapExtent.height), 1};
+                vkCmdBlitImage(cb,
+                               sceneDepth.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               depthImage.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                               1, &depthBlit, VK_FILTER_NEAREST);
+
+                transitionImage(cb, sceneDepth.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                VK_ACCESS_2_MEMORY_READ_BIT,
+                                sceneDepthAspect);
+                transitionImage(cb, depthImage.image,
+                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                                VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                        VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                                localDepthAspect);
+            } else {
+                VkImageMemoryBarrier2 toDepth{};
+                toDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+                toDepth.srcStageMask = inheritSceneDepth
+                        ? VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT
+                        : VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                  VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+                toDepth.srcAccessMask = inheritSceneDepth
+                        ? VK_ACCESS_2_MEMORY_READ_BIT
+                        : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+                                  VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                                       VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+                toDepth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+                toDepth.oldLayout = inheritSceneDepth
+                        ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                        : VK_IMAGE_LAYOUT_UNDEFINED;
+                toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+                toDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                toDepth.image = depthImage.image;
+                toDepth.subresourceRange.aspectMask = depthBarrierAspect(depthImage.format);
+                toDepth.subresourceRange.levelCount = 1;
+                toDepth.subresourceRange.layerCount = 1;
+                VkDependencyInfo toDepthDep{};
+                toDepthDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                toDepthDep.imageMemoryBarrierCount = 1;
+                toDepthDep.pImageMemoryBarriers = &toDepth;
+                vkCmdPipelineBarrier2(cb, &toDepthDep);
+            }
 
             VkRenderingAttachmentInfo depth{};
             depth.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
@@ -12334,7 +12404,7 @@ namespace threepp {
             rendering.pDepthAttachment = &depth;
             vkCmdBeginRendering(cb, &rendering);
 
-            VkViewport viewport{0.f, 0.f, float(extent.width), float(extent.height), 0.f, 1.f};
+            VkViewport viewport{0.f, float(extent.height), float(extent.width), -float(extent.height), 0.f, 1.f};
             VkRect2D scissor{{0, 0}, extent};
             vkCmdSetViewport(cb, 0, 1, &viewport);
             vkCmdSetScissor(cb, 0, 1, &scissor);
@@ -12468,7 +12538,7 @@ namespace threepp {
 
             vkCmdEndRendering(cb);
 
-            if (inheritSceneDepth) {
+            if (inheritSceneDepth && !scaleSceneDepth) {
                 transitionImage(cb, depthImage.image,
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                                 VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL,
@@ -20563,10 +20633,10 @@ namespace threepp {
                 // Fills rasterGbufs[currentFrame].unjitDepth with the
                 // unjittered VP for opaque/depth-occluding scene surfaces.
                 // Consumed by the post-TAA wireframe overlay pass for
-                // occlusion testing. Only runs when an overlay pipeline
-                // exists AND the scene actually has overlay candidates
-                // this frame (else the prepass is wasted work).
-                if (overlayDepthPrepassPipeline != VK_NULL_HANDLE && sceneHasOverlayContent()) {
+                // 覆盖层与默认帧 ShaderMaterial 共用无抖动深度；
+                // 两者都不存在时跳过这次额外 prepass。
+                if (overlayDepthPrepassPipeline != VK_NULL_HANDLE &&
+                    (sceneHasOverlayContent() || hasVisibleCustomShaderMaterials())) {
                     gpuTimings_->begin(cb, TP_OverlayDepth, currentFrame);
                     // Swapchain extent — unjitDepth is full-res so the
                     // post-TAA overlay can depth-test the upscaled image.
@@ -20650,7 +20720,29 @@ namespace threepp {
                         if (en.isOverlay) continue;// overlay meshes drawn by overlay pass instead
                         if (!isActiveInstancedEntry(en)) continue;
                         if (!en.inFrustum) continue;// frustum cull (same lever as the gbuf prepass)
-                        if (skipsOverlayDepth(i)) continue;
+                        const auto geometry = en.mesh->geometry();
+                        if (!geometry) continue;
+                        std::vector<std::optional<GeometryGroup>> depthGroups;
+                        if (!skipsOverlayDepth(i)) {
+                            depthGroups.emplace_back(std::nullopt);
+                        } else {
+                            const auto writesCustomDepth = [](const auto& material) {
+                                return dynamic_cast<ShaderMaterial*>(material.get()) &&
+                                       material->visible && material->depthTest && material->depthWrite;
+                            };
+                            const auto& materials = en.mesh->materials();
+                            if (materials.size() > 1) {
+                                for (const auto& group : geometry->groups) {
+                                    if (group.materialIndex < materials.size() &&
+                                        writesCustomDepth(materials[group.materialIndex])) {
+                                        depthGroups.emplace_back(group);
+                                    }
+                                }
+                            } else if (!materials.empty() && writesCustomDepth(materials.front())) {
+                                depthGroups.emplace_back(std::nullopt);
+                            }
+                        }
+                        if (depthGroups.empty()) continue;
                         const BlasRecord* rec = resolveBlasForEntry(en);
                         if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
@@ -20672,17 +20764,19 @@ namespace threepp {
                                                VK_SHADER_STAGE_VERTEX_BIT,
                                                0, sizeof(pcDepth), &pcDepth);
 
-                            if (rec->index.handle != VK_NULL_HANDLE) {
+                            const bool indexed = rec->index.handle != VK_NULL_HANDLE;
+                            if (indexed) {
                                 vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
-                                auto* idxAttr = en.mesh->geometry()->getIndex();
-                                if (idxAttr) {
-                                    vkCmdDrawIndexed(cb, static_cast<uint32_t>(idxAttr->count()),
-                                                     1, 0, 0, 0);
-                                }
-                            } else {
-                                auto* posAttr = en.mesh->geometry()->getAttribute<float>("position");
-                                if (posAttr) {
-                                    vkCmdDraw(cb, static_cast<uint32_t>(posAttr->count()), 1, 0, 0);
+                            }
+                            const uint32_t dataCount = indexed ? rec->indexCount : rec->vertexCount;
+                            for (const auto& group : depthGroups) {
+                                const auto span = resolveVulkanDrawSpan(
+                                        dataCount, geometry->drawRange, group);
+                                if (span.count == 0u) continue;
+                                if (indexed) {
+                                    vkCmdDrawIndexed(cb, span.count, 1, span.first, 0, 0);
+                                } else {
+                                    vkCmdDraw(cb, span.count, 1, span.first, 0);
                                 }
                             }
                         });
@@ -21240,6 +21334,15 @@ namespace threepp {
                 gpuTimings_->end(cb, TP_TAA, currentFrame);
             }
             // ── End raster TAA ─────────────────────────────────────────────────
+
+            const bool directCustomShaderMrt = currentRenderTarget_ &&
+                                               currentRenderTarget_->textures.size() > 1;
+            if (lastRenderedCamera_ && !directCustomShaderMrt) {
+                THREEPP_VK_TRACE_SCOPE("recordCommandBuffer.recordCustomShaderMaterialPass");
+                recordCustomShaderMaterialPass(
+                        cb, imageIndex, currentFrame, *lastRenderedCamera_,
+                        true);
+            }
 
             // ── Hybrid raster overlay pass ─────────────────────────────────────
             // Wireframe-flagged meshes (any material with wireframe == true)
@@ -22583,24 +22686,12 @@ namespace threepp {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordCommandBuffer");
                 recordCommandBuffer(cmdBuffers[currentFrame], imageIndex);
             }
-            const auto swapExtentForCustomRt = ctx->swapchainExtent();
-            const auto customRtExtent = currentRenderTarget_
-                    ? activeRenderTargetExtent(*currentRenderTarget_)
-                    : VkExtent2D{};
-            const bool directCustomToRenderTarget = currentRenderTarget_ && renderTargets_ &&
-                                                    currentRenderTarget_->texture &&
-                                                    currentRenderTarget_->texture->format != Format::Depth &&
-                                                    customRtExtent.width <= swapExtentForCustomRt.width &&
-                                                    customRtExtent.height <= swapExtentForCustomRt.height;
-            if (currentRenderTarget_ && directCustomToRenderTarget) {
+            if (currentRenderTarget_) {
                 recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
-            }
-            {
-                THREEPP_VK_TRACE_SCOPE("beginFrameForPT.recordCustomShaderMaterialPass");
-                recordCustomShaderMaterialPass(cmdBuffers[currentFrame], imageIndex, currentFrame, camera);
-            }
-            if (currentRenderTarget_ && !directCustomToRenderTarget) {
-                recordCopyDefaultFramebufferToRenderTarget(cmdBuffers[currentFrame], *currentRenderTarget_);
+                if (currentRenderTarget_->textures.size() > 1 && lastRenderedCamera_) {
+                    recordCustomShaderMaterialPass(
+                            cmdBuffers[currentFrame], imageIndex, currentFrame, *lastRenderedCamera_);
+                }
             }
 
             // Scene-only swapchain capture. Runs BEFORE the sprite + ImGui
@@ -23084,6 +23175,39 @@ namespace threepp {
                 pimpl_->prevSceneFingerprint.clear();
             }
         }
+        scene.updateMatrixWorld();
+        if (!camera.parent) {
+            camera.updateMatrixWorld();
+        }
+        Matrix4 projectionScreen;
+        projectionScreen.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        Frustum frustum;
+        frustum.setFromProjectionMatrix(projectionScreen);
+        scene.traverseVisible([&](Object3D& object) {
+            auto* mesh = dynamic_cast<Mesh*>(&object);
+            if (!mesh || !object.onBeforeRender ||
+                !object.layers.test(camera.layers) ||
+                (object.frustumCulled && !frustum.intersectsObject(object))) {
+                return;
+            }
+
+            const auto geometry = mesh->geometry();
+            const auto& materials = mesh->materials();
+            if (!geometry || materials.empty()) return;
+            if (materials.size() > 1) {
+                for (const auto& group : geometry->groups) {
+                    if (group.materialIndex >= materials.size()) continue;
+                    auto* material = materials[group.materialIndex].get();
+                    if (material && material->visible) {
+                        object.onBeforeRender.value()(
+                                this, &scene, &camera, geometry.get(), material, group);
+                    }
+                }
+            } else if (materials.front() && materials.front()->visible) {
+                object.onBeforeRender.value()(
+                        this, &scene, &camera, geometry.get(), materials.front().get(), std::nullopt);
+            }
+        });
         // Scene build populates lastVisibleEntries_, BLAS cache, motion bits,
         // and the per-mesh fingerprint state used by raster/custom material
         // passes. Only the GL-style HUD pattern's second render() call may skip
