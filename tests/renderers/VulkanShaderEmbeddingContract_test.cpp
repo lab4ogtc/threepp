@@ -1,7 +1,10 @@
 #include <catch2/catch_test_macros.hpp>
 
+#include "threepp/renderers/vulkan/shaders/deferred_shade.comp.pure_raster.spv.h"
+
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -22,6 +25,10 @@ namespace {
     }
 
 }// namespace
+
+TEST_CASE("Vulkan pure raster deferred shader is embedded", "[vulkan][shader]") {
+    CHECK(std::size(kDeferredShadeCompPureRasterSpv) > 0);
+}
 
 TEST_CASE("Vulkan static shader compilation emits target-local headers", "[vulkan][shader]") {
     const auto root = std::filesystem::path(PROJECT_SOURCE_DIR);
@@ -71,4 +78,18 @@ TEST_CASE("Vulkan engine and example shader declarations stay on their owning ta
     CHECK(engineCmake.find("compile_vulkan_shader(threepp") != std::string::npos);
     CHECK(examplesCmake.find("compile_vulkan_shader(threepp") == std::string::npos);
     CHECK(examplesCmake.find("compile_vulkan_shader(vulkan_") != std::string::npos);
+}
+
+TEST_CASE("Vulkan TLAS full build and refit share one material mask rule", "[vulkan][raytracing]") {
+    const auto root = std::filesystem::path(PROJECT_SOURCE_DIR);
+    const auto source = readText(root / "src" / "threepp" / "renderers" / "VulkanRenderer.cpp");
+    const std::string sharedCall = "rayMaskForMaterialDesc(";
+    std::size_t count = 0;
+    for (auto pos = source.find(sharedCall); pos != std::string::npos;
+         pos = source.find(sharedCall, pos + sharedCall.size())) {
+        ++count;
+    }
+
+    CHECK(count == 3u);// 一处定义，加 full build/refit 各一处调用
+    CHECK(source.find("materialUsesAlphaRayMask") == std::string::npos);
 }

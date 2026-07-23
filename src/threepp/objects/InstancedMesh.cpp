@@ -5,6 +5,20 @@
 
 using namespace threepp;
 
+namespace {
+
+    void mergeUpdateRange(UpdateRange& range, int offset, int count) {
+        if (range.count < 0) {
+            range = {offset, count};
+            return;
+        }
+        const int end = std::max(range.offset + range.count, offset + count);
+        range.offset = std::min(range.offset, offset);
+        range.count = end - range.offset;
+    }
+
+}// namespace
+
 
 InstancedMesh::InstancedMesh(
         std::shared_ptr<BufferGeometry> geometry,
@@ -64,11 +78,13 @@ void InstancedMesh::setColorAt(size_t index, const Color& color) {
     }
 
     color.toArray(this->instanceColor_->array(), index * 3);
+    mergeUpdateRange(this->instanceColor_->updateRange, static_cast<int>(index * 3), 3);
 }
 
 void InstancedMesh::setMatrixAt(size_t index, const Matrix4& matrix) const {
 
     matrix.toArray(this->instanceMatrix_->array(), index * 16);
+    mergeUpdateRange(this->instanceMatrix_->updateRange, static_cast<int>(index * 16), 16);
 }
 
 void InstancedMesh::dispose() {

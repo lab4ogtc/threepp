@@ -1,6 +1,8 @@
 #version 460
 #extension GL_EXT_scalar_block_layout : require
+#ifndef THREEPP_PURE_RASTER
 #extension GL_EXT_ray_query : require
+#endif
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
 #extension GL_GOOGLE_include_directive : enable
@@ -78,10 +80,13 @@ layout(set = 0, binding = 4) uniform sampler2D  gbufDepthTex;  // .x = Vulkan ND
 layout(set = 0, binding = 5) uniform usampler2D gbufIdsTex;    // .x = materialId+1 (0 == sky), .y = instanceId+1
 layout(set = 0, binding = 6) uniform sampler2D  gbufAlbedoTex; // .rgb = albedo, .a = metalness
 layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D outImage;
+#ifndef THREEPP_PURE_RASTER
 layout(set = 0, binding = 8) uniform accelerationStructureEXT topAS;
+#endif
 layout(set = 0, binding = 9, scalar) readonly buffer MatBuf  { MaterialDesc mats[]; };
 
 // Geometry fetch for reflection-hit normals + UVs — mirrors closest_hit.rchit.
+#ifndef THREEPP_PURE_RASTER
 layout(buffer_reference, scalar) readonly buffer NormalBuf { float n[]; };
 layout(buffer_reference, scalar) readonly buffer IndexBuf  { uint  i[]; };
 layout(buffer_reference, scalar) readonly buffer UvBuf     { float u[]; };
@@ -102,12 +107,14 @@ struct GeometryDesc {
 };
 layout(buffer_reference, scalar) readonly buffer MaterialGroupBuf { MaterialGroupDesc groups[]; };
 layout(set = 0, binding = 10, scalar) readonly buffer GeomDescBuf { GeometryDesc geoms[]; };
+#endif
 // Bindless material textures (reflection hits sample these). Indexed by the
 // material's per-map texIndex — same array + convention as closest_hit binding 8.
 layout(set = 0, binding = 11) uniform sampler2D albedoMaps[kMaxMaterialTextures];
 // Emissive triangles (area-light NEE). Packed as the path tracer's EmTri:
 // v0.xyz/area, v1.xyz/cumPower(CDF), v2.xyz/power, emission.rgb. Same buffer
 // as the RT set's binding 14 (per-frame emissiveTriBuffers).
+#ifndef THREEPP_PURE_RASTER
 struct EmTri {
     vec4 v0;       // xyz = pos, w = area
     vec4 v1;       // xyz = pos, w = cumPower (running power CDF)
@@ -115,6 +122,7 @@ struct EmTri {
     vec4 emission; // xyz = emissive × intensity
 };
 layout(set = 0, binding = 12, scalar) readonly buffer EmissiveTriBuf { EmTri emissiveTris[]; };
+#endif
 
 // Ocean FFT fine-cascade height (sub-mesh chop) + world-space foam accumulator.
 // Mirror closest_hit bindings 32 + 44. Both fall back to 1×1 dummies (and the
@@ -221,13 +229,18 @@ layout(push_constant) uniform Pc {
 } pc;
 
 bool rayAccentsOn() {
+#ifdef THREEPP_PURE_RASTER
+    return false;
+#else
     return (pc.flags & 16u) != 0u;
+#endif
 }
 
 bool solidBackgroundEnv() {
     return (pc.flags & 32u) != 0u;
 }
 
+#ifndef THREEPP_PURE_RASTER
 uint resolveMaterialIndex(uint instanceIndex, uint primitiveIndex) {
     const GeometryDesc g = geoms[instanceIndex];
     if (g.materialGroupAddress == 0ul || g.materialGroupCount == 0u) {
@@ -243,6 +256,7 @@ uint resolveMaterialIndex(uint instanceIndex, uint primitiveIndex) {
     }
     return instanceIndex;
 }
+#endif
 
 // ReBLUR-style TEMPORAL accumulation for the reflection (+ glass). Adaptive blend
 // α = 1/historyLength → fast convergence early, then a long stable mean. Tracks the
@@ -544,6 +558,7 @@ vec3 evalIridescence(float outsideIOR, float eta2, float cosTheta1,
 
 // Interpolated UV at a hit (lean — UV only, for the alpha-tested shadow test).
 // Mirrors fetchHit's index + barycentric interpolation.
+#ifndef THREEPP_PURE_RASTER
 vec2 fetchUvAt(int instIdx, int primId, vec2 bary) {
     const GeometryDesc g = geoms[instIdx];
     if (g.uvAddress == 0ul) return vec2(0.0);
@@ -631,6 +646,7 @@ bool shadowOccludes(int instIdx, int primId, vec2 bary, vec3 worldPos) {
     }
     return a >= m.alphaCutoff;
 }
+#endif
 
 bool lightCastsShadow(uint encoded) {
     return (encoded & 1u) != 0u;
@@ -686,6 +702,7 @@ float shadowMapVis(uint encoded, vec3 worldPos, vec3 normal) {
 // would ignore those candidates anyway (transmission>0 / alphaCutoff<0 never
 // block), so this is a pure traversal saving; water stays opaque-mask and is
 // still ignored by the material test.
+#ifndef THREEPP_PURE_RASTER
 float shadowVis(vec3 origin, vec3 dir, float tMax) {
     rayQueryEXT rq;
     rayQueryInitializeEXT(rq, topAS, gl_RayFlagsTerminateOnFirstHitEXT,
@@ -701,12 +718,17 @@ float shadowVis(vec3 origin, vec3 dir, float tMax) {
     return (rayQueryGetIntersectionTypeEXT(rq, true) ==
             gl_RayQueryCommittedIntersectionNoneEXT) ? 1.0 : 0.0;
 }
+#endif
 
 float directShadowVis(uint encoded, vec3 worldPos, vec3 normal,
                       vec3 rayOrigin, vec3 rayDir, float rayTMax) {
     const float mapVis = shadowMapVis(encoded, worldPos, normal);
     if (mapVis >= 0.0) return mapVis;
+#ifdef THREEPP_PURE_RASTER
+    return 1.0;
+#else
     return shadowVis(rayOrigin, rayDir, rayTMax);
+#endif
 }
 
 vec3 vsmShadowDir(vec3 dir, float radius) {
@@ -983,6 +1005,7 @@ float sampleFoamBicubic(vec2 uv) {
     return g0.y * (g0.x * t00 + g1.x * t10) + g1.y * (g0.x * t01 + g1.x * t11);
 }
 
+#ifndef THREEPP_PURE_RASTER
 // Emissive-mesh NEE: directly sample the emissive-triangle area lights (power
 // CDF), shadow-test, add the contribution. Clean (samples the emitter, not a
 // random hemisphere), so an emissive sphere actually illuminates the room.
@@ -1582,6 +1605,7 @@ vec3 gatherEnv(vec3 P, vec3 N, ivec2 px, uint frame, bool doShadows, bool stocha
     acc += hitHack * smoothstep(0.0, 0.03, openness);
     return acc / float(GI_RAYS);
 }
+#endif
 
 vec3 rectEdgeVectorFormFactor(vec3 v1, vec3 v2) {
     const float x = dot(v1, v2);
@@ -1836,8 +1860,10 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
     // but REFLECTED hits (traceRadiance) ALWAYS add it — reservoirs are per-screen-pixel
     // and don't exist for reflected surfaces, so without this metals reflecting an
     // emissive-lit room lose their reflected lighting (= "metals lost their color").
+    #ifndef THREEPP_PURE_RASTER
     if (addEmissive)
         lit += emissiveNEE(cheapHit ? 4 : 16, P, N, V, NdotV, F0, albedo, roughness, metalness, k, seed, doShadows);
+    #endif
 
     // Diffuse indirect (caller-supplied): visibility-gated env irradiance for
     // the primary surface, crude env IBL for reflected hits. Only modulates the
@@ -1851,6 +1877,7 @@ vec3 shadeDiffuseDirect(vec3 P, vec3 N, vec3 clearcoatN, vec3 V, vec3 albedo, fl
     return lit;
 }
 
+#ifndef THREEPP_PURE_RASTER
 // Interpolated world-space normal + UV/UV2 at a reflection hit. Mirrors
 // closest_hit's GeometryDesc + barycentric interpolation + world transform.
 void fetchHit(int instIdx, int primId, vec2 bary, mat4x3 worldToObj,
@@ -1890,6 +1917,7 @@ void fetchHit(int instIdx, int primId, vec2 bary, mat4x3 worldToObj,
         uv2Out = w * u20 + bary.x * u21 + bary.y * u22;
     }
 }
+#endif
 
 // Sample a bindless material texture at a reflection-hit UV (compute has no
 // derivatives → explicit mip 0). texIndex < 0 → return `fallback` unchanged.
@@ -1978,6 +2006,7 @@ vec3 sampleGGXReflectionFib(vec3 V, vec3 N, float roughness, int s, int count) {
     return reflect(-V, ggxHalfVectorFib(N, roughness, s, count));
 }
 
+#ifndef THREEPP_PURE_RASTER
 // MULTI-BOUNCE specular reflection (or refraction-continuation). Follows the ray
 // through up to REFL_MAX_BOUNCES reflective hits: at each hit it adds the
 // surface's diffuse + direct (shadowed) shading weighted by the running specular
@@ -2580,6 +2609,7 @@ void traceGlassInterior(vec3 origin, vec3 dir, float maxLod, bool doShadows, ino
     }
     blocked = true;// layer budget exhausted — treat the last hit as the blocker
 }
+#endif
 
 // Refractive glass (CLOSED transmissive mesh — sphere / bottle / goblet, NOT the
 // thin-shell water handled above). Deterministic 2-interface refraction so it's
@@ -2629,6 +2659,7 @@ vec3 fresnelSchlickRgb(float cosTheta, vec3 iorRgb) {
     return r0 + (vec3(1.0) - r0) * pow(1.0 - cosTheta, 5.0);
 }
 
+#ifndef THREEPP_PURE_RASTER
 vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
                 bool doShadows, float maxLod, inout uint seed) {
     const float ior     = max(pm.ior, 1.0);
@@ -2773,6 +2804,7 @@ vec3 shadeGlass(vec3 P, vec3 N, vec3 V, MaterialDesc pm, vec3 albedo,
     }
     return sum / float(kGlassSamples) + glint;
 }
+#endif
 
 // ── Volumetric SPOT-light beams (single scattering, ray-marched) ─────────────
 // In-scattered radiance along [ro, ro+rd·tMax] from every spot light — the
@@ -3015,8 +3047,12 @@ void main() {
             uint seedU = pcgHash(uint(px.x) ^ pcgHash(uint(px.y) ^ 0x85ebca6bu));
             const bool sceneShadowsOnU = ((pc.flags & 1u) != 0u);
             const float opacity = 1.0 - clamp(pm.transmission, 0.0, 1.0);
+            #ifdef THREEPP_PURE_RASTER
+            const vec3 behind = sampleMaterialEnvLod(pm, -VU, 0.0);
+            #else
             const vec3 behind = traceRadiance(wpU - VU * SHADOW_EPS, -VU, sceneShadowsOnU, maxLod, 0.0, seedU,
                                               /*cheapHits=*/false);
+            #endif
             litU = mix(behind, litU, opacity);
         }
         imageStore(outImage, px, vec4(litU, 1.0));
@@ -3121,6 +3157,7 @@ void main() {
     // thin-walled too (no KHR_volume → thinWalled), and routing it here painted
     // it milky-teal ocean water instead of clear refraction. Thin-walled glass
     // now falls through to the refractive glass branch below like closed glass.
+    #ifndef THREEPP_PURE_RASTER
     const uint instIdx = max(instId, 1u) - 1u;
     if (pm.thinWalled != 0 && transmission > 0.0 && geoms[instIdx].foamAddress != 0ul) {
         vec3 wcol = shadeWater(worldPos, N, V, pm, int(instIdx),
@@ -3132,6 +3169,7 @@ void main() {
         imageStore(reflectImage, px, vec4(0.0));// water shades its own reflection inline
         return;
     }
+    #endif
 
     const float NdotV = max(dot(N, V), 1e-4);
     const bool legacyLambert = pm.sheenRoughness < -1.5;
@@ -3187,9 +3225,13 @@ void main() {
             }
         }
         const float opacity = shadow * clamp(pm.transmission, 0.0, 1.0);
+        #ifdef THREEPP_PURE_RASTER
+        const vec3 behind = sampleMaterialEnvLod(pm, -V, 0.0);
+        #else
         const vec3 behind = traceAccentRadiance(worldPos - V * SHADOW_EPS, -V,
                                                 sceneShadowsOn, maxLod, 0.0, seed,
                                                 /*cheapHits=*/false);
+        #endif
         vec3 lit = mix(behind, albedo, opacity);
         lit = applySceneFog(lit, camPos, worldPos);
         imageStore(outImage, px, vec4(lit, 1.0));
@@ -3261,9 +3303,22 @@ void main() {
     }
 
     // Diffuse indirect: visibility-gated env irradiance (RT, flags bit 1).
+    #ifdef THREEPP_PURE_RASTER
+    const bool aoOn = false;
+    #else
     const bool aoOn = (pc.flags & 2u) != 0u;
+    #endif
     if (!aoOn) giSkip = false;// checkerboard only pays off on the RT gather
     vec3 diffInd;
+    #ifdef THREEPP_PURE_RASTER
+    if (legacyLambert) {
+        diffInd = ambientIrradiance(N);
+    } else if (legacyEnvMap) {
+        diffInd = sampleIblEnvLod(N, maxLod) + ambientIrradiance(N);
+    } else {
+        diffInd = sampleMaterialEnvLod(pm, N, maxLod) + ambientIrradiance(N);
+    }
+    #else
     if (legacyLambert) {
         diffInd = ambientIrradiance(N);
     } else if (giSkip) {
@@ -3283,16 +3338,19 @@ void main() {
     } else {
         diffInd = sampleMaterialEnvLod(pm, N, maxLod) + ambientIrradiance(N);
     }
+    #endif
     diffInd = (diffInd + lightMapIrradiance) * ambientOcclusion;
     // ReSTIR DI emissive area lighting → DEMOD irradiance folded into the diffuse-
     // indirect channel so it rides the SVGF temporal + à-trous denoise (the reservoir
     // converges light selection; this denoises the 1-sample radiance). Added before
     // the demod split so it flows through BOTH the denoise accum path AND the inline
     // (denoise-off) path. restirEmissiveDI also persists this pixel's reservoir.
+    #ifndef THREEPP_PURE_RASTER
     if (!giSkip && (pc.flags & 8u) != 0u) {
         const float rNdotV = max(dot(N, V), 1e-4);
         diffInd += restirEmissiveDI(worldPos, N, rNdotV, F0, sceneShadowsOn);// F0 already iridescence-modulated
     }
+    #endif
     const vec3 diffIndShade = demodIndirect ? vec3(0.0) : diffInd;
     const vec3 clearcoatN = clearcoatNormalFromMap(px, id, worldPos, N, primUv, pm);
 
@@ -3342,11 +3400,13 @@ void main() {
     // double-counts). The NEE add is faded by reflBlend so emitter spec follows
     // the same ≥0.7-roughness specular cutoff as the rest of the spec model.
     const float specNEET = smoothstep(0.10, 0.25, roughness);
+    #ifndef THREEPP_PURE_RASTER
     if (rayAccentsOn() && opaqueRefl && reflBlend > 0.0 && specNEET > 0.0 && pc.emissiveCount > 0u) {
         const float kS = (roughness + 1.0) * (roughness + 1.0) / 8.0;
         lit += (specNEET * reflBlend)
              * emissiveSpecNEE(worldPos, N, V, NdotV, F0, roughness, kS, sceneShadowsOn);
     }
+    #endif
     vec3 reflOut = vec3(0.0);
     // CHECKERBOARD reflections (OPPOSITE parity to giSkip → an eligible pixel
     // traces exactly ONE indirect channel per frame): with ≥4 frames of usable
@@ -3367,7 +3427,13 @@ void main() {
         const float missLod = roughness * maxLod;// ray-miss reads the roughness-blurred env mip
         if (pm.envTexIndex >= 0) {
             reflOut = sampleMaterialEnvLod(pm, R, missLod) * (F0 * ab.x + ab.y) * reflBlend;
-        } else if (rayAccentsOn() && !reflSkip) {
+        }
+        #ifdef THREEPP_PURE_RASTER
+        else {
+            reflOut = sampleIblEnvLod(R, missLod) * (F0 * ab.x + ab.y) * reflBlend;
+        }
+        #else
+        else if (rayAccentsOn() && !reflSkip) {
             // Emitter self-emission scale for the ray (the other half of the split):
             // DIELECTRICS → 0: F0≈0.04, a reflected small emitter is ~invisible in the
             // PT, yet a full-radiance hit produced bright "probe speckles" (their faint
@@ -3404,6 +3470,7 @@ void main() {
             if (rl > pc.fireflyClamp) r *= pc.fireflyClamp / rl;
             reflOut = r * (F0 * ab.x + ab.y) * reflBlend;
         }
+        #endif
     }
     if (pm.envTexIndex >= 0 && !legacyEnvMap) {
         lit += reflOut;
@@ -3439,8 +3506,12 @@ void main() {
         // straight (-V) ray to recover it. Host encodes strength = transmission-1
         // (transmission>1 is the additive marker).
         const float strength = clamp(transmission - 1.0, 0.0, 1.0);
+        #ifdef THREEPP_PURE_RASTER
+        const vec3  behind   = sampleMaterialEnvLod(pm, -V, 0.0);
+        #else
         const vec3  behind   = traceRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
                                              /*cheapHits=*/false);// straight into lit, unblurred
+        #endif
         lit = behind + lit * strength;
     } else if (transmission > 0.0) {
         if (pm.ior < 1.05) {
@@ -3450,15 +3521,28 @@ void main() {
             // darkening. (One transparent layer over opaque: the behind ray sees
             // opaque geometry shaded as PBR; overlapping transparent isn't sorted.)
             const float opacity = 1.0 - clamp(transmission, 0.0, 1.0);
+            #ifdef THREEPP_PURE_RASTER
+            const vec3  behind  = sampleMaterialEnvLod(pm, -V, 0.0);
+            #else
             const vec3  behind  = traceRadiance(worldPos - V * SHADOW_EPS, -V, sceneShadowsOn, maxLod, 0.0, seed,
                                                 /*cheapHits=*/false);// straight into lit, unblurred
+            #endif
             lit = mix(behind, lit, opacity);
         } else {
             // REAL refractive glass (ior>1). ONE sharp Fresnel reflect+refract
             // sample (no ghost copies); the reflection denoise blurs it by the glass
             // roughness (the frost) + recombines — same channel as opaque reflections.
             const float gt       = clamp(transmission, 0.0, 1.0);
+            #ifdef THREEPP_PURE_RASTER
+            vec3 refracted = refract(-V, N, 1.0 / max(pm.ior, 1.0));
+            if (dot(refracted, refracted) < 1e-8) refracted = reflect(-V, N);
+            const float f0 = pow((1.0 - pm.ior) / (1.0 + pm.ior), 2.0);
+            const float fresnel = f0 + (1.0 - f0) * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+            const vec3 glassCol = mix(sampleMaterialEnvLod(pm, refracted, roughness * maxLod),
+                                      sampleMaterialEnvLod(pm, reflect(-V, N), roughness * maxLod), fresnel);
+            #else
             const vec3  glassCol = shadeGlass(worldPos, N, V, pm, albedo, sceneShadowsOn, maxLod, seed);
+            #endif
             if (denoiseOn) {
                 // Demodulate the mix(): hand glassCol·t to the reflection denoise
                 // (which ADDS blur(reflect)) and scale the opaque base by (1-t), so

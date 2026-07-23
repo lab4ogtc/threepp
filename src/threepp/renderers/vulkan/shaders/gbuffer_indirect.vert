@@ -66,6 +66,19 @@ struct DrawInfo {
 layout(set = 0, binding = 4, scalar) readonly buffer DrawInfoBuf {
     DrawInfo draws[];
 };
+#ifdef THREEPP_RASTER_INSTANCED
+struct RasterInstance {
+    mat4 model;
+    mat4 prevModel;
+    vec4 color;
+    uint sceneIndex;
+    uint drawInfoIndex;
+    uvec2 pad;
+};
+layout(set = 0, binding = 5, scalar) readonly buffer RasterInstanceBuf {
+    RasterInstance instances[];
+};
+#endif
 layout(set = 0, binding = 2, scalar) readonly buffer GbufMatBuf {
     MaterialDesc gbufMats[];
 };
@@ -103,7 +116,12 @@ float displacementAmount(MaterialDesc m, vec2 uv) {
 }
 
 void main() {
+#ifdef THREEPP_RASTER_INSTANCED
+    const RasterInstance instance = instances[gl_InstanceIndex];
+    const DrawInfo d = draws[instance.drawInfoIndex];
+#else
     const DrawInfo d = draws[gl_InstanceIndex];
+#endif
 
     // Indexed meshes: gl_VertexIndex is the index-buffer cursor (0..indexCount-1);
     // resolve to the real vertex ID by reading from the bindless index buffer.
@@ -126,15 +144,29 @@ void main() {
     const vec3 displacedPos = inPos + normalize(inNormal) * disp;
     const vec3 displacedPrevPos = inPrevPos + normalize(inNormal) * disp;
 
-    const vec4 worldPos     = d.model * vec4(displacedPos, 1.0);
-    const vec4 prevWorldPos = motionMat[d.instanceCustomIndex] * d.model * vec4(displacedPrevPos, 1.0);
+    #ifdef THREEPP_RASTER_INSTANCED
+    const mat4 model = instance.model;
+    const mat4 prevModel = instance.prevModel;
+    const uint sceneIndex = instance.sceneIndex;
+    const vec3 instanceColor = instance.color.rgb;
+    #else
+    const mat4 model = d.model;
+    const uint sceneIndex = d.instanceCustomIndex;
+    const vec3 instanceColor = vec3(1.0);
+    #endif
+    const vec4 worldPos     = model * vec4(displacedPos, 1.0);
+    #ifdef THREEPP_RASTER_INSTANCED
+    const vec4 prevWorldPos = prevModel * vec4(displacedPrevPos, 1.0);
+    #else
+    const vec4 prevWorldPos = motionMat[sceneIndex] * model * vec4(displacedPrevPos, 1.0);
+    #endif
 
-    vWorldNormal = mat3(d.model) * inNormal;
+    vWorldNormal = mat3(model) * inNormal;
 
     vCurrClipUnjit = cam.currVPunjittered * worldPos;
     vPrevClip      = cam.prevVP           * prevWorldPos;
     vInstanceIdx   = d.materialIndex;
-    vMeshIdx       = d.instanceCustomIndex;
+    vMeshIdx       = sceneIndex;
     vFlags         = d.flags;
     vUv            = inUv;
     vUv2           = inUv2;
@@ -142,7 +174,7 @@ void main() {
     // Per-vertex color (material.vertexColors). gbuffer.frag multiplies albedo
     // by this; white when the mesh has no "color" attribute so the multiply is
     // a no-op. Linear working space — matches the material albedo.
-    vColor         = (d.colorAddr != 0ul) ? fetchVec3(d.colorAddr, vid) : vec3(1.0);
+    vColor         = ((d.colorAddr != 0ul) ? fetchVec3(d.colorAddr, vid) : vec3(1.0)) * instanceColor;
     for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
         vLocalClipPlanes[i] = d.clipPlanes[i];
     }

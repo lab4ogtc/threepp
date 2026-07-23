@@ -116,6 +116,7 @@
 #include "threepp/renderers/vulkan/shaders/gbuffer.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/gbuffer.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/gbuffer_indirect.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/gbuffer_indirect.vert.instanced.spv.h"
 #include "threepp/renderers/vulkan/shaders/shadow_depth.vert.spv.h"
 // (taa_resolve.comp.spv moved into vulkan/TaaResolve.cpp)
 #include "threepp/renderers/vulkan/shaders/overlay.vert.spv.h"
@@ -520,6 +521,9 @@ namespace threepp {
             // vector every frame → persistent denoiser/TAA history rejection
             // (runtime-updated geometry stays noisy / visibly shakes).
             bool prevVertexResyncPending = false;
+            // pure raster 可以继续改写共享顶点缓冲；已有 BLAS 随即失效，
+            // 下次进入显式 RT 时必须基于最新缓冲重新创建。
+            bool asContentsDirty = false;
         };
         std::unordered_map<const BufferGeometry*, std::unique_ptr<BlasRecord>> blasCache;
 
@@ -779,6 +783,8 @@ namespace threepp {
 
         // Single TLAS over all mesh instances in the scene.
         VkAccelerationStructureKHR tlas = VK_NULL_HANDLE;
+        uint32_t tlasBuiltInstanceCount_ = 0u;
+        std::unordered_map<const InstancedMesh*, size_t> tlasBuiltInstancedCounts_;
         Buffer tlasBuffer;
         // Per-in-flight-frame instance buffers. The per-frame TLAS refit is
         // recorded into the frame command buffer (not a one-shot drain), so the
@@ -846,6 +852,7 @@ namespace threepp {
         std::array<Buffer, kFramesInFlight> materialDescsBuffers{};
         std::vector<MaterialDesc> matDescsCached_;
         std::array<bool, kFramesInFlight> matDescsDirty_{};
+        std::array<std::vector<uint32_t>, kFramesInFlight> matDescDirtyIndices_;
         struct RasterGroupMaterialDescIndex {
             uint32_t materialIndex = 0;
             uint32_t descIndex = 0;
@@ -1137,6 +1144,7 @@ namespace threepp {
         // bit-for-bit with no float-precision pixel-snap drift (the cause of
         // the visible static-scene wobble we observed when always reprojecting).
         bool motionThisFrame_ = false;
+        bool emissiveSceneDirty_ = false;
 
         // Camera viewProj changed this frame — separate bit so the raygen can
         // reproject all non-sky pixels for camera motion while leaving pixels
@@ -1202,6 +1210,11 @@ namespace threepp {
             bool     isInstanced = false;// entry came from an InstancedMesh expansion
                                          // (the snapshot fast path recomputes its world
                                          // matrix as matrixWorld * getMatrixAt(i))
+            // 只有快速实例路径才允许在纯 RasterFirst 下压缩为单个 entry。
+            bool     rasterInstancingCompact = false;
+            uint32_t rasterInstanceCount = 1u;
+            unsigned int rasterBoundsMatrixVersion = 0u;
+            size_t rasterBoundsCount = 0u;
             // Frustum-cull bit, populated once per frame by
             // cullEntriesAgainstFrustum() right before record. Raster passes
             // skip entries with inFrustum == false to dodge the GPU's per-
@@ -1212,6 +1225,25 @@ namespace threepp {
             // local AABB doesn't reflect deformed extents.
             bool     inFrustum   = true;
         };
+
+        template<class Callback>
+        static void forEachAuxiliaryDepthWorld(const MeshEntry& entry, Callback&& callback) {
+            if (!entry.rasterInstancingCompact) {
+                Matrix4 world;
+                std::memcpy(world.elements.data(), entry.worldMatrix.data(), 64);
+                callback(world);
+                return;
+            }
+
+            auto* instances = static_cast<InstancedMesh*>(entry.mesh);
+            Matrix4 local;
+            Matrix4 world;
+            for (std::size_t i = 0; i < instances->count(); ++i) {
+                instances->getMatrixAt(i, local);
+                world.multiplyMatrices(*instances->matrixWorld, local);
+                callback(world);
+            }
+        }
 
         // ── Scene-structure SNAPSHOT (ensureSceneBuilt fast path) ────────────
         // One node per traverseVisible visit from the last full expansion, in
@@ -1245,7 +1277,8 @@ namespace threepp {
             BufferGeometry* geomB = nullptr;          // typed view of geom (attributesVersion reads)
             const Material* mat = nullptr;            // mesh material
             const MaterialWithWireframe* wf = nullptr;// cached cast of mat (same object ⇒ still valid)
-            int32_t instCount = -1;                   // InstancedMesh count; -1 = plain Mesh
+            size_t instCount = 0;// InstancedMesh 当前 active count；仅快速 raster 路径可忽略变化
+            bool rasterInstancingFastPath = false;
             uint32_t flags = 0;                       // kind(2b) | attr/wire/overlay/tet bits
             // BufferGeometry::attributesVersion() at record time. Unchanged ⇒
             // no attribute was added/replaced/removed ⇒ the hasPos/hasNorm
@@ -1307,6 +1340,7 @@ namespace threepp {
         // tree shape, visibility, classification routing and all mesh/geom/mat
         // pointers are unchanged since the last full expansion.
         bool sceneSnapshotMatches(Object3D& scene) {
+            if (forceSceneFullRebuild_) return false;
             if (!sceneBuilt_ || sceneSnapshot_.empty()) return false;
             if (sceneSnapshotRoot_ != &scene || sceneSnapshotRootId_ != scene.id) return false;
             if (prevSceneFingerprint.size() != lastVisibleEntries_.size()) return false;
@@ -1318,7 +1352,7 @@ namespace threepp {
                     ok = false;
                     return;
                 }
-                const SnapNode& sn = sceneSnapshot_[cur++];
+                SnapNode& sn = sceneSnapshot_[cur++];
                 const uint32_t kind = sn.flags & kSnapKindMask;
                 if (kind == kSnapKindOther) return;// pointer identity is all we need
                 // Same object at the same address ⇒ same dynamic type — the
@@ -1353,19 +1387,70 @@ namespace threepp {
                 const bool materialDisplaced = hasMaterialDisplacement(*m);
                 const bool castShadow = m->castShadow;
                 const bool receiveShadow = m->receiveShadow;
+                const bool activeForShadowRouting = !sn.inst || sn.inst->count() != 0u;
                 if (wire != ((sn.flags & kSnapWire) != 0u) ||
                     over != ((sn.flags & kSnapOverlay) != 0u) ||
                     tet != ((sn.flags & kSnapTet) != 0u) ||
                     particle != ((sn.flags & kSnapParticle) != 0u) ||
                     materialDisplaced != ((sn.flags & kSnapMaterialDisplaced) != 0u) ||
-                    castShadow != ((sn.flags & kSnapCastShadow) != 0u) ||
-                    receiveShadow != ((sn.flags & kSnapReceiveShadow) != 0u)) {
+                    (activeForShadowRouting &&
+                     (castShadow != ((sn.flags & kSnapCastShadow) != 0u) ||
+                      receiveShadow != ((sn.flags & kSnapReceiveShadow) != 0u)))) {
                     ok = false;
                     return;
                 }
-                if (sn.instCount >= 0 &&
-                    sn.inst->count() != static_cast<size_t>(sn.instCount)) {
-                    ok = false;
+                if (!activeForShadowRouting) {
+                    sn.flags &= ~(kSnapCastShadow | kSnapReceiveShadow);
+                    if (castShadow) sn.flags |= kSnapCastShadow;
+                    if (receiveShadow) sn.flags |= kSnapReceiveShadow;
+                }
+                if (sn.inst) {
+                    MeshEntry entry{};
+                    entry.mesh = m;
+                    entry.isInstanced = true;
+                    entry.isOverlay = over;
+                    entry.isSkinned = dynamic_cast<SkinnedMesh*>(m) != nullptr;
+                    entry.isDisplaced = dynamic_cast<DisplacedMesh*>(m) != nullptr;
+                    entry.isGrass = dynamic_cast<GrassMesh*>(m) != nullptr;
+                    entry.isMorphed = isMorphedMesh(*m);
+                    entry.isTet = tet;
+                    entry.isMaterialDisplaced = materialDisplaced;
+                    entry.rasterInstanceCount = static_cast<uint32_t>(sn.inst->count());
+                    if (!requiresRayScene()) {
+                        const bool currentFastPath = canUseRasterInstancingFastPath(entry);
+                        if (currentFastPath != sn.rasterInstancingFastPath) {
+                            forceSceneFullRebuild_ = true;
+                            ok = false;
+                            return;
+                        }
+                        if (sn.inst->count() != sn.instCount) {
+                            if (!currentFastPath) {
+                                forceSceneFullRebuild_ = true;
+                                ok = false;
+                                return;
+                            }
+                            sn.instCount = sn.inst->count();
+                            instancedActiveCountChanged_ = true;
+                        }
+                        return;
+                    }
+                    const auto built = tlasBuiltInstancedCounts_.find(sn.inst);
+                    const bool currentFallback = !canUseRasterInstancingFastPath(entry);
+                    if (currentFallback &&
+                        (built == tlasBuiltInstancedCounts_.end() || built->second != sn.inst->count())) {
+                        forceSceneFullRebuild_ = true;
+                        ok = false;
+                        return;
+                    }
+                    if (sn.inst->count() != sn.instCount) {
+                        if (currentFallback) {
+                            forceSceneFullRebuild_ = true;
+                            ok = false;
+                            return;
+                        }
+                        sn.instCount = sn.inst->count();
+                        instancedActiveCountChanged_ = true;
+                    }
                 }
             });
             return ok && cur == sceneSnapshot_.size();
@@ -1465,8 +1550,8 @@ namespace threepp {
         //     AND per-instance setMatrixAt; the matrix already incorporates
         //     mesh->matrixWorld * instanceMatrix[i] for InstancedMesh)
         //   - PBR scalars (covers material slider tweaks)
-        // Instance count change shows up as currFp.size() mismatch, forcing
-        // structural rebuild — correct since each instance is its own TLAS slot.
+        // 所有 RT/回退路径都将 instance count 视为结构变化；仅当前满足
+        // RasterFirst 快速路径资格时保留容量 block，并免于完整场景重建。
         struct MeshFingerprint {
             const void* mesh;
             const void* geom;
@@ -1499,6 +1584,9 @@ namespace threepp {
                                         // (~21 dynamic_casts/mesh) when nothing on the
                                         // material has changed since last frame.
             unsigned int geomVersion = 0;// composite BufferAttribute version (pos+norm+idx+uv+uv2)
+            unsigned int instanceColorVersion = 0;// 跟踪 InstancedMesh 实例颜色更新
+            unsigned int instanceMatrixVersion = 0;// 跟踪 InstancedMesh 实例矩阵更新
+            std::array<float, 3> instanceColor{1.f, 1.f, 1.f};
             std::array<float, 16> matrix{};
             std::array<float, 21> pbr{};// + normalScale.xy + transmission/ior + clearcoat/roughness + clearcoatNormalScale.xy + envMapIntensity/envMapCombine + aoMapIntensity/lightMapIntensity
             std::array<float, 40> materialValues{};// public scalar fields can change without Material::needsUpdate()
@@ -1533,6 +1621,9 @@ namespace threepp {
         // lastVisibleEntries_.
         std::vector<VkCullModeFlags> lastVisibleCullMode_;
         bool sceneBuilt_ = false;
+        bool forceSceneFullRebuild_ = false;
+        bool instancedActiveCountChanged_ = false;
+        uint32_t sceneFullRebuildCount_ = 0u;
 
         // Ray-tracing pipeline.
         VkDescriptorSetLayout rtDsLayout = VK_NULL_HANDLE;
@@ -1702,6 +1793,7 @@ namespace threepp {
         // gbuf pass since it collapses N draws into a few vkCmdDrawIndirect
         // calls — see recordRasterGbufPass.
         VkPipeline            rasterGbufIndirectPipeline = VK_NULL_HANDLE;
+        VkPipeline            rasterGbufInstancedPipeline = VK_NULL_HANDLE;
         // Same indirect G-buffer shaders with depth test/write disabled for
         // materials that set depthTest=false. This preserves unlit/basic
         // visibility without growing MaterialDesc or shader layouts.
@@ -1729,6 +1821,13 @@ namespace threepp {
         // indirectGroupRanges_ during recordRasterGbufPass.
         std::array<Buffer, kFramesInFlight> indirectCmdBuffers{};
         std::array<VkDeviceSize, kFramesInFlight> indirectCmdBufferCapacity{};
+        std::array<Buffer, kFramesInFlight> rasterInstanceBuffers{};
+        std::array<VkDeviceSize, kFramesInFlight> rasterInstanceBufferCapacity{};
+        uint32_t lastRasterInstancedBatchCount_ = 0u;
+        uint32_t lastRasterInstancedInstanceCount_ = 0u;
+        uint32_t lastRasterInstancedPatchedInstanceCount_ = 0u;
+        uint32_t lastRasterInstancedMaterialDescUpdateCount_ = 0u;
+        uint32_t lastRasterInstancedDescriptorWriteCount_ = 0u;
 
         // Hybrid raster overlay (wireframe + Line/LineSegments). Runs after
         // TAA resolve, draws onto the swapchain with the G-buffer's depth
@@ -2021,6 +2120,7 @@ namespace threepp {
         // raygen + denoise stages; bloom + TAA finish the frame unchanged. Owns
         // no images and does not touch rtDsLayout, so ReferencePT is unaffected.
         std::unique_ptr<vulkan::DeferredShade> deferredShade_;
+        bool deferredShadeRayScene_ = false;
         float bloomThreshold_ = 1.0f;// soft-knee bright-pass cutoff (linear HDR)
         float bloomClamp_ = 0.0f;    // per-tap HDR cap before the bright pass; <= 0 = off
         float sharpenStrength_ = 0.0f;// post-TAA RCAS amount; 0 = off
@@ -2188,6 +2288,7 @@ namespace threepp {
             // against unjitDepth, so they need the prepass + overlay pass too.
             if (!lastVisibleSprites_.empty()) return true;
             for (const auto& en : lastVisibleEntries_) {
+                if (!isActiveInstancedEntry(en)) continue;
                 // isOverlay covers particle billboards too (kSnapParticle folds
                 // into isOverlay), so a scene with only particles still triggers
                 // the depth prepass + overlay pass the billboard loop needs.
@@ -2217,6 +2318,18 @@ namespace threepp {
         // deterministic raster path unless the user explicitly selects the
         // reference path tracer.
         VulkanRenderer::RenderMode renderMode_ = VulkanRenderer::RenderMode::RasterFirst;
+
+        // scanLidar() is itself an explicit RT request. Once used, keep the
+        // ray scene synchronized for the renderer lifetime so later scans do
+        // not rebuild TLAS/BLAS from scratch every time.
+        bool lidarRaySceneRequested_ = false;
+        Object3D* lastRenderedScene_ = nullptr;
+        Camera* lastRenderedCamera_ = nullptr;
+
+        [[nodiscard]] bool requiresRayScene() const {
+            return renderMode_ == VulkanRenderer::RenderMode::ReferencePT ||
+                   deferredAO_ || deferredRayAccents_ || lidarRaySceneRequested_;
+        }
 
         // Debug: gate raygen to exit immediately after step-0 primary trace
         // so pathTraceMs measures roughly the primary-trace cost. See
@@ -2566,6 +2679,8 @@ namespace threepp {
             if (rtDsLayout)       vkDestroyDescriptorSetLayout(d, rtDsLayout, nullptr);
 
             if (tlas) ctx->rt().destroyAccelerationStructure(d, tlas, nullptr);
+            tlasBuiltInstanceCount_ = 0u;
+            tlasBuiltInstancedCounts_.clear();
             destroyBuffer(ctx->allocator(), tlasBuffer);
             for (auto& b : tlasInstancesBuffers) destroyBuffer(ctx->allocator(), b);
             destroyBuffer(ctx->allocator(), tlasRefitScratch_);
@@ -2799,8 +2914,13 @@ namespace threepp {
             for (auto& b : rasterCameraUbos)    destroyBuffer(ctx->allocator(), b);
             for (auto& b : drawInfoBuffers)     destroyBuffer(ctx->allocator(), b);
             for (auto& b : indirectCmdBuffers)  destroyBuffer(ctx->allocator(), b);
+            for (auto& b : rasterInstanceBuffers) destroyBuffer(ctx->allocator(), b);
             if (rasterGbufPipeline)         vkDestroyPipeline(d, rasterGbufPipeline, nullptr);
             if (rasterGbufIndirectPipeline) vkDestroyPipeline(d, rasterGbufIndirectPipeline, nullptr);
+            if (rasterGbufInstancedPipeline) {
+                vkDestroyPipeline(d, rasterGbufInstancedPipeline, nullptr);
+                rasterGbufInstancedPipeline = VK_NULL_HANDLE;
+            }
             if (rasterGbufNoDepthPipeline)  vkDestroyPipeline(d, rasterGbufNoDepthPipeline, nullptr);
             if (rasterGbufNoDepthWritePipeline) vkDestroyPipeline(d, rasterGbufNoDepthWritePipeline, nullptr);
             for (auto& [_, pipeline] : rasterGbufStencilPipelines_) {
@@ -2808,6 +2928,7 @@ namespace threepp {
             }
             rasterGbufStencilPipelines_.clear();
             if (rasterGbufDecalPipeline)    vkDestroyPipeline(d, rasterGbufDecalPipeline, nullptr);
+            clearRasterInstancingState();
             if (rasterPipelineLayout)   vkDestroyPipelineLayout(d, rasterPipelineLayout, nullptr);
             if (rasterDsLayout)         vkDestroyDescriptorSetLayout(d, rasterDsLayout, nullptr);
             if (rasterDescPool)         vkDestroyDescriptorPool(d, rasterDescPool, nullptr);
@@ -3342,10 +3463,9 @@ namespace threepp {
             rec = {};
         }
 
-        // Build a single BLAS for the given geometry. Vertex / index buffers
-        // are uploaded host-mapped, then the AS is built into freshly allocated
-        // device storage. The temporary scratch buffer is destroyed on exit.
-        std::unique_ptr<BlasRecord> buildBlasFor(
+        // 上传 raster 与 RT 共用的几何缓冲；加速结构由
+        // ensureBlasBuilt() 延迟创建。
+        std::unique_ptr<BlasRecord> uploadGeometryFor(
                 const BufferGeometry& geom,
                 const std::vector<float>* positionOverride = nullptr) {
             auto* posAttr = geom.getAttribute<float>("position");
@@ -3515,15 +3635,40 @@ namespace threepp {
                 vmaUnmapMemory(ctx->allocator(), rec->index.alloc);
             }
 
+            rec->geomVersion = geomVersionOf(geom);
+            rec->vertexCount = vertexCount;
+            rec->indexCount  = indexed ? static_cast<uint32_t>(idxAttr->count()) : 0u;
+            rec->vbBytes     = vbBytes;
+            return rec;
+        }
+
+        void ensureBlasBuilt(BlasRecord& rec) {
+            if (rec.as != VK_NULL_HANDLE && !rec.asContentsDirty) return;
+            if (rec.as != VK_NULL_HANDLE) {
+                ctx->rt().destroyAccelerationStructure(ctx->device(), rec.as, nullptr);
+                rec.as = VK_NULL_HANDLE;
+                rec.address = 0;
+                destroyBuffer(ctx->allocator(), rec.storage);
+                destroyBuffer(ctx->allocator(), rec.prevVertex);
+                destroyBuffer(ctx->allocator(), rec.blasScratch);
+                rec.storage = {};
+                rec.prevVertex = {};
+                rec.blasScratch = {};
+                rec.blasScratchSize = 0;
+                rec.blasRefitCounter = 0;
+            }
+            const bool indexed = rec.index.handle != VK_NULL_HANDLE;
+            const uint32_t primitiveCount = indexed ? rec.indexCount / 3u : rec.vertexCount / 3u;
+
             VkAccelerationStructureGeometryTrianglesDataKHR triData{};
             triData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
             triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triData.vertexData.deviceAddress = rec->vertex.address;
+            triData.vertexData.deviceAddress = rec.vertex.address;
             triData.vertexStride = 3 * sizeof(float);
-            triData.maxVertex = vertexCount - 1;
+            triData.maxVertex = rec.vertexCount - 1;
             if (indexed) {
                 triData.indexType = VK_INDEX_TYPE_UINT32;
-                triData.indexData.deviceAddress = rec->index.address;
+                triData.indexData.deviceAddress = rec.index.address;
             } else {
                 triData.indexType = VK_INDEX_TYPE_NONE_KHR;
             }
@@ -3559,7 +3704,7 @@ namespace threepp {
                     VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                     &blasBuild, &primitiveCount, &blasSizes);
 
-            rec->storage = createBuffer(
+            rec.storage = createBuffer(
                     ctx->allocator(), ctx->device(), blasSizes.accelerationStructureSize,
                     VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
                             VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
@@ -3567,15 +3712,15 @@ namespace threepp {
 
             VkAccelerationStructureCreateInfoKHR blasCreate{};
             blasCreate.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_CREATE_INFO_KHR;
-            blasCreate.buffer = rec->storage.handle;
+            blasCreate.buffer = rec.storage.handle;
             blasCreate.size = blasSizes.accelerationStructureSize;
             blasCreate.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-            check(ctx->rt().createAccelerationStructure(ctx->device(), &blasCreate, nullptr, &rec->as),
+            check(ctx->rt().createAccelerationStructure(ctx->device(), &blasCreate, nullptr, &rec.as),
                   "vkCreateAccelerationStructureKHR(BLAS)");
 
             Buffer scratch = createAsScratchBuffer(ctx->allocator(), ctx->device(), blasSizes.buildScratchSize);
 
-            blasBuild.dstAccelerationStructure = rec->as;
+            blasBuild.dstAccelerationStructure = rec.as;
             blasBuild.scratchData.deviceAddress = scratch.address;
 
             VkAccelerationStructureBuildRangeInfoKHR range{};
@@ -3592,38 +3737,42 @@ namespace threepp {
             // accumulator blends mismatched history. Static meshes get a free
             // copy (prev == current forever) — chit motion vector resolves to
             // zero, matching the previous fallback behavior.
-            rec->prevVertex = createBuffer(
-                    ctx->allocator(), ctx->device(), vbBytes,
-                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
-                            VK_BUFFER_USAGE_TRANSFER_DST_BIT |
-                            VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
-                    VMA_MEMORY_USAGE_AUTO);
+            if (rec.prevVertex.handle == VK_NULL_HANDLE) {
+                rec.prevVertex = createBuffer(
+                        ctx->allocator(), ctx->device(), rec.vbBytes,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        VMA_MEMORY_USAGE_AUTO);
+            }
 
             VkCommandBuffer cb = beginOneShot();
             // Seed prevVertex with the initial (current) vertex data — first
             // refresh would otherwise copy garbage into prev. Fold into the
             // same one-shot as the BLAS build to avoid an extra submit.
             VkBufferCopy seedCopy{};
-            seedCopy.size = vbBytes;
-            vkCmdCopyBuffer(cb, rec->vertex.handle, rec->prevVertex.handle, 1, &seedCopy);
+            seedCopy.size = rec.vbBytes;
+            vkCmdCopyBuffer(cb, rec.vertex.handle, rec.prevVertex.handle, 1, &seedCopy);
             ctx->rt().cmdBuildAccelerationStructures(cb, 1, &blasBuild, &pRange);
             endAndSubmitOneShot(cb, "buildBlasFor");
             destroyBuffer(ctx->allocator(), scratch);
 
             VkAccelerationStructureDeviceAddressInfoKHR addrInfo{};
             addrInfo.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_DEVICE_ADDRESS_INFO_KHR;
-            addrInfo.accelerationStructure = rec->as;
-            rec->address = ctx->rt().getAccelerationStructureDeviceAddress(ctx->device(), &addrInfo);
+            addrInfo.accelerationStructure = rec.as;
+            rec.address = ctx->rt().getAccelerationStructureDeviceAddress(ctx->device(), &addrInfo);
+            rec.asContentsDirty = false;
+        }
 
-            rec->geomVersion = geomVersionOf(geom);
-            rec->vertexCount = vertexCount;
-            rec->indexCount  = indexed ? static_cast<uint32_t>(idxAttr->count()) : 0u;
-            rec->vbBytes     = vbBytes;// for the prevVertex re-sync copy
-
+        std::unique_ptr<BlasRecord> buildBlasFor(
+                const BufferGeometry& geom,
+                const std::vector<float>* positionOverride = nullptr) {
+            auto rec = uploadGeometryFor(geom, positionOverride);
+            if (rec) ensureBlasBuilt(*rec);
             return rec;
         }
 
-        BlasRecord* ensureCachedStaticBlas(Mesh& mesh) {
+        BlasRecord* ensureCachedStaticBlas(Mesh& mesh, bool buildAs = true) {
             const BufferGeometry* geomKey = mesh.geometry().get();
             auto it = blasCache.find(geomKey);
             if (it != blasCache.end()) {
@@ -3635,11 +3784,12 @@ namespace threepp {
                 }
             }
             if (it == blasCache.end()) {
-                auto rec = buildBlasFor(*mesh.geometry());
+                auto rec = uploadGeometryFor(*mesh.geometry());
                 if (!rec) return nullptr;
                 rec->liveCheck = mesh.geometry();
                 it = blasCache.emplace(geomKey, std::move(rec)).first;
             }
+            if (buildAs) ensureBlasBuilt(*it->second);
             return it->second.get();
         }
 
@@ -3732,13 +3882,81 @@ namespace threepp {
             }
         }
 
+        void uploadCurrentSkinnedPose(SkinnedMesh& sm, SkinnedMeshState& st) {
+            if (!st.blas) return;
+            cpuSkin(sm, st.deformedPositions, st.deformedNormals);
+            if (st.deformedPositions.empty() || st.deformedNormals.empty()) return;
+            void* mapped = nullptr;
+            vmaMapMemory(ctx->allocator(), st.blas->vertex.alloc, &mapped);
+            std::memcpy(mapped, st.deformedPositions.data(),
+                        st.deformedPositions.size() * sizeof(float));
+            vmaUnmapMemory(ctx->allocator(), st.blas->vertex.alloc);
+            vmaMapMemory(ctx->allocator(), st.blas->normal.alloc, &mapped);
+            std::memcpy(mapped, st.deformedNormals.data(),
+                        st.deformedNormals.size() * sizeof(float));
+            vmaUnmapMemory(ctx->allocator(), st.blas->normal.alloc);
+        }
+
+        void ensureSkinnedBlasScratch(SkinnedMeshState& st) {
+            if (!st.blas || st.blas->as == VK_NULL_HANDLE) return;
+            VkAccelerationStructureGeometryTrianglesDataKHR triData{};
+            triData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            triData.vertexData.deviceAddress = st.blas->vertex.address;
+            triData.vertexStride = 3 * sizeof(float);
+            triData.maxVertex = st.vertexCount - 1;
+            if (st.indexed) {
+                triData.indexType = VK_INDEX_TYPE_UINT32;
+                triData.indexData.deviceAddress = st.blas->index.address;
+            } else {
+                triData.indexType = VK_INDEX_TYPE_NONE_KHR;
+            }
+            VkAccelerationStructureGeometryKHR blasGeom{};
+            blasGeom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            blasGeom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            blasGeom.geometry.triangles = triData;
+            VkAccelerationStructureBuildGeometryInfoKHR blasBuild{};
+            blasBuild.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+            blasBuild.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            blasBuild.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                              VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+            blasBuild.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            blasBuild.geometryCount = 1;
+            blasBuild.pGeometries = &blasGeom;
+            blasBuild.dstAccelerationStructure = st.blas->as;
+            VkAccelerationStructureBuildSizesInfoKHR sizes{};
+            sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+            ctx->rt().getAccelerationStructureBuildSizes(
+                    ctx->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                    &blasBuild, &st.primitiveCount, &sizes);
+            if (st.blasScratch.handle == VK_NULL_HANDLE ||
+                st.blasScratchSize < sizes.buildScratchSize) {
+                destroyBuffer(ctx->allocator(), st.blasScratch);
+                st.blasScratch = createAsScratchBuffer(
+                        ctx->allocator(), ctx->device(), sizes.buildScratchSize);
+                st.blasScratchSize = sizes.buildScratchSize;
+            }
+        }
+
         // Allocate or look up the per-SkinnedMesh BLAS state. Builds the BLAS
         // once with the current pose; subsequent dirty frames go through
         // refreshSkinnedBlas which only re-skins + rebuilds in-place. Returns
         // null if the geometry is unsupported (no position/normal/skin attrs).
-        SkinnedMeshState* ensureSkinnedBlas(SkinnedMesh& sm) {
+        SkinnedMeshState* ensureSkinnedBlas(SkinnedMesh& sm, bool buildAs = true) {
             auto it = skinnedMeshStates.find(&sm);
-            if (it != skinnedMeshStates.end()) return it->second.get();
+            if (it != skinnedMeshStates.end()) {
+                auto& state = *it->second;
+                updateSkinnedBoneMatrices(sm, state);
+                if (buildAs) {
+                    uploadCurrentSkinnedPose(sm, state);
+                    if (state.blas->as != VK_NULL_HANDLE) state.blas->asContentsDirty = true;
+                    ensureBlasBuilt(*state.blas);
+                    ensureSkinnedBlasScratch(state);
+                } else {
+                    pendingSkinnedRebuilds_.push_back(&state);
+                }
+                return &state;
+            }
 
             auto* posAttr     = sm.geometry()->getAttribute<float>("position");
             auto* nrmAttr     = sm.geometry()->getAttribute<float>("normal");
@@ -3750,13 +3968,12 @@ namespace threepp {
             // Build BLAS with the bind-pose positions/normals first. The
             // BLAS buffers are then re-written each frame by the skinning
             // compute shader (binding 5/6) and rebuilt in-place.
-            auto rec = buildBlasFor(*sm.geometry());
+            auto rec = uploadGeometryFor(*sm.geometry());
             if (!rec) return nullptr;
             rec->liveCheck = sm.geometry();
 
-            // buildBlasFor() already allocates and seeds prevVertex with the
-            // TRANSFER_DST | VERTEX_BUFFER | SHADER_DEVICE_ADDRESS usage needed
-            // by the per-frame skinning copy below. Reuse that buffer here.
+            // uploadGeometryFor() 只上传共享几何缓冲；骨骼动画的 prevVertex
+            // 由下方状态初始化按需创建，供逐帧姿态快照使用。
 
             auto state = std::make_unique<SkinnedMeshState>();
             state->blas = std::move(rec);
@@ -3847,49 +4064,16 @@ namespace threepp {
                                    static_cast<uint32_t>(wr.size()),
                                    wr.data(), 0, nullptr);
 
-            // BLAS rebuild scratch buffer (persistent — sized once, reused).
-            VkAccelerationStructureGeometryTrianglesDataKHR triData{};
-            triData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-            triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triData.vertexData.deviceAddress = state->blas->vertex.address;
-            triData.vertexStride = 3 * sizeof(float);
-            triData.maxVertex    = vertexCount - 1;
-            if (state->indexed) {
-                triData.indexType = VK_INDEX_TYPE_UINT32;
-                triData.indexData.deviceAddress = state->blas->index.address;
-            } else {
-                triData.indexType = VK_INDEX_TYPE_NONE_KHR;
-            }
-            VkAccelerationStructureGeometryKHR blasGeom{};
-            blasGeom.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-            blasGeom.geometryType  = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-            blasGeom.geometry.triangles = triData;
-            blasGeom.flags         = 0;
-            VkAccelerationStructureBuildGeometryInfoKHR blasBuild{};
-            blasBuild.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-            blasBuild.type  = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-            blasBuild.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                              VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-            blasBuild.mode  = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-            blasBuild.geometryCount = 1;
-            blasBuild.pGeometries   = &blasGeom;
-            blasBuild.dstAccelerationStructure = state->blas->as;
-            VkAccelerationStructureBuildSizesInfoKHR blasSizes{};
-            blasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-            ctx->rt().getAccelerationStructureBuildSizes(
-                    ctx->device(),
-                    VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                    &blasBuild, &state->primitiveCount, &blasSizes);
-            state->blasScratchSize = blasSizes.buildScratchSize;
-            state->blasScratch = createAsScratchBuffer(
-                    ctx->allocator(), ctx->device(), state->blasScratchSize);
-
             auto* raw = state.get();
             skinnedMeshStates.emplace(&sm, std::move(state));
-            // First-frame refresh: upload bones + queue a rebuild so the BLAS
-            // reflects the current pose, not bind pose, when the next frame
-            // records.
-            refreshSkinnedBlas(sm, *raw);
+            updateSkinnedBoneMatrices(sm, *raw);
+            if (buildAs) {
+                uploadCurrentSkinnedPose(sm, *raw);
+                ensureBlasBuilt(*raw->blas);
+                ensureSkinnedBlasScratch(*raw);
+            } else {
+                pendingSkinnedRebuilds_.push_back(raw);
+            }
             return raw;
         }
 
@@ -3898,7 +4082,7 @@ namespace threepp {
         // place (same AS handle and storage so the device address — and the
         // TLAS reference to it — stay valid). The TLAS doesn't need refit
         // for pose-only changes; the instance's transform is unchanged.
-        void refreshSkinnedBlas(SkinnedMesh& sm, SkinnedMeshState& st) {
+        void updateSkinnedBoneMatrices(SkinnedMesh& sm, SkinnedMeshState& st) {
             if (!st.blas || !sm.skeleton || st.boneCount == 0) return;
 
             // Recompute per-bone matrix = bones[b]->matrixWorld * boneInverse[b].
@@ -3939,10 +4123,81 @@ namespace threepp {
                 st.prevBoneMats = bm;
             }
 
-            // Queue for per-frame skinning compute + BLAS rebuild. The actual
-            // GPU work is recorded into the main command buffer at the start
-            // of recordCommandBuffer — no blocking submit here.
+        }
+
+        void refreshSkinnedBlas(SkinnedMesh& sm, SkinnedMeshState& st) {
+            updateSkinnedBoneMatrices(sm, st);
             pendingSkinnedRebuilds_.push_back(&st);
+        }
+
+        void recordTetRasterDeformation(VkCommandBuffer cb, TetMeshState& st) {
+            ensureTetSkinningPipeline();
+            tetSkinning_->bindPipeline(cb);
+            tetSkinning_->recordDispatch(cb, st.tetDescSet, st.vertexCount);
+            VkMemoryBarrier2 mb{};
+            mb.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+            mb.srcStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+            mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+            mb.dstStageMask = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT;
+            mb.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+            VkDependencyInfo dep{};
+            dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+            dep.memoryBarrierCount = 1;
+            dep.pMemoryBarriers = &mb;
+            vkCmdPipelineBarrier2(cb, &dep);
+        }
+
+        void ensureTetBlasScratch(TetMeshState& st) {
+            if (!st.blas || st.blas->as == VK_NULL_HANDLE) return;
+            VkAccelerationStructureGeometryTrianglesDataKHR triData{};
+            triData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
+            triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
+            triData.vertexData.deviceAddress = st.blas->vertex.address;
+            triData.vertexStride = 3 * sizeof(float);
+            triData.maxVertex = st.vertexCount - 1;
+            if (st.indexed) {
+                triData.indexType = VK_INDEX_TYPE_UINT32;
+                triData.indexData.deviceAddress = st.blas->index.address;
+            } else {
+                triData.indexType = VK_INDEX_TYPE_NONE_KHR;
+            }
+            VkAccelerationStructureGeometryKHR geom{};
+            geom.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+            geom.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
+            geom.geometry.triangles = triData;
+            VkAccelerationStructureBuildGeometryInfoKHR build{};
+            build.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
+            build.type = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
+            build.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
+                          VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+            build.mode = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
+            build.geometryCount = 1;
+            build.pGeometries = &geom;
+            build.dstAccelerationStructure = st.blas->as;
+            VkAccelerationStructureBuildSizesInfoKHR sizes{};
+            sizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
+            ctx->rt().getAccelerationStructureBuildSizes(
+                    ctx->device(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
+                    &build, &st.primitiveCount, &sizes);
+            if (st.blasScratch.handle == VK_NULL_HANDLE ||
+                st.blasScratchSize < sizes.buildScratchSize) {
+                destroyBuffer(ctx->allocator(), st.blasScratch);
+                st.blasScratch = createAsScratchBuffer(
+                        ctx->allocator(), ctx->device(), sizes.buildScratchSize);
+                st.blasScratchSize = sizes.buildScratchSize;
+            }
+        }
+
+        void applyCurrentTetPoseNow(Mesh& mesh, TetMeshState& st) {
+            refreshTetBlas(mesh, st);
+            const bool queued = std::find(pendingTetRebuilds_.begin(),
+                                          pendingTetRebuilds_.end(), &st) !=
+                                pendingTetRebuilds_.end();
+            if (!queued) return;
+            VkCommandBuffer cb = beginOneShot();
+            recordTetRasterDeformation(cb, st);
+            endAndSubmitOneShot(cb, "tet raster deformation");
+            std::erase(pendingTetRebuilds_, &st);
         }
 
         // Allocate or look up the per-tet-skinned-mesh BLAS state (PhysX soft body).
@@ -3951,9 +4206,21 @@ namespace threepp {
         // per-frame tet-position buffer + descriptor set, then queue a first refresh.
         // Returns null if the geometry/material lack the tet attributes that
         // SoftBody::enableGpuSkinning() sets.
-        TetMeshState* ensureTetBlas(Mesh& m) {
+        TetMeshState* ensureTetBlas(Mesh& m, bool buildAs = true) {
             auto found = tetMeshStates.find(&m);
-            if (found != tetMeshStates.end()) return found->second.get();
+            if (found != tetMeshStates.end()) {
+                if (buildAs) {
+                    applyCurrentTetPoseNow(m, *found->second);
+                    if (found->second->blas->as != VK_NULL_HANDLE) {
+                        found->second->blas->asContentsDirty = true;
+                    }
+                    ensureBlasBuilt(*found->second->blas);
+                    ensureTetBlasScratch(*found->second);
+                } else {
+                    refreshTetBlas(m, *found->second);
+                }
+                return found->second.get();
+            }
 
             auto geom = m.geometry();
             if (!geom) return nullptr;
@@ -3970,7 +4237,7 @@ namespace threepp {
 
             // BLAS built from the rest positions; the tet_skinning compute then
             // rewrites the vertex/normal buffers each frame and the BLAS is refit.
-            auto rec = buildBlasFor(*geom);
+            auto rec = uploadGeometryFor(*geom);
             if (!rec) return nullptr;
             rec->liveCheck = geom;
 
@@ -4049,47 +4316,15 @@ namespace threepp {
             vkUpdateDescriptorSets(ctx->device(),
                                    static_cast<uint32_t>(wr.size()), wr.data(), 0, nullptr);
 
-            // Persistent BLAS-rebuild scratch (sized once, reused every frame).
-            VkAccelerationStructureGeometryTrianglesDataKHR triData{};
-            triData.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
-            triData.vertexFormat = VK_FORMAT_R32G32B32_SFLOAT;
-            triData.vertexData.deviceAddress = state->blas->vertex.address;
-            triData.vertexStride = 3 * sizeof(float);
-            triData.maxVertex    = vertexCount - 1;
-            if (state->indexed) {
-                triData.indexType = VK_INDEX_TYPE_UINT32;
-                triData.indexData.deviceAddress = state->blas->index.address;
-            } else {
-                triData.indexType = VK_INDEX_TYPE_NONE_KHR;
-            }
-            VkAccelerationStructureGeometryKHR blasGeom{};
-            blasGeom.sType         = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
-            blasGeom.geometryType  = VK_GEOMETRY_TYPE_TRIANGLES_KHR;
-            blasGeom.geometry.triangles = triData;
-            blasGeom.flags         = 0;
-            VkAccelerationStructureBuildGeometryInfoKHR blasBuild{};
-            blasBuild.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_GEOMETRY_INFO_KHR;
-            blasBuild.type  = VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR;
-            blasBuild.flags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR |
-                              VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-            blasBuild.mode  = VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR;
-            blasBuild.geometryCount = 1;
-            blasBuild.pGeometries   = &blasGeom;
-            blasBuild.dstAccelerationStructure = state->blas->as;
-            VkAccelerationStructureBuildSizesInfoKHR blasSizes{};
-            blasSizes.sType = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR;
-            ctx->rt().getAccelerationStructureBuildSizes(
-                    ctx->device(),
-                    VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
-                    &blasBuild, &state->primitiveCount, &blasSizes);
-            state->blasScratchSize = blasSizes.buildScratchSize;
-            state->blasScratch = createAsScratchBuffer(
-                    ctx->allocator(), ctx->device(), state->blasScratchSize);
-
             auto* raw = state.get();
             tetMeshStates.emplace(&m, std::move(state));
-            // First-frame refresh so the BLAS reflects the current deformation.
-            refreshTetBlas(m, *raw);
+            if (buildAs) {
+                applyCurrentTetPoseNow(m, *raw);
+                ensureBlasBuilt(*raw->blas);
+                ensureTetBlasScratch(*raw);
+            } else {
+                refreshTetBlas(m, *raw);
+            }
             return raw;
         }
 
@@ -4235,16 +4470,24 @@ namespace threepp {
             }
             if (liveOps.empty()) return;
 
-            // Phase B — snapshot current vertex into prevVertex for the chit's
-            // per-vertex motion vector. Recorded into one shared cmdbuf; submit
-            // + wait once. Must run before the host memcpy of new positions
-            // below or we'd snapshot the new state, not last frame's.
+            // 阶段 B：普通几何第一次变为动态时才创建 prevVertex，避免给所有
+            // 静态几何无条件增配缓冲。共享 one-shot 在同一图形队列提交并等待，
+            // 既保存 host 覆写前的旧顶点，也保证前序帧不再读取 vertex/normal/index。
             {
-                bool any = false;
+                for (size_t k : liveOps) {
+                    auto& rec = *ops[k].rec;
+                    if (rec.prevVertex.handle != VK_NULL_HANDLE) continue;
+                    rec.prevVertex = createBuffer(
+                            ctx->allocator(), ctx->device(), rec.vbBytes,
+                            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT |
+                                    VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                    VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                            VMA_MEMORY_USAGE_AUTO);
+                }
+
                 VkCommandBuffer cb = beginOneShot();
                 for (size_t k : liveOps) {
                     auto& rec = *ops[k].rec;
-                    if (rec.prevVertex.handle == VK_NULL_HANDLE) continue;
                     auto* posAttr = ops[k].geom->getAttribute<float>("position");
                     VkBufferCopy region{};
                     region.size = posAttr->array().size() * sizeof(float);
@@ -4254,16 +4497,8 @@ namespace threepp {
                     // the new positions on the next clean frame (see the resync
                     // pass in ensureSceneBuilt) or the mesh shakes forever.
                     rec.prevVertexResyncPending = true;
-                    any = true;
                 }
-                if (any) {
-                    endAndSubmitOneShot(cb, "refreshGeomBlasBatch (prevVertex)");
-                } else {
-                    // No prev buffers attached — skip the empty submit so we
-                    // don't round-trip the queue for zero work.
-                    vkEndCommandBuffer(cb);
-                    vkFreeCommandBuffers(ctx->device(), cmdPool, 1, &cb);
-                }
+                endAndSubmitOneShot(cb, "refreshGeomBlasBatch (prevVertex)");
             }
 
             // Phase C — host writes into the now-snapshotted vertex/normal/uv/
@@ -4310,7 +4545,13 @@ namespace threepp {
                                 idxAttr->array().size() * sizeof(unsigned int));
                     vmaUnmapMemory(ctx->allocator(), rec.index.alloc);
                 }
+                rec.geomVersion = geomVersionOf(geom);
+                if (!requiresRayScene() && rec.as != VK_NULL_HANDLE) {
+                    rec.asContentsDirty = true;
+                }
             }
+
+            if (!requiresRayScene()) return;
 
             // Phase D — refit each BLAS. The build-info structs need to outlive
             // the cmdBuildAccelerationStructures call until the GPU executes
@@ -4397,12 +4638,12 @@ namespace threepp {
                 ranges[kk].primitiveCount = primitiveCount;
                 rangePtrs[kk] = &ranges[kk];
 
-                rec.geomVersion = geomVersionOf(geom);
             }
 
             VkCommandBuffer cb = beginOneShot();
             ctx->rt().cmdBuildAccelerationStructures(cb, N, blasBuilds.data(), rangePtrs.data());
             endAndSubmitOneShot(cb, "refreshGeomBlasBatch (BLAS)");
+            for (const auto k : liveOps) ops[k].rec->asContentsDirty = false;
         }
 
         // ── Morph-target helpers ─────────────────────────────────────────
@@ -4500,11 +4741,14 @@ namespace threepp {
             }
         }
 
-        MorphedMeshState* ensureMorphedBlas(Mesh& mesh) {
+        MorphedMeshState* ensureMorphedBlas(Mesh& mesh, bool buildAs = true) {
             auto it = morphedMeshStates.find(&mesh);
-            if (it != morphedMeshStates.end()) return it->second.get();
+            if (it != morphedMeshStates.end()) {
+                refreshMorphedBlas(mesh, *it->second, buildAs);
+                return it->second.get();
+            }
 
-            auto rec = buildBlasFor(*mesh.geometry());
+            auto rec = uploadGeometryFor(*mesh.geometry());
             if (!rec) return nullptr;
             rec->liveCheck = mesh.geometry();
 
@@ -4515,11 +4759,11 @@ namespace threepp {
             auto* raw = state.get();
             morphedMeshStates.emplace(&mesh, std::move(state));
 
-            refreshMorphedBlas(mesh, *raw);
+            refreshMorphedBlas(mesh, *raw, buildAs);
             return raw;
         }
 
-        void refreshMorphedBlas(Mesh& mesh, MorphedMeshState& st) {
+        void refreshMorphedBlas(Mesh& mesh, MorphedMeshState& st, bool updateAs = true) {
             cpuMorphBlend(mesh, *mesh.geometry(), st.blendedPositions, st.blendedNormals);
             if (st.blendedPositions.empty() || !st.blas) return;
 
@@ -4533,6 +4777,17 @@ namespace threepp {
             std::memcpy(mapped, st.blendedNormals.data(),
                         st.blendedNormals.size() * sizeof(float));
             vmaUnmapMemory(ctx->allocator(), st.blas->normal.alloc);
+
+            auto* morphObj = mesh.as<ObjectWithMorphTargetInfluences>();
+            if (morphObj) st.prevInfluences = morphObj->morphTargetInfluences();
+            if (!updateAs) {
+                if (st.blas->as != VK_NULL_HANDLE) st.blas->asContentsDirty = true;
+                return;
+            }
+            if (st.blas->as == VK_NULL_HANDLE || st.blas->asContentsDirty) {
+                ensureBlasBuilt(*st.blas);
+                return;
+            }
 
             auto* posAttr = mesh.geometry()->getAttribute<float>("position");
             auto* idxAttr = mesh.geometry()->getIndex();
@@ -4589,9 +4844,7 @@ namespace threepp {
             ctx->rt().cmdBuildAccelerationStructures(cb, 1, &blasBuild, &pRange);
             endAndSubmitOneShot(cb);
             destroyBuffer(ctx->allocator(), scratch);
-
-            auto* morphObj = mesh.as<ObjectWithMorphTargetInfluences>();
-            if (morphObj) st.prevInfluences = morphObj->morphTargetInfluences();
+            st.blas->asContentsDirty = false;
         }
 
         static const MaterialWithDisplacementMap* displacementOfMaterial(const std::shared_ptr<Material>& material) {
@@ -4949,12 +5202,13 @@ namespace threepp {
             return expanded;
         }
 
-        MaterialDisplacedMeshState* ensureMaterialDisplacedBlas(Mesh& mesh) {
+        MaterialDisplacedMeshState* ensureMaterialDisplacedBlas(Mesh& mesh, bool buildAs = true) {
             if (!hasMaterialDisplacement(mesh)) return nullptr;
 
             auto it = materialDisplacedMeshStates.find(&mesh);
             if (it != materialDisplacedMeshStates.end() &&
                 materialDisplacedStateMatches(mesh, *it->second)) {
+                if (buildAs && it->second->blas) ensureBlasBuilt(*it->second->blas);
                 return it->second.get();
             }
 
@@ -4979,14 +5233,14 @@ namespace threepp {
                     return nullptr;
                 }
                 referenceGroups = expanded->groups;
-                rec = buildBlasFor(*expanded);
+                rec = uploadGeometryFor(*expanded);
             } else if (const auto* disp = materialDisplacementOf(mesh)) {
                 auto positions = buildMaterialDisplacedPositions(mesh, *disp);
                 if (positions.empty()) {
                     materialDisplacedMeshStates.erase(it);
                     return nullptr;
                 }
-                rec = buildBlasFor(*geometry, &positions);
+                rec = uploadGeometryFor(*geometry, &positions);
             }
             if (!rec) {
                 materialDisplacedMeshStates.erase(it);
@@ -5003,6 +5257,7 @@ namespace threepp {
             state.referenceGroups = std::move(referenceGroups);
             state.drawRange = geometry->drawRange;
             state.geomVersion = geomVersionOf(*geometry);
+            if (buildAs) ensureBlasBuilt(*state.blas);
             return &state;
         }
 
@@ -5012,9 +5267,12 @@ namespace threepp {
         // compute pass before the first ray-trace) and stands up the FFT
         // cascade. Returns nullptr if the geometry is unsupported (must be a
         // square indexed plane with N×N vertices for some power-of-two N).
-        DisplacedMeshState* ensureDisplacedState(DisplacedMesh& dm) {
+        DisplacedMeshState* ensureDisplacedState(DisplacedMesh& dm, bool buildAs = true) {
             auto it = displacedStates.find(&dm);
-            if (it != displacedStates.end()) return it->second.get();
+            if (it != displacedStates.end()) {
+                if (buildAs) ensureBlasBuilt(*it->second->blas);
+                return it->second.get();
+            }
 
             auto* posAttr = dm.geometry()->getAttribute<float>("position");
             if (!posAttr) return nullptr;
@@ -5036,7 +5294,7 @@ namespace threepp {
             const float planeSize = xMax - xMin;
             if (!(planeSize > 0.f)) return nullptr;
 
-            auto blas = buildBlasFor(*dm.geometry());
+            auto blas = uploadGeometryFor(*dm.geometry());
             if (!blas) return nullptr;
             blas->liveCheck = dm.geometry();
 
@@ -5400,7 +5658,8 @@ namespace threepp {
 
         // Per-frame: run the FFT chain → water_displace → BLAS rebuild for
         // one DisplacedMesh. Mirrors refreshSkinnedBlas's structure.
-        void refreshDisplacedBlas(DisplacedMesh& dm, DisplacedMeshState& st, float elapsedSeconds) {
+        void refreshDisplacedBlas(DisplacedMesh& dm, DisplacedMeshState& st,
+                                  float elapsedSeconds, bool updateAs = true) {
             VkCommandBuffer cb = beginOneShot();
 
             // (1)..(3) Run each enabled cascade's FFT chain in turn. Phillips
@@ -5655,15 +5914,18 @@ namespace threepp {
                 fmb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
                 vkCmdPipelineBarrier(cb,
                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                        VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR,
+                        updateAs ? VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR
+                                 : VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                         0, 0, nullptr, 0, nullptr, 1, &fmb);
             }
 
-            // Buffer barrier: compute write → AS-build read on the vertex/normal buffers.
+            // pure raster 只发布给顶点输入；显式 RT 还需发布给 AS 构建。
             VkBufferMemoryBarrier bbs[2]{};
             bbs[0].sType         = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
             bbs[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-            bbs[0].dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+            bbs[0].dstAccessMask = updateAs
+                    ? VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
+                    : VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT;
             bbs[0].buffer        = st.blas->vertex.handle;
             bbs[0].size          = VK_WHOLE_SIZE;
             bbs[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -5672,12 +5934,16 @@ namespace threepp {
             bbs[1].buffer = st.blas->normal.handle;
             vkCmdPipelineBarrier(cb,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                updateAs ? VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
+                         : VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
                 0, 0, nullptr, 2, bbs, 0, nullptr);
 
             // (5) Rebuild the BLAS in-place (same buffers, same AS handle).
             // Mirrors refreshSkinnedBlas — extracted into a helper would be
             // nicer but the duplicated 70-line block is fine for a first cut.
+            Buffer scratch{};
+            if (updateAs) {
+            ensureBlasBuilt(*st.blas);
             auto* posAttr = dm.geometry()->getAttribute<float>("position");
             auto* idxAttr = dm.geometry()->getIndex();
             const uint32_t vc = static_cast<uint32_t>(posAttr->count());
@@ -5733,16 +5999,19 @@ namespace threepp {
 
             const VkDeviceSize scratchSize =
                     fullRebuild ? sizes.buildScratchSize : sizes.updateScratchSize;
-            Buffer scratch = createAsScratchBuffer(ctx->allocator(), ctx->device(), scratchSize);
+            scratch = createAsScratchBuffer(ctx->allocator(), ctx->device(), scratchSize);
             build.scratchData.deviceAddress = scratch.address;
 
             VkAccelerationStructureBuildRangeInfoKHR range{};
             range.primitiveCount = primCount;
             const VkAccelerationStructureBuildRangeInfoKHR* pRange = &range;
             ctx->rt().cmdBuildAccelerationStructures(cb, 1, &build, &pRange);
+            } else if (st.blas->as != VK_NULL_HANDLE) {
+                st.blas->asContentsDirty = true;
+            }
 
             endAndSubmitOneShot(cb);
-            destroyBuffer(ctx->allocator(), scratch);
+            if (scratch.handle != VK_NULL_HANDLE) destroyBuffer(ctx->allocator(), scratch);
 
             // Mirror cascade height fields into DisplacedMesh for CPU sampling.
             // endAndSubmit waits for completion, so the staging buffers are
@@ -5777,9 +6046,16 @@ namespace threepp {
         // (built ALLOW_UPDATE, refit each frame) plus an immutable copy of the
         // rest positions and the per-vertex height fractions the wind shader
         // reads. Returns nullptr if the geometry lacks position / heightFrac.
-        GrassMeshState* ensureGrassState(GrassMesh& gm) {
+        GrassMeshState* ensureGrassState(GrassMesh& gm, bool buildAs = true) {
             auto it = grassStates.find(&gm);
-            if (it != grassStates.end()) return it->second.get();
+            if (it != grassStates.end()) {
+                if (buildAs) {
+                    ensureBlasBuilt(*it->second->blas);
+                } else {
+                    pendingGrassDeforms_.emplace_back(&gm, it->second.get());
+                }
+                return it->second.get();
+            }
 
             auto* posAttr = gm.geometry()->getAttribute<float>("position");
             auto* hfAttr  = gm.geometry()->getAttribute<float>("heightFrac");
@@ -5787,7 +6063,7 @@ namespace threepp {
             const uint32_t vertexCount = static_cast<uint32_t>(posAttr->count());
             if (vertexCount == 0 || static_cast<uint32_t>(hfAttr->count()) != vertexCount) return nullptr;
 
-            auto blas = buildBlasFor(*gm.geometry());
+            auto blas = uploadGeometryFor(*gm.geometry());
             if (!blas) return nullptr;
             blas->liveCheck = gm.geometry();
 
@@ -5828,6 +6104,8 @@ namespace threepp {
             state->blas = std::move(blas);
             auto* raw = state.get();
             grassStates.emplace(&gm, std::move(state));
+            ensureGrassWindPipeline();
+            refreshGrassBlas(gm, *raw, 0.f, buildAs);
             return raw;
         }
 
@@ -5838,7 +6116,8 @@ namespace threepp {
         // vkQueueWaitIdle. Uses the persistent per-BLAS scratch (grass geometry
         // is fixed-size, so it's allocated once on first use). Normals are left
         // static, so only the position buffer is written/barriered.
-        void recordGrassDeform(VkCommandBuffer cb, GrassMesh& gm, GrassMeshState& st) {
+        void recordGrassDeform(VkCommandBuffer cb, GrassMesh& gm, GrassMeshState& st,
+                               bool updateAs = true) {
             vulkan::GrassWindPipeline::PushConstants pc{};
             pc.posOut       = st.blas->vertex.address;
             pc.restIn       = st.restPos.address;
@@ -5858,18 +6137,26 @@ namespace threepp {
                 mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                 mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
                 mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                                   VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-                                   VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-                mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                                   VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
-                                   VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                mb.dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT;
+                mb.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT;
+                if (updateAs) {
+                    mb.dstStageMask |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    mb.dstAccessMask |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                }
                 VkDependencyInfo dep{};
                 dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
                 dep.memoryBarrierCount = 1;
                 dep.pMemoryBarriers    = &mb;
                 vkCmdPipelineBarrier2(cb, &dep);
             }
+
+            if (!updateAs) {
+                if (st.blas->as != VK_NULL_HANDLE) st.blas->asContentsDirty = true;
+                return;
+            }
+            ensureBlasBuilt(*st.blas);
 
             // Refit the BLAS in place (periodic full rebuild keeps it balanced).
             auto* posAttr = gm.geometry()->getAttribute<float>("position");
@@ -5941,9 +6228,10 @@ namespace threepp {
         // One-shot wrapper — used only for the initial prime during scene build
         // (rare). The per-frame path records into the frame cb via the pending
         // queue, so it never drains.
-        void refreshGrassBlas(GrassMesh& gm, GrassMeshState& st, float /*elapsedSeconds*/) {
+        void refreshGrassBlas(GrassMesh& gm, GrassMeshState& st, float /*elapsedSeconds*/,
+                              bool updateAs = true) {
             VkCommandBuffer cb = beginOneShot();
-            recordGrassDeform(cb, gm, st);
+            recordGrassDeform(cb, gm, st, updateAs);
             endAndSubmitOneShot(cb, "grass prime");
         }
 
@@ -6029,6 +6317,7 @@ namespace threepp {
             ctx->rt().cmdBuildAccelerationStructures(cb, 1, &tlasBuild, &pRange);
             endAndSubmitOneShot(cb, "buildTlas");
             destroyBuffer(ctx->allocator(), scratch);
+            tlasBuiltInstanceCount_ = instanceCount;
         }
 
         // Record a per-frame TLAS refit/rebuild into `cb` — NO blocking submit.
@@ -6115,6 +6404,26 @@ namespace threepp {
                 vmaMapMemory(ctx->allocator(), target.alloc, &mapped);
                 std::memcpy(mapped, descs.data(), descs.size() * sizeof(DescT));
                 vmaUnmapMemory(ctx->allocator(), target.alloc);
+            }
+        }
+
+        void uploadMaterialDescBuffers(const std::vector<MaterialDesc>& descs, size_t instanceCount) {
+            const VkDeviceSize bytes = std::max<VkDeviceSize>(
+                    (descs.size() + instanceCount) * sizeof(MaterialDesc), sizeof(MaterialDesc));
+            for (auto& buffer : materialDescsBuffers) {
+                buffer = createBuffer(
+                        ctx->allocator(), ctx->device(), bytes,
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                        VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+                if (!descs.empty()) {
+                    void* mapped = nullptr;
+                    check(vmaMapMemory(ctx->allocator(), buffer.alloc, &mapped),
+                          "vmaMapMemory(material desc upload)");
+                    std::memcpy(mapped, descs.data(), descs.size() * sizeof(MaterialDesc));
+                    vmaUnmapMemory(ctx->allocator(), buffer.alloc);
+                }
             }
         }
 
@@ -6472,13 +6781,25 @@ namespace threepp {
         // path that called vkDeviceWaitIdle on every animated-pbr update.
         void flushMaterialDescsIfDirty(uint32_t frame) {
             if (!matDescsDirty_[frame]) return;
-            matDescsDirty_[frame] = false;
-            if (matDescsCached_.empty()) return;
+            if (matDescsCached_.empty()) {
+                matDescsDirty_[frame] = false;
+                matDescDirtyIndices_[frame].clear();
+                return;
+            }
             void* mapped = nullptr;
-            vmaMapMemory(ctx->allocator(), materialDescsBuffers[frame].alloc, &mapped);
-            std::memcpy(mapped, matDescsCached_.data(),
-                        matDescsCached_.size() * sizeof(MaterialDesc));
+            check(vmaMapMemory(ctx->allocator(), materialDescsBuffers[frame].alloc, &mapped),
+                  "vmaMapMemory(material desc flush)");
+            auto& dirtyIndices = matDescDirtyIndices_[frame];
+            if (dirtyIndices.empty()) {
+                std::memcpy(mapped, matDescsCached_.data(),
+                            matDescsCached_.size() * sizeof(MaterialDesc));
+            } else {
+                auto* dst = static_cast<MaterialDesc*>(mapped);
+                for (const auto index : dirtyIndices) dst[index] = matDescsCached_[index];
+            }
             vmaUnmapMemory(ctx->allocator(), materialDescsBuffers[frame].alloc);
+            dirtyIndices.clear();
+            matDescsDirty_[frame] = false;
         }
 
         // Per-frame frustum cull: tag every entry with `inFrustum` so raster
@@ -6512,12 +6833,7 @@ namespace threepp {
             vp.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
             Frustum frustum;
             frustum.setFromProjectionMatrix(vp);
-            // Pre-compute a sparse "is glass" lookup. glassEntryIndices_ is
-            // already sorted ascending (built by walking entries in order),
-            // so we can iterate it in lockstep with i.
-            size_t gi = 0;
-            const size_t gN = glassEntryIndices_.size();
-            for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
+            for (size_t i = 0; i < lastVisibleEntries_.size();) {
                 auto& en = lastVisibleEntries_[i];
                 // Default-include conservative cases — they always draw. Deformers
                 // (skinned/displaced/morphed/tet) are here because their cached local
@@ -6526,22 +6842,63 @@ namespace threepp {
                 if (en.isOverlay || en.isSkinned || en.isDisplaced || en.isGrass ||
                     en.isMorphed || en.isTet || en.isMaterialDisplaced) {
                     en.inFrustum = true;
+                    ++i;
+                } else if (en.isInstanced) {
+                    auto* inst = static_cast<InstancedMesh*>(en.mesh);
+                    if (en.rasterInstancingCompact) {
+                        // 没有可靠的聚合包围体时必须保守绘制，不能拿代表 entry
+                        // 的基准 AABB 代替全部实例。已有包围球只在矩阵版本或
+                        // active count 改变时重算；颜色更新与包围体无关。
+                        if (!inst->boundingSphere) {
+                            en.inFrustum = true;
+                        } else {
+                            if (en.rasterBoundsMatrixVersion != inst->instanceMatrix()->version ||
+                                en.rasterBoundsCount != inst->count()) {
+                                inst->computeBoundingSphere();
+                                en.rasterBoundsMatrixVersion = inst->instanceMatrix()->version;
+                                en.rasterBoundsCount = inst->count();
+                            }
+                            Sphere worldSphere = *inst->boundingSphere;
+                            worldSphere.applyMatrix4(*inst->matrixWorld);
+                            en.inFrustum = frustum.intersectsSphere(worldSphere);
+                        }
+                        ++i;
+                        continue;
+                    }
+
+                    auto geom = en.mesh->geometry();
+                    if (!geom) {
+                        en.inFrustum = true;
+                    } else {
+                        if (!geom->boundingBox) geom->computeBoundingBox();
+                        if (!geom->boundingBox) {
+                            en.inFrustum = true;
+                        } else {
+                            Box3 worldAabb = *geom->boundingBox;
+                            Matrix4 w;
+                            std::memcpy(w.elements.data(), en.worldMatrix.data(), 64);
+                            worldAabb.applyMatrix4(w);
+                            en.inFrustum = frustum.intersectsBox(worldAabb);
+                        }
+                    }
+                    ++i;
                 } else {
                     auto geom = en.mesh->geometry();
-                    if (!geom) { en.inFrustum = true; continue; }
+                    if (!geom) { en.inFrustum = true; ++i; continue; }
                     if (!geom->boundingBox) geom->computeBoundingBox();
-                    if (!geom->boundingBox) { en.inFrustum = true; continue; }
+                    if (!geom->boundingBox) { en.inFrustum = true; ++i; continue; }
                     Box3 worldAabb = *geom->boundingBox;
                     Matrix4 w;
                     std::memcpy(w.elements.data(), en.worldMatrix.data(), 64);
                     worldAabb.applyMatrix4(w);
                     en.inFrustum = frustum.intersectsBox(worldAabb);
+                    ++i;
                 }
-                // Advance the glass-index cursor in lockstep; if this entry
-                // is glass AND in-frustum, light the global flag.
-                while (gi < gN && glassEntryIndices_[gi] < i) ++gi;
-                if (gi < gN && glassEntryIndices_[gi] == i && en.inFrustum) {
+            }
+            for (const auto i : glassEntryIndices_) {
+                if (i < lastVisibleEntries_.size() && lastVisibleEntries_[i].inFrustum) {
                     glassVisibleThisFrame_ = true;
+                    break;
                 }
             }
         }
@@ -6818,6 +7175,16 @@ namespace threepp {
             return (d.ior < 1.05f && d.transmission > 0.0f) || d.alphaCutoff < 0.0f;
         }
 
+        static uint32_t rayMaskForMaterialDesc(const MaterialDesc& material,
+                                               bool isDisplaced,
+                                               bool castShadow) {
+            if (!isDisplaced &&
+                (material.transmission > 0.0f || material.alphaCutoff < 0.0f)) {
+                return kRayMaskAlpha;
+            }
+            return kRayMaskOpaque | (castShadow ? kRayMaskShadow : 0u);
+        }
+
         MaterialDesc materialDescForMaterial(const std::shared_ptr<Material>& material) const {
             MaterialDesc d = materialFromMaterial(material);
             auto appendPlane = [&](const Plane& p) {
@@ -6851,17 +7218,25 @@ namespace threepp {
             return materialDescForMaterial(m.material());
         }
 
-        static void applyInstanceColor(MaterialDesc& d, const MeshEntry& en) {
-            if (!en.isInstanced) return;
+        static std::array<float, 3> instanceColorFingerprint(const MeshEntry& en) {
+            std::array<float, 3> result{1.f, 1.f, 1.f};
+            if (!en.isInstanced) return result;
             auto* inst = dynamic_cast<InstancedMesh*>(en.mesh);
             auto* color = inst ? inst->instanceColor() : nullptr;
-            if (!color || en.instanceIndex >= static_cast<uint32_t>(color->count())) return;
+            if (!color || en.instanceIndex >= static_cast<uint32_t>(color->count())) return result;
             const auto& values = color->array();
             const auto base = static_cast<size_t>(en.instanceIndex) * 3u;
-            if (base + 2 >= values.size()) return;
-            d.albedo[0] *= values[base + 0];
-            d.albedo[1] *= values[base + 1];
-            d.albedo[2] *= values[base + 2];
+            if (base + 2 >= values.size()) return result;
+            std::copy_n(values.data() + base, result.size(), result.data());
+            return result;
+        }
+
+        static void applyInstanceColor(MaterialDesc& d, const MeshEntry& en) {
+            if (!en.isInstanced) return;
+            const auto color = instanceColorFingerprint(en);
+            d.albedo[0] *= color[0];
+            d.albedo[1] *= color[1];
+            d.albedo[2] *= color[2];
         }
 
         static std::array<float, 21> materialPbrFingerprint(const MaterialDesc& md) {
@@ -7280,6 +7655,7 @@ namespace threepp {
         // the TLAS + scene desc buffers, and rewrites bindings 0/3/4 across
         // every descriptor set without re-allocating from the pool.
         void ensureSceneBuilt(Object3D& scene, Camera& camera) {
+            const bool rayScene = requiresRayScene();
             // force=false (matching GLRenderer/WgpuRenderer): with
             // updateMatrix()'s change-detection early-out, only subtrees whose
             // transforms actually moved pay the world-matrix multiplies — a
@@ -7302,6 +7678,8 @@ namespace threepp {
             // motion checks below + in updateCameraUbo OR true into this flag
             // before dispatch.
             motionThisFrame_ = false;
+            emissiveSceneDirty_ = false;
+            instancedActiveCountChanged_ = false;
             cameraMovedThisFrame_ = false;
             shadowCasterMovedThisFrame_ = false;
             std::fill(meshMovedBits_.begin(), meshMovedBits_.end(), 0u);
@@ -7320,15 +7698,38 @@ namespace threepp {
             std::vector<MeshEntry>& entries = lastVisibleEntries_;// canonical list, cached across frames
             std::vector<MeshFingerprint> currFp;
             if (snapLean) {
-                for (auto& e : entries) {
+                for (size_t i = 0; i < entries.size();) {
+                    auto& e = entries[i];
                     if (e.isInstanced) {
+                        auto* inst = static_cast<InstancedMesh*>(e.mesh);
+                        if (!rayScene && e.rasterInstancingCompact) {
+                            e.rasterInstanceCount = static_cast<uint32_t>(inst->count());
+                            std::memcpy(e.worldMatrix.data(), e.mesh->matrixWorld->elements.data(), 64);
+                            ++i;
+                            continue;
+                        }
+                        size_t end = i + 1;
+                        while (end < entries.size() && entries[end].mesh == e.mesh && entries[end].isInstanced) {
+                            ++end;
+                        }
                         Matrix4 instMat;
                         Matrix4 world;
-                        static_cast<InstancedMesh*>(e.mesh)->getMatrixAt(e.instanceIndex, instMat);
+                        inst->getMatrixAt(e.instanceIndex, instMat);
                         world.multiplyMatrices(*e.mesh->matrixWorld, instMat);
-                        std::memcpy(e.worldMatrix.data(), world.elements.data(), 64);
+                        const bool unchanged =
+                                prevSceneFingerprint[i].instanceMatrixVersion == inst->instanceMatrix()->version &&
+                                std::memcmp(prevSceneFingerprint[i].matrix.data(), world.elements.data(), 64) == 0;
+                        if (!unchanged) {
+                            for (size_t j = i; j < end; ++j) {
+                                inst->getMatrixAt(entries[j].instanceIndex, instMat);
+                                world.multiplyMatrices(*e.mesh->matrixWorld, instMat);
+                                std::memcpy(entries[j].worldMatrix.data(), world.elements.data(), 64);
+                            }
+                        }
+                        i = end;
                     } else {
                         std::memcpy(e.worldMatrix.data(), e.mesh->matrixWorld->elements.data(), 64);
+                        ++i;
                     }
                 }
                 for (auto& le : lastVisibleLines_) {
@@ -7427,7 +7828,7 @@ namespace threepp {
                 sn.geomB     = m->geometry().get();
                 sn.mat       = m->material().get();
                 sn.wf        = wf;
-                sn.instCount = inst ? static_cast<int32_t>(inst->count()) : -1;
+                sn.instCount = inst ? inst->count() : 0u;
                 sn.flags     = snapMeshFlags(*m, wf);
                 if (sn.geomB) sn.attrVer = sn.geomB->attributesVersion();
                 sceneSnapshot_.push_back(sn);
@@ -7460,26 +7861,43 @@ namespace threepp {
                 const bool isMaterialDisplaced = !isSkinned && !isDisplaced && !isGrass &&
                                                   !isMorphed && !isTet &&
                                                   hasMaterialDisplacement(*m);
-                if (inst && inst->count() > 0) {
-                    Matrix4 instMat;
-                    Matrix4 world;
-                    for (size_t j = 0; j < inst->count(); ++j) {
-                        inst->getMatrixAt(j, instMat);
-                        world.multiplyMatrices(*m->matrixWorld, instMat);
-                        MeshEntry e{};
-                        e.mesh = m;
-                        e.instanceIndex = static_cast<uint32_t>(j);
-                        e.isOverlay    = isOverlay;
-                        e.isParticle   = isParticle;
-                        e.isSkinned    = isSkinned;
-                        e.isDisplaced  = isDisplaced;
-                        e.isGrass      = isGrass;
-                        e.isMorphed    = isMorphed;
-                        e.isTet        = isTet;
-                        e.isMaterialDisplaced = isMaterialDisplaced;
-                        e.isInstanced  = true;
-                        std::memcpy(e.worldMatrix.data(), world.elements.data(), 64);
+                if (inst) {
+                    MeshEntry prototype{};
+                    prototype.mesh = m;
+                    prototype.instanceIndex = 0u;
+                    prototype.isOverlay    = isOverlay;
+                    prototype.isParticle   = isParticle;
+                    prototype.isSkinned    = isSkinned;
+                    prototype.isDisplaced  = isDisplaced;
+                    prototype.isGrass      = isGrass;
+                    prototype.isMorphed    = isMorphed;
+                    prototype.isTet        = isTet;
+                    prototype.isMaterialDisplaced = isMaterialDisplaced;
+                    prototype.isInstanced  = true;
+                    const bool compact = !rayScene && canUseRasterInstancingFastPath(prototype);
+                    sceneSnapshot_.back().rasterInstancingFastPath = compact;
+                    if (compact) {
+                        MeshEntry e = prototype;
+                        e.rasterInstancingCompact = true;
+                        e.rasterInstanceCount = static_cast<uint32_t>(inst->count());
+                        // 即使矩阵版本是当前值，已有 boundingSphere 也可能在
+                        // 渲染器接管场景前由旧矩阵缓存；首帧必须强制重算。
+                        e.rasterBoundsMatrixVersion = (std::numeric_limits<unsigned int>::max)();
+                        e.rasterBoundsCount = (std::numeric_limits<size_t>::max)();
+                        std::memcpy(e.worldMatrix.data(), m->matrixWorld->elements.data(), 64);
                         built.push_back(e);
+                    } else {
+                        Matrix4 instMat;
+                        Matrix4 world;
+                        const size_t instanceCapacity = inst->instanceMatrix()->count();
+                        for (size_t j = 0; j < instanceCapacity; ++j) {
+                            inst->getMatrixAt(j, instMat);
+                            world.multiplyMatrices(*m->matrixWorld, instMat);
+                            MeshEntry e = prototype;
+                            e.instanceIndex = static_cast<uint32_t>(j);
+                            std::memcpy(e.worldMatrix.data(), world.elements.data(), 64);
+                            built.push_back(e);
+                        }
                     }
                 } else {
                     MeshEntry e{};
@@ -7503,7 +7921,7 @@ namespace threepp {
 
             // Change flags shared by the LEAN in-place diff and the generic
             // compare loop below — exactly one of the two fills them.
-            bool structuralSame = true;
+            bool structuralSame = !forceSceneFullRebuild_;
             bool matricesSame = true;
             bool materialValuesSame = true;
             bool bonesDirtyAny = false;
@@ -7538,14 +7956,140 @@ namespace threepp {
             bool leanOk = false;
             if (snapLean) {
                 leanOk = true;
-                for (size_t i = 0; i < prevSceneFingerprint.size() && leanOk; ++i) {
+                Mesh* fingerprintedMesh = nullptr;
+                std::array<float, 40> sharedMaterialValues{};
+                unsigned int sharedInstanceColorVersion = 0;
+                unsigned int sharedInstanceMatrixVersion = 0;
+                const std::vector<float>* sharedInstanceColors = nullptr;
+                FloatBufferAttribute* sharedInstanceColorAttr = nullptr;
+                unsigned int sharedAttrVersion = 0;
+                unsigned int sharedGeomVersion = 0;
+                const BufferAttribute* sharedPosAttr = nullptr;
+                const BufferAttribute* sharedNormAttr = nullptr;
+                const BufferAttribute* sharedUvAttr = nullptr;
+                const BufferAttribute* sharedUv2Attr = nullptr;
+                const BufferAttribute* sharedIdxAttr = nullptr;
+                size_t sharedBlockEnd = 0;
+                for (size_t i = 0; i < prevSceneFingerprint.size() && leanOk;) {
                     MeshFingerprint& fp = prevSceneFingerprint[i];
                     const MeshEntry& en = entries[i];
                     const bool xfmChanged =
                             std::memcmp(fp.matrix.data(), en.worldMatrix.data(), sizeof(fp.matrix)) != 0;
                     bool matChanged = false;
-                    const auto materialValues = materialValueFingerprint(*en.mesh);
+                    const std::array<float, 4> previousEmissive{
+                            fp.pbr[5], fp.pbr[6], fp.pbr[7], fp.pbr[8]};
+                    if (en.mesh != fingerprintedMesh) {
+                        fingerprintedMesh = en.mesh;
+                        sharedBlockEnd = i + 1;
+                        while (sharedBlockEnd < entries.size() &&
+                               entries[sharedBlockEnd].mesh == en.mesh &&
+                               entries[sharedBlockEnd].isInstanced == en.isInstanced) {
+                            ++sharedBlockEnd;
+                        }
+                        sharedMaterialValues = materialValueFingerprint(*en.mesh);
+                        sharedInstanceColorVersion = 0;
+                        sharedInstanceMatrixVersion = 0;
+                        sharedInstanceColors = nullptr;
+                        sharedInstanceColorAttr = nullptr;
+                        if (en.isInstanced) {
+                            const auto* inst = static_cast<InstancedMesh*>(en.mesh);
+                            auto* color = inst->instanceColor();
+                            if (color) {
+                                sharedInstanceColorVersion = color->version;
+                                sharedInstanceColors = &color->array();
+                                sharedInstanceColorAttr = color;
+                            }
+                            sharedInstanceMatrixVersion = inst->instanceMatrix()->version;
+                        }
+                        auto* g = fp.geomTyped;
+                        sharedAttrVersion = g->attributesVersion();
+                        if (sharedAttrVersion == fp.attrVersion) {
+                            sharedPosAttr = fp.posAttr;
+                            sharedNormAttr = fp.normAttr;
+                            sharedUvAttr = fp.uvAttr;
+                            sharedUv2Attr = fp.uv2Attr;
+                            sharedIdxAttr = fp.idxAttr;
+                        } else {
+                            sharedPosAttr = g->getAttribute<float>("position");
+                            sharedNormAttr = g->getAttribute<float>("normal");
+                            sharedUvAttr = g->getAttribute<float>("uv");
+                            sharedUv2Attr = g->getAttribute<float>("uv2");
+                            sharedIdxAttr = g->getIndex();
+                        }
+                        sharedGeomVersion = 0;
+                        if (sharedPosAttr) sharedGeomVersion += sharedPosAttr->version;
+                        if (sharedNormAttr) sharedGeomVersion += sharedNormAttr->version;
+                        if (sharedIdxAttr) sharedGeomVersion += sharedIdxAttr->version;
+                        if (sharedUvAttr) sharedGeomVersion += sharedUvAttr->version;
+                        if (sharedUv2Attr) sharedGeomVersion += sharedUv2Attr->version;
+                    }
+                    const auto& materialValues = sharedMaterialValues;
+                    const bool instanceColorVersionChanged =
+                            sharedInstanceColorVersion != fp.instanceColorVersion;
+                    auto instanceColor = fp.instanceColor;
+                    if (instanceColorVersionChanged) {
+                        instanceColor = {1.f, 1.f, 1.f};
+                        const auto base = static_cast<size_t>(en.instanceIndex) * 3u;
+                        if (sharedInstanceColors && base + 2u < sharedInstanceColors->size()) {
+                            std::copy_n(sharedInstanceColors->data() + base,
+                                        instanceColor.size(), instanceColor.data());
+                        }
+                    }
+                    const bool instanceColorChanged = instanceColor != fp.instanceColor;
                     const unsigned int matVer = fp.matTyped ? fp.matTyped->version() : 0u;
+                    if (en.isInstanced) {
+                        const bool blockStable = !xfmChanged && matVer == fp.matVersion &&
+                                                 materialValues == fp.materialValues &&
+                                                 sharedInstanceMatrixVersion == fp.instanceMatrixVersion &&
+                                                 sharedAttrVersion == fp.attrVersion &&
+                                                 sharedGeomVersion == fp.geomVersion;
+                        if (blockStable) {
+                            if (sharedInstanceColorVersion == fp.instanceColorVersion) {
+                                i = sharedBlockEnd;
+                                continue;
+                            }
+                            const UpdateRange noRange{0, -1};
+                            const auto& range = sharedInstanceColorAttr
+                                                        ? sharedInstanceColorAttr->updateRange
+                                                        : noRange;
+                            const bool validRange = sharedInstanceColors &&
+                                                    range.offset >= 0 && range.count > 0 &&
+                                                    range.offset % 3 == 0 && range.count % 3 == 0 &&
+                                                    static_cast<size_t>(range.offset) <= sharedInstanceColors->size() &&
+                                                    static_cast<size_t>(range.count) <=
+                                                            sharedInstanceColors->size() -
+                                                                    static_cast<size_t>(range.offset);
+                            if (validRange) {
+                                const uint32_t firstInstance = static_cast<uint32_t>(range.offset / 3);
+                                const uint32_t endInstance = firstInstance +
+                                        static_cast<uint32_t>(range.count / 3);
+                                for (size_t j = i; j < sharedBlockEnd; ++j) {
+                                    auto& dirtyFp = prevSceneFingerprint[j];
+                                    dirtyFp.instanceColorVersion = sharedInstanceColorVersion;
+                                    const auto instanceIndex = entries[j].instanceIndex;
+                                    if (instanceIndex < firstInstance || instanceIndex >= endInstance) continue;
+                                    std::array<float, 3> color{1.f, 1.f, 1.f};
+                                    const auto base = static_cast<size_t>(instanceIndex) * 3u;
+                                    if (sharedInstanceColors && base + 2u < sharedInstanceColors->size()) {
+                                        std::copy_n(sharedInstanceColors->data() + base, color.size(), color.data());
+                                    }
+                                    if (color == dirtyFp.instanceColor) continue;
+                                    MaterialDesc md = materialDescForMesh(*entries[j].mesh);
+                                    applyInstanceColor(md, entries[j]);
+                                    dirtyFp.pbr = materialPbrFingerprint(md);
+                                    dirtyFp.instanceColor = color;
+                                    if (!isActiveInstancedEntry(entries[j])) continue;
+                                    entryMatDirty[j] = true;
+                                    materialValuesSame = false;
+                                    const size_t w = j >> 5;
+                                    if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
+                                    meshMovedBits_[w] |= (1u << (j & 31u));
+                                }
+                                i = sharedBlockEnd;
+                                continue;
+                            }
+                        }
+                    }
                     if (matVer != fp.matVersion) {
                         Mesh* m = en.mesh;
                         if (albedoTexOf(*m) != fp.albedoTex ||
@@ -7573,29 +8117,27 @@ namespace threepp {
                         applyInstanceColor(md, en);
                         fp.pbr = materialPbrFingerprint(md);
                         fp.materialValues = materialValues;
-                    } else if (materialValues != fp.materialValues) {
+                        fp.instanceColor = instanceColor;
+                    } else if (materialValues != fp.materialValues || instanceColorChanged) {
                         matChanged = true;
                         MaterialDesc md = materialDescForMesh(*en.mesh);
                         applyInstanceColor(md, en);
                         fp.pbr = materialPbrFingerprint(md);
                         fp.materialValues = materialValues;
+                        fp.instanceColor = instanceColor;
                     }
-                    BufferGeometry* g = fp.geomTyped;
-                    const unsigned int av = g->attributesVersion();
+                    fp.instanceColorVersion = sharedInstanceColorVersion;
+                    fp.instanceMatrixVersion = sharedInstanceMatrixVersion;
+                    const unsigned int av = sharedAttrVersion;
                     if (av != fp.attrVersion) {// attribute added/replaced/removed — re-cache
                         fp.attrVersion = av;
-                        fp.posAttr  = g->getAttribute<float>("position");
-                        fp.normAttr = g->getAttribute<float>("normal");
-                        fp.uvAttr   = g->getAttribute<float>("uv");
-                        fp.uv2Attr  = g->getAttribute<float>("uv2");
-                        fp.idxAttr  = g->getIndex();
+                        fp.posAttr  = sharedPosAttr;
+                        fp.normAttr = sharedNormAttr;
+                        fp.uvAttr   = sharedUvAttr;
+                        fp.uv2Attr  = sharedUv2Attr;
+                        fp.idxAttr  = sharedIdxAttr;
                     }
-                    unsigned int gv = 0;// must mirror geomVersionOf()
-                    if (fp.posAttr)  gv += fp.posAttr->version;
-                    if (fp.normAttr) gv += fp.normAttr->version;
-                    if (fp.idxAttr)  gv += fp.idxAttr->version;
-                    if (fp.uvAttr)   gv += fp.uvAttr->version;
-                    if (fp.uv2Attr)  gv += fp.uv2Attr->version;
+                    const unsigned int gv = sharedGeomVersion;
                     const bool geomChanged = (gv != fp.geomVersion);
                     if (geomChanged) {
                         fp.geomVersion = gv;
@@ -7612,15 +8154,21 @@ namespace threepp {
                         }
                     }
                     if (xfmChanged) {
-                        matricesSame = false;
+                        if (isActiveInstancedEntry(en)) matricesSame = false;
                         fp.matrix = en.worldMatrix;
                     }
                     if (matChanged) { materialValuesSame = false; entryMatDirty[i] = true; }
-                    if (xfmChanged || matChanged || geomChanged) {
+                    const bool emissiveChanged = matChanged &&
+                                                 previousEmissive != std::array<float, 4>{
+                                                         fp.pbr[5], fp.pbr[6], fp.pbr[7], fp.pbr[8]};
+                    const bool activeMatrixChanged = xfmChanged && isActiveInstancedEntry(en);
+                    if (activeMatrixChanged || geomChanged || emissiveChanged) emissiveSceneDirty_ = true;
+                    if (activeMatrixChanged || matChanged || geomChanged) {
                         const size_t w = i >> 5;
                         if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
                         meshMovedBits_[w] |= (1u << (i & 31u));
                     }
+                    ++i;
                 }
                 if (!leanOk) {
                     // Partial in-place updates are all verified-correct values;
@@ -7651,6 +8199,14 @@ namespace threepp {
                 const Material* matPtr = matSp.get();
                 const unsigned int matVer = matPtr ? matPtr->version() : 0u;
                 const auto materialValues = materialValueFingerprint(*m);
+                unsigned int instanceColorVersion = 0;
+                unsigned int instanceMatrixVersion = 0;
+                if (en.isInstanced) {
+                    const auto* inst = static_cast<InstancedMesh*>(m);
+                    const auto* color = inst->instanceColor();
+                    if (color) instanceColorVersion = color->version;
+                    instanceMatrixVersion = inst->instanceMatrix()->version;
+                }
                 const void* geomPtr = m->geometry().get();
                 const unsigned int geomVer = geomVersionOf(*m->geometry());
 
@@ -7661,6 +8217,8 @@ namespace threepp {
                     if (p.mesh == m && p.mat == matPtr && p.geom == geomPtr &&
                         p.instanceIndex == en.instanceIndex &&
                         p.matVersion == matVer && p.geomVersion == geomVer &&
+                        p.instanceColorVersion == instanceColorVersion &&
+                        p.instanceMatrixVersion == instanceMatrixVersion &&
                         p.materialValues == materialValues) {
                         // Texture pointers + material values match. Copy
                         // everything from prev, then overwrite matrix (transform
@@ -7678,6 +8236,9 @@ namespace threepp {
                     fp.matVersion = matVer;
                     fp.materialValues = materialValues;
                     fp.geomVersion = geomVer;
+                    fp.instanceColorVersion = instanceColorVersion;
+                    fp.instanceMatrixVersion = instanceMatrixVersion;
+                    fp.instanceColor = instanceColorFingerprint(en);
                     fp.matTyped  = matPtr;
                     fp.geomTyped = m->geometry().get();
                     fp.attrVersion = fp.geomTyped->attributesVersion();
@@ -7799,6 +8360,7 @@ namespace threepp {
                     const bool mo = entryMorphDirty[i];
                     const bool md = entryMaterialDisplacedDirty[i];
                     if (!(b || d || gr || mo || md)) continue;
+                    emissiveSceneDirty_ = true;
                     if (b) bonesDirtyAny = true;
                     if (d) displacedDirtyAny = true;
                     if (gr) grassDirtyAny = true;
@@ -7863,6 +8425,7 @@ namespace threepp {
                     // PBR floats themselves didn't move.
                     const bool matChanged   = std::memcmp(a.pbr.data(), b.pbr.data(), sizeof(a.pbr)) != 0 ||
                                               a.materialValues != b.materialValues ||
+                                              a.instanceColor != b.instanceColor ||
                                               a.matVersion != b.matVersion;
                     const bool bonesChanged = entryBonesDirty[i];
                     const bool dispChanged  = entryDisplacedDirty[i];
@@ -7870,7 +8433,11 @@ namespace threepp {
                     const bool geomChanged  = (a.geomVersion != b.geomVersion);
                     const bool morphChanged = entryMorphDirty[i];
                     const bool matDispChanged = entryMaterialDisplacedDirty[i];
-                    if (xfmChanged) matricesSame = false;
+                    const bool emissiveChanged =
+                            a.pbr[5] != b.pbr[5] || a.pbr[6] != b.pbr[6] ||
+                            a.pbr[7] != b.pbr[7] || a.pbr[8] != b.pbr[8];
+                    const bool activeMatrixChanged = xfmChanged && isActiveInstancedEntry(entries[i]);
+                    if (activeMatrixChanged) matricesSame = false;
                     if (matChanged) { materialValuesSame = false; entryMatDirty[i] = true; }
                     if (bonesChanged) bonesDirtyAny = true;
                     if (dispChanged)  displacedDirtyAny = true;
@@ -7896,11 +8463,15 @@ namespace threepp {
                         }
                     }
                     if (morphChanged) morphDirtyAny = true;
+                    if (activeMatrixChanged || geomChanged || bonesChanged || dispChanged || grassChanged ||
+                        morphChanged || matDispChanged || emissiveChanged) {
+                        emissiveSceneDirty_ = true;
+                    }
                     // All flavors of change invalidate this pixel's history —
                     // share the same per-mesh bit. Reproject+halve FC for any
                     // of: matrix shift, pbr shift, pose deformation, ocean
                     // surface displacement, geometry data mutation, morph blend.
-                    if (xfmChanged || matChanged || bonesChanged || dispChanged ||
+                    if (activeMatrixChanged || matChanged || bonesChanged || dispChanged ||
                         geomChanged || morphChanged || matDispChanged) {
                         const size_t w = i >> 5;
                         if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
@@ -7909,6 +8480,10 @@ namespace threepp {
                 }
                 if (materialDisplacedDirtyAny) {
                     structuralSame = false;
+                }
+                if (instancedActiveCountChanged_) {
+                    materialValuesSame = false;
+                    emissiveSceneDirty_ = true;
                 }
                 if (structuralSame) {
                     if (!matricesSame || !materialValuesSame || bonesDirtyAny ||
@@ -7943,7 +8518,7 @@ namespace threepp {
                             auto* dm = static_cast<DisplacedMesh*>(entries[i].mesh);
                             auto stIt = displacedStates.find(dm);
                             if (stIt == displacedStates.end()) continue;
-                            refreshDisplacedBlas(*dm, *stIt->second, now);
+                            refreshDisplacedBlas(*dm, *stIt->second, now, rayScene);
                             ++dm->frameTick;
                         }
                     }
@@ -7969,7 +8544,7 @@ namespace threepp {
                             if (!refreshed.insert(m).second) continue;
                             auto mIt = morphedMeshStates.find(m);
                             if (mIt == morphedMeshStates.end()) continue;
-                            refreshMorphedBlas(*m, *mIt->second);
+                            refreshMorphedBlas(*m, *mIt->second, rayScene);
                         }
                     }
                     // Tet-skinned soft bodies (PhysX) deform every frame — re-upload
@@ -7981,6 +8556,7 @@ namespace threepp {
                         if (tIt == tetMeshStates.end()) continue;
                         refreshTetBlas(*entries[i].mesh, *tIt->second);
                         tetDirtyAny = true;
+                        emissiveSceneDirty_ = true;
                         const size_t w = i >> 5;
                         if (w >= meshMovedBits_.size()) meshMovedBits_.resize(w + 1, 0u);
                         meshMovedBits_[w] |= (1u << (i & 31u));
@@ -7991,6 +8567,7 @@ namespace threepp {
                             const size_t w = i >> 5;
                             if (w >= meshMovedBits_.size()) continue;
                             if ((meshMovedBits_[w] & (1u << (i & 31u))) != 0u &&
+                                isActiveInstancedEntry(entries[i]) &&
                                 entries[i].mesh && entries[i].mesh->castShadow) {
                                 shadowCasterMovedThisFrame_ = true;
                                 break;
@@ -8107,9 +8684,18 @@ namespace threepp {
                         }
                     }
 
-                    if (!matricesSame || bonesDirtyAny || displacedDirtyAny ||
+                    const bool tlasNeedsFallbackMatrix = std::any_of(
+                            entries.begin(), entries.end(), [this, &entries](const MeshEntry& entry) {
+                                 const auto index = static_cast<size_t>(&entry - entries.data());
+                                 const auto word = index >> 5;
+                                 return isActiveInstancedEntry(entry) &&
+                                        word < meshMovedBits_.size() &&
+                                        (meshMovedBits_[word] & (1u << (index & 31u))) != 0u &&
+                                        !canUseRasterInstancingFastPath(entry);
+                            });
+                    if (rayScene && (tlasNeedsFallbackMatrix || bonesDirtyAny || displacedDirtyAny ||
                         grassDirtyAny || tetDirtyAny || geomDirtyAny ||
-                        morphDirtyAny || materialDisplacedDirtyAny) {
+                        morphDirtyAny || materialDisplacedDirtyAny)) {
                         // TLAS refit: needed when instance transforms change
                         // (matricesSame=false) AND when any skinned BLAS was
                         // just rebuilt — the TLAS's per-instance wrapped AABB
@@ -8125,9 +8711,16 @@ namespace threepp {
                         // indexed geomDescs/matDescs built in the full rebuild);
                         // overlay/skipped entries push no instance, exactly as
                         // their geomDescs/matDescs slots are left default.
+                        const Mesh* maskMesh = nullptr;
+                        MaterialDesc liveMaterialDesc{};
                         for (size_t i = 0; i < entries.size(); ++i) {
                             const MeshEntry& en = entries[i];
                             if (en.isOverlay) continue;// raster-overlay only
+                            if (!isActiveInstancedEntry(en)) continue;
+                            if (maskMesh != en.mesh) {
+                                maskMesh = en.mesh;
+                                liveMaterialDesc = materialDescForMesh(*en.mesh);
+                            }
                             VkDeviceAddress blasAddr = 0;
                             if (en.isSkinned) {
                                 auto* sm = static_cast<SkinnedMesh*>(en.mesh);
@@ -8174,12 +8767,8 @@ namespace threepp {
                             // Same visibility-group rule as the full rebuild:
                             // blend/transmissive (non-water) → alpha mask so
                             // occlusion queries skip them.
-                            inst.mask = kRayMaskOpaque | (en.mesh->castShadow ? kRayMaskShadow : 0u);
-                            if (i < matDescsCached_.size() && !en.isDisplaced) {
-                                const auto& cmd = matDescsCached_[i];
-                                if (cmd.transmission > 0.0f || cmd.alphaCutoff < 0.0f)
-                                    inst.mask = kRayMaskAlpha;
-                            }
+                            inst.mask = rayMaskForMaterialDesc(
+                                    liveMaterialDesc, en.isDisplaced, en.mesh->castShadow);
                             inst.instanceShaderBindingTableRecordOffset = 0;
                             inst.flags = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
                             inst.accelerationStructureReference = blasAddr;
@@ -8189,6 +8778,7 @@ namespace threepp {
                                                    grassDirtyAny || tetDirtyAny ||
                                                    morphDirtyAny || geomDirtyAny ||
                                                    materialDisplacedDirtyAny;
+                        if (instances.size() != tlasBuiltInstanceCount_) goto fullRebuild;
                         // Stage the refit; recordCommandBuffer records it into the
                         // frame cb after the deformable BLAS rebuilds (no drain).
                         pendingTlasInstances_ = std::move(instances);
@@ -8229,6 +8819,8 @@ namespace threepp {
                         // match (never on the fast path that reaches here).
                         const bool patchMatDescs = matDescsCached_.size() >= entries.size();
                         if (!patchMatDescs) matDescsCached_.assign(entries.size(), MaterialDesc{});
+                        std::vector<uint32_t> updatedMatDescIndices;
+                        if (patchMatDescs) updatedMatDescIndices.reserve(8);
                         // Same dedup as the full-rebuild path below (consulted only on
                         // the full-rebuild fallback): entries order is identical
                         // (overlay skip matches), so identical Material* pointers
@@ -8314,6 +8906,7 @@ namespace threepp {
                                 md.envTexIndex = ensureMaterialTexture(tex);
                             }
                             matDescsCached_[i] = md;
+                            if (patchMatDescs) updatedMatDescIndices.push_back(static_cast<uint32_t>(i));
                             if (patchMatDescs && i < rasterGroupMaterialDescIndices_.size()) {
                                 const auto& materials = m->materials();
                                 for (const auto& groupDesc : rasterGroupMaterialDescIndices_[i]) {
@@ -8326,10 +8919,22 @@ namespace threepp {
                                             en, materials[groupDesc.materialIndex], matAssetMap);
                                     groupMd.materialAssetIdx = matDescsCached_[groupDesc.descIndex].materialAssetIdx;
                                     matDescsCached_[groupDesc.descIndex] = groupMd;
+                                    updatedMatDescIndices.push_back(groupDesc.descIndex);
                                 }
                             }
                         }
-                        for (auto& d : matDescsDirty_) d = true;
+                        for (uint32_t f = 0; f < kFramesInFlight; ++f) {
+                            auto& dirtyIndices = matDescDirtyIndices_[f];
+                            if (!patchMatDescs) {
+                                dirtyIndices.clear();
+                            } else if (!matDescsDirty_[f]) {
+                                dirtyIndices = updatedMatDescIndices;
+                            } else if (!dirtyIndices.empty()) {
+                                dirtyIndices.insert(dirtyIndices.end(),
+                                                    updatedMatDescIndices.begin(), updatedMatDescIndices.end());
+                            }
+                            matDescsDirty_[f] = true;
+                        }
                         sceneHasGlass_ = false;
                         sceneHasClearcoat_ = false;
                         sceneHasIridescence_ = false;
@@ -8340,7 +8945,7 @@ namespace threepp {
                         // stays entry-index based (cullEntriesAgainstFrustum walks
                         // it in lockstep with i).
                         for (size_t i = 0; i < entries.size(); ++i) {
-                            if (entries[i].isOverlay) continue;
+                            if (entries[i].isOverlay || !isActiveInstancedEntry(entries[i])) continue;
                             const auto& md = matDescsCached_[i];
                             if (md.transmission > 0.0f) {
                                 sceneHasGlass_ = true;
@@ -8365,6 +8970,8 @@ namespace threepp {
             }
 
             fullRebuild:
+            forceSceneFullRebuild_ = false;
+            ++sceneFullRebuildCount_;
             // Structural change — invalidate the emissive-tri cache so next
             // frame's buildAndUploadEmissiveTris does a full walk regardless
             // of whether entries.size() happens to match.
@@ -8379,6 +8986,8 @@ namespace threepp {
                     ctx->rt().destroyAccelerationStructure(ctx->device(), tlas, nullptr);
                     tlas = VK_NULL_HANDLE;
                 }
+                tlasBuiltInstanceCount_ = 0u;
+                tlasBuiltInstancedCounts_.clear();
                 destroyBuffer(ctx->allocator(), tlasBuffer);
                 for (auto& b : tlasInstancesBuffers) { destroyBuffer(ctx->allocator(), b); b = {}; }
                 destroyBuffer(ctx->allocator(), geometryDescsBuffer);
@@ -8566,6 +9175,15 @@ namespace threepp {
                     }
                 }
             }
+            if (!rayScene && !descriptorSets.empty()) {
+                check(vkResetDescriptorPool(ctx->device(), descriptorPool, 0),
+                      "vkResetDescriptorPool(RT scene disabled)");
+                descriptorSets.clear();
+                binding1Mode_.fill(-1);
+                pendingTlasInstances_.clear();
+                pendingTlasRefit_ = false;
+                pendingTlasFullBuild_ = false;
+            }
 
             std::vector<VkAccelerationStructureInstanceKHR> instances;
             instances.reserve(entries.size());
@@ -8596,6 +9214,7 @@ namespace threepp {
             for (size_t i = 0; i < entries.size(); ++i) {
                 const MeshEntry& en = entries[i];
                 Mesh* m = en.mesh;
+                if (!isActiveInstancedEntry(en)) continue;
                 // Particle billboard meshes own their vertex buffers in the
                 // dedicated billboard pass — they need no BLAS and never enter
                 // the TLAS. Skip before the geometry-keyed build so we don't
@@ -8612,38 +9231,40 @@ namespace threepp {
                 const std::vector<GeometryGroup>* referenceGroups = nullptr;
                 auto* sm = en.isSkinned ? static_cast<SkinnedMesh*>(m) : nullptr;
                 if (sm && sm->skeleton && !sm->skeleton->bones.empty()) {
-                    auto* st = ensureSkinnedBlas(*sm);
+                    auto* st = ensureSkinnedBlas(*sm, rayScene);
                     if (!st) continue;
                     recPtr = st->blas.get();
                 } else if (en.isDisplaced) {
                     auto* dm = static_cast<DisplacedMesh*>(m);
-                    auto* st = ensureDisplacedState(*dm);
+                    auto* st = ensureDisplacedState(*dm, rayScene);
                     if (!st) continue;
                     recPtr = st->blas.get();
                     // Trigger an initial FFT/displace dispatch so the BLAS
                     // contents (rest grid right now) become the displaced
                     // surface before the first ray-trace sees it.
-                    refreshDisplacedBlas(*dm, *st, static_cast<float>(glfwGetTime()));
+                    refreshDisplacedBlas(*dm, *st, static_cast<float>(glfwGetTime()), rayScene);
                 } else if (en.isGrass) {
                     auto* gm = static_cast<GrassMesh*>(m);
-                    auto* st = ensureGrassState(*gm);
+                    auto* st = ensureGrassState(*gm, rayScene);
                     if (!st) continue;
                     recPtr = st->blas.get();
                     // Prime the BLAS with the first wind pose before the first trace.
-                    refreshGrassBlas(*gm, *st, static_cast<float>(glfwGetTime()));
+                    if (rayScene) {
+                        refreshGrassBlas(*gm, *st, static_cast<float>(glfwGetTime()), true);
+                    }
                 } else if (en.isTet) {
-                    auto* st = ensureTetBlas(*m);
+                    auto* st = ensureTetBlas(*m, rayScene);
                     if (!st) continue;
                     recPtr = st->blas.get();
                 } else if (en.isMorphed) {
-                    auto* st = ensureMorphedBlas(*m);
+                    auto* st = ensureMorphedBlas(*m, rayScene);
                     if (!st) continue;
                     recPtr = st->blas.get();
                 } else {
-                    BlasRecord* baseRec = ensureCachedStaticBlas(*m);
+                    BlasRecord* baseRec = ensureCachedStaticBlas(*m, rayScene);
                     if (!baseRec) continue;// degenerate / unsupported geometry
                     if (en.isMaterialDisplaced) {
-                        auto* st = ensureMaterialDisplacedBlas(*m);
+                        auto* st = ensureMaterialDisplacedBlas(*m, rayScene);
                         if (!st || !st->blas) continue;
                         recPtr = st->blas.get();
                         if (!st->referenceGroups.empty()) referenceGroups = &st->referenceGroups;
@@ -8657,6 +9278,7 @@ namespace threepp {
                 // GeometryDesc/MaterialDesc arrays — PT must not see them.
                 if (en.isOverlay) continue;
 
+                if (rayScene) {
                 VkAccelerationStructureInstanceKHR inst{};
                 // VkTransformMatrixKHR is row-major 3x4; threepp Matrix4 is
                 // column-major 4x4 (elements[c*4 + r]). For InstancedMesh the
@@ -8716,32 +9338,52 @@ namespace threepp {
                 gdesc.materialGroupCount = 0;
                 gdesc._materialGroupPad = 0;
                 geomDescs[i] = gdesc;
+                }
 
                 MaterialDesc md = buildMaterialDescForEntryMaterial(en, m->material(), matAssetMap);
                 matDescs[i] = md;
                 appendRasterGroupMaterialDescs(
                         static_cast<uint32_t>(i), en, matDescs, matAssetMap);
-                appendReferenceMaterialGroupDescs(
-                        static_cast<uint32_t>(i), en,
-                        recPtr->index.handle != VK_NULL_HANDLE ? recPtr->indexCount : recPtr->vertexCount,
-                        materialGroupDescs, materialGroupOffsets, materialGroupCounts,
-                        referenceGroups);
+                if (rayScene) {
+                    appendReferenceMaterialGroupDescs(
+                            static_cast<uint32_t>(i), en,
+                            recPtr->index.handle != VK_NULL_HANDLE ? recPtr->indexCount : recPtr->vertexCount,
+                            materialGroupDescs, materialGroupOffsets, materialGroupCounts,
+                            referenceGroups);
+                }
                 // Visibility group (see vulkan_shared.h): blend/transmissive
                 // surfaces move to the alpha mask so pure-visibility occlusion
                 // queries (env gather, GI, emissive-NEE) cull them out — a text
                 // decal's transparent quad must not block IBL light. Water
                 // (DisplacedMesh) stays opaque-mask: underwater light transport
                 // is handled by its volumetrics, not pass-through.
-                if (!instances.empty()) {
-                    instances.back().mask =
-                            (!en.isDisplaced && (md.transmission > 0.0f || md.alphaCutoff < 0.0f))
-                                    ? kRayMaskAlpha
-                                    : (kRayMaskOpaque | (en.mesh->castShadow ? kRayMaskShadow : 0u));
+                if (rayScene && !instances.empty()) {
+                    instances.back().mask = rayMaskForMaterialDesc(
+                            md, en.isDisplaced, en.mesh->castShadow);
                 }
             }
 
-            buildTlas(instances);
-            if (!materialGroupDescs.empty()) {
+            if (rayScene) buildTlas(instances);
+            tlasBuiltInstancedCounts_.clear();
+            for (size_t i = 0; i < entries.size();) {
+                const auto& first = entries[i];
+                if (!first.isInstanced || !first.mesh) {
+                    ++i;
+                    continue;
+                }
+                size_t blockEnd = i + 1;
+                while (blockEnd < entries.size() &&
+                       entries[blockEnd].mesh == first.mesh &&
+                       entries[blockEnd].isInstanced) {
+                    ++blockEnd;
+                }
+                if (rayScene && !first.isOverlay && !first.isParticle) {
+                    const auto* inst = static_cast<const InstancedMesh*>(first.mesh);
+                    tlasBuiltInstancedCounts_[inst] = inst->count();
+                }
+                i = blockEnd;
+            }
+            if (rayScene && !materialGroupDescs.empty()) {
                 uploadDescBuffer(materialGroupDescsBuffer, materialGroupDescs);
                 for (size_t i = 0; i < entries.size(); ++i) {
                     if (materialGroupCounts[i] == 0u) continue;
@@ -8751,16 +9393,17 @@ namespace threepp {
                     geomDescs[i].materialGroupCount = materialGroupCounts[i];
                 }
             }
-            uploadDescBuffer(geometryDescsBuffer, geomDescs);
+            if (rayScene) uploadDescBuffer(geometryDescsBuffer, geomDescs);
             // Seed every per-frame slot with the fresh matDescs so the first
             // few frames don't try to flush against a half-initialised ring.
             // matDescsCached_ stays in sync as the host-side authoritative
             // copy used by the hot-path flush.
-            for (uint32_t f = 0; f < kFramesInFlight; ++f) {
-                uploadDescBuffer(materialDescsBuffers[f], matDescs);
-            }
+            uploadMaterialDescBuffers(matDescs, entries.size());
             matDescsCached_ = matDescs;
-            for (auto& d : matDescsDirty_) d = false;
+            for (uint32_t f = 0; f < kFramesInFlight; ++f) {
+                matDescsDirty_[f] = false;
+                matDescDirtyIndices_[f].clear();
+            }
             sceneHasGlass_ = false;
             sceneHasClearcoat_ = false;
             sceneHasIridescence_ = false;
@@ -8770,7 +9413,7 @@ namespace threepp {
             // separate filtered counter mi). glassEntryIndices_ stays entry-index
             // based — cullEntriesAgainstFrustum walks it in lockstep with i.
             for (size_t i = 0; i < entries.size(); ++i) {
-                if (entries[i].isOverlay) continue;
+                if (entries[i].isOverlay || !isActiveInstancedEntry(entries[i])) continue;
                 const auto& md = matDescs[i];
                 if (md.transmission > 0.0f) {
                     sceneHasGlass_ = true;
@@ -8844,10 +9487,14 @@ namespace threepp {
             }
             meshMovedBits_.resize(neededBitWords, 0u);
 
-            if (sceneBuilt_) {
-                rewriteSceneDescriptors();
+            if (rayScene) {
+                if (descriptorSets.empty()) {
+                    allocateAndUpdateDescriptors();
+                } else {
+                    rewriteSceneDescriptors();
+                }
             } else {
-                allocateAndUpdateDescriptors();
+                rewriteDeferredDescriptors();
             }
             // The (re)build above rebound the RT bindless texture array
             // (binding 8). The raster descriptor's binding 3 mirrors that same
@@ -9095,11 +9742,18 @@ namespace threepp {
             std::vector<uint8_t> settled(count, 0);
             bool anyNonIdentity = false;
             for (uint32_t i = 0; i < count; ++i) {
+                EntryKey key{entries[i].mesh, entries[i].instanceIndex};
+                if (!isActiveInstancedEntry(entries[i])) {
+                    Matrix4 identity;
+                    std::memcpy(&data[i * 16], identity.elements.data(), 64);
+                    prevWorldMats.erase(key);
+                    settled[i] = 1u;
+                    continue;
+                }
                 Matrix4 cur;
                 std::memcpy(cur.elements.data(), entries[i].worldMatrix.data(), 64);
 
                 Matrix4 motion;// identity by default
-                EntryKey key{entries[i].mesh, entries[i].instanceIndex};
                 auto it = prevWorldMats.find(key);
                 if (it != prevWorldMats.end()) {
                     Matrix4 prev;
@@ -9134,7 +9788,8 @@ namespace threepp {
                 // Buffer slot already holds identities; skip the upload.
             } else {
                 void* mapped = nullptr;
-                vmaMapMemory(ctx->allocator(), motionMatBuffers[frame].alloc, &mapped);
+                check(vmaMapMemory(ctx->allocator(), motionMatBuffers[frame].alloc, &mapped),
+                      "vmaMapMemory(motion matrices)");
                 std::memcpy(mapped, data.data(), data.size() * sizeof(float));
                 vmaUnmapMemory(ctx->allocator(), motionMatBuffers[frame].alloc);
                 motionMatBufferAllIdentity_[frame] = !anyNonIdentity;
@@ -9146,7 +9801,7 @@ namespace threepp {
             // each frame keeps the body locked in render space until real
             // motion actually crosses the eps threshold.
             for (uint32_t i = 0; i < count; ++i) {
-                if (settled[i]) continue;
+                if (!isActiveInstancedEntry(entries[i]) || settled[i]) continue;
                 EntryKey key{entries[i].mesh, entries[i].instanceIndex};
                 prevWorldMats[key] = entries[i].worldMatrix;
             }
@@ -9180,6 +9835,7 @@ namespace threepp {
                                         const std::vector<MeshEntry>& entries) {
             emissiveTriCountThisFrame_ = 0;
             emissiveTotalPowerThisFrame_ = 0.0f;
+            if (!requiresRayScene()) return false;
 
             // Fast path: nothing that affects the world-space emissive CDF
             // has changed since the last rebuild. World-space tri positions
@@ -9189,11 +9845,8 @@ namespace threepp {
             // frames hit this path and skip the per-tri walk entirely; the
             // walk is O(visible-emissive-meshes × tris) per frame and was
             // CPU-bound on Bistro before this cache.
-            const bool anyMeshMoved =
-                    std::any_of(meshMovedBits_.begin(), meshMovedBits_.end(),
-                                [](uint32_t v) { return v != 0u; });
             const bool entriesUnchanged = (cachedEmissiveEntryCount_ == entries.size());
-            if (!anyMeshMoved && entriesUnchanged) {
+            if (!emissiveSceneDirty_ && entriesUnchanged) {
                 emissiveTriCountThisFrame_   = cachedEmissiveTriCount_;
                 emissiveTotalPowerThisFrame_ = cachedEmissiveTotalPower_;
                 if (cachedEmissiveTriCount_ == 0) {
@@ -9219,6 +9872,7 @@ namespace threepp {
 
             for (const auto& en : entries) {
                 if (en.isOverlay) continue;// raster-overlay only — no emissive contribution to PT
+                if (!isActiveInstancedEntry(en)) continue;
                 if (!en.mesh) continue;
                 auto matPtr = en.mesh->material();
                 if (!matPtr) continue;
@@ -9328,6 +9982,7 @@ namespace threepp {
         // frame-in-flight. Called when buildAndUploadEmissiveTris reports the
         // backing buffer was reallocated.
         void rewriteEmissiveTriDescriptors(uint32_t frame) {
+            if (descriptorSets.empty()) return;
             VkDescriptorBufferInfo bufInfo{};
             bufInfo.buffer = emissiveTriBuffers[frame].handle;
             bufInfo.offset = 0;
@@ -9566,32 +10221,38 @@ namespace threepp {
                 auto it = skinnedMeshStates.find(sm);
                 if (it != skinnedMeshStates.end() && it->second->blas)
                     return it->second->blas.get();
-                return nullptr;
+                if (requiresRayScene()) return nullptr;
             }
             if (en.isDisplaced) {
                 auto* dm = static_cast<DisplacedMesh*>(en.mesh);
                 auto it = displacedStates.find(dm);
                 if (it != displacedStates.end() && it->second->blas)
                     return it->second->blas.get();
-                return nullptr;
+                if (requiresRayScene()) return nullptr;
             }
             if (en.isGrass) {
                 auto* gm = static_cast<GrassMesh*>(en.mesh);
                 auto it = grassStates.find(gm);
                 if (it != grassStates.end() && it->second->blas)
                     return it->second->blas.get();
-                return nullptr;
+                if (requiresRayScene()) return nullptr;
             }
             if (en.isTet) {
                 auto it = tetMeshStates.find(en.mesh);
                 if (it != tetMeshStates.end() && it->second->blas)
                     return it->second->blas.get();
-                return nullptr;
+                if (requiresRayScene()) return nullptr;
             }
             if (en.isMorphed) {
                 auto it = morphedMeshStates.find(en.mesh);
                 if (it != morphedMeshStates.end() && it->second->blas)
                     return it->second->blas.get();
+            }
+            if (en.isMaterialDisplaced) {
+                auto it = materialDisplacedMeshStates.find(en.mesh);
+                if (it != materialDisplacedMeshStates.end() && it->second->blas)
+                    return it->second->blas.get();
+                if (requiresRayScene()) return nullptr;
             }
             auto* geom = en.mesh->geometry().get();
             auto it = blasCache.find(geom);
@@ -9835,6 +10496,63 @@ namespace threepp {
         static_assert(sizeof(DrawInfoGpu) == 224,
                       "DrawInfoGpu layout drifted from gbuffer_indirect.vert");
 
+        struct RasterInstanceGpu {
+            float model[16];
+            float prevModel[16];
+            float color[4];
+            uint32_t sceneIndex;
+            uint32_t drawInfoIndex;
+            uint32_t pad[2];
+        };
+        static_assert(sizeof(RasterInstanceGpu) == 160,
+                      "RasterInstanceGpu layout drifted from gbuffer_indirect.vert");
+
+        struct DirtyInstanceRange {
+            uint32_t first = 0;
+            uint32_t count = 0;
+        };
+
+        struct RasterInstancingFingerprint {
+            const Mesh* mesh = nullptr;
+            const BufferGeometry* geometry = nullptr;
+            const Material* material = nullptr;
+            bool operator==(const RasterInstancingFingerprint& other) const {
+                return mesh == other.mesh &&
+                       geometry == other.geometry &&
+                       material == other.material;
+            }
+        };
+
+        struct RasterInstancedBatch {
+            InstancedMesh* mesh = nullptr;
+            RasterInstancingFingerprint fingerprint{};
+            size_t firstEntry = 0;
+            size_t entryCount = 0;
+            uint32_t drawInfoIndex = 0;
+            uint32_t materialDescIndex = std::numeric_limits<uint32_t>::max();
+            uint32_t firstInstance = 0;
+            uint32_t firstVertex = 0;
+            uint32_t vertexCount = 0;
+            int bucket = 0;
+            std::array<unsigned int, kFramesInFlight> uploadedMatrixVersion{};
+            std::array<unsigned int, kFramesInFlight> uploadedColorVersion{};
+            unsigned int cachedMatrixVersion = 0;
+            unsigned int cachedColorVersion = 0;
+            std::array<DirtyInstanceRange, kFramesInFlight> matrixDirty{};
+            std::array<DirtyInstanceRange, kFramesInFlight> colorDirty{};
+            DirtyInstanceRange previousModelResetPending{};
+            bool modelUpdatedForWorldChangeThisFrame = false;
+            std::array<bool, kFramesInFlight> materialDescDirty{};
+            size_t cachedCount = 0;
+            uint32_t cachedDrawInfoIndex = std::numeric_limits<uint32_t>::max();
+            std::array<float, 16> cachedMeshWorld{};
+            const Material* material = nullptr;
+            unsigned int materialVersion = 0;
+            std::array<float, 40> materialValues{};
+            MaterialDesc materialDesc{};
+            uint32_t sceneGeneration = std::numeric_limits<uint32_t>::max();
+        };
+
         // Per-cull/depth-mode dispatch span into indirectCmdBuffers[frame].
         struct DrawGroup {
             VkCullModeFlags cullMode = VK_CULL_MODE_BACK_BIT;
@@ -9848,6 +10566,199 @@ namespace threepp {
         // vkCmdDrawIndirect calls and skip the empty ones.
         std::array<DrawGroup, 10> indirectGroups_{};
         uint32_t indirectTotalDraws_ = 0;
+        std::array<std::vector<DrawInfoGpu>, 10> indirectDrawScratch_;
+        std::array<std::vector<VkDrawIndirectCommand>, 10> indirectCmdScratch_;
+        std::vector<RasterInstanceGpu> rasterInstanceScratch_;
+        uint32_t rasterInstancePayloadGeneration_ = std::numeric_limits<uint32_t>::max();
+        std::vector<RasterInstancedBatch> rasterInstancedBatches_;
+        std::vector<DrawInfoGpu> rasterInstancedDrawScratch_;
+        std::array<DrawGroup, 3> rasterInstancedGroups_{};
+        std::vector<bool> rasterInstancedEntryMask_;
+        std::array<bool, kFramesInFlight> rasterInstanceBufferGrown_{};
+        std::array<bool, kFramesInFlight> rasterDrawInfoDescriptorDirty_{};
+        std::array<bool, kFramesInFlight> rasterInstanceDescriptorDirty_{};
+
+        void clearRasterInstancingState() {
+            rasterInstanceScratch_.clear();
+            rasterInstancePayloadGeneration_ = std::numeric_limits<uint32_t>::max();
+            rasterInstancedBatches_.clear();
+            rasterInstancedDrawScratch_.clear();
+            rasterInstancedEntryMask_.clear();
+            for (auto& group : rasterInstancedGroups_) group = {};
+            rasterInstanceBufferGrown_.fill(false);
+        }
+
+        static void mergeDirtyInstanceRange(DirtyInstanceRange& range,
+                                            uint32_t first,
+                                            uint32_t count) {
+            if (count == 0u) return;
+            if (range.count == 0u) {
+                range = {first, count};
+                return;
+            }
+            const uint32_t end = std::max(range.first + range.count, first + count);
+            range.first = std::min(range.first, first);
+            range.count = end - range.first;
+        }
+
+        static bool updateRangeForBatch(const UpdateRange& updateRange,
+                                        uint32_t stride,
+                                        uint32_t batchFirst,
+                                        uint32_t batchCount,
+                                        DirtyInstanceRange& range) {
+            if (updateRange.offset < 0 || updateRange.count <= 0 ||
+                updateRange.offset % static_cast<int>(stride) != 0 ||
+                updateRange.count % static_cast<int>(stride) != 0) return false;
+            const uint64_t first = static_cast<uint32_t>(updateRange.offset / static_cast<int>(stride));
+            const uint64_t end = first + static_cast<uint32_t>(updateRange.count / static_cast<int>(stride));
+            const uint64_t batchEnd = static_cast<uint64_t>(batchFirst) + batchCount;
+            const uint64_t clippedFirst = std::max<uint64_t>(first, batchFirst);
+            const uint64_t clippedEnd = std::min(end, batchEnd);
+            range = clippedFirst < clippedEnd
+                            ? DirtyInstanceRange{static_cast<uint32_t>(clippedFirst - batchFirst),
+                                                 static_cast<uint32_t>(clippedEnd - clippedFirst)}
+                            : DirtyInstanceRange{};
+            return true;
+        }
+
+        void writeRasterInstanceModel(const RasterInstancedBatch& batch,
+                                      uint32_t instanceIndex,
+                                      bool initializePrevious) {
+            Matrix4 local;
+            Matrix4 world;
+            batch.mesh->getMatrixAt(instanceIndex, local);
+            world.multiplyMatrices(*batch.mesh->matrixWorld, local);
+
+            auto& payload = rasterInstanceScratch_[batch.firstInstance + instanceIndex];
+            if (initializePrevious) {
+                std::memcpy(payload.prevModel, world.elements.data(), sizeof(payload.prevModel));
+            } else {
+                std::memcpy(payload.prevModel, payload.model, sizeof(payload.prevModel));
+            }
+            std::memcpy(payload.model, world.elements.data(), sizeof(payload.model));
+        }
+
+        void writeRasterInstanceColor(const RasterInstancedBatch& batch, uint32_t instanceIndex) {
+            auto& payload = rasterInstanceScratch_[batch.firstInstance + instanceIndex];
+            Color color = Color::white;
+            if (batch.mesh->instanceColor()) batch.mesh->getColorAt(instanceIndex, color);
+            payload.color[0] = color.r;
+            payload.color[1] = color.g;
+            payload.color[2] = color.b;
+            payload.color[3] = 1.0f;
+        }
+
+        void writeRasterInstancePayload(const RasterInstancedBatch& batch, uint32_t instanceIndex) {
+            writeRasterInstanceModel(batch, instanceIndex, true);
+            writeRasterInstanceColor(batch, instanceIndex);
+            auto& payload = rasterInstanceScratch_[batch.firstInstance + instanceIndex];
+            payload.sceneIndex = static_cast<uint32_t>(batch.firstEntry);
+        }
+
+        void consumeRasterInstancePreviousModelReset(RasterInstancedBatch& batch) {
+            if (batch.previousModelResetPending.count != 0u) {
+                const auto first = batch.previousModelResetPending.first;
+                const auto end = std::min<uint32_t>(
+                        first + batch.previousModelResetPending.count,
+                        static_cast<uint32_t>(batch.entryCount));
+                for (uint32_t index = first; index < end; ++index) {
+                    auto& payload = rasterInstanceScratch_[batch.firstInstance + index];
+                    std::memcpy(payload.prevModel, payload.model, sizeof(payload.prevModel));
+                }
+                for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+                    mergeDirtyInstanceRange(batch.matrixDirty[slot], first, end - first);
+                }
+                batch.previousModelResetPending = {};
+            }
+        }
+
+        void refreshRasterInstancedDirtyRanges(RasterInstancedBatch& batch) {
+            const auto apply = [&](FloatBufferAttribute* attribute,
+                                   uint32_t stride,
+                                   auto& uploadedVersions,
+                                   unsigned int& cachedVersion,
+                                   auto& dirtyRanges,
+                                   auto&& updatePayload) {
+                if (!attribute) return;
+                DirtyInstanceRange changed{};
+                const bool hasRange = attribute->updateRange.count >= 0;
+                const auto rangeOffset = attribute->updateRange.offset;
+                const auto rangeCount = attribute->updateRange.count;
+                const bool rangeInAttribute = hasRange && rangeOffset >= 0 && rangeCount > 0 &&
+                        static_cast<size_t>(rangeOffset) <= attribute->array().size() &&
+                        static_cast<size_t>(rangeCount) <=
+                                attribute->array().size() - static_cast<size_t>(rangeOffset);
+                const bool validRange = hasRange && rangeInAttribute &&
+                                        updateRangeForBatch(attribute->updateRange, stride,
+                                                            0u,
+                                                            static_cast<uint32_t>(batch.entryCount), changed);
+                const bool versionChanged = cachedVersion != attribute->version;
+                if (!hasRange && !versionChanged) return;
+                for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+                    if (validRange) {
+                        mergeDirtyInstanceRange(dirtyRanges[slot], changed.first, changed.count);
+                    } else if (hasRange || uploadedVersions[slot] != attribute->version) {
+                        mergeDirtyInstanceRange(dirtyRanges[slot], 0u,
+                                                static_cast<uint32_t>(batch.entryCount));
+                    }
+                }
+                if (hasRange || versionChanged) {
+                    const auto patch = validRange
+                            ? changed
+                            : DirtyInstanceRange{0u, static_cast<uint32_t>(batch.entryCount)};
+                    for (uint32_t index = patch.first; index < patch.first + patch.count; ++index) {
+                        updatePayload(index);
+                    }
+                }
+            };
+
+            apply(batch.mesh->instanceMatrix(), 16u, batch.uploadedMatrixVersion,
+                  batch.cachedMatrixVersion, batch.matrixDirty, [&](uint32_t index) {
+                      if (!batch.modelUpdatedForWorldChangeThisFrame) {
+                          writeRasterInstanceModel(batch, index, false);
+                      }
+                      mergeDirtyInstanceRange(batch.previousModelResetPending, index, 1u);
+                  });
+            apply(batch.mesh->instanceColor(), 3u, batch.uploadedColorVersion,
+                  batch.cachedColorVersion, batch.colorDirty, [&](uint32_t index) {
+                      writeRasterInstanceColor(batch, index);
+                  });
+        }
+
+        bool canUseRasterInstancingFastPath(const MeshEntry& entry) const {
+            if (renderMode_ != VulkanRenderer::RenderMode::RasterFirst ||
+                deferredAO_ || deferredRayAccents_ ||
+                !entry.isInstanced || entry.isOverlay || entry.isSkinned ||
+                entry.isDisplaced || entry.isGrass || entry.isMorphed ||
+                entry.isTet || entry.isMaterialDisplaced || !entry.mesh) return false;
+
+            const auto& materials = entry.mesh->materials();
+            if (materials.size() != 1 || !materials.front()) return false;
+            const auto& material = materials.front();
+            if (dynamic_cast<const ShadowMaterial*>(material.get())) return false;
+            if (material->transparent || material->blending != Blending::Normal ||
+                !material->depthTest || !material->depthWrite || material->stencilWrite) return false;
+            if (const auto* wireframe = dynamic_cast<const MaterialWithWireframe*>(material.get());
+                wireframe && wireframe->wireframe) return false;
+            if (dynamic_cast<ShaderMaterial*>(material.get()) ||
+                dynamic_cast<RawShaderMaterial*>(material.get())) return false;
+            const auto* transmissive = dynamic_cast<const MaterialWithTransmission*>(material.get());
+            return !transmissive || transmissive->transmission <= 0.0f;
+        }
+
+        RasterInstancingFingerprint rasterInstancingFingerprint(const MeshEntry& entry) const {
+            const auto& material = entry.mesh->materials().front();
+            return {
+                    entry.mesh,
+                    entry.mesh->geometry().get(),
+                    material.get()};
+        }
+
+        [[nodiscard]] bool isActiveInstancedEntry(const MeshEntry& entry) const {
+            return !entry.isInstanced ||
+                   (entry.mesh && entry.instanceIndex <
+                                          static_cast<const InstancedMesh*>(entry.mesh)->count());
+        }
 
         bool ensureDrawInfoCapacity(uint32_t frame, VkDeviceSize neededBytes) {
             if (neededBytes <= drawInfoBufferCapacity[frame]) return false;
@@ -9881,6 +10792,304 @@ namespace threepp {
             return true;
         }
 
+        bool ensureRasterInstanceCapacity(uint32_t frame, VkDeviceSize neededBytes) {
+            if (neededBytes <= rasterInstanceBufferCapacity[frame]) return false;
+            const VkDeviceSize newCap = std::max<VkDeviceSize>(
+                    neededBytes, rasterInstanceBufferCapacity[frame] * 2u);
+            destroyBuffer(ctx->allocator(), rasterInstanceBuffers[frame]);
+            rasterInstanceBuffers[frame] = createBuffer(
+                    ctx->allocator(), ctx->device(), newCap,
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+                            VMA_ALLOCATION_CREATE_MAPPED_BIT);
+            rasterInstanceBufferCapacity[frame] = newCap;
+            return true;
+        }
+
+        void buildRasterInstancedDrawData(uint32_t frame, bool sceneHasShadowCaster) {
+            const bool generationChanged =
+                    rasterInstancePayloadGeneration_ != sceneFullRebuildCount_;
+            if (generationChanged) {
+                clearRasterInstancingState();
+                rasterInstancePayloadGeneration_ = sceneFullRebuildCount_;
+            }
+            auto previousBatches = std::move(rasterInstancedBatches_);
+            if (generationChanged) previousBatches.clear();
+            size_t previousBatchCursor = 0;
+            rasterInstancedBatches_.clear();
+            rasterInstancedDrawScratch_.clear();
+            rasterInstancedEntryMask_.assign(lastVisibleEntries_.size(), false);
+            rasterInstanceBufferGrown_[frame] = false;
+            for (auto& group : rasterInstancedGroups_) group = {};
+            size_t requiredInstanceSlots = 0;
+
+            for (size_t i = 0; i < lastVisibleEntries_.size();) {
+                const auto& first = lastVisibleEntries_[i];
+                if (!first.isInstanced || !first.mesh) {
+                    ++i;
+                    continue;
+                }
+                size_t blockEnd = i + 1;
+                const bool compact = first.rasterInstancingCompact;
+                if (!compact) {
+                    while (blockEnd < lastVisibleEntries_.size() &&
+                           lastVisibleEntries_[blockEnd].mesh == first.mesh &&
+                           lastVisibleEntries_[blockEnd].isInstanced) {
+                        ++blockEnd;
+                    }
+                }
+                const bool blockUsesFastPath = canUseRasterInstancingFastPath(first);
+
+                for (size_t batchBegin = i; batchBegin < blockEnd;) {
+                    const auto& entry = lastVisibleEntries_[batchBegin];
+                    if (!isActiveInstancedEntry(entry) || !entry.inFrustum ||
+                        !blockUsesFastPath) {
+                        ++batchBegin;
+                        continue;
+                    }
+                    size_t batchEnd = batchBegin + 1;
+                    if (!compact) {
+                        while (batchEnd < blockEnd &&
+                               isActiveInstancedEntry(lastVisibleEntries_[batchEnd]) &&
+                               lastVisibleEntries_[batchEnd].inFrustum) {
+                            ++batchEnd;
+                        }
+                    }
+
+                const auto* rec = resolveBlasForEntry(entry);
+                if (!rec || rec->vertex.handle == VK_NULL_HANDLE) {
+                    ++batchBegin;
+                    continue;
+                }
+                const bool indexed = rec->index.handle != VK_NULL_HANDLE;
+                const uint32_t vertexCount = indexed ? rec->indexCount : rec->vertexCount;
+                if (vertexCount == 0u) {
+                    ++batchBegin;
+                    continue;
+                }
+                const auto geometry = entry.mesh->geometry();
+                const VulkanDrawSpan span = resolveVulkanDrawSpan(
+                        vertexCount,
+                        geometry ? geometry->drawRange : DrawRange{0, static_cast<int>(vertexCount)});
+                if (span.count == 0u) {
+                    batchBegin = batchEnd;
+                    continue;
+                }
+
+                const auto& material = entry.mesh->materials().front();
+                const int bucket = material->side == Side::Back ? 1 :
+                                   material->side == Side::Double ? 2 : 0;
+                RasterInstancedBatch batch{};
+                batch.mesh = static_cast<InstancedMesh*>(entry.mesh);
+                batch.fingerprint = rasterInstancingFingerprint(entry);
+                batch.firstEntry = batchBegin;
+                batch.entryCount = compact ? entry.rasterInstanceCount : batchEnd - batchBegin;
+                batch.firstInstance = static_cast<uint32_t>(requiredInstanceSlots);
+                batch.firstVertex = span.first;
+                batch.vertexCount = span.count;
+                batch.bucket = bucket;
+                while (previousBatchCursor < previousBatches.size() &&
+                       previousBatches[previousBatchCursor].firstEntry < batch.firstEntry) {
+                    ++previousBatchCursor;
+                }
+                const RasterInstancedBatch* previous =
+                        previousBatchCursor < previousBatches.size() &&
+                        previousBatches[previousBatchCursor].firstEntry == batch.firstEntry
+                                ? &previousBatches[previousBatchCursor++]
+                                : nullptr;
+                bool reusedPayloadLifecycleState = previous &&
+                                                   previous->mesh == batch.mesh &&
+                                                   previous->firstInstance == batch.firstInstance;
+                size_t sharedPayloadCount = 0;
+                if (reusedPayloadLifecycleState) {
+                    sharedPayloadCount = std::min(previous->entryCount, batch.entryCount);
+                    reusedPayloadLifecycleState = sharedPayloadCount > 0u &&
+                            batch.firstInstance + sharedPayloadCount <= rasterInstanceScratch_.size();
+                }
+                if (reusedPayloadLifecycleState) {
+                    batch.uploadedMatrixVersion = previous->uploadedMatrixVersion;
+                    batch.uploadedColorVersion = previous->uploadedColorVersion;
+                    batch.cachedMatrixVersion = previous->cachedMatrixVersion;
+                    batch.cachedColorVersion = previous->cachedColorVersion;
+                    batch.matrixDirty = previous->matrixDirty;
+                    batch.colorDirty = previous->colorDirty;
+                    batch.previousModelResetPending = previous->previousModelResetPending;
+                    batch.cachedCount = previous->cachedCount;
+                    batch.cachedMeshWorld = previous->cachedMeshWorld;
+                }
+                const bool reusedPipelineState = previous &&
+                                                 previous->fingerprint == batch.fingerprint &&
+                                                 previous->bucket == batch.bucket;
+                if (reusedPipelineState) {
+                    if (reusedPayloadLifecycleState &&
+                        previous->entryCount == batch.entryCount) {
+                        batch.cachedDrawInfoIndex = previous->cachedDrawInfoIndex;
+                    }
+                    batch.materialDescIndex = previous->materialDescIndex;
+                    batch.materialDescDirty = previous->materialDescDirty;
+                    batch.material = previous->material;
+                    batch.materialVersion = previous->materialVersion;
+                    batch.materialValues = previous->materialValues;
+                    batch.materialDesc = previous->materialDesc;
+                    batch.sceneGeneration = previous->sceneGeneration;
+                }
+
+                const uint32_t materialDescIndex = static_cast<uint32_t>(
+                        matDescsCached_.size() + batch.firstEntry);
+                const auto materialValues = materialValueFingerprint(*entry.mesh);
+                if (batch.material != material.get() ||
+                    batch.materialDescIndex != materialDescIndex ||
+                    batch.materialVersion != material->version() ||
+                    batch.materialValues != materialValues ||
+                    batch.sceneGeneration != sceneFullRebuildCount_) {
+                    batch.materialDesc = materialDescForMesh(*entry.mesh);
+                    populateMaterialTextureSlots(batch.materialDesc, material);
+                    batch.materialDescDirty.fill(true);
+                    batch.material = material.get();
+                    batch.materialVersion = material->version();
+                    batch.materialValues = materialValues;
+                    batch.materialDescIndex = materialDescIndex;
+                    batch.sceneGeneration = sceneFullRebuildCount_;
+                }
+
+                DrawInfoGpu draw{};
+                draw.posAddr = rec->vertex.address;
+                draw.nrmAddr = rec->normal.address;
+                draw.uvAddr = rec->uv.handle != VK_NULL_HANDLE ? rec->uv.address : 0ull;
+                draw.uv2Addr = rec->uv2.handle != VK_NULL_HANDLE ? rec->uv2.address : draw.uvAddr;
+                draw.prevPosAddr = rec->prevVertex.handle != VK_NULL_HANDLE
+                                           ? rec->prevVertex.address : rec->vertex.address;
+                draw.indexAddr = indexed ? rec->index.address : 0ull;
+                draw.colorAddr = rec->color.handle != VK_NULL_HANDLE && material->vertexColors
+                                        ? rec->color.address : 0ull;
+                draw.indexed = indexed ? 1u : 0u;
+                if (const auto* flat = dynamic_cast<MaterialWithFlatShading*>(material.get());
+                    flat && flat->flatShading) {
+                    draw.flags |= 16u;
+                }
+                if (shadowMapEnabled_ && (!sceneHasShadowCaster || entry.mesh->receiveShadow)) {
+                    draw.flags |= 32u;
+                }
+                if (material->polygonOffset) {
+                    const float units = material->polygonOffsetUnits + material->polygonOffsetFactor;
+                    draw.polygonOffset = units != 0.f ? -units * 1.0e-6f : 4.0e-6f;
+                }
+                if (localClippingEnabled_ && !material->clippingPlanes.empty()) {
+                    draw.clipPlaneCount = std::min<uint32_t>(
+                            static_cast<uint32_t>(material->clippingPlanes.size()), kMaxRasterClipPlanes);
+                    draw.clipIntersection = material->clipIntersection ? 1u : 0u;
+                    for (uint32_t clipIndex = 0; clipIndex < draw.clipPlaneCount; ++clipIndex) {
+                        const auto& plane = material->clippingPlanes[clipIndex];
+                        draw.clipPlanes[clipIndex][0] = plane.normal.x;
+                        draw.clipPlanes[clipIndex][1] = plane.normal.y;
+                        draw.clipPlanes[clipIndex][2] = plane.normal.z;
+                        draw.clipPlanes[clipIndex][3] = -plane.constant;
+                    }
+                }
+                rasterInstancedDrawScratch_.push_back(draw);
+
+                requiredInstanceSlots += batch.entryCount;
+                if (rasterInstanceScratch_.size() < requiredInstanceSlots) {
+                    rasterInstanceScratch_.resize(requiredInstanceSlots);
+                }
+
+                bool initializedPayload = false;
+                const uint32_t firstUninitialized = reusedPayloadLifecycleState
+                        ? static_cast<uint32_t>(sharedPayloadCount) : 0u;
+                for (uint32_t j = firstUninitialized; j < batch.entryCount; ++j) {
+                    writeRasterInstancePayload(batch, j);
+                    initializedPayload = true;
+                }
+                for (size_t j = batchBegin; j < batchEnd; ++j) rasterInstancedEntryMask_[j] = true;
+                if (initializedPayload) {
+                    for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+                        mergeDirtyInstanceRange(batch.matrixDirty[slot], 0u,
+                                                static_cast<uint32_t>(batch.entryCount));
+                    }
+                }
+                consumeRasterInstancePreviousModelReset(batch);
+                if (std::memcmp(batch.cachedMeshWorld.data(), entry.mesh->matrixWorld->elements.data(), 64) != 0) {
+                    for (uint32_t j = 0; j < batch.entryCount; ++j) {
+                        Matrix4 local;
+                        Matrix4 world;
+                        batch.mesh->getMatrixAt(j, local);
+                        world.multiplyMatrices(*batch.mesh->matrixWorld, local);
+                        const auto& payload = rasterInstanceScratch_[batch.firstInstance + j];
+                        if (std::memcmp(payload.model, world.elements.data(), sizeof(payload.model)) != 0) {
+                            writeRasterInstanceModel(batch, j, false);
+                            batch.modelUpdatedForWorldChangeThisFrame = true;
+                            mergeDirtyInstanceRange(batch.previousModelResetPending, j, 1u);
+                            for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+                                mergeDirtyInstanceRange(batch.matrixDirty[slot], j, 1u);
+                            }
+                        }
+                    }
+                }
+                std::memcpy(batch.cachedMeshWorld.data(), entry.mesh->matrixWorld->elements.data(), 64);
+                rasterInstancedBatches_.push_back(batch);
+                batchBegin = batchEnd;
+                }
+                i = blockEnd;
+            }
+
+            if (rasterInstancedBatches_.empty()) {
+                rasterInstanceScratch_.clear();
+                return;
+            }
+            rasterInstanceScratch_.resize(requiredInstanceSlots);
+            const VkDeviceSize instanceBytes = rasterInstanceScratch_.size() * sizeof(RasterInstanceGpu);
+            rasterInstanceBufferGrown_[frame] = ensureRasterInstanceCapacity(frame, instanceBytes);
+            if (rasterInstanceBufferGrown_[frame]) {
+                rasterInstanceDescriptorDirty_[frame] = true;
+            }
+            void* mapped = nullptr;
+
+            const VkDeviceSize materialBytes =
+                    (matDescsCached_.size() + lastVisibleEntries_.size()) * sizeof(MaterialDesc);
+            if (materialDescsBuffers[frame].size < materialBytes) {
+                rasterInstancedEntryMask_.assign(lastVisibleEntries_.size(), false);
+                rasterInstancedBatches_.clear();
+                rasterInstancedDrawScratch_.clear();
+                rasterInstanceScratch_.clear();
+                return;
+            }
+            if (std::any_of(rasterInstancedBatches_.begin(), rasterInstancedBatches_.end(),
+                            [frame](const RasterInstancedBatch& batch) {
+                                return batch.materialDescDirty[frame];
+                            })) {
+                check(vmaMapMemory(ctx->allocator(), materialDescsBuffers[frame].alloc, &mapped),
+                      "vmaMapMemory(raster instanced material desc)");
+                auto* descs = static_cast<MaterialDesc*>(mapped);
+                for (auto& batch : rasterInstancedBatches_) {
+                    if (!batch.materialDescDirty[frame]) continue;
+                    descs[batch.materialDescIndex] = batch.materialDesc;
+                }
+                vmaUnmapMemory(ctx->allocator(), materialDescsBuffers[frame].alloc);
+                for (auto& batch : rasterInstancedBatches_) {
+                    if (!batch.materialDescDirty[frame]) continue;
+                    batch.materialDescDirty[frame] = false;
+                    ++lastRasterInstancedMaterialDescUpdateCount_;
+                }
+            }
+
+            if (rasterInstanceDescriptorDirty_[frame]) {
+                VkDescriptorBufferInfo info{};
+                info.buffer = rasterInstanceBuffers[frame].handle;
+                info.range = VK_WHOLE_SIZE;
+                VkWriteDescriptorSet write{};
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = rasterDescSets[frame];
+                write.dstBinding = 5;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = &info;
+                vkUpdateDescriptorSets(ctx->device(), 1, &write, 0, nullptr);
+                rasterInstanceDescriptorDirty_[frame] = false;
+                ++lastRasterInstancedDescriptorWriteCount_;
+            }
+        }
+
         // Build the per-frame DrawInfo + indirect-command buffers for the
         // hybrid raster G-buffer pass. Called from renderFrame right after
         // cullEntriesAgainstFrustum (which sets MeshEntry::inFrustum) so we
@@ -9899,17 +11108,28 @@ namespace threepp {
         void buildIndirectDrawData(uint32_t frame) {
             for (auto& g : indirectGroups_) { g.offset = 0; g.count = 0; }
             indirectTotalDraws_ = 0;
+            lastRasterInstancedBatchCount_ = 0u;
+            lastRasterInstancedInstanceCount_ = 0u;
+            lastRasterInstancedPatchedInstanceCount_ = 0u;
+            lastRasterInstancedMaterialDescUpdateCount_ = 0u;
+            lastRasterInstancedDescriptorWriteCount_ = 0u;
 
-            if (lastVisibleEntries_.empty()) return;
-
+            if (lastVisibleEntries_.empty()) {
+                clearRasterInstancingState();
+                return;
+            }
             const bool sceneHasShadowCaster = std::any_of(
                     lastVisibleEntries_.begin(), lastVisibleEntries_.end(),
-                    [](const MeshEntry& en) {
-                        return !en.isOverlay && en.mesh && en.mesh->castShadow;
+                    [this](const MeshEntry& en) {
+                        return !en.isOverlay && isActiveInstancedEntry(en) &&
+                               en.mesh && en.mesh->castShadow;
                     });
+            buildRasterInstancedDrawData(frame, sceneHasShadowCaster);
 
-            std::array<std::vector<DrawInfoGpu>, 10>          draws;
-            std::array<std::vector<VkDrawIndirectCommand>, 10> cmds;
+            auto& draws = indirectDrawScratch_;
+            auto& cmds = indirectCmdScratch_;
+            for (auto& bucket : draws) bucket.clear();
+            for (auto& bucket : cmds) bucket.clear();
             auto bucketOf = [](VkCullModeFlags cm) -> int {
                 if (cm == VK_CULL_MODE_BACK_BIT)  return 0;
                 if (cm == VK_CULL_MODE_FRONT_BIT) return 1;
@@ -9917,18 +11137,37 @@ namespace threepp {
             };
 
             uint32_t globalIdx = 0;
+            const Mesh* cachedMesh = nullptr;
+            const BlasRecord* cachedRec = nullptr;
+            std::shared_ptr<BufferGeometry> cachedGeometry;
+            const std::vector<std::shared_ptr<Material>>* cachedMaterials = nullptr;
+            std::shared_ptr<Material> cachedPrimaryMaterial;
+            bool cachedFlatShading = false;
             for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                 const auto& en = lastVisibleEntries_[i];
                 if (en.isOverlay)  continue;
+                if (!isActiveInstancedEntry(en)) continue;
                 if (!en.inFrustum) continue;
-                const BlasRecord* rec = resolveBlasForEntry(en);
+                if (i < rasterInstancedEntryMask_.size() && rasterInstancedEntryMask_[i]) continue;
+                if (!en.isInstanced || en.mesh != cachedMesh) {
+                    cachedMesh = en.isInstanced ? en.mesh : nullptr;
+                    cachedRec = resolveBlasForEntry(en);
+                    cachedGeometry = en.mesh->geometry();
+                    cachedMaterials = &en.mesh->materials();
+                    cachedPrimaryMaterial = en.mesh->material();
+                    cachedFlatShading = false;
+                    if (auto* flat = dynamic_cast<MaterialWithFlatShading*>(cachedPrimaryMaterial.get())) {
+                        cachedFlatShading = flat->flatShading;
+                    }
+                }
+                const BlasRecord* rec = cachedRec;
                 if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
                 const bool indexed = (rec->index.handle != VK_NULL_HANDLE);
                 const uint32_t vcount = indexed ? rec->indexCount : rec->vertexCount;
                 if (vcount == 0u) continue;
 
-                const auto geometry = en.mesh->geometry();
+                const auto& geometry = cachedGeometry;
                 auto cullModeForMaterial = [](const std::shared_ptr<Material>& material) {
                     if (!material) return VK_CULL_MODE_BACK_BIT;
                     switch (material->side) {
@@ -10002,7 +11241,12 @@ namespace threepp {
                     uint32_t flags = 0u;
                     if (en.isDisplaced) flags |= 1u;
                     if (en.isSkinned)   flags |= 8u;
-                    if (auto* flat = dynamic_cast<MaterialWithFlatShading*>(material.get()); flat && flat->flatShading) {
+                    bool flatShading = cachedFlatShading;
+                    if (material.get() != cachedPrimaryMaterial.get()) {
+                        const auto* flat = dynamic_cast<MaterialWithFlatShading*>(material.get());
+                        flatShading = flat && flat->flatShading;
+                    }
+                    if (flatShading) {
                         flags |= 16u;
                     }
                     if (shadowMapEnabled_ && (!sceneHasShadowCaster || en.mesh->receiveShadow)) flags |= 32u;
@@ -10048,7 +11292,7 @@ namespace threepp {
                     ++globalIdx;
                 };
 
-                const auto& materials = en.mesh->materials();
+                const auto& materials = *cachedMaterials;
                 if (geometry && materials.size() > 1 && !geometry->groups.empty()) {
                     const auto* groupIndices = i < rasterGroupMaterialDescIndices_.size()
                                                        ? &rasterGroupMaterialDescIndices_[i]
@@ -10063,23 +11307,34 @@ namespace threepp {
                         emitDraw(materials[group.materialIndex], descIndex, group);
                     }
                 } else {
-                    emitDraw(en.mesh->material(), static_cast<uint32_t>(i), std::nullopt);
+                    emitDraw(cachedPrimaryMaterial, static_cast<uint32_t>(i), std::nullopt);
                 }
             }
 
             indirectTotalDraws_ = globalIdx;
-            if (globalIdx == 0u) return;
+            const uint32_t instancedDrawCount = static_cast<uint32_t>(rasterInstancedBatches_.size());
+            if (globalIdx == 0u && instancedDrawCount == 0u) return;
 
             // Concatenate buckets into the per-frame device buffers.
-            const VkDeviceSize drawBytes = sizeof(DrawInfoGpu) * globalIdx;
-            const VkDeviceSize cmdBytes  = sizeof(VkDrawIndirectCommand) * globalIdx;
-            const bool drawGrown = ensureDrawInfoCapacity(frame, drawBytes);
+            const uint32_t totalDraws = globalIdx + instancedDrawCount;
+            const VkDeviceSize drawBytes = sizeof(DrawInfoGpu) * totalDraws;
+            const VkDeviceSize cmdBytes  = sizeof(VkDrawIndirectCommand) * totalDraws;
+            if (ensureDrawInfoCapacity(frame, drawBytes)) {
+                rasterDrawInfoDescriptorDirty_[frame] = true;
+            }
             ensureIndirectCmdCapacity(frame, cmdBytes);
 
             void* mappedDraws = nullptr;
-            vmaMapMemory(ctx->allocator(), drawInfoBuffers[frame].alloc, &mappedDraws);
             void* mappedCmds = nullptr;
-            vmaMapMemory(ctx->allocator(), indirectCmdBuffers[frame].alloc, &mappedCmds);
+            bool drawsMapped = false;
+            bool cmdsMapped = false;
+            try {
+            check(vmaMapMemory(ctx->allocator(), drawInfoBuffers[frame].alloc, &mappedDraws),
+                  "vmaMapMemory(raster draw info)");
+            drawsMapped = true;
+            check(vmaMapMemory(ctx->allocator(), indirectCmdBuffers[frame].alloc, &mappedCmds),
+                  "vmaMapMemory(raster indirect commands)");
+            cmdsMapped = true;
 
             uint8_t* dDst = static_cast<uint8_t*>(mappedDraws);
             uint8_t* cDst = static_cast<uint8_t*>(mappedCmds);
@@ -10113,13 +11368,147 @@ namespace threepp {
                 offset += n;
             }
 
+            for (int b = 0; b < 3; ++b) {
+                auto& group = rasterInstancedGroups_[b];
+                group.cullMode = cullForBucket[b];
+                group.offset = offset;
+                group.count = 0u;
+                for (size_t batchIndex = 0; batchIndex < rasterInstancedBatches_.size(); ++batchIndex) {
+                    auto& batch = rasterInstancedBatches_[batchIndex];
+                    if (batch.bucket != b) continue;
+                    const auto* rec = resolveBlasForEntry(lastVisibleEntries_[batch.firstEntry]);
+                    if (!rec) continue;
+                    batch.drawInfoIndex = offset;
+                    auto draw = rasterInstancedDrawScratch_[batchIndex];
+                    draw.materialIndex = batch.materialDescIndex;
+                    std::memcpy(dDst + offset * sizeof(DrawInfoGpu), &draw, sizeof(draw));
+                    VkDrawIndirectCommand cmd{};
+                    cmd.vertexCount = batch.vertexCount;
+                    cmd.instanceCount = static_cast<uint32_t>(batch.entryCount);
+                    cmd.firstVertex = batch.firstVertex;
+                    cmd.firstInstance = batch.firstInstance;
+                    std::memcpy(cDst + offset * sizeof(VkDrawIndirectCommand), &cmd, sizeof(cmd));
+                    if (batch.cachedDrawInfoIndex != batch.drawInfoIndex) {
+                        for (size_t instance = batch.firstInstance;
+                             instance < batch.firstInstance + batch.entryCount; ++instance) {
+                            rasterInstanceScratch_[instance].drawInfoIndex = batch.drawInfoIndex;
+                        }
+                    }
+                    ++offset;
+                    ++group.count;
+                }
+            }
+
+            if (!rasterInstancedBatches_.empty() && !rasterInstanceScratch_.empty()) {
+                for (auto& batch : rasterInstancedBatches_) {
+                    refreshRasterInstancedDirtyRanges(batch);
+                    const bool countChanged = batch.cachedCount != batch.entryCount;
+                    if (countChanged) {
+                        for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+                            batch.matrixDirty[slot] = {
+                                    0u, static_cast<uint32_t>(batch.entryCount)};
+                            batch.colorDirty[slot] = {};
+                        }
+                    } else if (batch.cachedDrawInfoIndex != batch.drawInfoIndex) {
+                        for (uint32_t slot = 0; slot < kFramesInFlight; ++slot) {
+                            mergeDirtyInstanceRange(batch.matrixDirty[slot], 0u,
+                                                    static_cast<uint32_t>(batch.entryCount));
+                        }
+                    }
+                }
+
+                const auto dirtyForFrame = [this, frame](const RasterInstancedBatch& batch) {
+                    const auto available = batch.firstInstance < rasterInstanceScratch_.size()
+                                                   ? rasterInstanceScratch_.size() - batch.firstInstance
+                                                   : 0u;
+                    const auto payloadCount = static_cast<uint32_t>(
+                            std::min<size_t>(batch.entryCount, available));
+                    const auto clamp = [payloadCount](DirtyInstanceRange range) {
+                        if (range.first >= payloadCount) return DirtyInstanceRange{};
+                        range.count = std::min(range.count, payloadCount - range.first);
+                        return range;
+                    };
+                    DirtyInstanceRange dirty = clamp(batch.matrixDirty[frame]);
+                    const auto colorDirty = clamp(batch.colorDirty[frame]);
+                    mergeDirtyInstanceRange(dirty, colorDirty.first, colorDirty.count);
+                    return dirty;
+                };
+                const bool hasPendingUpload = rasterInstanceBufferGrown_[frame] ||
+                        std::any_of(rasterInstancedBatches_.begin(), rasterInstancedBatches_.end(),
+                                    [&dirtyForFrame](const RasterInstancedBatch& batch) {
+                                        return dirtyForFrame(batch).count != 0u;
+                                    });
+                if (hasPendingUpload) {
+                    if (!rasterInstanceBuffers[frame].alloc ||
+                        rasterInstanceBuffers[frame].handle == VK_NULL_HANDLE) {
+                        throw std::runtime_error("raster instance upload buffer is invalid");
+                    }
+                    void* mappedInstances = nullptr;
+                    check(vmaMapMemory(ctx->allocator(), rasterInstanceBuffers[frame].alloc,
+                                       &mappedInstances),
+                          "vmaMapMemory(raster instance upload)");
+                    auto* instances = static_cast<RasterInstanceGpu*>(mappedInstances);
+                    uint32_t patchedInstances = 0u;
+                    if (rasterInstanceBufferGrown_[frame]) {
+                        std::memcpy(instances, rasterInstanceScratch_.data(),
+                                    rasterInstanceScratch_.size() * sizeof(RasterInstanceGpu));
+                        for (const auto& batch : rasterInstancedBatches_) {
+                            patchedInstances += static_cast<uint32_t>(batch.entryCount);
+                        }
+                    } else {
+                        for (const auto& batch : rasterInstancedBatches_) {
+                            const auto dirty = dirtyForFrame(batch);
+                            if (dirty.count == 0u) continue;
+                            std::memcpy(instances + batch.firstInstance + dirty.first,
+                                        rasterInstanceScratch_.data() + batch.firstInstance + dirty.first,
+                                        static_cast<size_t>(dirty.count) * sizeof(RasterInstanceGpu));
+                            patchedInstances += dirty.count;
+                        }
+                    }
+                    vmaUnmapMemory(ctx->allocator(), rasterInstanceBuffers[frame].alloc);
+                    lastRasterInstancedPatchedInstanceCount_ += patchedInstances;
+
+                    for (auto& batch : rasterInstancedBatches_) {
+                        batch.cachedMatrixVersion = batch.mesh->instanceMatrix()->version;
+                        batch.mesh->instanceMatrix()->updateRange.count = -1;
+                        if (auto* color = batch.mesh->instanceColor()) {
+                            batch.cachedColorVersion = color->version;
+                            color->updateRange.count = -1;
+                        }
+                        if (!rasterInstanceBufferGrown_[frame] &&
+                            dirtyForFrame(batch).count == 0u) continue;
+                        batch.uploadedMatrixVersion[frame] = batch.mesh->instanceMatrix()->version;
+                        if (auto* color = batch.mesh->instanceColor()) {
+                            batch.uploadedColorVersion[frame] = color->version;
+                        }
+                        batch.matrixDirty[frame] = {};
+                        batch.colorDirty[frame] = {};
+                        batch.cachedCount = batch.entryCount;
+                        batch.cachedDrawInfoIndex = batch.drawInfoIndex;
+                    }
+                }
+            }
+
             vmaUnmapMemory(ctx->allocator(), indirectCmdBuffers[frame].alloc);
+            cmdsMapped = false;
             vmaUnmapMemory(ctx->allocator(), drawInfoBuffers[frame].alloc);
+            drawsMapped = false;
+            } catch (...) {
+                if (cmdsMapped) vmaUnmapMemory(ctx->allocator(), indirectCmdBuffers[frame].alloc);
+                if (drawsMapped) vmaUnmapMemory(ctx->allocator(), drawInfoBuffers[frame].alloc);
+                throw;
+            }
+
+            lastRasterInstancedBatchCount_ = static_cast<uint32_t>(rasterInstancedBatches_.size());
+            lastRasterInstancedInstanceCount_ = 0u;
+            for (const auto& batch : rasterInstancedBatches_) {
+                lastRasterInstancedInstanceCount_ += static_cast<uint32_t>(batch.entryCount);
+            }
 
             // Rewrite binding 4 if the DrawInfo buffer handle moved (grow).
             // The indirect cmd buffer is consumed by vkCmdDrawIndirect — no
             // descriptor binding needed for it.
-            if (drawGrown) {
+            if (rasterDrawInfoDescriptorDirty_[frame]) {
                 VkDescriptorBufferInfo dbInfo{};
                 dbInfo.buffer = drawInfoBuffers[frame].handle;
                 dbInfo.offset = 0;
@@ -10132,6 +11521,7 @@ namespace threepp {
                 w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                 w.pBufferInfo     = &dbInfo;
                 vkUpdateDescriptorSets(ctx->device(), 1, &w, 0, nullptr);
+                rasterDrawInfoDescriptorDirty_[frame] = false;
             }
         }
 
@@ -10342,14 +11732,16 @@ namespace threepp {
 
             const bool sceneHasShadowCaster = std::any_of(
                     lastVisibleEntries_.begin(), lastVisibleEntries_.end(),
-                    [](const MeshEntry& en) {
-                        return !en.isOverlay && en.mesh && en.mesh->castShadow;
+                    [this](const MeshEntry& en) {
+                        return !en.isOverlay && isActiveInstancedEntry(en) &&
+                               en.mesh && en.mesh->castShadow;
                     });
 
             VkPipeline boundPipeline = VK_NULL_HANDLE;
             for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                 const auto& en = lastVisibleEntries_[i];
                 if (en.isOverlay) continue;
+                if (!isActiveInstancedEntry(en)) continue;
                 if (!en.mesh) continue;
                 const auto material = en.mesh->material();
                 if (!material || !material->stencilWrite) continue;
@@ -10424,6 +11816,101 @@ namespace threepp {
                 } else {
                     vkCmdDraw(cb, vertexCount, 1, 0, 0);
                 }
+            }
+        }
+
+        void ensureRasterGbufInstancedPipeline() {
+            if (rasterGbufInstancedPipeline != VK_NULL_HANDLE || rasterInstancedBatches_.empty()) return;
+
+            VkShaderModuleCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vci.codeSize = sizeof(kGbufferInstancedVertSpv);
+            vci.pCode = kGbufferInstancedVertSpv;
+            VkShaderModule vert = VK_NULL_HANDLE;
+            VkShaderModule frag = VK_NULL_HANDLE;
+            try {
+                check(vkCreateShaderModule(ctx->device(), &vci, nullptr, &vert),
+                      "vkCreateShaderModule(gbuffer_indirect.vert.instanced)");
+            VkShaderModuleCreateInfo fci{};
+            fci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fci.codeSize = sizeof(kGbufferFragSpv);
+            fci.pCode = kGbufferFragSpv;
+            check(vkCreateShaderModule(ctx->device(), &fci, nullptr, &frag),
+                  "vkCreateShaderModule(gbuffer.frag for instanced)");
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vert;
+            stages[0].pName = "main";
+            stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = frag;
+            stages[1].pName = "main";
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount = 1;
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode = VK_CULL_MODE_BACK_BIT;
+            rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth = 1.f;
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineDepthStencilStateCreateInfo ds{};
+            ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+            ds.depthTestEnable = VK_TRUE;
+            ds.depthWriteEnable = VK_TRUE;
+            ds.depthCompareOp = VK_COMPARE_OP_GREATER;
+            VkPipelineColorBlendAttachmentState attachments[5]{};
+            for (auto& attachment : attachments) {
+                attachment.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                            VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            }
+            VkPipelineColorBlendStateCreateInfo blend{};
+            blend.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            blend.attachmentCount = 5;
+            blend.pAttachments = attachments;
+            const VkDynamicState dynamicStates[] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                                     VK_DYNAMIC_STATE_SCISSOR,
+                                                     VK_DYNAMIC_STATE_CULL_MODE};
+            VkPipelineDynamicStateCreateInfo dynamic{};
+            dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dynamic.dynamicStateCount = 3;
+            dynamic.pDynamicStates = dynamicStates;
+            VkGraphicsPipelineCreateInfo pipeline{};
+            pipeline.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            pipeline.stageCount = 2;
+            pipeline.pStages = stages;
+            pipeline.pVertexInputState = &vi;
+            pipeline.pInputAssemblyState = &ia;
+            pipeline.pViewportState = &vp;
+            pipeline.pRasterizationState = &rs;
+            pipeline.pMultisampleState = &ms;
+            pipeline.pDepthStencilState = &ds;
+            pipeline.pColorBlendState = &blend;
+            pipeline.pDynamicState = &dynamic;
+            pipeline.layout = rasterPipelineLayout;
+            pipeline.renderPass = rasterGbufRenderPass;
+            check(ctx->createGraphicsPipeline(pipeline, &rasterGbufInstancedPipeline),
+                  "vkCreateGraphicsPipelines(rasterGbufInstanced)");
+            vkDestroyShaderModule(ctx->device(), vert, nullptr);
+            vkDestroyShaderModule(ctx->device(), frag, nullptr);
+            } catch (...) {
+                if (frag != VK_NULL_HANDLE) vkDestroyShaderModule(ctx->device(), frag, nullptr);
+                if (vert != VK_NULL_HANDLE) vkDestroyShaderModule(ctx->device(), vert, nullptr);
+                if (rasterGbufInstancedPipeline != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(ctx->device(), rasterGbufInstancedPipeline, nullptr);
+                }
+                rasterGbufInstancedPipeline = VK_NULL_HANDLE;
+                throw;
             }
         }
 
@@ -10521,17 +12008,30 @@ namespace threepp {
                                       g.count,
                                       static_cast<uint32_t>(cmdStride));
                 }
-                // Blend decals last: albedo-blend pipeline lerps over the receivers
-                // rasterized above (same layout/descriptors, no set rebind needed).
-                if (const auto& g = indirectGroups_[9]; g.count > 0u) {
-                    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufDecalPipeline);
-                    vkCmdSetCullMode(cb, g.cullMode);
+            }
+            if (!rasterInstancedBatches_.empty()) {
+                ensureRasterGbufInstancedPipeline();
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufInstancedPipeline);
+                for (const auto& group : rasterInstancedGroups_) {
+                    if (group.count == 0u) continue;
+                    vkCmdSetCullMode(cb, group.cullMode);
                     vkCmdDrawIndirect(cb,
                                       indirectCmdBuffers[frame].handle,
-                                      static_cast<VkDeviceSize>(g.offset) * cmdStride,
-                                      g.count,
+                                      static_cast<VkDeviceSize>(group.offset) * cmdStride,
+                                      group.count,
                                       static_cast<uint32_t>(cmdStride));
                 }
+            }
+            // Blend decals last so they tint every opaque receiver, including
+            // the instanced opaque batches recorded immediately above.
+            if (const auto& g = indirectGroups_[9]; g.count > 0u) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, rasterGbufDecalPipeline);
+                vkCmdSetCullMode(cb, g.cullMode);
+                vkCmdDrawIndirect(cb,
+                                  indirectCmdBuffers[frame].handle,
+                                  static_cast<VkDeviceSize>(g.offset) * cmdStride,
+                                  g.count,
+                                  static_cast<uint32_t>(cmdStride));
             }
             recordStencilGbufDraws(cb, frame);
 
@@ -10539,7 +12039,8 @@ namespace threepp {
         }
 
         bool hasVisibleCustomShaderMaterials() const {
-            return std::any_of(lastVisibleEntries_.begin(), lastVisibleEntries_.end(), [](const MeshEntry& entry) {
+            return std::any_of(lastVisibleEntries_.begin(), lastVisibleEntries_.end(), [this](const MeshEntry& entry) {
+                if (!isActiveInstancedEntry(entry)) return false;
                 if (!entry.mesh || entry.isOverlay || !entry.inFrustum) return false;
                 const auto geometry = entry.mesh->geometry();
                 const auto& materials = entry.mesh->materials();
@@ -10852,6 +12353,7 @@ namespace threepp {
             cameraPosition.setFromMatrixPosition(*camera.matrixWorld);
 
             for (const auto& entry : lastVisibleEntries_) {
+                if (!isActiveInstancedEntry(entry)) continue;
                 if (!entry.mesh || entry.isOverlay || !entry.inFrustum) continue;
                 const auto geometry = entry.mesh->geometry();
                 if (!geometry) continue;
@@ -11999,10 +13501,13 @@ namespace threepp {
             Matrix4 cameraVP;
             std::memcpy(cameraVP.elements.data(), currVPunjit_.data(), 64);
             for (const auto& entry : lastVisibleEntries_) {
+                if (!isActiveInstancedEntry(entry)) continue;
                 if (entry.isOverlay || !entry.inFrustum || !entry.mesh) continue;
                 const auto* rec = resolveBlasForEntry(entry);
                 if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
-                recordShadowCasterDraw(cb, entry, *rec, cameraVP, false);
+                forEachAuxiliaryDepthWorld(entry, [&](const Matrix4& world) {
+                    recordShadowCasterDraw(cb, entry, *rec, cameraVP, false, &world);
+                });
             }
             vkCmdEndRendering(cb);
 
@@ -12879,6 +14384,25 @@ namespace threepp {
             outResults.clear();
             if (beams.empty()) return;
 
+            if (!lidarRaySceneRequested_) {
+                if (!lastRenderedScene_ || !lastRenderedCamera_) {
+                    throw std::runtime_error(
+                            "scanLidar requires renderer.render(scene, camera) first");
+                }
+                // The first pure-raster frame may still be open and references
+                // compact raster-only scene buffers. Submit it before replacing
+                // those resources with the explicit LIDAR ray scene.
+                if (frameState_ != FrameState::Idle) endFrame();
+                lidarRaySceneRequested_ = true;
+                forceSceneFullRebuild_ = true;
+                try {
+                    ensureSceneBuilt(*lastRenderedScene_, *lastRenderedCamera_);
+                } catch (...) {
+                    lidarRaySceneRequested_ = false;
+                    throw;
+                }
+            }
+
             // Lazy-construct the LIDAR pipeline. Idempotent; if the user
             // never calls scanLidar, the pipeline + SBT cost is never paid.
             if (!lidar_) lidar_ = std::make_unique<vulkan::LidarScanner>(*ctx);
@@ -13283,7 +14807,8 @@ namespace threepp {
 
         void recordShadowCasterDraw(VkCommandBuffer cb, const MeshEntry& entry,
                                     const BlasRecord& rec, const Matrix4& lightVP,
-                                    bool shadowPass = true) {
+                                    bool shadowPass = true,
+                                    const Matrix4* worldOverride = nullptr) {
             if (!entry.mesh || (shadowPass && !entry.mesh->castShadow)) return;
             auto geometry = entry.mesh->geometry();
             if (!geometry) return;
@@ -13299,7 +14824,11 @@ namespace threepp {
             }
 
             Matrix4 world;
-            std::memcpy(world.elements.data(), entry.worldMatrix.data(), 64);
+            if (worldOverride) {
+                world = *worldOverride;
+            } else {
+                std::memcpy(world.elements.data(), entry.worldMatrix.data(), 64);
+            }
             Matrix4 mvp;
             mvp.multiplyMatrices(lightVP, world);
             vkCmdPushConstants(cb, shadowDepthPipelineLayout_,
@@ -13453,6 +14982,7 @@ namespace threepp {
 
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowDepthPipeline_);
                 for (const auto& entry : lastVisibleEntries_) {
+                    if (!isActiveInstancedEntry(entry)) continue;
                     if (entry.isOverlay || !entry.mesh || !entry.mesh->castShadow) continue;
                     const BlasRecord* rec = resolveBlasForEntry(entry);
                     if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
@@ -13618,7 +15148,8 @@ namespace threepp {
             destroyRasterGbufImages();
             const VkImageUsageFlags colorUsage =
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                    VK_IMAGE_USAGE_SAMPLED_BIT;
+                    VK_IMAGE_USAGE_SAMPLED_BIT |
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
             const VkImageUsageFlags depthUsage =
                     VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                     VK_IMAGE_USAGE_SAMPLED_BIT |
@@ -14015,7 +15546,9 @@ namespace threepp {
             //            for the indirect-drawing gbuf pipeline). Re-pointed at
             //            this frame's drawInfoBuffers slot in
             //            recordRasterGbufPass before each indirect dispatch.
-            VkDescriptorSetLayoutBinding bindings[5]{};
+            // binding 5: RasterInstance[] storage for the instanced indirect
+            //            variant; only populated when a fast-path batch exists.
+            VkDescriptorSetLayoutBinding bindings[6]{};
             bindings[0].binding         = 0;
             bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             bindings[0].descriptorCount = 1;
@@ -14036,10 +15569,14 @@ namespace threepp {
             bindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             bindings[4].descriptorCount = 1;
             bindings[4].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
+            bindings[5].binding         = 5;
+            bindings[5].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            bindings[5].descriptorCount = 1;
+            bindings[5].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
 
             VkDescriptorSetLayoutCreateInfo dlci{};
             dlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-            dlci.bindingCount = 5;
+            dlci.bindingCount = 6;
             dlci.pBindings    = bindings;
             check(vkCreateDescriptorSetLayout(ctx->device(), &dlci, nullptr, &rasterDsLayout),
                   "vkCreateDescriptorSetLayout(raster)");
@@ -14048,7 +15585,7 @@ namespace threepp {
             sizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
             sizes[0].descriptorCount = kFramesInFlight;
             sizes[1].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            sizes[1].descriptorCount = kFramesInFlight * 3;// motionMat + mats + drawInfo
+            sizes[1].descriptorCount = kFramesInFlight * 4;// motionMat + mats + drawInfo + instances
             sizes[2].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
             sizes[2].descriptorCount = kFramesInFlight * kMaxMaterialTextures;
 
@@ -15732,11 +17269,17 @@ namespace threepp {
         // is rebuilt. The UBO buffers are stable; rewriting them is harmless.
         bool ensureDeferredShade() {
             THREEPP_VK_TRACE_SCOPE("Impl.ensureDeferredShade");
-            if (deferredShade_) return true;
-            if (!ctx->rayQuerySupported()) return false;
+            const bool rayScene = requiresRayScene();
+            if (deferredShade_ && deferredShadeRayScene_ == rayScene) return true;
+            if (rayScene && !ctx->rayQuerySupported()) return false;
+            if (deferredShade_) {
+                vkDeviceWaitIdle(ctx->device());
+                deferredShade_.reset();
+            }
             {
                 THREEPP_VK_TRACE_SCOPE("Impl.ensureDeferredShade.createDeferredShade");
-                deferredShade_ = std::make_unique<vulkan::DeferredShade>(*ctx, kFramesInFlight);
+                deferredShade_ = std::make_unique<vulkan::DeferredShade>(*ctx, kFramesInFlight, rayScene);
+                deferredShadeRayScene_ = rayScene;
             }
             {
                 THREEPP_VK_TRACE_SCOPE("Impl.ensureDeferredShade.rewriteDescriptors");
@@ -15746,12 +17289,8 @@ namespace threepp {
         }
 
         void rewriteDeferredDescriptors() {
-            // Needs a built TLAS (binding 8) + material buffer (binding 9). Both
-            // come from the scene build; before then there's nothing to bind and
-            // the deferred pass can't dispatch anyway. allocateAndUpdateDescriptors
-            // (which runs right after the TLAS build) calls this, so the first
-            // valid write lands before the first RasterFirst dispatch.
-            if (!deferredShade_ || tlas == VK_NULL_HANDLE) return;
+            if (!deferredShade_ || materialDescsBuffers[0].handle == VK_NULL_HANDLE ||
+                (deferredShadeRayScene_ && tlas == VK_NULL_HANDLE)) return;
             ensureShadowMapResources(shadowMapSize_ != 0u ? shadowMapSize_ : 2048u);
             std::array<VkBuffer, kFramesInFlight>    camBufs{};
             std::array<VkBuffer, kFramesInFlight>    lightBufs{};
@@ -15821,9 +17360,9 @@ namespace threepp {
             in.sceneHdr         = sceneHdrViews.data();
             in.fogBuf           = fogBufs.data();
             in.fogRange         = sizeof(GpuFogUbo);
-            in.tlas             = tlas;
+            in.tlas             = deferredShadeRayScene_ ? tlas : VK_NULL_HANDLE;
             in.materialBuf      = matBufs.data();
-            in.geomDescBuf      = geometryDescsBuffer.handle;
+            in.geomDescBuf      = deferredShadeRayScene_ ? geometryDescsBuffer.handle : VK_NULL_HANDLE;
             in.materialTex      = matTexInfos.data();
             in.materialTexCount = kMaxMaterialTextures;
             in.emissiveTriBuf   = emBufs.data();
@@ -16367,7 +17906,11 @@ namespace threepp {
             // lazily by invalidating its per-frame validity flag. All three must
             // see the new image views or the (default RasterFirst) gbuffer keeps
             // sampling the freed view.
-            rewriteSceneDescriptors();
+            if (descriptorSets.empty()) {
+                rewriteDeferredDescriptors();
+            } else {
+                rewriteSceneDescriptors();
+            }
             rasterMatTexValid_.fill(0);
         }
 
@@ -18530,6 +20073,10 @@ namespace threepp {
         // when refreshEnvTextureFromScene replaces the env image). Avoids
         // re-allocating the pool / sets.
         void rewriteEnvDescriptors() {
+            if (descriptorSets.empty()) {
+                rewriteDeferredDescriptors();
+                return;
+            }
             const uint32_t totalSets = imageCount_ * kFramesInFlight;
             // Three writes per set: env image (binding 6) + env CDF (18) + env marg (19).
             std::vector<VkDescriptorImageInfo> envInfos(totalSets);
@@ -18607,7 +20154,7 @@ namespace threepp {
             // render callers (e.g. setRenderScale during init) hit a fresh pool
             // with no TLAS/buffers; the first ensureSceneBuilt would then
             // double-allocate into a full pool and fail with OUT_OF_POOL_MEMORY.
-            if (sceneBuilt_) {
+            if (sceneBuilt_ && requiresRayScene()) {
                 allocateAndUpdateDescriptors();
             }
             // TAA descriptor sets are persistent (pool lives inside TaaResolve);
@@ -18688,6 +20235,7 @@ namespace threepp {
             // deformed vertex/normal buffers the dispatch just wrote. The
             // raygen/raster downstream reads the BLAS via TLAS.
             if (!pendingSkinnedRebuilds_.empty()) {
+                const bool updateRayAs = requiresRayScene();
                 ensureSkinningPipeline();
                 // ── Step 1: snapshot current vertex → prevVertex ──────────
                 // Before the skinning compute overwrites vertex with frame
@@ -18711,8 +20259,10 @@ namespace threepp {
                     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                     mb.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
                     mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    if (updateRayAs) {
+                        mb.dstStageMask |= VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    }
                     mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
                                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
                     VkDependencyInfo dep{};
@@ -18735,12 +20285,15 @@ namespace threepp {
                     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                     mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
                     mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                                       VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-                    mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                                       VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    mb.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
                                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                    if (updateRayAs) {
+                        mb.dstStageMask |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                                           VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                        mb.dstAccessMask |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                    }
                     VkDependencyInfo dep{};
                     dep.sType               = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
                     dep.memoryBarrierCount  = 1;
@@ -18753,7 +20306,7 @@ namespace threepp {
                 // frames to keep the BVH balanced under articulated motion.
                 // Persistent scratch is sized to buildScratchSize, which is
                 // always >= updateScratchSize, so the same buffer serves both.
-                for (auto* st : pendingSkinnedRebuilds_) {
+                if (updateRayAs) for (auto* st : pendingSkinnedRebuilds_) {
                     const bool fullRebuild =
                             st->blasRefitCounter >=
                             SkinnedMeshState::kBlasFullRebuildInterval;
@@ -18797,7 +20350,7 @@ namespace threepp {
                 }
 
                 // AS build write → TLAS / RT_SHADER read.
-                {
+                if (updateRayAs) {
                     VkMemoryBarrier2 mb{};
                     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                     mb.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
@@ -18810,6 +20363,10 @@ namespace threepp {
                     dep.memoryBarrierCount = 1;
                     dep.pMemoryBarriers    = &mb;
                     vkCmdPipelineBarrier2(cb, &dep);
+                } else {
+                    for (auto* st : pendingSkinnedRebuilds_) {
+                        if (st->blas->as != VK_NULL_HANDLE) st->blas->asContentsDirty = true;
+                    }
                 }
 
                 pendingSkinnedRebuilds_.clear();
@@ -18819,6 +20376,7 @@ namespace threepp {
             // block above: prevVertex snapshot → barrier → tet_skinning dispatch →
             // barrier → BLAS refit → barrier. Separate pipeline + pending list.
             if (!pendingTetRebuilds_.empty()) {
+                const bool updateRayAs = requiresRayScene();
                 ensureTetSkinningPipeline();
                 for (auto* st : pendingTetRebuilds_) {
                     if (st->blas->prevVertex.handle == VK_NULL_HANDLE) continue;
@@ -18832,8 +20390,10 @@ namespace threepp {
                     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                     mb.srcStageMask  = VK_PIPELINE_STAGE_2_COPY_BIT;
                     mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
-                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT |
-                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    if (updateRayAs) {
+                        mb.dstStageMask |= VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    }
                     mb.dstAccessMask = VK_ACCESS_2_SHADER_STORAGE_READ_BIT |
                                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
                     VkDependencyInfo dep{};
@@ -18853,12 +20413,15 @@ namespace threepp {
                     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                     mb.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
                     mb.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
-                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                                       VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
-                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-                    mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR |
-                                       VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
+                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                                       VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+                    mb.dstAccessMask = VK_ACCESS_2_VERTEX_ATTRIBUTE_READ_BIT |
                                        VK_ACCESS_2_SHADER_STORAGE_READ_BIT;
+                    if (updateRayAs) {
+                        mb.dstStageMask |= VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                                           VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                        mb.dstAccessMask |= VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                    }
                     VkDependencyInfo dep{};
                     dep.sType               = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
                     dep.memoryBarrierCount  = 1;
@@ -18866,7 +20429,7 @@ namespace threepp {
                     vkCmdPipelineBarrier2(cb, &dep);
                 }
 
-                for (auto* st : pendingTetRebuilds_) {
+                if (updateRayAs) for (auto* st : pendingTetRebuilds_) {
                     const bool fullRebuild =
                             st->blasRefitCounter >= TetMeshState::kBlasFullRebuildInterval;
                     st->blasRefitCounter = fullRebuild ? 0u : (st->blasRefitCounter + 1u);
@@ -18907,7 +20470,7 @@ namespace threepp {
                     ctx->rt().cmdBuildAccelerationStructures(cb, 1, &blasBuild, &pRange);
                 }
 
-                {
+                if (updateRayAs) {
                     VkMemoryBarrier2 mb{};
                     mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
                     mb.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
@@ -18920,6 +20483,10 @@ namespace threepp {
                     dep.memoryBarrierCount = 1;
                     dep.pMemoryBarriers    = &mb;
                     vkCmdPipelineBarrier2(cb, &dep);
+                } else {
+                    for (auto* st : pendingTetRebuilds_) {
+                        if (st->blas->as != VK_NULL_HANDLE) st->blas->asContentsDirty = true;
+                    }
                 }
 
                 pendingTetRebuilds_.clear();
@@ -18933,22 +20500,25 @@ namespace threepp {
             // the trace. (The TLAS sees last frame's bounds — fine for the small
             // sway envelope, same 1-frame-late deal as skinned.)
             if (!pendingGrassDeforms_.empty()) {
+                const bool updateRayAs = requiresRayScene();
                 ensureGrassWindPipeline();
                 for (auto& [gm, st] : pendingGrassDeforms_) {
-                    recordGrassDeform(cb, *gm, *st);
+                    recordGrassDeform(cb, *gm, *st, updateRayAs);
                 }
-                VkMemoryBarrier2 mb{};
-                mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
-                mb.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
-                mb.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-                mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
-                                   VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
-                mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-                VkDependencyInfo dep{};
-                dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
-                dep.memoryBarrierCount = 1;
-                dep.pMemoryBarriers    = &mb;
-                vkCmdPipelineBarrier2(cb, &dep);
+                if (updateRayAs) {
+                    VkMemoryBarrier2 mb{};
+                    mb.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+                    mb.srcStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+                    mb.srcAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+                    mb.dstStageMask  = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                                       VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+                    mb.dstAccessMask = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+                    VkDependencyInfo dep{};
+                    dep.sType              = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+                    dep.memoryBarrierCount = 1;
+                    dep.pMemoryBarriers    = &mb;
+                    vkCmdPipelineBarrier2(cb, &dep);
+                }
                 pendingGrassDeforms_.clear();
             }
 
@@ -19078,41 +20648,44 @@ namespace threepp {
                     for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                         const auto& en = lastVisibleEntries_[i];
                         if (en.isOverlay) continue;// overlay meshes drawn by overlay pass instead
+                        if (!isActiveInstancedEntry(en)) continue;
                         if (!en.inFrustum) continue;// frustum cull (same lever as the gbuf prepass)
                         if (skipsOverlayDepth(i)) continue;
                         const BlasRecord* rec = resolveBlasForEntry(en);
                         if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
 
-                        struct PC {
-                            float    model[16];
-                            uint32_t instanceCustomIndex;
-                            uint32_t flags;
-                            uint32_t _pad0;
-                            uint32_t _pad1;
-                        } pcDepth{};
-                        std::memcpy(pcDepth.model, en.worldMatrix.data(), 64);
-                        pcDepth.instanceCustomIndex = static_cast<uint32_t>(i);
-                        pcDepth.flags = 0u;
-                        vkCmdPushConstants(cb, rasterPipelineLayout,
-                                           VK_SHADER_STAGE_VERTEX_BIT,
-                                           0, sizeof(pcDepth), &pcDepth);
-
                         VkBuffer     vbufs[1] = {rec->vertex.handle};
                         VkDeviceSize voffs[1] = {0};
                         vkCmdBindVertexBuffers(cb, 0, 1, vbufs, voffs);
-                        if (rec->index.handle != VK_NULL_HANDLE) {
-                            vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
-                            auto* idxAttr = en.mesh->geometry()->getIndex();
-                            if (idxAttr) {
-                                vkCmdDrawIndexed(cb, static_cast<uint32_t>(idxAttr->count()),
-                                                 1, 0, 0, 0);
+                        forEachAuxiliaryDepthWorld(en, [&](const Matrix4& world) {
+                            struct PC {
+                                float    model[16];
+                                uint32_t instanceCustomIndex;
+                                uint32_t flags;
+                                uint32_t _pad0;
+                                uint32_t _pad1;
+                            } pcDepth{};
+                            std::memcpy(pcDepth.model, world.elements.data(), 64);
+                            pcDepth.instanceCustomIndex = static_cast<uint32_t>(i);
+                            pcDepth.flags = 0u;
+                            vkCmdPushConstants(cb, rasterPipelineLayout,
+                                               VK_SHADER_STAGE_VERTEX_BIT,
+                                               0, sizeof(pcDepth), &pcDepth);
+
+                            if (rec->index.handle != VK_NULL_HANDLE) {
+                                vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                                auto* idxAttr = en.mesh->geometry()->getIndex();
+                                if (idxAttr) {
+                                    vkCmdDrawIndexed(cb, static_cast<uint32_t>(idxAttr->count()),
+                                                     1, 0, 0, 0);
+                                }
+                            } else {
+                                auto* posAttr = en.mesh->geometry()->getAttribute<float>("position");
+                                if (posAttr) {
+                                    vkCmdDraw(cb, static_cast<uint32_t>(posAttr->count()), 1, 0, 0);
+                                }
                             }
-                        } else {
-                            auto* posAttr = en.mesh->geometry()->getAttribute<float>("position");
-                            if (posAttr) {
-                                vkCmdDraw(cb, static_cast<uint32_t>(posAttr->count()), 1, 0, 0);
-                            }
-                        }
+                        });
                     }
                     vkCmdEndRendering(cb);
 
@@ -19807,6 +21380,7 @@ namespace threepp {
                     for (size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
                         const auto& en = lastVisibleEntries_[i];
                         if (!en.mesh || !en.isOverlay) continue;
+                        if (!isActiveInstancedEntry(en)) continue;
                         // Particle billboards are isOverlay but drawn by the
                         // dedicated billboard loop below — their un-expanded
                         // quads would render as zero-area triangles here.
@@ -20122,6 +21696,7 @@ namespace threepp {
                     {
                         bool anyParticle = false;
                         for (const auto& en : lastVisibleEntries_) {
+                            if (!isActiveInstancedEntry(en)) continue;
                             if (en.isParticle && en.mesh) { anyParticle = true; break; }
                         }
                         const bool anySprite = !lastVisibleSprites_.empty();
@@ -20139,6 +21714,7 @@ namespace threepp {
 
                             for (const auto& en : lastVisibleEntries_) {
                                 if (!en.isParticle || !en.mesh) continue;
+                                if (!isActiveInstancedEntry(en)) continue;
                                 auto geomSp = en.mesh->geometry();
                                 const ParticleGeomRec* prec = ensureParticleGeom(geomSp);
                                 if (!prec) continue;
@@ -20935,7 +22511,7 @@ namespace threepp {
             // sits on top to handle motion.
             {
                 const int8_t desired = 1;// binding 1 → bloom sceneHdr (HDR resolve)
-                if (binding1Mode_[currentFrame] != desired) {
+                if (!descriptorSets.empty() && binding1Mode_[currentFrame] != desired) {
                     THREEPP_VK_TRACE_SCOPE("beginFrameForPT.rewriteBinding1");
                     for (uint32_t i = 0; i < imageCount_; ++i) {
                         const uint32_t idx = currentFrame * imageCount_ + i;
@@ -21479,7 +23055,10 @@ namespace threepp {
         if (pimpl_->shadowMapEnabled_ != shadowMapEnabled) {
             pimpl_->shadowMapEnabled_ = shadowMapEnabled;
             if (pimpl_->taa_) pimpl_->taa_->invalidateHistory();
-            if (pimpl_->sceneBuilt_) pimpl_->resetAccumulation();
+            if (pimpl_->sceneBuilt_) {
+                pimpl_->resetAccumulation();
+                pimpl_->forceSceneFullRebuild_ = true;
+            }
         }
         const auto shadowMapType = shadowMap().type;
         if (pimpl_->shadowMapType_ != shadowMapType) {
@@ -21542,6 +23121,8 @@ namespace threepp {
             if (!camera.parent) {
                 camera.updateMatrixWorld();
             }
+            pimpl_->lastRenderedScene_ = &scene;
+            pimpl_->lastRenderedCamera_ = &camera;
             const auto sceneStart = std::chrono::high_resolution_clock::now();
             {
                 THREEPP_VK_TRACE_SCOPE("VulkanRenderer.ensureSceneBuilt");
@@ -23112,7 +24693,9 @@ namespace threepp {
     }
 
     void VulkanRenderer::setDeferredAO(bool enabled) {
+        if (pimpl_->deferredAO_ == enabled) return;
         pimpl_->deferredAO_ = enabled;
+        if (pimpl_->sceneBuilt_) pimpl_->forceSceneFullRebuild_ = true;
     }
 
     bool VulkanRenderer::deferredAO() const {
@@ -23120,7 +24703,9 @@ namespace threepp {
     }
 
     void VulkanRenderer::setDeferredRayAccents(bool enabled) {
+        if (pimpl_->deferredRayAccents_ == enabled) return;
         pimpl_->deferredRayAccents_ = enabled;
+        if (pimpl_->sceneBuilt_) pimpl_->forceSceneFullRebuild_ = true;
     }
 
     bool VulkanRenderer::deferredRayAccents() const {
@@ -23186,11 +24771,9 @@ namespace threepp {
     }
 
     void VulkanRenderer::setRenderMode(RenderMode mode) {
-        if (mode == RenderMode::RasterFirst) {
-            pimpl_->ensureDeferredShade();
-        }
         if (pimpl_->renderMode_ == mode) return;
         pimpl_->renderMode_ = mode;
+        if (pimpl_->sceneBuilt_) pimpl_->forceSceneFullRebuild_ = true;
         // The deferred (RasterFirst) descriptor set is only rewritten on scene
         // build / resize / env change — never on a mode toggle. Switching modes
         // at runtime can otherwise leave it stale (manifested as a black scene
@@ -23296,7 +24879,18 @@ namespace threepp {
     }
 
     VulkanRenderer::FrameTimings VulkanRenderer::lastFrameTimings() const {
-        return pimpl_->gpuTimings_->timings();
+        auto timings = pimpl_->gpuTimings_->timings();
+        timings.raySceneInstances = pimpl_->tlasBuiltInstanceCount_;
+        timings.rasterSceneEntries = static_cast<uint32_t>(pimpl_->lastVisibleEntries_.size());
+        timings.rasterInstancedBatches = pimpl_->lastRasterInstancedBatchCount_;
+        timings.rasterInstancedInstances = pimpl_->lastRasterInstancedInstanceCount_;
+        timings.rasterInstancedPatchedInstances = pimpl_->lastRasterInstancedPatchedInstanceCount_;
+        timings.rasterInstancedMaterialDescUpdates = pimpl_->lastRasterInstancedMaterialDescUpdateCount_;
+        timings.rasterInstancedDescriptorWrites = pimpl_->lastRasterInstancedDescriptorWriteCount_;
+        timings.sceneFullRebuilds = pimpl_->sceneFullRebuildCount_;
+        timings.sceneFeatureFlags = pimpl_->currentSceneFeatures() |
+                                     (pimpl_->emissiveTriCountThisFrame_ > 0u ? 16u : 0u);
+        return timings;
     }
 
     void VulkanRenderer::scanLidar(const std::vector<LidarBeam>& beams,

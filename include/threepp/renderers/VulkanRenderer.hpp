@@ -529,6 +529,8 @@ namespace threepp {
         // come back. Typical cadence for a real LIDAR is 10-30 Hz, so the
         // round-trip overhead is acceptable. Calling between render()
         // invocations is safe; calling concurrently with render() is not.
+        // The first non-empty scan explicitly enables the renderer's ray-scene
+        // tier; later render() calls keep that acceleration structure current.
         //
         // Beam / return / params types live in helpers/LidarTypes.hpp so
         // GL-side LidarSensor and Vulkan-side PathTracedLidarSensor can
@@ -559,6 +561,17 @@ namespace threepp {
             float cpuEnsureSceneMs = 0.f;// ensureSceneBuilt
             float cpuRecordMs      = 0.f;// recordCommandBuffer
             float cpuFrameMs       = 0.f;// total render() wall time
+            uint32_t raySceneInstances = 0u;
+            uint32_t rasterSceneEntries = 0u;
+            uint32_t rasterInstancedBatches = 0u;
+            uint32_t rasterInstancedInstances = 0u;
+            uint32_t rasterInstancedPatchedInstances = 0u;
+            uint32_t rasterInstancedMaterialDescUpdates = 0u;
+            uint32_t rasterInstancedDescriptorWrites = 0u;
+            uint32_t sceneFullRebuilds = 0u;// 渲染器生命周期累计值，非单帧计数
+            // bit 0: 玻璃，bit 1: clearcoat，bit 2: iridescence，bit 3: sheen，
+            // bit 4: 当前活跃实例产生 emissive triangle。
+            uint32_t sceneFeatureFlags = 0u;
         };
         [[nodiscard]] FrameTimings lastFrameTimings() const;
 

@@ -1073,6 +1073,12 @@ if (THREEPP_WITH_VULKAN)
         kDeferredShadeCompSpv
         _deferred_shade_spv_h)
     compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/deferred_shade.comp"
+        kDeferredShadeCompPureRasterSpv
+        _deferred_shade_pure_raster_spv_h
+        VARIANT_SUFFIX pure_raster
+        DEFINES THREEPP_PURE_RASTER=1)
+    compile_vulkan_shader(threepp
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/deferred_denoise.comp"
         kDeferredDenoiseCompSpv
         _deferred_denoise_spv_h)
@@ -1146,6 +1152,12 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/gbuffer_indirect.vert"
         kGbufferIndirectVertSpv
         _gbuffer_indirect_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/gbuffer_indirect.vert"
+        kGbufferInstancedVertSpv
+        _gbuffer_instanced_vert_spv_h
+        VARIANT_SUFFIX instanced
+        DEFINES THREEPP_RASTER_INSTANCED=1)
     compile_vulkan_shader(threepp
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/shadow_depth.vert"
         kShadowDepthVertSpv

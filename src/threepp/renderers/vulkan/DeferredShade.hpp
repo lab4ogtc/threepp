@@ -27,7 +27,7 @@ namespace threepp::vulkan {
     class DeferredShade {
 
     public:
-        DeferredShade(VulkanContext& ctx, uint32_t framesInFlight);
+        DeferredShade(VulkanContext& ctx, uint32_t framesInFlight, bool rayScene = true);
         ~DeferredShade();
         DeferredShade(const DeferredShade&) = delete;
         DeferredShade& operator=(const DeferredShade&) = delete;
@@ -125,6 +125,7 @@ namespace threepp::vulkan {
     private:
         VulkanContext& ctx_;
         uint32_t       framesInFlight_;
+        bool           rayScene_;
 
         VkSampler             gbufSampler_  = VK_NULL_HANDLE;// nearest (texelFetch ignores it)
         VkDescriptorSetLayout dsLayout_     = VK_NULL_HANDLE;
