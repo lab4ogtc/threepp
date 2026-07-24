@@ -1120,6 +1120,11 @@ namespace threepp {
         // Effective default-framebuffer raster MSAA sample count selected from
         // Canvas::samples() and the physical device color/depth limits.
         VkSampleCountFlagBits defaultFramebufferSamples_ = VK_SAMPLE_COUNT_1_BIT;
+        // The deferred G-buffer may use fewer samples than the default
+        // framebuffer. Hardware resolve is only mathematically valid for the
+        // simple unlit path; lit materials keep a single-sample G-buffer and
+        // use the existing post-process antialiasing path.
+        VkSampleCountFlagBits rasterGbufSamples_ = VK_SAMPLE_COUNT_1_BIT;
         // # of extra primary rays fired at detected silhouette pixels
         // (gbufIds-mismatch / depth-gradient / diagonal neighbour).
         // 0 disables silhouette MSAA entirely.
@@ -1759,6 +1764,11 @@ namespace threepp {
             Image2D       ids;          // rgba16ui — instanceCustomIndex/meshID/flags/reserved
             Image2D       uv;           // rgba16f — material UV in .rg
             Image2D       albedo;       // rgba8 unorm — linear base colour in .rgb, metalness in .a (raster-first deferred input)
+            Image2D       normalMsaa;
+            Image2D       motionMsaa;
+            Image2D       idsMsaa;
+            Image2D       uvMsaa;
+            Image2D       albedoMsaa;
             Image2D       indirect;     // rgba16f — demodulated diffuse-indirect irradiance (deferred denoiser scratch; STORAGE, not an attachment)
             Image2D       momentsSq;    // r16f — temporally-accumulated E[L²] of the indirect luminance (SVGF variance: var = E[L²] - lum(indirect)²); STORAGE+SAMPLED, ping-ponged like indirect
             Image2D       atrousA;      // rgba16f — SVGF multi-pass à-trous ping-pong (rgb=GI, a=variance); STORAGE scratch
@@ -1767,6 +1777,8 @@ namespace threepp {
             Image2D       reflAux;      // rgba16f — reflection-denoiser auxiliary (ping-pong, mirrors `reflect`: STORAGE write + SAMPLED prev-frame read)
             Image2D       depth;        // d32_sfloat_s8 — JITTERED projection (depth-only view is sampled by chit + TAA)
             VkImageView   depthStencilView = VK_NULL_HANDLE;// framebuffer view with both depth and stencil aspects
+            Image2D       depthMsaa;
+            VkImageView   depthMsaaStencilView = VK_NULL_HANDLE;
             // Hybrid raster overlay's UNJITTERED depth attachment. Filled by
             // an extra depth-only prepass (overlay_depth.vert) right after
             // the main G-buffer pass. The wireframe overlay reads it as a
@@ -2195,11 +2207,31 @@ namespace threepp {
         VkSampleCountFlagBits chooseDefaultFramebufferSamples(int requested) const {
             if (requested <= 1) return VK_SAMPLE_COUNT_1_BIT;
 
-            VkPhysicalDeviceProperties props{};
-            vkGetPhysicalDeviceProperties(ctx->physicalDevice(), &props);
-            const VkSampleCountFlags supported =
-                    props.limits.framebufferColorSampleCounts &
-                    props.limits.framebufferDepthSampleCounts;
+            const auto formatSamples = [this](VkFormat format, VkImageUsageFlags usage) {
+                VkImageFormatProperties properties{};
+                const VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+                        ctx->physicalDevice(), format, VK_IMAGE_TYPE_2D,
+                        VK_IMAGE_TILING_OPTIMAL, usage, 0, &properties);
+                return result == VK_SUCCESS ? properties.sampleCounts
+                                            : VkSampleCountFlags{0};
+            };
+
+            VkSampleCountFlags supported = ~0u;
+            for (const VkFormat format : {
+                         VK_FORMAT_R16G16B16A16_SFLOAT,
+                         VK_FORMAT_R16G16B16A16_UINT,
+                         VK_FORMAT_R8G8B8A8_UNORM}) {
+                supported &= formatSamples(
+                        format, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                                        VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
+            }
+            supported &= formatSamples(ctx->swapchainFormat(), VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+            supported &= formatSamples(VK_FORMAT_D32_SFLOAT,
+                                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+            supported &= formatSamples(
+                    VK_FORMAT_D32_SFLOAT_S8_UINT,
+                    VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT);
 
             const std::array<std::pair<int, VkSampleCountFlagBits>, 6> candidates{{
                     {64, VK_SAMPLE_COUNT_64_BIT},
@@ -2915,24 +2947,11 @@ namespace threepp {
             for (auto& b : drawInfoBuffers)     destroyBuffer(ctx->allocator(), b);
             for (auto& b : indirectCmdBuffers)  destroyBuffer(ctx->allocator(), b);
             for (auto& b : rasterInstanceBuffers) destroyBuffer(ctx->allocator(), b);
-            if (rasterGbufPipeline)         vkDestroyPipeline(d, rasterGbufPipeline, nullptr);
-            if (rasterGbufIndirectPipeline) vkDestroyPipeline(d, rasterGbufIndirectPipeline, nullptr);
-            if (rasterGbufInstancedPipeline) {
-                vkDestroyPipeline(d, rasterGbufInstancedPipeline, nullptr);
-                rasterGbufInstancedPipeline = VK_NULL_HANDLE;
-            }
-            if (rasterGbufNoDepthPipeline)  vkDestroyPipeline(d, rasterGbufNoDepthPipeline, nullptr);
-            if (rasterGbufNoDepthWritePipeline) vkDestroyPipeline(d, rasterGbufNoDepthWritePipeline, nullptr);
-            for (auto& [_, pipeline] : rasterGbufStencilPipelines_) {
-                if (pipeline) vkDestroyPipeline(d, pipeline, nullptr);
-            }
-            rasterGbufStencilPipelines_.clear();
-            if (rasterGbufDecalPipeline)    vkDestroyPipeline(d, rasterGbufDecalPipeline, nullptr);
+            destroyRasterGbufPipelines();
             clearRasterInstancingState();
             if (rasterPipelineLayout)   vkDestroyPipelineLayout(d, rasterPipelineLayout, nullptr);
             if (rasterDsLayout)         vkDestroyDescriptorSetLayout(d, rasterDsLayout, nullptr);
             if (rasterDescPool)         vkDestroyDescriptorPool(d, rasterDescPool, nullptr);
-            if (rasterGbufRenderPass)   vkDestroyRenderPass(d, rasterGbufRenderPass, nullptr);
             if (shadowDepthPipeline_)       vkDestroyPipeline(d, shadowDepthPipeline_, nullptr);
             if (renderTargetDepthPipeline_) vkDestroyPipeline(d, renderTargetDepthPipeline_, nullptr);
             if (shadowDepthLineListPipeline_) vkDestroyPipeline(d, shadowDepthLineListPipeline_, nullptr);
@@ -11661,7 +11680,7 @@ namespace threepp {
 
             VkPipelineMultisampleStateCreateInfo ms{};
             ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.rasterizationSamples = rasterGbufSamples_;
 
             VkPipelineDepthStencilStateCreateInfo ds{};
             ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -11868,7 +11887,7 @@ namespace threepp {
             rs.lineWidth = 1.f;
             VkPipelineMultisampleStateCreateInfo ms{};
             ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.rasterizationSamples = rasterGbufSamples_;
             VkPipelineDepthStencilStateCreateInfo ds{};
             ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
             ds.depthTestEnable = VK_TRUE;
@@ -11932,7 +11951,7 @@ namespace threepp {
             const auto& g = rasterGbufs[frame];
             if (g.framebuffer == VK_NULL_HANDLE) return;// not initialized
 
-            VkClearValue clears[6]{};
+            VkClearValue clears[12]{};
             clears[0].color = {{0.f, 0.f, 0.f, 0.f}};   // normal — sky/miss as zero
             clears[1].color = {{0.f, 0.f, 0.f, 0.f}};   // motion
             clears[2].color.uint32[0] = 0u;             // instanceID — 0 reserved as sky
@@ -11949,7 +11968,8 @@ namespace threepp {
             rpbi.framebuffer     = g.framebuffer;
             rpbi.renderArea.offset = {0, 0};
             rpbi.renderArea.extent = {g.width, g.height};
-            rpbi.clearValueCount = 6;
+            rpbi.clearValueCount =
+                    rasterGbufSamples_ == VK_SAMPLE_COUNT_1_BIT ? 6u : 12u;
             rpbi.pClearValues    = clears;
             vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
 
@@ -13994,12 +14014,16 @@ namespace threepp {
             const uint32_t copyH = std::min(dstH, ext.height);
             const int32_t srcX = std::clamp(static_cast<int32_t>(std::lround(position.x)), 0,
                                             std::max(0, static_cast<int32_t>(ext.width) - static_cast<int32_t>(copyW)));
-            const int32_t srcY = std::clamp(static_cast<int32_t>(std::lround(position.y)), 0,
-                                            std::max(0, static_cast<int32_t>(ext.height) - static_cast<int32_t>(copyH)));
+            const int32_t srcBottomY = std::clamp(static_cast<int32_t>(std::lround(position.y)), 0,
+                                                  std::max(0, static_cast<int32_t>(ext.height) - static_cast<int32_t>(copyH)));
+            // Renderer API 与 OpenGL 一致，position.y 从 framebuffer 底部计数；
+            // Vulkan image offset 则从顶部计数。
+            const int32_t srcY = static_cast<int32_t>(ext.height - copyH) - srcBottomY;
 
             VkCommandBuffer cb = cmdBuffers[currentFrame];
             VkImage src = frameOutputImage(frameImageIndex_);
-            VkImageLayout srcOldLayout = VK_IMAGE_LAYOUT_GENERAL;
+            VkFormat srcFormat = ctx->swapchainFormat();
+            VkImageLayout srcOldLayout = swapchainFrameLayout_;
             uint32_t srcLayer = 0;
             if (currentRenderTarget_) {
                 auto& rt = renderTargets_->getOrCreate(*currentRenderTarget_, activeCubeFace_, activeMipmapLevel_,
@@ -14008,12 +14032,23 @@ namespace threepp {
                     throw std::runtime_error("VulkanRenderer::copyFramebufferToTexture requires a color render target");
                 }
                 src = rt.color.image;
+                srcFormat = rt.color.format;
                 srcOldLayout = rt.colorLayout;
                 srcLayer = rt.color.arrayLayers > 1
                         ? (rt.key.cube
                                   ? static_cast<uint32_t>(std::max(0, activeCubeFace_))
                                   : static_cast<uint32_t>(std::max(0, activeLayer_)))
                         : 0;
+            }
+
+            VkFormatProperties srcProperties{};
+            VkFormatProperties dstProperties{};
+            vkGetPhysicalDeviceFormatProperties(ctx->physicalDevice(), srcFormat, &srcProperties);
+            vkGetPhysicalDeviceFormatProperties(ctx->physicalDevice(), rec.image.format, &dstProperties);
+            if ((srcProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT) == 0 ||
+                (dstProperties.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT) == 0) {
+                throw std::runtime_error(
+                        "VulkanRenderer::copyFramebufferToTexture: source or destination format does not support image blit");
             }
 
             transitionImage(cb, src,
@@ -14057,19 +14092,24 @@ namespace threepp {
                             VK_IMAGE_ASPECT_COLOR_BIT,
                             mipLevel);
 
-            VkImageCopy region{};
+            VkImageBlit region{};
             region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             region.srcSubresource.baseArrayLayer = srcLayer;
             region.srcSubresource.layerCount = 1;
-            region.srcOffset = {srcX, srcY, 0};
+            region.srcOffsets[0] = {srcX, srcY, 0};
+            region.srcOffsets[1] = {srcX + static_cast<int32_t>(copyW),
+                                    srcY + static_cast<int32_t>(copyH), 1};
             region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             region.dstSubresource.mipLevel = mipLevel;
             region.dstSubresource.layerCount = 1;
-            region.extent = {copyW, copyH, 1};
-            vkCmdCopyImage(cb,
+            // 将 Vulkan 顶部原点的 framebuffer 行翻转到 Texture 的底部原点，
+            // 与 glCopyTexSubImage2D 的结果保持一致。
+            region.dstOffsets[0] = {0, static_cast<int32_t>(copyH), 0};
+            region.dstOffsets[1] = {static_cast<int32_t>(copyW), 0, 1};
+            vkCmdBlitImage(cb,
                            src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                            rec.image.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                           1, &region);
+                           1, &region, VK_FILTER_NEAREST);
 
             transitionImage(cb, rec.image.image,
                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -14103,6 +14143,7 @@ namespace threepp {
                                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                                        VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                                                        VK_ACCESS_2_TRANSFER_READ_BIT);
+                swapchainFrameLayout_ = VK_IMAGE_LAYOUT_GENERAL;
             }
         }
 
@@ -14598,6 +14639,9 @@ namespace threepp {
 
             VmaAllocationCreateInfo aci{};
             aci.usage = VMA_MEMORY_USAGE_AUTO;
+            if ((usage & VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) != 0) {
+                aci.preferredFlags = VK_MEMORY_PROPERTY_LAZILY_ALLOCATED_BIT;
+            }
             check(vmaCreateImage(ctx->allocator(), &ici, &aci,
                                  &out.image, &out.alloc, nullptr),
                   "vmaCreateImage(rasterGbuf attachment)");
@@ -15110,6 +15154,11 @@ namespace threepp {
                 destroyImage2D(ctx->allocator(), d, g.ids);
                 destroyImage2D(ctx->allocator(), d, g.uv);
                 destroyImage2D(ctx->allocator(), d, g.albedo);
+                destroyImage2D(ctx->allocator(), d, g.normalMsaa);
+                destroyImage2D(ctx->allocator(), d, g.motionMsaa);
+                destroyImage2D(ctx->allocator(), d, g.idsMsaa);
+                destroyImage2D(ctx->allocator(), d, g.uvMsaa);
+                destroyImage2D(ctx->allocator(), d, g.albedoMsaa);
                 destroyImage2D(ctx->allocator(), d, g.indirect);
                 destroyImage2D(ctx->allocator(), d, g.momentsSq);
                 destroyImage2D(ctx->allocator(), d, g.atrousA);
@@ -15121,6 +15170,11 @@ namespace threepp {
                     g.depthStencilView = VK_NULL_HANDLE;
                 }
                 destroyImage2D(ctx->allocator(), d, g.depth);
+                if (g.depthMsaaStencilView) {
+                    vkDestroyImageView(d, g.depthMsaaStencilView, nullptr);
+                    g.depthMsaaStencilView = VK_NULL_HANDLE;
+                }
+                destroyImage2D(ctx->allocator(), d, g.depthMsaa);
                 destroyImage2D(ctx->allocator(), d, g.unjitDepth);
                 destroyImage2D(ctx->allocator(), d, g.customShaderDepth);
                 destroyImage2D(ctx->allocator(), d, g.customShaderMsaaDepth);
@@ -15131,55 +15185,191 @@ namespace threepp {
             }
         }
 
-        void createRasterGbufRenderPass() {
-            VkAttachmentDescription attachments[6]{};
-            // 0: world-space normal (rgba16f). FragShader writes; raygen samples.
-            attachments[0].format         = VK_FORMAT_R16G16B16A16_SFLOAT;
-            attachments[0].samples        = VK_SAMPLE_COUNT_1_BIT;
-            attachments[0].loadOp         = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            attachments[0].storeOp        = VK_ATTACHMENT_STORE_OP_STORE;
-            attachments[0].stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-            attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-            attachments[0].initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
-            attachments[0].finalLayout    = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-            // 1: motion vector (rgba16f, only rg used).
-            attachments[1] = attachments[0];
-            // 2: per-pixel IDs + flags (rgba16ui).
-            attachments[2] = attachments[0];
-            attachments[2].format = VK_FORMAT_R16G16B16A16_UINT;
-            // 3: material UV (rgba16f, only rg used).
-            attachments[3] = attachments[0];
-            // 4: albedo + metalness (rgba8 unorm) — raster-first deferred input.
-            attachments[4]        = attachments[0];
-            attachments[4].format = VK_FORMAT_R8G8B8A8_UNORM;
-            // 5: depth/stencil. Depth is sampled through a depth-only view;
-            // stencil is used only inside this render pass for material stencil ops.
-            attachments[5]              = attachments[0];
-            attachments[5].format       = VK_FORMAT_D32_SFLOAT_S8_UINT;
-            attachments[5].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-            attachments[5].stencilStoreOp = VK_ATTACHMENT_STORE_OP_STORE;
-            attachments[5].finalLayout  = VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        void destroyRasterGbufPipelines() {
+            if (!ctx) return;
+            const VkDevice d = ctx->device();
+            const auto destroyPipeline = [d](VkPipeline& pipeline) {
+                if (pipeline != VK_NULL_HANDLE) {
+                    vkDestroyPipeline(d, pipeline, nullptr);
+                    pipeline = VK_NULL_HANDLE;
+                }
+            };
+            destroyPipeline(rasterGbufPipeline);
+            destroyPipeline(rasterGbufIndirectPipeline);
+            destroyPipeline(rasterGbufInstancedPipeline);
+            destroyPipeline(rasterGbufNoDepthPipeline);
+            destroyPipeline(rasterGbufNoDepthWritePipeline);
+            destroyPipeline(rasterGbufDecalPipeline);
+            for (auto& [_, pipeline] : rasterGbufStencilPipelines_) {
+                destroyPipeline(pipeline);
+            }
+            rasterGbufStencilPipelines_.clear();
+            if (rasterGbufRenderPass != VK_NULL_HANDLE) {
+                vkDestroyRenderPass(d, rasterGbufRenderPass, nullptr);
+                rasterGbufRenderPass = VK_NULL_HANDLE;
+            }
+        }
 
-            VkAttachmentReference colorRefs[5]{};
-            for (uint32_t i = 0; i < 5; ++i) {
+        [[nodiscard]] bool supportsResolvedGbufMsaa(Object3D& scene) const {
+            if (renderMode_ != VulkanRenderer::RenderMode::RasterFirst ||
+                defaultFramebufferSamples_ == VK_SAMPLE_COUNT_1_BIT ||
+                matDescsCached_.empty()) {
+                return false;
+            }
+            if (const auto* sc = dynamic_cast<const Scene*>(&scene);
+                sc && sc->fog.has_value()) {
+                return false;
+            }
+            VkPhysicalDeviceDepthStencilResolveProperties resolveProperties{};
+            resolveProperties.sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES;
+            VkPhysicalDeviceProperties2 properties{};
+            properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+            properties.pNext = &resolveProperties;
+            vkGetPhysicalDeviceProperties2(ctx->physicalDevice(), &properties);
+            if ((resolveProperties.supportedDepthResolveModes &
+                 VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) == 0) {
+                return false;
+            }
+            return std::all_of(matDescsCached_.begin(), matDescsCached_.end(),
+                               [](const MaterialDesc& material) {
+                                   return material.roughness == -1.f &&
+                                          material.lightTexIndex < 0 &&
+                                          material.envTexIndex < 0 &&
+                                          material.transmission <= 0.f &&
+                                          material.alphaCutoff == 0.f;
+                               });
+        }
+
+        void updateRasterGbufSamples(Object3D& scene) {
+            const VkSampleCountFlagBits desired =
+                    supportsResolvedGbufMsaa(scene)
+                            ? defaultFramebufferSamples_
+                            : VK_SAMPLE_COUNT_1_BIT;
+            if (desired == rasterGbufSamples_) return;
+
+            check(vkDeviceWaitIdle(ctx->device()),
+                  "vkDeviceWaitIdle(update raster G-buffer samples)");
+            destroyRasterGbufImages();
+            destroyRasterGbufPipelines();
+            rasterGbufSamples_ = desired;
+            createRasterGbufRenderPass();
+            createRasterGbufPipeline();
+            const VkExtent2D ext = renderExtent();
+            createRasterGbufImages(ext.width, ext.height);
+            rewriteTaaDescriptors();
+            rewriteBloomDescriptors();
+            rewriteDeferredDescriptors();
+            if (taa_) taa_->invalidateHistory();
+            rasterPrevVPValid_ = false;
+            rasterPrevJitterValid_ = false;
+        }
+
+        void createRasterGbufRenderPass() {
+            const bool multisampled =
+                    rasterGbufSamples_ != VK_SAMPLE_COUNT_1_BIT;
+            constexpr std::array<VkFormat, 5> colorFormats{
+                    VK_FORMAT_R16G16B16A16_SFLOAT,
+                    VK_FORMAT_R16G16B16A16_SFLOAT,
+                    VK_FORMAT_R16G16B16A16_UINT,
+                    VK_FORMAT_R16G16B16A16_SFLOAT,
+                    VK_FORMAT_R8G8B8A8_UNORM};
+
+            std::array<VkAttachmentDescription2, 12> attachments{};
+            const auto makeAttachment = [](VkFormat format,
+                                           VkSampleCountFlagBits samples,
+                                           VkAttachmentLoadOp loadOp,
+                                           VkAttachmentStoreOp storeOp,
+                                           VkImageLayout finalLayout) {
+                VkAttachmentDescription2 attachment{};
+                attachment.sType          = VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION_2;
+                attachment.format         = format;
+                attachment.samples        = samples;
+                attachment.loadOp         = loadOp;
+                attachment.storeOp        = storeOp;
+                attachment.stencilLoadOp  = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+                attachment.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+                attachment.initialLayout  = VK_IMAGE_LAYOUT_UNDEFINED;
+                attachment.finalLayout    = finalLayout;
+                return attachment;
+            };
+
+            for (uint32_t i = 0; i < colorFormats.size(); ++i) {
+                attachments[i] = makeAttachment(
+                        colorFormats[i], rasterGbufSamples_,
+                        VK_ATTACHMENT_LOAD_OP_CLEAR,
+                        multisampled ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                     : VK_ATTACHMENT_STORE_OP_STORE,
+                        multisampled ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
+                                     : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+            }
+            attachments[5] = makeAttachment(
+                    VK_FORMAT_D32_SFLOAT_S8_UINT, rasterGbufSamples_,
+                    VK_ATTACHMENT_LOAD_OP_CLEAR,
+                    multisampled ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                 : VK_ATTACHMENT_STORE_OP_STORE,
+                    multisampled ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                 : VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            attachments[5].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            attachments[5].stencilStoreOp =
+                    multisampled ? VK_ATTACHMENT_STORE_OP_DONT_CARE
+                                 : VK_ATTACHMENT_STORE_OP_STORE;
+
+            if (multisampled) {
+                for (uint32_t i = 0; i < colorFormats.size(); ++i) {
+                    attachments[6 + i] = makeAttachment(
+                            colorFormats[i], VK_SAMPLE_COUNT_1_BIT,
+                            VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                            VK_ATTACHMENT_STORE_OP_STORE,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+                }
+                attachments[11] = makeAttachment(
+                        VK_FORMAT_D32_SFLOAT_S8_UINT, VK_SAMPLE_COUNT_1_BIT,
+                        VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+                        VK_ATTACHMENT_STORE_OP_STORE,
+                        VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL);
+            }
+
+            std::array<VkAttachmentReference2, 5> colorRefs{};
+            std::array<VkAttachmentReference2, 5> resolveRefs{};
+            for (uint32_t i = 0; i < colorRefs.size(); ++i) {
+                colorRefs[i].sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
                 colorRefs[i].attachment = i;
                 colorRefs[i].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+                resolveRefs[i].sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+                resolveRefs[i].attachment = 6 + i;
+                resolveRefs[i].layout     = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
             }
-            VkAttachmentReference depthRef{};
+            VkAttachmentReference2 depthRef{};
+            depthRef.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
             depthRef.attachment = 5;
             depthRef.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+            VkAttachmentReference2 depthResolveRef{};
+            depthResolveRef.sType      = VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE_2;
+            depthResolveRef.attachment = 11;
+            depthResolveRef.layout     = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
 
-            VkSubpassDescription subpass{};
+            VkSubpassDescriptionDepthStencilResolve depthResolve{};
+            depthResolve.sType = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_DEPTH_STENCIL_RESOLVE;
+            depthResolve.depthResolveMode   = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+            depthResolve.stencilResolveMode = VK_RESOLVE_MODE_NONE;
+            depthResolve.pDepthStencilResolveAttachment = &depthResolveRef;
+
+            VkSubpassDescription2 subpass{};
+            subpass.sType                   = VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION_2;
+            subpass.pNext                   = multisampled ? &depthResolve : nullptr;
             subpass.pipelineBindPoint       = VK_PIPELINE_BIND_POINT_GRAPHICS;
-            subpass.colorAttachmentCount    = 5;
-            subpass.pColorAttachments       = colorRefs;
+            subpass.colorAttachmentCount    = static_cast<uint32_t>(colorRefs.size());
+            subpass.pColorAttachments       = colorRefs.data();
+            subpass.pResolveAttachments     = multisampled ? resolveRefs.data() : nullptr;
             subpass.pDepthStencilAttachment = &depthRef;
 
             // Sandwich the pass between (any prior raygen reads of these
             // attachments) and (the post-pass raygen consumer). Vulkan
             // doesn't know raygen reads them — we declare the synchronization
             // explicitly via subpass dependencies.
-            VkSubpassDependency deps[2]{};
+            VkSubpassDependency2 deps[2]{};
+            deps[0].sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2;
             deps[0].srcSubpass    = VK_SUBPASS_EXTERNAL;
             deps[0].dstSubpass    = 0;
             deps[0].srcStageMask  = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR |
@@ -15189,6 +15379,7 @@ namespace threepp {
             deps[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
             deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+            deps[1].sType         = VK_STRUCTURE_TYPE_SUBPASS_DEPENDENCY_2;
             deps[1].srcSubpass    = 0;
             deps[1].dstSubpass    = VK_SUBPASS_EXTERNAL;
             deps[1].srcStageMask  = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
@@ -15202,16 +15393,16 @@ namespace threepp {
                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
             deps[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
-            VkRenderPassCreateInfo rpci{};
-            rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-            rpci.attachmentCount = 6;
-            rpci.pAttachments    = attachments;
+            VkRenderPassCreateInfo2 rpci{};
+            rpci.sType           = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO_2;
+            rpci.attachmentCount = multisampled ? 12u : 6u;
+            rpci.pAttachments    = attachments.data();
             rpci.subpassCount    = 1;
             rpci.pSubpasses      = &subpass;
             rpci.dependencyCount = 2;
             rpci.pDependencies   = deps;
-            check(vkCreateRenderPass(ctx->device(), &rpci, nullptr, &rasterGbufRenderPass),
-                  "vkCreateRenderPass(rasterGbuf)");
+            check(vkCreateRenderPass2(ctx->device(), &rpci, nullptr, &rasterGbufRenderPass),
+                  "vkCreateRenderPass2(rasterGbuf)");
         }
 
         void createRasterGbufImages(uint32_t w, uint32_t h) {
@@ -15291,6 +15482,41 @@ namespace threepp {
                         g.depth.image, g.depth.format,
                         VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
                         N("depthStencilView"));
+                if (rasterGbufSamples_ != VK_SAMPLE_COUNT_1_BIT) {
+                    const VkImageUsageFlags msaaColorUsage =
+                            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                            VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT;
+                    g.normalMsaa = createAttachmentImage2D(
+                            w, h, VK_FORMAT_R16G16B16A16_SFLOAT,
+                            msaaColorUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+                            N("normalMsaa"), rasterGbufSamples_);
+                    g.motionMsaa = createAttachmentImage2D(
+                            w, h, VK_FORMAT_R16G16B16A16_SFLOAT,
+                            msaaColorUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+                            N("motionMsaa"), rasterGbufSamples_);
+                    g.idsMsaa = createAttachmentImage2D(
+                            w, h, VK_FORMAT_R16G16B16A16_UINT,
+                            msaaColorUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+                            N("idsMsaa"), rasterGbufSamples_);
+                    g.uvMsaa = createAttachmentImage2D(
+                            w, h, VK_FORMAT_R16G16B16A16_SFLOAT,
+                            msaaColorUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+                            N("uvMsaa"), rasterGbufSamples_);
+                    g.albedoMsaa = createAttachmentImage2D(
+                            w, h, VK_FORMAT_R8G8B8A8_UNORM,
+                            msaaColorUsage, VK_IMAGE_ASPECT_COLOR_BIT,
+                            N("albedoMsaa"), rasterGbufSamples_);
+                    g.depthMsaa = createAttachmentImage2D(
+                            w, h, VK_FORMAT_D32_SFLOAT_S8_UINT,
+                            VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                    VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT,
+                            VK_IMAGE_ASPECT_DEPTH_BIT,
+                            N("depthMsaa"), rasterGbufSamples_);
+                    g.depthMsaaStencilView = createAttachmentImageView(
+                            g.depthMsaa.image, g.depthMsaa.format,
+                            VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT,
+                            N("depthMsaaStencilView"));
+                }
                 // Unjittered depth, written by the overlay depth prepass and
                 // read by the post-TAA wireframe overlay's depth-test. Lives
                 // outside the main G-buffer render pass — bound only via
@@ -15328,13 +15554,27 @@ namespace threepp {
                             VK_IMAGE_ASPECT_COLOR_BIT, N("overlayResolvedColor"));
                 }
 
-                VkImageView views[6] = {g.normal.view, g.motion.view, g.ids.view,
-                                        g.uv.view, g.albedo.view, g.depthStencilView};
+                std::array<VkImageView, 12> views{};
+                uint32_t attachmentCount = 6;
+                if (rasterGbufSamples_ == VK_SAMPLE_COUNT_1_BIT) {
+                    views[0] = g.normal.view;
+                    views[1] = g.motion.view;
+                    views[2] = g.ids.view;
+                    views[3] = g.uv.view;
+                    views[4] = g.albedo.view;
+                    views[5] = g.depthStencilView;
+                } else {
+                    views = {g.normalMsaa.view, g.motionMsaa.view, g.idsMsaa.view,
+                             g.uvMsaa.view, g.albedoMsaa.view, g.depthMsaaStencilView,
+                             g.normal.view, g.motion.view, g.ids.view,
+                             g.uv.view, g.albedo.view, g.depthStencilView};
+                    attachmentCount = static_cast<uint32_t>(views.size());
+                }
                 VkFramebufferCreateInfo fci{};
                 fci.sType           = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
                 fci.renderPass      = rasterGbufRenderPass;
-                fci.attachmentCount = 6;
-                fci.pAttachments    = views;
+                fci.attachmentCount = attachmentCount;
+                fci.pAttachments    = views.data();
                 fci.width           = w;
                 fci.height          = h;
                 fci.layers          = 1;
@@ -15780,7 +16020,7 @@ namespace threepp {
 
             VkPipelineMultisampleStateCreateInfo ms{};
             ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            ms.rasterizationSamples = rasterGbufSamples_;
 
             VkPipelineDepthStencilStateCreateInfo ds{};
             ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
@@ -15811,19 +16051,21 @@ namespace threepp {
             dyn.dynamicStateCount = 3;
             dyn.pDynamicStates    = dynStates;
 
-            VkPushConstantRange pcRange{};
-            pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
-            pcRange.offset     = 0;
-            pcRange.size       = 80;// mat4 model + uvec4 (instId/flags/pad/pad)
+            if (rasterPipelineLayout == VK_NULL_HANDLE) {
+                VkPushConstantRange pcRange{};
+                pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+                pcRange.offset     = 0;
+                pcRange.size       = 80;// mat4 model + uvec4 (instId/flags/pad/pad)
 
-            VkPipelineLayoutCreateInfo plci{};
-            plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-            plci.setLayoutCount         = 1;
-            plci.pSetLayouts            = &rasterDsLayout;
-            plci.pushConstantRangeCount = 1;
-            plci.pPushConstantRanges    = &pcRange;
-            check(vkCreatePipelineLayout(ctx->device(), &plci, nullptr, &rasterPipelineLayout),
-                  "vkCreatePipelineLayout(raster)");
+                VkPipelineLayoutCreateInfo plci{};
+                plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+                plci.setLayoutCount         = 1;
+                plci.pSetLayouts            = &rasterDsLayout;
+                plci.pushConstantRangeCount = 1;
+                plci.pPushConstantRanges    = &pcRange;
+                check(vkCreatePipelineLayout(ctx->device(), &plci, nullptr, &rasterPipelineLayout),
+                      "vkCreatePipelineLayout(raster)");
+            }
 
             VkGraphicsPipelineCreateInfo gpci{};
             gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -21268,7 +21510,8 @@ namespace threepp {
             bloom_->recordDispatch(cb, currentFrame, regionRenderExt_.width, regionRenderExt_.height,
                                    static_cast<uint32_t>(toneMapping_),
                                    exposureBits, envIsBgColor,
-                                   defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT,
+                                   /*antialias*/ defaultFramebufferSamples_ != VK_SAMPLE_COUNT_1_BIT &&
+                                           rasterGbufSamples_ == VK_SAMPLE_COUNT_1_BIT,
                                    bloomIntensity_, bloomThreshold_, bloomClamp_);
             // ── End bloom ──────────────────────────────────────────────────────
 
@@ -23252,6 +23495,7 @@ namespace threepp {
                 THREEPP_VK_TRACE_SCOPE("VulkanRenderer.ensureSceneBuilt");
                 pimpl_->ensureSceneBuilt(scene, camera);
             }
+            pimpl_->updateRasterGbufSamples(scene);
             // World-space Sprites (screenSpace == false) are drawn by the overlay
             // billboard pass, not the PT/G-buffer path. Snapshot them each frame
             // with fresh world matrices (ensureSceneBuilt just ran

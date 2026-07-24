@@ -332,7 +332,10 @@ void main() {
     // Decals emit texture alpha as the blend factor (the decal pipeline's
     // SRC_ALPHA blend consumes it; its RGB-only write mask keeps the
     // receiver's metalness in .a). Everything else writes metalness.
-    outAlbedoMetal = vec4(albedo, isDecal ? albedoAlpha : metalness);
+    // MeshBasic 的 albedo 已是最终颜色；alpha 保存多重采样覆盖率，
+    // 供延迟阶段在最终颜色上解析轮廓。其他材质仍保存 metalness。
+    const bool isBasic = m.roughness == -1.0;
+    outAlbedoMetal = vec4(albedo, isDecal ? albedoAlpha : (isBasic ? 1.0 : metalness));
 
     vec2 currNDC = vCurrClipUnjit.xy / vCurrClipUnjit.w;
     vec2 prevNDC = vPrevClip.xy      / vPrevClip.w;

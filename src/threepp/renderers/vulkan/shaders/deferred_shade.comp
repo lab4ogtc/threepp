@@ -2950,6 +2950,15 @@ vec3 volumetricSpotScatter(vec3 ro, vec3 rd, float tMax, ivec2 px) {
     return sum;
 }
 
+vec3 sceneSky(vec2 ndc, vec3 camPos, ivec2 px) {
+    const vec4 tVS   = cam.projInverse * vec4(ndc, 1.0, 1.0);
+    const vec3 dirVS = normalize(tVS.xyz / tVS.w);
+    const vec3 dirWS = normalize((cam.viewInverse * vec4(dirVS, 0.0)).xyz);
+    return sampleEnvLod(dirWS, 0.0)
+         + proceduralStars(dirWS)
+         + volumetricSpotScatter(camPos, dirWS, 2000.0, px);
+}
+
 void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.width) || px.y >= int(pc.height)) return;
@@ -2971,23 +2980,22 @@ void main() {
     const uvec4 idsTap = texelFetch(gbufIdsTex, px, 0);
     const uint id = idsTap.x;// 0 == sky
     const uint instId = idsTap.y;
+    const vec4 nTap = texelFetch(gbufNormalTex, px, 0);
+    const vec4 am   = texelFetch(gbufAlbedoTex, px, 0);
 
     if (id == 0u) {
-        const vec4 tVS   = cam.projInverse * vec4(ndc, 1.0, 1.0);
-        const vec3 dirVS = normalize(tVS.xyz / tVS.w);
-        const vec3 dirWS = normalize((cam.viewInverse * vec4(dirVS, 0.0)).xyz);
-        // Sky pixels march the beams too — a lighthouse beam against the night
-        // sky is exactly where the volumetric is most visible.
-        const vec3 sky = sampleEnvLod(dirWS, 0.0)
-                       + proceduralStars(dirWS)
-                       + volumetricSpotScatter(camPos, dirWS, 2000.0, px);
-        imageStore(outImage, px, vec4(sky, 1.0));
+        const vec3 sky = sceneSky(ndc, camPos, px);
+        // 整数 ID 解析可能选中未覆盖的 sample。MeshBasic 用
+        // normal.w=-coverage、albedo.a=coverage 标识这种边缘，直接解析
+        // 已着色的 albedo，避免轮廓退化为单采样。
+        const float coverage = clamp(am.a, 0.0, 1.0);
+        const bool basicEdge = coverage > 0.0 && abs(nTap.w + coverage) < 0.02;
+        const vec3 color = basicEdge ? am.rgb + sky * (1.0 - coverage) : sky;
+        imageStore(outImage, px, vec4(color, 1.0));
         imageStore(indirectImage, px, vec4(0.0));
         return;
     }
 
-    const vec4  nTap   = texelFetch(gbufNormalTex, px, 0);
-    const vec4  am     = texelFetch(gbufAlbedoTex, px, 0);
     const vec3  albedo = am.rgb;
     MaterialDesc pm = mats[id - 1u];
     const bool legacyEnvMap = hasLegacyEnvMap(pm);
@@ -3015,10 +3023,12 @@ void main() {
     // Unlit materials (roughness sentinel < 0): MeshBasic emits base colour;
     // MeshMatcap uses sentinel -4 and samples its matcap by view-space normal.
     if (nTap.w < 0.0) {
+        const bool isBasic = pm.roughness == -1.0;
+        const float coverage = isBasic ? clamp(am.a, 0.0, 1.0) : 1.0;
         const float depthU = gbufferSurfaceDepth(px, idsTap.z);
         const vec4  vhU    = cam.projInverse * vec4(ndc, depthU, 1.0);
         const vec3  wpU    = (cam.viewInverse * vec4(vhU.xyz / vhU.w, 1.0)).xyz;
-        vec3 litU = albedo;
+        vec3 litU = isBasic ? albedo / max(coverage, 1e-6) : albedo;
         if (nTap.w < -3.5 && pm.roughnessTexIndex >= 0) {
             const vec3 Nw = normalize(nTap.xyz * 2.0 - 1.0);
             const mat3 worldToView = transpose(mat3(cam.viewInverse));
@@ -3054,6 +3064,9 @@ void main() {
                                               /*cheapHits=*/false);
             #endif
             litU = mix(behind, litU, opacity);
+        }
+        if (isBasic && coverage < 1.0) {
+            litU = litU * coverage + sceneSky(ndc, camPos, px) * (1.0 - coverage);
         }
         imageStore(outImage, px, vec4(litU, 1.0));
         imageStore(indirectImage, px, vec4(0.0));
