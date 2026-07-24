@@ -334,6 +334,11 @@ bool reflReproject(vec2 uv, vec3 N, float rough, float viewDist, out vec2 pUv, o
 }
 vec4 reflSVGFTemporal(vec4 cur, ivec2 px, vec2 uv, vec3 N, float viewDist, bool hold) {
     const float curLum = dot(cur.rgb, vec3(0.2126, 0.7152, 0.0722));
+    if (!rayAccentsOn()) {
+        // Deterministic env samples need spatial roughness blur, not stale temporal history.
+        imageStore(reflAuxWrite, px, vec4(1.0, curLum * curLum, 0.0, 0.0));
+        return cur;
+    }
     const float rough  = abs(cur.a);// .a < 0 = glass marker (frost gr) — same policy
     vec2 pUv; float histCap;
     bool valid = reflReproject(uv, N, rough, viewDist, pUv, histCap);
