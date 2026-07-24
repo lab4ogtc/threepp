@@ -2518,7 +2518,7 @@ namespace threepp {
             }
             {
                 THREEPP_VK_TRACE_SCOPE("Impl.VulkanRenderTargets");
-                renderTargets_ = std::make_unique<vulkan::VulkanRenderTargets>(*ctx);
+                renderTargets_ = std::make_unique<vulkan::VulkanRenderTargets>(*ctx, kFramesInFlight);
             }
             defaultFramebufferSamples_ = chooseDefaultFramebufferSamples(canvas.samples());
             viewport.set(0.f, 0.f, static_cast<float>(size.width()), static_cast<float>(size.height()));
@@ -6554,7 +6554,9 @@ namespace threepp {
 
         Image2D resolveCustomShaderFrameTexture(uint32_t frame, Texture& texture) {
             if (auto* rtImage = renderTargets_ ? renderTargets_->findByTexture(texture) : nullptr) {
-                return *rtImage->image;
+                auto image = *rtImage->image;
+                if (rtImage->unormView != VK_NULL_HANDLE) image.view = rtImage->unormView;
+                return image;
             }
 
             auto image = buildMaterialImage2D(&texture);
@@ -15231,14 +15233,42 @@ namespace threepp {
                  VK_RESOLVE_MODE_SAMPLE_ZERO_BIT) == 0) {
                 return false;
             }
-            return std::all_of(matDescsCached_.begin(), matDescsCached_.end(),
-                               [](const MaterialDesc& material) {
-                                   return material.roughness == -1.f &&
-                                          material.lightTexIndex < 0 &&
-                                          material.envTexIndex < 0 &&
-                                          material.transmission <= 0.f &&
-                                          material.alphaCutoff == 0.f;
-                               });
+            const auto supportsDesc = [](const MaterialDesc& material) {
+                return material.roughness == -1.f &&
+                       material.lightTexIndex < 0 &&
+                       material.envTexIndex < 0 &&
+                       material.transmission <= 0.f &&
+                       material.alphaCutoff == 0.f;
+            };
+            const auto supportsMaterial = [&](const std::shared_ptr<Material>& material,
+                                              uint32_t descIndex) {
+                if (!material || material->stencilWrite ||
+                    dynamic_cast<ShaderMaterial*>(material.get())) {
+                    return true;
+                }
+                return descIndex < matDescsCached_.size() &&
+                       supportsDesc(matDescsCached_[descIndex]);
+            };
+
+            for (std::size_t i = 0; i < lastVisibleEntries_.size(); ++i) {
+                const auto& entry = lastVisibleEntries_[i];
+                if (entry.isOverlay || !isActiveInstancedEntry(entry) || !entry.mesh) continue;
+
+                const auto& materials = entry.mesh->materials();
+                if (materials.size() > 1 &&
+                    i < rasterGroupMaterialDescIndices_.size() &&
+                    !rasterGroupMaterialDescIndices_[i].empty()) {
+                    for (const auto& group : rasterGroupMaterialDescIndices_[i]) {
+                        if (group.materialIndex < materials.size() &&
+                            !supportsMaterial(materials[group.materialIndex], group.descIndex)) {
+                            return false;
+                        }
+                    }
+                } else if (!supportsMaterial(entry.mesh->material(), static_cast<uint32_t>(i))) {
+                    return false;
+                }
+            }
+            return true;
         }
 
         void updateRasterGbufSamples(Object3D& scene) {
@@ -22799,6 +22829,9 @@ namespace threepp {
                 THREEPP_VK_TRACE_SCOPE("beginFrameForPT.vkAcquireNextImageKHR");
                 if (!acquireFrameImage()) return false;
             }
+            // 只在成功取得下一帧后推进退休计数，避免 OUT_OF_DATE 时重复
+            // 等待同一个已 signaled fence 并过早释放资源。
+            renderTargets_->collectRetired();
             const uint32_t imageIndex = frameImageIndex_;
 
             {
@@ -23001,6 +23034,7 @@ namespace threepp {
             gpuTimings_->readBack(currentFrame, pendingCpuEnsureSceneMs_);
 
             if (!acquireFrameImage()) return false;
+            renderTargets_->collectRetired();
             const uint32_t imageIndex = frameImageIndex_;
 
             vkResetFences(d, 1, &inFlight[currentFrame]);

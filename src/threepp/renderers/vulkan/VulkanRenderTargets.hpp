@@ -7,6 +7,7 @@
 #include "threepp/renderers/RenderTarget.hpp"
 #include "threepp/renderers/vulkan/VulkanResources.hpp"
 
+#include <list>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -47,13 +48,16 @@ namespace threepp::vulkan {
             VkImageAspectFlags aspect = VK_IMAGE_ASPECT_COLOR_BIT;
             RenderTarget* target = nullptr;
             std::size_t textureIndex = 0;
+            VkImageView unormView = VK_NULL_HANDLE;
         };
 
         struct Record {
             RenderTargetKey key;
             Image2D color;
+            VkImageView colorUnormView = VK_NULL_HANDLE;
             VkImageLayout colorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             std::vector<Image2D> extraColors;
+            std::vector<VkImageView> extraColorUnormViews;
             std::vector<VkImageLayout> extraColorLayouts;
             Image2D msaaColor;
             VkImageLayout msaaColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
@@ -66,7 +70,7 @@ namespace threepp::vulkan {
             Buffer depthStencilCopyBuffer;
         };
 
-        explicit VulkanRenderTargets(VulkanContext& ctx);
+        explicit VulkanRenderTargets(VulkanContext& ctx, uint32_t framesInFlight);
         ~VulkanRenderTargets();
 
         VulkanRenderTargets(const VulkanRenderTargets&) = delete;
@@ -81,22 +85,34 @@ namespace threepp::vulkan {
                             int activeLayer = 0);
         TextureImage* findByTexture(const Texture& texture);
         const TextureImage* findByTexture(const Texture& texture) const;
-        void release(RenderTarget* target);
+        void release(RenderTarget* target) noexcept;
+        void collectRetired() noexcept;
 
     private:
         struct DisposeListener: EventListener {
             explicit DisposeListener(VulkanRenderTargets& owner): owner(owner) {}
-            void onEvent(Event& event) override;
+            void onEvent(Event& event) noexcept override;
             VulkanRenderTargets& owner;
         };
 
+        struct StoredRecord {
+            RenderTarget* target = nullptr;
+            Record record;
+            uint32_t pendingFrameCompletions = 0;
+        };
+        using RecordList = std::list<StoredRecord>;
+
         VulkanContext& ctx_;
         DisposeListener disposeListener_;
-        std::unordered_map<RenderTarget*, Record> records_;
+        uint32_t framesInFlight_;
+        RecordList records_;
+        std::unordered_map<RenderTarget*, RecordList::iterator> activeRecords_;
         std::unordered_map<const Texture*, TextureImage> textureImages_;
         std::unordered_set<RenderTarget*> listening_;
 
-        void destroy(Record& record);
+        void unregisterTextures(RenderTarget* target) noexcept;
+        void retire(RecordList::iterator record) noexcept;
+        void destroy(Record& record) noexcept;
         Record create(RenderTarget& target, const RenderTargetKey& key);
     };
 

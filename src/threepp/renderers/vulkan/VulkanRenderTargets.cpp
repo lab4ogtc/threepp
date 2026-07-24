@@ -51,6 +51,14 @@ namespace threepp::vulkan {
             return levels;
         }
 
+        VkFormat unormViewFormat(VkFormat format) {
+            switch (format) {
+                case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+                case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+                default: return format;
+            }
+        }
+
         Image2D createImage(VulkanContext& ctx,
                             uint32_t width,
                             uint32_t height,
@@ -106,6 +114,27 @@ namespace threepp::vulkan {
             return out;
         }
 
+        VkImageView createUnormView(VulkanContext& ctx, const Image2D& image, bool cube) {
+            const auto format = unormViewFormat(image.format);
+            if (format == image.format) return VK_NULL_HANDLE;
+
+            VkImageViewCreateInfo info{};
+            info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            info.image = image.image;
+            info.viewType = cube ? VK_IMAGE_VIEW_TYPE_CUBE
+                                 : (image.arrayLayers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY
+                                                        : VK_IMAGE_VIEW_TYPE_2D);
+            info.format = format;
+            info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            info.subresourceRange.levelCount = image.mipLevels;
+            info.subresourceRange.layerCount = image.arrayLayers;
+
+            VkImageView view = VK_NULL_HANDLE;
+            check(vkCreateImageView(ctx.device(), &info, nullptr, &view),
+                  "vkCreateImageView(render target UNORM)");
+            return view;
+        }
+
         bool isDepthOnlyTarget(const RenderTarget& target) {
             return target.texture && target.texture->format == Format::Depth;
         }
@@ -155,11 +184,16 @@ namespace threepp::vulkan {
 
     }// namespace
 
-    VulkanRenderTargets::VulkanRenderTargets(VulkanContext& ctx)
-        : ctx_(ctx), disposeListener_(*this) {}
+    VulkanRenderTargets::VulkanRenderTargets(VulkanContext& ctx, uint32_t framesInFlight)
+        : ctx_(ctx),
+          disposeListener_(*this),
+          framesInFlight_(std::max(1u, framesInFlight)) {}
 
     VulkanRenderTargets::~VulkanRenderTargets() {
-        for (auto& [_, record] : records_) destroy(record);
+        for (auto* target : listening_) {
+            if (target) target->removeEventListener("dispose", disposeListener_);
+        }
+        for (auto& stored : records_) destroy(stored.record);
     }
 
     RenderTargetKey VulkanRenderTargets::makeKey(const RenderTarget& target,
@@ -272,19 +306,24 @@ namespace threepp::vulkan {
         }
 
         const auto key = makeKey(target, activeCubeFace, activeMipmapLevel, samples);
-        auto it = records_.find(&target);
-        if (it != records_.end() && it->second.key == key) return it->second;
-
-        if (it != records_.end()) {
-            destroy(it->second);
-            records_.erase(it);
+        auto active = activeRecords_.find(&target);
+        if (active != activeRecords_.end() && active->second->record.key == key) {
+            return active->second->record;
         }
 
-        auto [inserted, _] = records_.emplace(&target, create(target, key));
-        auto& record = inserted->second;
+        if (active != activeRecords_.end()) {
+            retire(active->second);
+            activeRecords_.erase(active);
+        }
+
+        records_.push_back({&target, create(target, key), 0});
+        auto inserted = std::prev(records_.end());
+        activeRecords_[&target] = inserted;
+        auto& record = inserted->record;
         textureImages_[target.texture.get()] = isDepthOnlyTarget(target)
                 ? TextureImage{&record.depth, &record.depthLayout, VK_IMAGE_ASPECT_DEPTH_BIT, &target, 0}
-                : TextureImage{&record.color, &record.colorLayout, VK_IMAGE_ASPECT_COLOR_BIT, &target, 0};
+                : TextureImage{&record.color, &record.colorLayout, VK_IMAGE_ASPECT_COLOR_BIT,
+                               &target, 0, record.colorUnormView};
         for (std::size_t i = 1; i < target.textures.size() && i - 1 < record.extraColors.size(); ++i) {
             if (target.textures[i]) {
                 textureImages_[target.textures[i].get()] = {
@@ -292,7 +331,8 @@ namespace threepp::vulkan {
                         &record.extraColorLayouts[i - 1],
                         VK_IMAGE_ASPECT_COLOR_BIT,
                         &target,
-                        i};
+                        i,
+                        record.extraColorUnormViews[i - 1]};
             }
         }
         if (target.depthTexture) {
@@ -316,22 +356,55 @@ namespace threepp::vulkan {
         return it == textureImages_.end() ? nullptr : &it->second;
     }
 
-    void VulkanRenderTargets::release(RenderTarget* target) {
+    void VulkanRenderTargets::release(RenderTarget* target) noexcept {
         if (!target) return;
-        auto it = records_.find(target);
-        if (it == records_.end()) return;
-        destroy(it->second);
-        records_.erase(it);
+        auto active = activeRecords_.find(target);
+        if (active == activeRecords_.end()) return;
+        retire(active->second);
+        activeRecords_.erase(active);
+        target->removeEventListener("dispose", disposeListener_);
         listening_.erase(target);
     }
 
-    void VulkanRenderTargets::DisposeListener::onEvent(Event& event) {
-        if (event.target.has_value()) {
-            owner.release(std::any_cast<RenderTarget*>(event.target));
+    void VulkanRenderTargets::collectRetired() noexcept {
+        for (auto it = records_.begin(); it != records_.end();) {
+            if (it->pendingFrameCompletions == 0) {
+                ++it;
+            } else if (--it->pendingFrameCompletions == 0) {
+                destroy(it->record);
+                it = records_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
-    void VulkanRenderTargets::destroy(Record& record) {
+    void VulkanRenderTargets::DisposeListener::onEvent(Event& event) noexcept {
+        if (event.target.has_value()) {
+            if (auto* target = std::any_cast<RenderTarget*>(&event.target)) {
+                owner.release(*target);
+            }
+        }
+    }
+
+    void VulkanRenderTargets::unregisterTextures(RenderTarget* target) noexcept {
+        for (auto it = textureImages_.begin(); it != textureImages_.end();) {
+            if (it->second.target == target) {
+                it = textureImages_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    void VulkanRenderTargets::retire(RecordList::iterator stored) noexcept {
+        unregisterTextures(stored->target);
+        // 多等一个成功启动的帧，确保队列中位于旧 frame fence 之后的
+        // readback/one-shot 提交也已被后续 frame fence 覆盖。
+        stored->pendingFrameCompletions = framesInFlight_ + 1;
+    }
+
+    void VulkanRenderTargets::destroy(Record& record) noexcept {
         for (auto it = textureImages_.begin(); it != textureImages_.end();) {
             const auto ownsImage = [&] {
                 if (it->second.image == &record.color || it->second.image == &record.depth) return true;
@@ -345,6 +418,12 @@ namespace threepp::vulkan {
             } else {
                 ++it;
             }
+        }
+        if (record.colorUnormView != VK_NULL_HANDLE) {
+            vkDestroyImageView(ctx_.device(), record.colorUnormView, nullptr);
+        }
+        for (const auto view : record.extraColorUnormViews) {
+            if (view != VK_NULL_HANDLE) vkDestroyImageView(ctx_.device(), view, nullptr);
         }
         destroyImage2D(ctx_.allocator(), ctx_.device(), record.color);
         for (auto& color : record.extraColors) {
@@ -369,6 +448,11 @@ namespace threepp::vulkan {
         const uint32_t colorLayers = key.cube ? 6u : std::max(1u, key.depth);
 
         if (!depthOnly) {
+            const auto colorFlags =
+                    (key.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0) |
+                    (unormViewFormat(ctx_.swapchainFormat()) != ctx_.swapchainFormat()
+                             ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT
+                             : 0);
             record.color = createImage(
                     ctx_, key.width, key.height, ctx_.swapchainFormat(),
                     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
@@ -380,12 +464,14 @@ namespace threepp::vulkan {
                     colorLayers,
                     "renderTarget.color",
                     VK_SAMPLE_COUNT_1_BIT,
-                    key.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
+                    colorFlags);
+            record.colorUnormView = createUnormView(ctx_, record.color, key.cube);
             record.color.sampler = createSampler(ctx_, *target.texture, colorMipLevels);
 
             const auto colorCount = target.textures.size();
             if (colorCount > 1) {
                 record.extraColors.reserve(colorCount - 1);
+                record.extraColorUnormViews.reserve(colorCount - 1);
                 record.extraColorLayouts.resize(colorCount - 1, VK_IMAGE_LAYOUT_UNDEFINED);
                 for (std::size_t i = 1; i < colorCount; ++i) {
                     const auto& texture = target.textures[i] ? *target.textures[i] : *target.texture;
@@ -400,7 +486,8 @@ namespace threepp::vulkan {
                             colorLayers,
                             "renderTarget.extraColor",
                             VK_SAMPLE_COUNT_1_BIT,
-                            key.cube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0);
+                            colorFlags);
+                    record.extraColorUnormViews.push_back(createUnormView(ctx_, extra, key.cube));
                     extra.sampler = createSampler(ctx_, texture, colorMipLevels);
                     record.extraColors.push_back(std::move(extra));
                 }
