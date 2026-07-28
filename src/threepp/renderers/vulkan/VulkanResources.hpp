@@ -41,7 +41,8 @@ namespace threepp::vulkan {
     Buffer createBuffer(VmaAllocator alloc, VkDevice device,
                         VkDeviceSize size, VkBufferUsageFlags usage,
                         VmaMemoryUsage memoryUsage,
-                        VmaAllocationCreateFlags flags = 0);
+                        VmaAllocationCreateFlags flags = 0,
+                        VkMemoryPropertyFlags requiredFlags = 0);
 
     // Free a buffer (idempotent — safe to call on a zero-initialized Buffer).
     // Zeroes the struct on exit so subsequent calls are no-ops.
@@ -94,6 +95,7 @@ namespace threepp::vulkan {
         uint32_t      width     = 0;
         uint32_t      height    = 0;
         uint32_t      mipLevels = 1;
+        uint32_t      arrayLayers = 1;
         VkFormat      format    = VK_FORMAT_UNDEFINED;
     };
 

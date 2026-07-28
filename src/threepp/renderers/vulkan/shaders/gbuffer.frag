@@ -4,6 +4,8 @@
 
 #include "vulkan_shared.h"
 
+const int kMaxRasterClipPlanes = 4;
+
 // G-buffer fragment for the hybrid raster prepass. Emits world-space
 // normal (with normal map applied), screen-space motion vector, and
 // per-pixel IDs/flags. Depth is written automatically.
@@ -28,6 +30,11 @@ layout(set = 0, binding = 0) uniform CameraUbo {
     mat4 prevVP;
     vec4 jitter;          // .xy = curr clip-space sub-pixel jitter
     vec4 prevJitter;      // .xy = prev clip-space sub-pixel jitter
+    vec4 clipPlanes[kMaxRasterClipPlanes]; // world-space global clipping planes; .w = threshold
+    uint clipPlaneCount;
+    uint clipIntersection;
+    uint _clipPad0;
+    uint _clipPad1;
 } cam;
 
 layout(set = 0, binding = 2, scalar) readonly buffer GbufMatBuf {
@@ -43,6 +50,11 @@ layout(location = 4) flat in uint vFlags;
 layout(location = 5) in vec2 vUv;
 layout(location = 6) in vec3 vWorldPos;
 layout(location = 7) in vec3 vColor;// per-vertex color (material.vertexColors); white when unused
+layout(location = 8) flat in vec4 vLocalClipPlanes[kMaxRasterClipPlanes];
+layout(location = 12) flat in uint vLocalClipPlaneCount;
+layout(location = 13) flat in uint vLocalClipIntersection;
+layout(location = 14) flat in uint vMeshIdx;
+layout(location = 15) in vec2 vUv2;
 
 // Attachment 0: world-space normal (rgba16f). .xyz = n*0.5+0.5 encoded world
 // normal, .w = linear roughness (raster-first deferred pass reads it; raygen
@@ -56,12 +68,11 @@ layout(location = 0) out vec4 outNormal;
 layout(location = 1) out vec4 outMotion;
 
 // Attachment 2: per-pixel IDs + flags (rgba16ui).
-//   .x = instanceCustomIndex + 1 (matches raygen Payload.hitInstanceId
-//        convention; 0 reserved for sky/miss because the render pass
+//   .x = material index + 1 (0 reserved for sky/miss because the render pass
 //        clears IDs to 0 before any draw)
-//   .y = mesh-ID for the reproject same-mesh guard (currently == .x but
-//        kept separate so future stages can decouple)
-//   .z = flags (bit 0 is_water, bit 1 transmissive, bit 2 thinWalled, ...)
+//   .y = instanceCustomIndex + 1 for geometry lookups / same-mesh guards
+//   .z = flags (bit 0 is_water, bit 3 skinned, bit 4 flatShading, bit 5 receiveShadow,
+//               bit 6 depth attachment not valid for this pixel)
 //   .w = reserved
 layout(location = 2) out uvec4 outIds;
 
@@ -72,7 +83,7 @@ layout(location = 2) out uvec4 outIds;
 // sample to drive textureLod. Without this, raygen's `texture()` calls (RT
 // shaders have no implicit derivatives) snap to mip 0 and per-frame texture
 // shimmer survives TAA — which non-hybrid PT averages out via accumulated
-// samples but hybrid (1-2 spp/frame) cannot.
+// samples but hybrid (1-2 spp/frame) cannot. .a = material ambient occlusion.
 layout(location = 3) out vec4 outUv;
 
 // Attachment 4: albedo + metalness (rgba8 unorm). .rgb = linear base colour
@@ -91,14 +102,15 @@ layout(location = 4) out vec4 outAlbedoMetal;
 // screen-door (the PT accumulator converges it; the deferred one can't).
 layout(constant_id = 0) const uint DECAL_PASS = 0u;
 
-// Per-pixel, per-frame hash in [0,1) for the stochastic alpha-blend screen-
-// door. Folds the Halton sub-pixel jitter (changes every frame) into the seed
-// so the dither pattern decorrelates over time and the temporal accumulator /
-// TAA resolve it toward the true alpha-weighted blend instead of a fixed grid.
-float alphaHash(vec2 fragXY, vec2 jitter) {
+// Per-pixel, per-frame, per-instance hash in [0,1) for the stochastic alpha-
+// blend screen-door. Folds the Halton sub-pixel jitter (changes every frame)
+// and instance id (changes per transparent layer) into the seed so stacked
+// alpha layers do not share the same discard mask.
+float alphaHash(vec2 fragXY, vec2 jitter, uint instanceIdx) {
     uint h = uint(fragXY.x) * 1973u + uint(fragXY.y) * 9277u
            + floatBitsToUint(jitter.x) * 26699u
-           + floatBitsToUint(jitter.y) * 53401u + 0x9e3779b9u;
+           + floatBitsToUint(jitter.y) * 53401u
+           + instanceIdx * 73856093u + 0x9e3779b9u;
     h ^= h >> 16; h *= 0x7feb352du;
     h ^= h >> 15; h *= 0x846ca68bu;
     h ^= h >> 16;
@@ -106,25 +118,52 @@ float alphaHash(vec2 fragXY, vec2 jitter) {
 }
 
 void main() {
-    vec3 N = normalize(vWorldNormal);
+    if (cam.clipIntersection != 0u) {
+        bool clipped = cam.clipPlaneCount > 0u;
+        for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
+            if (uint(i) < cam.clipPlaneCount) {
+                clipped = clipped && (dot(vWorldPos, cam.clipPlanes[i].xyz) < cam.clipPlanes[i].w);
+            }
+        }
+        if (clipped) {
+            discard;
+        }
+    } else {
+        for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
+            if (uint(i) < cam.clipPlaneCount &&
+                dot(vWorldPos, cam.clipPlanes[i].xyz) < cam.clipPlanes[i].w) {
+                discard;
+            }
+        }
+    }
+    if (vLocalClipIntersection != 0u) {
+        bool clipped = vLocalClipPlaneCount > 0u;
+        for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
+            if (uint(i) < vLocalClipPlaneCount) {
+                clipped = clipped && (dot(vWorldPos, vLocalClipPlanes[i].xyz) < vLocalClipPlanes[i].w);
+            }
+        }
+        if (clipped) {
+            discard;
+        }
+    } else {
+        for (int i = 0; i < kMaxRasterClipPlanes; ++i) {
+            if (uint(i) < vLocalClipPlaneCount &&
+                dot(vWorldPos, vLocalClipPlanes[i].xyz) < vLocalClipPlanes[i].w) {
+                discard;
+            }
+        }
+    }
 
-    // Two-sided / back-facing fragments: flip the geometric normal to face the
-    // viewer. A Side::Double surface stores ONE geometric normal for both faces,
-    // so the face whose normal points away from a light stays dark in the
-    // deferred shade (and the lit side appears to "bleed" — e.g. one of two
-    // symmetric divider walls dark, the other lit). gl_FrontFacing is reliable
-    // here: the vertex-shader Y-flip (gl_Position.y = -y) restores GL's CCW-front
-    // convention, matching the pipeline frontFace = COUNTER_CLOCKWISE. Single-
-    // sided (cull-back) meshes never produce back fragments, so this is a no-op
-    // for them; done BEFORE the normal-map TBN so perturbation is relative to the
-    // correctly-oriented surface.
-    if (!gl_FrontFacing) N = -N;
+    vec3 N = normalize(vWorldNormal);
 
     // UV derivatives — used both for the LOD bias attachment and the normal-
     // map TBN construction below. Hoisted out of the normal-map branch
     // because dFdx/dFdy must be called from non-divergent control flow.
     const vec2 duvx = dFdx(vUv);
     const vec2 duvy = dFdy(vUv);
+    const vec3 dpx = dFdx(vWorldPos);
+    const vec3 dpy = dFdy(vWorldPos);
 
     // Normal map perturbation. TBN derived from screen-space derivatives:
     // (dpx, dpy) = world-space partial derivatives of position
@@ -140,9 +179,24 @@ void main() {
     // normal across the wave geometry and produce visible cellular noise.
     const MaterialDesc m = gbufMats[vInstanceIdx];
     const bool isWater = (vFlags & 1u) != 0u;
+    const bool flatShading = (vFlags & 16u) != 0u;
+    if (flatShading) {
+        N = normalize(cross(dpy, dpx));
+    }
+
+    // Two-sided / back-facing fragments: flip the geometric normal to face the
+    // viewer. A Side::Double surface stores ONE geometric normal for both faces,
+    // so the face whose normal points away from a light stays dark in the
+    // deferred shade (and the lit side appears to "bleed" — e.g. one of two
+    // symmetric divider walls dark, the other lit). gl_FrontFacing is reliable
+    // here: the vertex-shader Y-flip (gl_Position.y = -y) restores GL's CCW-front
+    // convention, matching the pipeline frontFace = COUNTER_CLOCKWISE. Single-
+    // sided (cull-back) meshes never produce back fragments, so this is a no-op
+    // for them; done BEFORE the normal-map TBN so perturbation is relative to the
+    // correctly-oriented surface.
+    if (!gl_FrontFacing) N = -N;
+
     if (m.normalTexIndex >= 0 && !isWater) {
-        const vec3 dpx = dFdx(vWorldPos);
-        const vec3 dpy = dFdy(vWorldPos);
         const float det = duvx.x * duvy.y - duvy.x * duvx.y;
         if (abs(det) > 1e-8) {
             vec3 T = (dpx * duvy.y - dpy * duvx.y) / det;
@@ -153,10 +207,22 @@ void main() {
                 const vec3 B = cross(N, T);
                 const int nidx = clamp(m.normalTexIndex, 0, int(kMaxMaterialTextures) - 1);
                 const vec2 uvN = (m.uvTransformNormal * vec3(vUv, 1.0)).xy;
-                vec3 ns = texture(gbufAlbedoMaps[nidx], uvN).rgb * 2.0 - 1.0;
-                ns.xy *= m.normalScale;
-                ns.z = sqrt(max(0.0, 1.0 - dot(ns.xy, ns.xy)));
-                N = normalize(T * ns.x + B * ns.y + N * ns.z);
+                if (m.normalMapMode == 1) {
+                    const float h0 = texture(gbufAlbedoMaps[nidx], uvN).r;
+                    const float hx = texture(gbufAlbedoMaps[nidx], uvN + dFdx(uvN)).r;
+                    const float hy = texture(gbufAlbedoMaps[nidx], uvN + dFdy(uvN)).r;
+                    const float bumpScale = m.normalScale.x;
+                    const vec3 R1 = cross(dpy, N);
+                    const vec3 R2 = cross(N, dpx);
+                    const float fDet = dot(dpx, R1);
+                    const vec3 grad = sign(fDet) * ((hx - h0) * bumpScale * R1 + (hy - h0) * bumpScale * R2);
+                    N = normalize(abs(fDet) * N - grad);
+                } else {
+                    vec3 ns = texture(gbufAlbedoMaps[nidx], uvN).rgb * 2.0 - 1.0;
+                    ns.xy *= m.normalScale;
+                    ns.z = sqrt(max(0.0, 1.0 - dot(ns.xy, ns.xy)));
+                    N = normalize(T * ns.x + B * ns.y + N * ns.z);
+                }
             }
         }
     }
@@ -177,6 +243,15 @@ void main() {
         albedoSample = texel.rgb;
         albedoAlpha  = texel.a;// linear (alpha is never sRGB-decoded) → matches chit
     }
+    if (m.alphaTexIndex >= 0) {
+        const int ai = clamp(m.alphaTexIndex, 0, int(kMaxMaterialTextures) - 1);
+        const vec2 uvAlpha = (m.uvTransformAlpha * vec3(vUv, 1.0)).xy;
+        albedoAlpha *= texture(gbufAlbedoMaps[ai], uvAlpha).g;
+    }
+    const bool isCleanAlpha = (m.transmission > 0.0 && m.transmission <= 1.0 && m.ior < 1.05);
+    if (isCleanAlpha) {
+        albedoAlpha *= 1.0 - clamp(m.transmission, 0.0, 1.0);
+    }
     // Per-vertex color (material.vertexColors): vColor is white when the mesh
     // has no "color" attribute, so this multiply is a no-op then. Linear working
     // space — matches m.albedo and the closest_hit.rchit vertex-color path.
@@ -195,7 +270,7 @@ void main() {
     float roughness = m.roughness;
     float metalness = m.metalness;
     if (roughness >= 0.0) {
-        if (m.roughnessTexIndex >= 0) {
+        if (m.roughnessTexIndex >= 0 && m.sheenRoughness >= 0.0) {
             const int i = clamp(m.roughnessTexIndex, 0, int(kMaxMaterialTextures) - 1);
             roughness *= texture(gbufAlbedoMaps[i], uvRoughMetal).g;
         }
@@ -229,18 +304,22 @@ void main() {
     // transparent texels. Deterministic: no screen-door, no temporal flicker,
     // the splat lerps over the receiver exactly like GL.
     const bool isDecal = (DECAL_PASS != 0u);
-    if (m.albedoTexIndex >= 0 && m.alphaCutoff != 0.0) {
+    if (m.alphaCutoff != 0.0) {
         if (m.alphaCutoff > 0.0) {
             if (albedoAlpha < m.alphaCutoff) discard;
         } else if (isDecal) {
             if (albedoAlpha <= 0.004) discard;// nothing to blend
+        } else if (isCleanAlpha) {
+            // ReferencePT uses this G-buffer only for primary visibility hints.
+            // Keep clean constant-opacity surfaces here; closest_hit handles
+            // the actual GL-style alpha blend by tracing straight through.
         } else {
             // BLEND: variance-reduced stochastic rejection, matching the PT
             // any-hit's 0.99 (accept) / 0.01 (reject) early-outs.
             if (albedoAlpha <= 0.01) {
                 discard;
             } else if (albedoAlpha < 0.99) {
-                if (alphaHash(gl_FragCoord.xy, cam.jitter.xy) >= albedoAlpha) discard;
+                if (alphaHash(gl_FragCoord.xy, cam.jitter.xy, vInstanceIdx) >= albedoAlpha) discard;
             }
         }
     }
@@ -253,7 +332,10 @@ void main() {
     // Decals emit texture alpha as the blend factor (the decal pipeline's
     // SRC_ALPHA blend consumes it; its RGB-only write mask keeps the
     // receiver's metalness in .a). Everything else writes metalness.
-    outAlbedoMetal = vec4(albedo, isDecal ? albedoAlpha : metalness);
+    // MeshBasic 的 albedo 已是最终颜色；alpha 保存多重采样覆盖率，
+    // 供延迟阶段在最终颜色上解析轮廓。其他材质仍保存 metalness。
+    const bool isBasic = m.roughness == -1.0;
+    outAlbedoMetal = vec4(albedo, isDecal ? albedoAlpha : (isBasic ? 1.0 : metalness));
 
     vec2 currNDC = vCurrClipUnjit.xy / vCurrClipUnjit.w;
     vec2 prevNDC = vPrevClip.xy      / vPrevClip.w;
@@ -272,18 +354,15 @@ void main() {
     // mesh) so it does NOT false-reset, but DIFFER for a real disocclusion (a
     // trail revealing another surface). Comparing curr-vs-prev depth instead would
     // wrongly reset any surface that moves in depth → dust on animated meshes.
-    outMotion = vec4(motion, vPrevClip.z / vPrevClip.w, 0.0);
+    // .a = current surface NDC depth for no-depth materials. Those pixels do not
+    // update the depth attachment, but deferred lighting still needs their real
+    // surface position for shadows, fog, and transmission.
+    outMotion = vec4(motion, vPrevClip.z / vPrevClip.w, vCurrClipUnjit.z / vCurrClipUnjit.w);
 
-    // +1 so the renderpass's clear-to-0 means "sky/no draw", matching
-    // raygen's Payload.hitInstanceId convention exactly.
-    outIds = uvec4(vInstanceIdx + 1u, vInstanceIdx + 1u, vFlags, 0u);
+    // +1 so the renderpass's clear-to-0 means "sky/no draw".
+    outIds = uvec4(vInstanceIdx + 1u, vMeshIdx + 1u, vFlags, 0u);
 
-    // log2 of the per-pixel UV-footprint diameter (texture-size-independent).
-    // raygen turns this into a per-texture LOD via `bias + log2(textureSize.x)`.
-    // Floor at -16 to keep textureLod's clamp from biting the rare
-    // duvx==duvy==0 case (degenerate triangle / fully orthogonal view).
-    const float fp2 = max(dot(duvx, duvx), dot(duvy, duvy));
-    const float lodBias = 0.5 * log2(max(fp2, 1e-32));
-
-    outUv = vec4(vUv, lodBias, 0.0);
+    // .rg = primary UV, .ba = uv2. Deferred samples uv2-dependent maps
+    // (aoMap/lightMap) here so they share one geometry channel.
+    outUv = vec4(vUv, vUv2);
 }

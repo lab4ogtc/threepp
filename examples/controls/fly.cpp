@@ -49,7 +49,9 @@ namespace {
         const auto materialMoon = MeshLambertMaterial::create(
                 MeshLambertMaterial::Params{}
                         .map(tex)
-                        .transparent(true));
+                        .transparent(true)
+                        .depthWrite(false)
+                        .polygonOffset(true));
 
         auto geometry = SphereGeometry::create(radius, 100, 50);
 

@@ -15,6 +15,7 @@
 
 #include <GLFW/glfw3.h>
 
+#include <algorithm>
 #include <iostream>
 #include <optional>
 
@@ -682,7 +683,14 @@ WindowSize monitor::monitorSize(int monitor) {
 
     int count;
     auto monitors = glfwGetMonitors(&count);
-    const GLFWvidmode* mode = glfwGetVideoMode(monitors[monitor]);
+    if (!monitors || count <= 0) {
+        return {800, 600};
+    }
+    const int safeMonitor = std::clamp(monitor, 0, count - 1);
+    const GLFWvidmode* mode = glfwGetVideoMode(monitors[safeMonitor]);
+    if (!mode) {
+        return {800, 600};
+    }
 
     return {mode->width, mode->height};
 #endif
@@ -690,14 +698,14 @@ WindowSize monitor::monitorSize(int monitor) {
 
 std::pair<float, float> monitor::contentScale(int monitor) {
 #ifdef __EMSCRIPTEN__
-    return {1, 1};//TODO
+    return {1.f, 1.f};//TODO
 #else
     initGLfw();
 
     int count;
     auto monitors = glfwGetMonitors(&count);
     if (!monitors || monitor < 0 || monitor >= count) {
-        return {1, 1};
+        return {1.f, 1.f};
     }
 
     float xscale = 1;

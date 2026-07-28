@@ -284,7 +284,7 @@ float brdfPdf(vec3 wo, vec3 wi, vec3 n, float roughness, float metalness) {
 // underestimates the mixture pdf on clearcoat materials — the cc lobe is a
 // sharp peak at glossy reflection angles — so MIS comes out skewed and
 // adds noise. ccProb=0 collapses this to brdfPdf.
-float brdfPdf3(vec3 wo, vec3 wi, vec3 n, float roughness, float metalness,
+float brdfPdf3(vec3 wo, vec3 wi, vec3 n, vec3 ccN, float roughness, float metalness,
                float ccProb, float ccRough) {
     const float NdotL = dot(n, wi);
     if (NdotL <= 0.0) return 0.0;
@@ -293,8 +293,21 @@ float brdfPdf3(vec3 wo, vec3 wi, vec3 n, float roughness, float metalness,
     const float diffPdf = NdotL * (1.0 / PI);
     const float basePdf = pSpec * specPdf + (1.0 - pSpec) * diffPdf;
     if (ccProb <= 0.0) return basePdf;
-    const float ccPdf = vndfPdf(wo, wi, n, ccRough);
+    const float ccPdf = dot(ccN, wi) > 0.0 ? vndfPdf(wo, wi, ccN, ccRough) : 0.0;
     return ccProb * ccPdf + (1.0 - ccProb) * basePdf;
+}
+
+vec3 clearcoatBrdfCos(vec3 V, vec3 L, vec3 ccN,
+                      float ccNdotV, float ccWeight, float ccRough) {
+    const float ccNdotL = max(dot(ccN, L), 0.0);
+    if (ccWeight <= 0.0 || ccNdotL <= 0.0) return vec3(0.0);
+    const vec3  H      = normalize(V + L);
+    const float ccNdotH = max(dot(ccN, H), 0.0);
+    const float k_cc   = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
+    const float D_cc   = distGGX(ccNdotH, ccRough);
+    const float G_cc   = geomSmithG1(ccNdotV, k_cc) * geomSmithG1(ccNdotL, k_cc);
+    return vec3((D_cc * G_cc) / max(4.0 * ccNdotV * ccNdotL, 1e-4) *
+                ccWeight * ccNdotL);
 }
 
 // ── Sheen (KHR_materials_sheen) ────────────────────────────────────────────
@@ -346,6 +359,11 @@ vec3 uvToEquirectDir(vec2 uv) {
 bool fogEnabled() { return fog.enabled > 0.5; }
 vec3 fogTransmittance(float dist) {
     const float d = clamp(dist, 0.0, 1e6);
+    if (fog.mode > 0.5) {
+        const float span = max(fog.linearFar - fog.linearNear, 1e-4);
+        const float f = smoothstep(0.0, 1.0, clamp((d - fog.linearNear) / span, 0.0, 1.0));
+        return vec3(1.0 - f);
+    }
     return exp(-fog.sigmaT * d);
 }
 
@@ -530,7 +548,7 @@ struct BsdfSample {
 };
 
 BsdfSample sampleBsdf(
-        vec3  V,         vec3  N,        vec3  F0,         vec3  albedo,
+        vec3  V,         vec3  N,        vec3  ccN,        vec3  F0,         vec3  albedo,
         float alpha,     float ccAlpha,  float metalness,  float NdotV,
         float pSpec,     float ccProb,   float ccWeight,
         float baseScale, float invBaseProb,
@@ -540,14 +558,14 @@ BsdfSample sampleBsdf(
     const float xiCC = urand(seed);
     if (ccProb > 0.0 && xiCC < ccProb) {
         const vec2 u2 = vec2(urand(seed), urand(seed));
-        r.dir = sampleVNDF(V, N, ccAlpha, u2);
-        const float NdotL = dot(N, r.dir);
-        if (NdotL <= 0.0) {
+        r.dir = sampleVNDF(V, ccN, ccAlpha, u2);
+        const float ccNdotL = dot(ccN, r.dir);
+        if (ccNdotL <= 0.0) {
             r.valid  = false;
             r.weight = vec3(0.0);
             return r;
         }
-        const float G1L = smithG1(NdotL, ccAlpha);
+        const float G1L = smithG1(ccNdotL, ccAlpha);
         r.weight = vec3(ccWeight * G1L / ccProb);
     } else {
         const float xi = urand(seed);
@@ -593,10 +611,10 @@ BsdfSample sampleBsdf(
 // Glass / transmission-dominant primaries should skip this entirely — they
 // have their own refraction handling that subsumes env contribution.
 vec3 envNeeOpaque(
-        vec3  V,         vec3  N,        vec3  hitPos,
+        vec3  V,         vec3  N,        vec3  ccN,        vec3  hitPos,
         vec3  F0,        vec3  albedo,
         float roughness, float metalness, float alpha,
-        float NdotV,     float k,
+        float NdotV,     float ccNdotV,  float k,
         float baseScale, float invBaseProb, float pSpec,
         float ccProb,    float ccRough,    float ccWeight, float ccAlpha,
         inout uint seed) {
@@ -626,20 +644,15 @@ vec3 envNeeOpaque(
                 const vec3  spec_e = (D_e * G_e * F_e) / max(4.0 * NdotV * NdotL_e, 1e-4) * kcSpec(F0, NdotV, roughness);
                 const vec3  kd_e   = (vec3(1.0) - F_e) * (1.0 - metalness);
                 const vec3  diff_e = kd_e * albedo / PI + kcDiff(albedo, metalness, F0, NdotV, alpha);
-                vec3 lobeSum = (diff_e + spec_e) * baseScale;
-                if (ccWeight > 0.0) {
-                    const float k_cc = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-                    const float D_cc = distGGX(NdotH, ccRough);
-                    const float G_cc = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotL_e, k_cc);
-                    lobeSum += vec3((D_cc * G_cc) / max(4.0 * NdotV * NdotL_e, 1e-4) * ccWeight);
-                }
+                vec3 lobeCos = (diff_e + spec_e) * baseScale * NdotL_e;
+                lobeCos += clearcoatBrdfCos(V, nDir, ccN, ccNdotV, ccWeight, ccRough);
                 vec3 envSample = sampleEquirect(nDir);
                 const float envLum = dot(envSample, vec3(0.2126, 0.7152, 0.0722));
                 if (envLum > pc.fireflyClamp) envSample *= pc.fireflyClamp / envLum;
                 // 3-lobe pdf: matches the cc + base-spec + base-diff sampler
                 // in main()'s bounce direction selection. Clearcoat-aware so
                 // MIS doesn't add noise on clearcoat materials.
-                const float pdfBrdf = brdfPdf3(V, nDir, N, roughness, metalness, ccProb, ccRough);
+                const float pdfBrdf = brdfPdf3(V, nDir, N, ccN, roughness, metalness, ccProb, ccRough);
                 const float wEnv    = pdfEnv / max(pdfEnv + pdfBrdf, 1e-8);
                 // Post-multiply firefly clamp. The env-sample clamp above caps
                 // the env texel's luminance, but on glossy surfaces the BSDF
@@ -653,7 +666,7 @@ vec3 envNeeOpaque(
                 // Matches the post-multiply clamp pattern used in the ReSTIR DI
                 // path and the emissive-tri NEE path. Gated by the `< 1e20`
                 // sentinel so setFireflyClamp(0) disables it.
-                vec3 envContrib = wEnv * lobeSum * NdotL_e * envSample
+                vec3 envContrib = wEnv * lobeCos * envSample
                                   * shadowVisibility / max(pdfEnv, 1e-8);
                 if (pc.fireflyClamp < 1e20) {
                     const float cLumE = lum3(envContrib);
@@ -666,7 +679,7 @@ vec3 envNeeOpaque(
         // Fallback: BSDF-sampled env NEE with constant 0.5 MIS (no CDF). The
         // sampler shares its lobe-pick logic with the indirect bounce below
         // so pdfs match and the balance-heuristic weight collapses to 0.5/0.5.
-        const BsdfSample s = sampleBsdf(V, N, F0, albedo, alpha, ccAlpha,
+        const BsdfSample s = sampleBsdf(V, N, ccN, F0, albedo, alpha, ccAlpha,
                                         metalness, NdotV, pSpec, ccProb,
                                         ccWeight, baseScale, invBaseProb, seed);
         if (s.valid) {
@@ -716,10 +729,10 @@ vec3 envNeeOpaque(
 // Glass / transmission primaries should skip this — they have their own
 // refraction handling. Bounce hits (bsdfOnlyMode) should also skip.
 vec3 analyticNeeOpaque(
-        vec3  V,         vec3  N,        vec3  hitPos,
+        vec3  V,         vec3  N,        vec3  ccN,        vec3  hitPos,
         vec3  F0,        vec3  albedo,
         float roughness, float metalness, float alpha,
-        float NdotV,     float k,
+        float NdotV,     float ccNdotV,  float k,
         float baseScale,
         float sheenScaling, bool hasSheen, vec3 sheenColor, float sheenRoughness,
         float ccWeight,  float ccRough,
@@ -768,17 +781,12 @@ vec3 analyticNeeOpaque(
             perLight += sheenColor * D_Charlie(NdotH, sheenRoughness)
                                    * V_Neubelt(NdotV, NdotL);
         }
-        if (ccWeight > 0.0) {
-            const float k_cc    = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-            const float D_cc    = distGGX(NdotH, ccRough);
-            const float G_cc    = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotL, k_cc);
-            const float spec_cc = (D_cc * G_cc) / max(4.0 * NdotV * NdotL, 1e-4);
-            perLight += vec3(spec_cc * ccWeight);
-        }
         // DirLight uses 1e30 maxDist sentinel (above), so fogAtten is vec3(1)
         // here — the sun is "outside" the fog. The volumeInscatter pass in
         // raygen handles the camera-ray scattering of this light into haze.
-        lit += perLight * NdotL * lights.dirLights[i].color * shadowVisibility;
+        vec3 contrib = perLight * NdotL;
+        contrib += clearcoatBrdfCos(V, L, ccN, ccNdotV, ccWeight, ccRough);
+        lit += contrib * lights.dirLights[i].color * shadowVisibility;
     }
 
     // === Point lights ===
@@ -828,14 +836,10 @@ vec3 analyticNeeOpaque(
             perPt += sheenColor * D_Charlie(NdotH, sheenRoughness)
                                 * V_Neubelt(NdotV, NdotL);
         }
-        if (ccWeight > 0.0) {
-            const float k_cc    = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-            const float D_cc    = distGGX(NdotH, ccRough);
-            const float G_cc    = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotL, k_cc);
-            perPt += vec3((D_cc * G_cc) / max(4.0 * NdotV * NdotL, 1e-4) * ccWeight);
-        }
+        vec3 contrib = perPt * NdotL;
+        contrib += clearcoatBrdfCos(V, toL, ccN, ccNdotV, ccWeight, ccRough);
         const vec3 fogAttenPt = fogEnabled() ? fogTransmittance(dist) : vec3(1.0);
-        lit += perPt * NdotL * lights.pointLights[i].color * atten * shadowVisibility * fogAttenPt;
+        lit += contrib * lights.pointLights[i].color * atten * shadowVisibility * fogAttenPt;
     }
 
     // === Spot lights ===
@@ -889,14 +893,10 @@ vec3 analyticNeeOpaque(
             perSp += sheenColor * D_Charlie(NdotH, sheenRoughness)
                                 * V_Neubelt(NdotV, NdotL);
         }
-        if (ccWeight > 0.0) {
-            const float k_cc    = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-            const float D_cc    = distGGX(NdotH, ccRough);
-            const float G_cc    = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotL, k_cc);
-            perSp += vec3((D_cc * G_cc) / max(4.0 * NdotV * NdotL, 1e-4) * ccWeight);
-        }
+        vec3 contrib = perSp * NdotL;
+        contrib += clearcoatBrdfCos(V, toL, ccN, ccNdotV, ccWeight, ccRough);
         const vec3 fogAttenSp = fogEnabled() ? fogTransmittance(dist) : vec3(1.0);
-        lit += perSp * NdotL * lights.spotLights[i].color * atten * shadowVisibility * fogAttenSp;
+        lit += contrib * lights.spotLights[i].color * atten * shadowVisibility * fogAttenSp;
     }
 
     // === Rect area lights ===
@@ -946,14 +946,10 @@ vec3 analyticNeeOpaque(
         const vec3  kd_r  = (vec3(1.0) - F_r) * (1.0 - metalness);
         const vec3  diff  = kd_r * albedo / PI + kcDiff(albedo, metalness, F0, NdotV, alpha);
         vec3 perRect = (diff + spec) * baseScale;
-        if (ccWeight > 0.0) {
-            const float k_cc    = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-            const float D_cc    = distGGX(NdotH, ccRough);
-            const float G_cc    = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotL, k_cc);
-            perRect += vec3((D_cc * G_cc) / max(4.0 * NdotV * NdotL, 1e-4) * ccWeight);
-        }
+        vec3 contrib = perRect * NdotL;
+        contrib += clearcoatBrdfCos(V, toL, ccN, ccNdotV, ccWeight, ccRough);
         const vec3 fogAttenRect = fogEnabled() ? fogTransmittance(dist) : vec3(1.0);
-        lit += perRect * NdotL * lights.rectLights[i].color * geomTerm * shadowVisibility * fogAttenRect;
+        lit += contrib * lights.rectLights[i].color * geomTerm * shadowVisibility * fogAttenRect;
     }
 
     // === Emissive-mesh NEE ===
@@ -1021,13 +1017,8 @@ vec3 analyticNeeOpaque(
                         const vec3  spec_e = (D_e * G_e * F_e) / max(4.0 * NdotV * NdotLe, 1e-4) * kcSpec(F0, NdotV, roughness);
                         const vec3  kd_e   = (vec3(1.0) - F_e) * (1.0 - metalness);
                         const vec3  diff_e = kd_e * albedo / PI + kcDiff(albedo, metalness, F0, NdotV, alpha);
-                        vec3 perEm = (diff_e + spec_e) * baseScale;
-                        if (ccWeight > 0.0) {
-                            const float k_cc = (ccRough + 1.0) * (ccRough + 1.0) / 8.0;
-                            const float D_cc = distGGX(NdotH, ccRough);
-                            const float G_cc = geomSmithG1(NdotV, k_cc) * geomSmithG1(NdotLe, k_cc);
-                            perEm += vec3((D_cc * G_cc) / max(4.0 * NdotV * NdotLe, 1e-4) * ccWeight);
-                        }
+                        vec3 perEmCos = (diff_e + spec_e) * baseScale * NdotLe;
+                        perEmCos += clearcoatBrdfCos(V, toL, ccN, ccNdotV, ccWeight, ccRough);
                         vec3 emCol = t.emission.rgb;
                         const float emLumE = dot(emCol, vec3(0.2126, 0.7152, 0.0722));
                         if (emLumE > pc.fireflyClamp) emCol *= pc.fireflyClamp / emLumE;
@@ -1037,7 +1028,7 @@ vec3 analyticNeeOpaque(
                         // pdfOmega dominates → w_light → 1.
                         const float pdfBsdfNee = brdfPdf(V, toL, N, roughness, metalness);
                         const float wLight = pdfOmega / max(pdfOmega + pdfBsdfNee, 1e-8);
-                        vec3 emContrib = perEm * NdotLe * emCol * wLight / max(pdfOmega, 1e-8);
+                        vec3 emContrib = perEmCos * emCol * wLight / max(pdfOmega, 1e-8);
                         const float emCLum = dot(emContrib, vec3(0.2126, 0.7152, 0.0722));
                         if (emCLum > pc.fireflyClamp) emContrib *= pc.fireflyClamp / emCLum;
                         const vec3 fogAttenEm = fogEnabled() ? fogTransmittance(dist) : vec3(1.0);

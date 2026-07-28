@@ -23,8 +23,18 @@ struct ModelEntry {
 
 static std::vector<ModelEntry> scanModels(const fs::path& root) {
     std::vector<ModelEntry> entries;
+    auto addModelFile = [&](const fs::path& path, const std::string& fallbackName = {}) {
+        const auto ext = path.extension().string();
+        if (ext != ".gltf" && ext != ".glb") return false;
+        entries.push_back({fallbackName.empty() ? path.stem().string() : fallbackName, path});
+        return true;
+    };
     for (auto& dir : fs::directory_iterator(root)) {
         try {
+            if (dir.is_regular_file()) {
+                addModelFile(dir.path());
+                continue;
+            }
             if (!dir.is_directory()) continue;
             auto name = dir.path().filename().string();
 
@@ -39,8 +49,7 @@ static std::vector<ModelEntry> scanModels(const fs::path& root) {
                 continue;
             }
             for (auto& f : fs::directory_iterator(dir.path())) {
-                if (f.path().extension() == ".gltf") {
-                    entries.push_back({name, f.path()});
+                if (addModelFile(f.path(), name)) {
                     break;
                 }
             }
@@ -88,7 +97,7 @@ int main(int argc, char** argv) {
     }
     std::cout << "Found " << models.size() << " models. Use Left/Right (or P/N) to browse." << std::endl;
 
-    Canvas canvas("Vulkan PT - GLTF Samples", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - GLTF Samples", {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     renderer.setRenderMode(VulkanRenderer::RenderMode::RasterFirst);
@@ -338,7 +347,7 @@ int main(int argc, char** argv) {
             const auto path = fs::path(PROJECT_FOLDER) / "aaa_caps" / shotPath;
             renderer.writeFramebuffer(path);
             std::cout << "wrote " << path.string() << std::endl;
-            std::exit(0);
+            canvas.close();
         }
     });
 

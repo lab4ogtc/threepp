@@ -45,6 +45,11 @@ namespace threepp {
         bool isZeroCopy = false;
     };
 
+    enum class PixelReadbackAspect {
+        Color,
+        Stencil
+    };
+
     struct PixelReadbackRequest {
         RenderTarget* renderTarget = nullptr;
         int x = 0;
@@ -53,8 +58,10 @@ namespace threepp {
         int height = 0;
         int depth = 1;
         int activeCubeFace = 0;
+        int activeMipmapLevel = 0;
         int activeLayer = 0;
         unsigned int textureIndex = 0;
+        PixelReadbackAspect aspect = PixelReadbackAspect::Color;
         Format format = Format::RGBA;
         Type type = Type::UnsignedByte;
     };

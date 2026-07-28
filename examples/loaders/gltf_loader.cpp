@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
         if (capturing && ++shotFrame >= shotFrames) {
             renderer->writeFramebuffer(shotPath);
             std::cout << "wrote " << shotPath << "\n";
-            std::exit(0);
+            canvas.close();
         }
     });
 

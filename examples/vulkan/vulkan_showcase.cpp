@@ -128,7 +128,7 @@ namespace {
 int main() {
 
     Canvas canvas("Vulkan PT — Showcase",
-                  {{"vsync", false}, {"size", WindowSize{1600, 1000}}});
+                  {{"vsync", true}, {"size", WindowSize{1600, 1000}}});
 
     VulkanRenderer renderer(canvas);
 

@@ -52,6 +52,16 @@ namespace threepp::vulkan {
         // discarded if incompatible, so it can never affect correctness.
         VkPipelineCache pipelineCache() const { return pipelineCache_; }
 
+        // Centralized single-pipeline creation. Interactive mode only accepts
+        // optimized cache hits and otherwise falls back to fast compilation;
+        // prewarm mode performs normal optimized compilation.
+        VkResult createGraphicsPipeline(const VkGraphicsPipelineCreateInfo& info,
+                                        VkPipeline* pipeline);
+        VkResult createComputePipeline(const VkComputePipelineCreateInfo& info,
+                                       VkPipeline* pipeline);
+        VkResult createRayTracingPipeline(const VkRayTracingPipelineCreateInfoKHR& info,
+                                          VkPipeline* pipeline);
+
         VkSurfaceKHR surface() const { return surface_; }
         VkQueue graphicsQueue() const { return graphicsQueue_; }
         VkQueue presentQueue() const { return presentQueue_; }
@@ -148,6 +158,11 @@ namespace threepp::vulkan {
         bool rayTracingInvocationReorderSupported_ = false;
         bool rayQuerySupported_ = false;
         bool externalMemorySupported_ = false;
+        bool prewarmPipelines_ = false;
+        bool pipelineCreationCacheControlSupported_ = false;
+        uint32_t optimizedCacheHits_ = 0;
+        uint32_t fastFallbacks_ = 0;
+        uint32_t prewarmOptimized_ = 0;
         VkPhysicalDeviceRayTracingPipelinePropertiesKHR rtPipelineProperties_{};
         RtFunctions rt_{};
         // Non-null only when VK_EXT_debug_utils is enabled (i.e. validation

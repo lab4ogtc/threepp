@@ -27,7 +27,7 @@ namespace threepp::vulkan {
     class DeferredShade {
 
     public:
-        DeferredShade(VulkanContext& ctx, uint32_t framesInFlight);
+        DeferredShade(VulkanContext& ctx, uint32_t framesInFlight, bool rayScene = true);
         ~DeferredShade();
         DeferredShade(const DeferredShade&) = delete;
         DeferredShade& operator=(const DeferredShade&) = delete;
@@ -39,6 +39,9 @@ namespace threepp::vulkan {
         struct DescriptorWriteInputs {
             const VkBuffer*    cameraUbo  = nullptr;// [framesInFlight] viewInverse/projInverse
             const VkBuffer*    lightsUbo  = nullptr;// [framesInFlight] GpuLightsUbo (scalar)
+            const VkBuffer*    shadowUbo  = nullptr;// [framesInFlight] GL-style shadow-map light matrices
+            VkImageView        shadowDepthView = VK_NULL_HANDLE;// depth 2D-array, one layer per shadow light
+            VkSampler          shadowSampler   = VK_NULL_HANDLE;// comparison sampler
             VkImageView        envView    = VK_NULL_HANDLE;// prefiltered PMREM mip chain
             VkSampler          envSampler = VK_NULL_HANDLE;
             const VkImageView* gbufNormal = nullptr;// [framesInFlight]
@@ -102,11 +105,12 @@ namespace threepp::vulkan {
         // foam-noise drift so its speed doesn't scale with fps.
         void recordDispatch(VkCommandBuffer cb, uint32_t frame,
                             uint32_t width, uint32_t height, uint32_t envMipCount,
-                            bool shadows, bool ao, uint32_t frameCounter,
+                            bool visibilityShadows, bool ao, uint32_t frameCounter,
                             uint32_t emissiveCount, float emissiveTotalPower,
                             float fireflyClamp,
                             float oceanFineTileSize, float oceanFoamTileSize,
-                            bool denoise, bool restirDI,
+                            bool denoise, bool restirDI, bool rayAccents,
+                            bool solidBackgroundEnv,
                             float volDensity, float volAniso,
                             float starIntensity,
                             float camDeltaLen, float camRotAngle,
@@ -121,6 +125,7 @@ namespace threepp::vulkan {
     private:
         VulkanContext& ctx_;
         uint32_t       framesInFlight_;
+        bool           rayScene_;
 
         VkSampler             gbufSampler_  = VK_NULL_HANDLE;// nearest (texelFetch ignores it)
         VkDescriptorSetLayout dsLayout_     = VK_NULL_HANDLE;

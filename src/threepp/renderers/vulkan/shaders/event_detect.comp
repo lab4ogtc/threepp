@@ -26,8 +26,7 @@
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 
 // Packed BGRA8 pixels of the post-TAA scene, one uint per pixel.
-// Vulkan swapchain is VK_FORMAT_B8G8R8A8_UNORM, so byte 0 = B, byte 1 = G,
-// byte 2 = R, byte 3 = A. We swizzle back to RGB for the luminance.
+// Byte 0 = B, byte 1 = G, byte 2 = R, byte 3 = A. We swizzle back to RGB.
 layout(set = 0, binding = 0, scalar) readonly buffer SceneBuf {
     uint pixels[];
 } sceneBuf;

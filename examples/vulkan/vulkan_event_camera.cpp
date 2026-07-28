@@ -27,6 +27,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 
 using namespace threepp;
@@ -105,10 +106,16 @@ namespace {
 
 }// namespace
 
-int main() {
+int main(int argc, char** argv) {
+
+    bool selfcheck = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--selfcheck") == 0) selfcheck = true;
+    }
+    int exitCode = 0;
 
     Canvas canvas("Vulkan PT - event camera (DVS)",
-                  {{"vsync", false}, {"size", WindowSize{1280, 720}}});
+                  {{"vsync", !selfcheck}, {"size", WindowSize{1280, 720}}});
     VulkanRenderer renderer(canvas);
     renderer.toneMapping = ToneMapping::ACESFilmic;
     renderer.toneMappingExposure = 1.0f;
@@ -153,7 +160,8 @@ int main() {
         // Prophesee Gen3/4 territory; physically meaningful AND about
         // 3× fewer pixels than the swapchain → smaller detector + readback
         // work. Pass (0,0) instead to match the swapchain.
-        renderer.setEventCameraResolution(640, 480);
+        renderer.setEventCameraResolution(selfcheck ? 64u : 640u,
+                                          selfcheck ? 48u : 480u);
         renderer.setEventCameraEnabled(true);
     }
 
@@ -207,8 +215,12 @@ int main() {
     // ── UI ─────────────────────────────────────────────────────────────
     float lastCaptureMs     = 0.f;
     bool  animatePendulums  = true;
-    bool  eventsOnly        = false;
+    bool  eventsOnly        = selfcheck;
     auto  evParams          = renderer.eventCameraParams();
+    if (eventsOnly) {
+        renderer.setEventsOnlyMode(true);
+        applySpriteLayout(true, canvas.size());
+    }
 
     // Sparse event-stream buffer — reused frame-to-frame; the demo
     // pulls events into it after every render() and the UI lambda
@@ -336,6 +348,11 @@ int main() {
 
     Clock clock;
     auto frameTp = std::chrono::steady_clock::now();
+    int selfcheckFrame = 0;
+    size_t selfcheckEvents = 0;
+    size_t selfcheckPositive = 0;
+    size_t selfcheckNegative = 0;
+    bool selfcheckOverflowed = false;
 
     canvas.animate([&] {
         const float t = clock.getElapsedTime();
@@ -380,6 +397,16 @@ int main() {
         // sake. Counts and overflow shown in the HUD.
         lastEventCount = renderer.readEventStreamInto(
                 events.data(), events.size(), &lastOverflowed);
+        size_t framePositive = 0;
+        size_t frameNegative = 0;
+        for (size_t i = 0; i < lastEventCount; ++i) {
+            if (events[i].polarity > 0) ++framePositive;
+            if (events[i].polarity < 0) ++frameNegative;
+        }
+        selfcheckEvents += lastEventCount;
+        selfcheckPositive += framePositive;
+        selfcheckNegative += frameNegative;
+        selfcheckOverflowed = selfcheckOverflowed || lastOverflowed;
 
         // Smoothed FPS for the HUD. Single-pole IIR (~1 s half-life at
         // ~60 Hz, faster at higher rates where the demo gets useful) so
@@ -395,5 +422,20 @@ int main() {
         }
 
         ui.render();
+
+        if (selfcheck && ++selfcheckFrame >= 8) {
+            const bool pass = got == dstBytes.size() &&
+                              selfcheckEvents > 0 &&
+                              selfcheckPositive > 0 &&
+                              selfcheckNegative > 0 &&
+                              !selfcheckOverflowed;
+            std::printf("[vulkan_event_camera] selfcheck frames=%d events=%zu positive=%zu negative=%zu overflow=%d vizBytes=%zu pass=%d\n",
+                        selfcheckFrame, selfcheckEvents, selfcheckPositive,
+                        selfcheckNegative, selfcheckOverflowed ? 1 : 0,
+                        got, pass ? 1 : 0);
+            exitCode = pass ? 0 : 1;
+            canvas.close();
+        }
     });
+    return exitCode;
 }

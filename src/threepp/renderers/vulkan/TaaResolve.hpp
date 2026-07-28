@@ -3,7 +3,8 @@
 // Reads the denoise output (`inputView(frame)` — denoise targets this image
 // when TAA is active), reprojects last frame's history via the raster
 // G-buffer's motion vector, blends with neighborhood-AABB clamp, writes the
-// result to the swapchain + a fresh history slot for next frame.
+// result to a fresh history slot for next frame, then uses a fullscreen
+// color-attachment pass to present it to the swapchain.
 //
 // Extracted from VulkanRenderer.cpp during the file split. Owns its
 // pipeline, descriptor set layout + pool + sets, sampler, input/history
@@ -51,16 +52,14 @@ namespace threepp::vulkan {
         void destroyImages();
 
         // Rewrite all descriptor sets. Caller supplies the external view
-        // sources from the raster G-buffer pass + the swapchain. Must be
+        // sources from the raster G-buffer pass. Must be
         // called after createImages + after the raster G-buffer has been
         // allocated (its views must be valid). Both per-frame arrays are
-        // indexed by frame-in-flight slot; swapchain views by swapchain
-        // image index.
+        // indexed by frame-in-flight slot.
         struct DescriptorWriteInputs {
             VkSampler          gbufSampler         = VK_NULL_HANDLE;
             const VkImageView* gbufMotionPerFrame  = nullptr;// [framesInFlight]
             const VkImageView* gbufIdsPerFrame     = nullptr;// [framesInFlight]
-            const VkImageView* swapchainViews      = nullptr;// [imageCount]
         };
         void rewriteDescriptors(const DescriptorWriteInputs& inputs);
 
@@ -69,23 +68,25 @@ namespace threepp::vulkan {
         // OUTPUT extent in 8×8 groups (each thread reconstructs one full-res
         // pixel; the input may be lower-res). Auto-flips history-valid to
         // true after the first dispatch.
-        // When `sharpen` is true the temporal resolve skips its swapchain
-        // write and a post-resolve RCAS pass (sharpenAmount ~0.2–0.6) reads
-        // the resolved frame back from the history slot and writes the
-        // sharpened result to the swapchain instead.
+        // When `sharpen` is true a post-resolve RCAS pass
+        // (sharpenAmount ~0.2–0.6) reads the resolved frame back from the
+        // history slot and writes the sharpened result to an internal present
+        // image. A fullscreen graphics pass then writes the linear LDR color
+        // to the swapchain color attachment, letting SRGB swapchain formats
+        // perform the final encode in fixed-function hardware.
         // `dtFrames` = this frame's duration in reference frames (dt · 90 fps,
         // clamped [1, 6] by the caller; 1 at high fps). The shader scales its
         // per-frame temporal constants (deviation-streak ramp, soft-clip rate)
         // by it so ghost decay is constant in wall-clock time, not frames.
-        // Split-screen: the pane content is rendered region-sized AT THE IMAGE
-        // ORIGIN of the (full-size) input/history textures. inWidth/inHeight and
-        // outWidth/outHeight are the PANE (region) sizes; physInW/H and
-        // physOutW/H are the full texture sizes (for UV normalisation); dstX/dstY
-        // offset the swapchain write to the pane's screen position. Defaults
-        // (phys = 0, dst = 0) reproduce the full-frame 1:1 behaviour exactly.
+        // Scissored writes: outWidth/outHeight are the dispatch/write region,
+        // dstX/dstY are the swapchain/history offset, and physIn/physOut are
+        // the full texture sizes used for full-frame UV normalisation.
         void recordResolve(VkCommandBuffer cb,
                            uint32_t frame,
                            uint32_t imageIndex,
+                           VkImage outputImage,
+                           VkImageView outputView,
+                           VkExtent2D outputExtent,
                            uint32_t inWidth,
                            uint32_t inHeight,
                            uint32_t outWidth,
@@ -101,6 +102,9 @@ namespace threepp::vulkan {
                            uint32_t physInH = 0,
                            uint32_t physOutW = 0,
                            uint32_t physOutH = 0);
+        void recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
+                                VkImage outputImage, VkImageView outputView,
+                                VkExtent2D outputExtent);
 
         // Denoise writes its output here when TAA is active (replaces the
         // direct-to-swapchain write of non-TAA mode).
@@ -129,9 +133,8 @@ namespace threepp::vulkan {
         uint32_t       imageCount_;
         uint32_t       framesInFlight_;
 
-        // Input image per frame-in-flight (denoise's target) — sized to the
-        // path-trace RENDER extent. BGRA8_UNORM to match denoise.comp's
-        // rgba8 output and the swapchain channel order.
+        // Linear LDR input per frame-in-flight at the path-trace render extent.
+        // RGBA16F avoids quantization before the final sRGB presentation pass.
         std::vector<Image2D> inputImagesPP_;
         // History ping-pong — sized to the OUTPUT (swapchain) extent, so it
         // accumulates the temporal upsampler's reconstructed full-res image.
@@ -139,6 +142,9 @@ namespace threepp::vulkan {
         // mix() doesn't re-quantize to uint8 each frame, which produced
         // visible iso-luminance "lines" on smooth specular surfaces.
         std::array<Image2D, 2> historyImagesPP_{};
+        // RCAS 开启时的内部输出。保持 UNORM/storage-capable，避免 compute
+        // 直接写 SRGB swapchain。
+        std::array<Image2D, 2> presentImagesPP_{};
         VkSampler sampler_ = VK_NULL_HANDLE;
 
         VkDescriptorSetLayout dsLayout_       = VK_NULL_HANDLE;
@@ -147,12 +153,21 @@ namespace threepp::vulkan {
         VkDescriptorPool      descPool_       = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> descSets_;
 
-        // Post-resolve RCAS sharpen (folded into this pass). Reads the just-
-        // written history slot (the resolved frame) and writes the swapchain.
+        // resolve 后的 RCAS 锐化。读取刚写入的 history slot，并写入
+        // presentImagesPP_。
         VkDescriptorSetLayout rcasDsLayout_   = VK_NULL_HANDLE;
         VkPipelineLayout      rcasPipeLayout_ = VK_NULL_HANDLE;
         VkPipeline            rcasPipe_       = VK_NULL_HANDLE;
         std::vector<VkDescriptorSet> rcasSets_;
+
+        // 最终 fullscreen present pass：采样 historyImagesPP_ 或
+        // presentImagesPP_，以 color attachment 写入 swapchain。
+        VkDescriptorSetLayout presentDsLayout_   = VK_NULL_HANDLE;
+        VkPipelineLayout      presentPipeLayout_ = VK_NULL_HANDLE;
+        VkPipeline            presentPipe_       = VK_NULL_HANDLE;
+        std::vector<VkDescriptorSet> presentSets_;
+        std::vector<VkDescriptorSet> presentSharpenSets_;
+        std::vector<VkDescriptorSet> presentInputSets_;
 
         bool historyValid_ = false;
 

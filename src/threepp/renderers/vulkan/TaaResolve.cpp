@@ -2,6 +2,8 @@
 
 #include "threepp/renderers/vulkan/VulkanContext.hpp"
 
+#include "threepp/renderers/vulkan/shaders/overlay_composite.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/present.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/taa_resolve.comp.spv.h"
 #include "threepp/renderers/vulkan/shaders/rcas.comp.spv.h"
 
@@ -29,6 +31,9 @@ namespace threepp::vulkan {
         if (rcasPipe_)       vkDestroyPipeline(d, rcasPipe_, nullptr);
         if (rcasPipeLayout_) vkDestroyPipelineLayout(d, rcasPipeLayout_, nullptr);
         if (rcasDsLayout_)   vkDestroyDescriptorSetLayout(d, rcasDsLayout_, nullptr);
+        if (presentPipe_)       vkDestroyPipeline(d, presentPipe_, nullptr);
+        if (presentPipeLayout_) vkDestroyPipelineLayout(d, presentPipeLayout_, nullptr);
+        if (presentDsLayout_)   vkDestroyDescriptorSetLayout(d, presentDsLayout_, nullptr);
         if (descPool_)       vkDestroyDescriptorPool(d, descPool_, nullptr);
         if (sampler_)        vkDestroySampler(d, sampler_, nullptr);
         destroyImages();
@@ -38,6 +43,7 @@ namespace threepp::vulkan {
         VkDevice d = ctx_.device();
         for (auto& img : inputImagesPP_)   destroyImage2D(ctx_.allocator(), d, img);
         for (auto& img : historyImagesPP_) destroyImage2D(ctx_.allocator(), d, img);
+        for (auto& img : presentImagesPP_) destroyImage2D(ctx_.allocator(), d, img);
         historyValid_ = false;
     }
 
@@ -132,11 +138,11 @@ namespace threepp::vulkan {
     void TaaResolve::createImages(uint32_t inWidth, uint32_t inHeight,
                                   uint32_t outWidth, uint32_t outHeight) {
         destroyImages();
-        // Input: BGRA8_UNORM at the render extent — matches denoise.comp's
-        // rgba8 output and the swapchain channel order.
+        // Input stays floating-point until the final sRGB presentation pass;
+        // quantizing linear LDR here produces visible bands in dark gradients.
         for (auto& img : inputImagesPP_)
             img = createStorageSampledImage(inWidth, inHeight,
-                                            VK_FORMAT_B8G8R8A8_UNORM,
+                                            VK_FORMAT_R16G16B16A16_SFLOAT,
                                             "vmaCreateImage(taa.input)");
         // History: RGBA16F at the output extent — the running mix() stays
         // sub-quantum precise and the reconstructed full-res image
@@ -145,6 +151,10 @@ namespace threepp::vulkan {
             img = createStorageSampledImage(outWidth, outHeight,
                                             VK_FORMAT_R16G16B16A16_SFLOAT,
                                             "vmaCreateImage(taa.history)");
+        for (auto& img : presentImagesPP_)
+            img = createStorageSampledImage(outWidth, outHeight,
+                                            VK_FORMAT_B8G8R8A8_UNORM,
+                                            "vmaCreateImage(taa.present)");
     }
 
     void TaaResolve::createPipeline() {
@@ -168,7 +178,7 @@ namespace threepp::vulkan {
         }
         // Descriptor set layout — 7 bindings:
         //   0..2: combined image samplers — taaInput, historyRead, gbufMotion
-        //   3..4: storage images          — swapOut, historyWrite
+        //   3..4: storage images          — presentOut, historyWrite
         //   5..6: combined image samplers — gbufIds (curr + prev)
         VkDescriptorSetLayoutBinding bindings[7]{};
         for (int i = 0; i < 3; ++i) {
@@ -233,8 +243,7 @@ namespace threepp::vulkan {
         cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpci.stage  = stage;
         cpci.layout = pipelineLayout_;
-        check(vkCreateComputePipelines(ctx_.device(), ctx_.pipelineCache(),
-                                       1, &cpci, nullptr, &pipeline_),
+        check(ctx_.createComputePipeline(cpci, &pipeline_),
               "vkCreateComputePipelines(taa)");
         vkDestroyShaderModule(ctx_.device(), mod, nullptr);
 
@@ -286,26 +295,131 @@ namespace threepp::vulkan {
             rcpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
             rcpci.stage  = rstage;
             rcpci.layout = rcasPipeLayout_;
-            check(vkCreateComputePipelines(ctx_.device(), ctx_.pipelineCache(), 1, &rcpci,
-                                           nullptr, &rcasPipe_),
+            check(ctx_.createComputePipeline(rcpci, &rcasPipe_),
                   "vkCreateComputePipelines(rcas)");
             vkDestroyShaderModule(ctx_.device(), rmod, nullptr);
+        }
+
+        // 最终 present pass：线性 LDR 纹理 -> swapchain color attachment。
+        {
+            VkDescriptorSetLayoutBinding pb{};
+            pb.binding         = 0;
+            pb.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            pb.descriptorCount = 1;
+            pb.stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+            VkDescriptorSetLayoutCreateInfo pdlci{};
+            pdlci.sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+            pdlci.bindingCount = 1;
+            pdlci.pBindings    = &pb;
+            check(vkCreateDescriptorSetLayout(ctx_.device(), &pdlci, nullptr,
+                                              &presentDsLayout_),
+                  "vkCreateDescriptorSetLayout(taa.present)");
+
+            VkPipelineLayoutCreateInfo pplci{};
+            pplci.sType          = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+            pplci.setLayoutCount = 1;
+            pplci.pSetLayouts    = &presentDsLayout_;
+            check(vkCreatePipelineLayout(ctx_.device(), &pplci, nullptr,
+                                         &presentPipeLayout_),
+                  "vkCreatePipelineLayout(taa.present)");
+
+            VkShaderModuleCreateInfo vsmci{};
+            vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            vsmci.codeSize = sizeof(kOverlayCompositeVertSpv);
+            vsmci.pCode    = kOverlayCompositeVertSpv;
+            VkShaderModule vert = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx_.device(), &vsmci, nullptr, &vert),
+                  "vkCreateShaderModule(taa.present.vert)");
+
+            VkShaderModuleCreateInfo fsmci{};
+            fsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+            fsmci.codeSize = sizeof(kPresentFragSpv);
+            fsmci.pCode    = kPresentFragSpv;
+            VkShaderModule frag = VK_NULL_HANDLE;
+            check(vkCreateShaderModule(ctx_.device(), &fsmci, nullptr, &frag),
+                  "vkCreateShaderModule(taa.present.frag)");
+
+            VkPipelineShaderStageCreateInfo stages[2]{};
+            stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+            stages[0].module = vert;
+            stages[0].pName  = "main";
+            stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+            stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+            stages[1].module = frag;
+            stages[1].pName  = "main";
+
+            VkPipelineVertexInputStateCreateInfo vi{};
+            vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+            VkPipelineInputAssemblyStateCreateInfo ia{};
+            ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+            ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+            VkPipelineViewportStateCreateInfo vp{};
+            vp.sType         = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+            vp.viewportCount = 1;
+            vp.scissorCount  = 1;
+            VkPipelineRasterizationStateCreateInfo rs{};
+            rs.sType       = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+            rs.polygonMode = VK_POLYGON_MODE_FILL;
+            rs.cullMode    = VK_CULL_MODE_NONE;
+            rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+            rs.lineWidth   = 1.0f;
+            VkPipelineMultisampleStateCreateInfo ms{};
+            ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+            ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+            VkPipelineColorBlendAttachmentState cbas{};
+            cbas.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                  VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+            VkPipelineColorBlendStateCreateInfo cb{};
+            cb.sType           = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+            cb.attachmentCount = 1;
+            cb.pAttachments    = &cbas;
+            VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+            VkPipelineDynamicStateCreateInfo dyn{};
+            dyn.sType             = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+            dyn.dynamicStateCount = 2;
+            dyn.pDynamicStates    = dynStates;
+
+            const VkFormat colorFmt = ctx_.swapchainFormat();
+            VkPipelineRenderingCreateInfo prci{};
+            prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+            prci.colorAttachmentCount    = 1;
+            prci.pColorAttachmentFormats = &colorFmt;
+
+            VkGraphicsPipelineCreateInfo gpci{};
+            gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+            gpci.pNext               = &prci;
+            gpci.stageCount          = 2;
+            gpci.pStages             = stages;
+            gpci.pVertexInputState   = &vi;
+            gpci.pInputAssemblyState = &ia;
+            gpci.pViewportState      = &vp;
+            gpci.pRasterizationState = &rs;
+            gpci.pMultisampleState   = &ms;
+            gpci.pColorBlendState    = &cb;
+            gpci.pDynamicState       = &dyn;
+            gpci.layout              = presentPipeLayout_;
+            check(ctx_.createGraphicsPipeline(gpci, &presentPipe_),
+                  "vkCreateGraphicsPipelines(taa.present)");
+
+            vkDestroyShaderModule(ctx_.device(), vert, nullptr);
+            vkDestroyShaderModule(ctx_.device(), frag, nullptr);
         }
     }
 
     void TaaResolve::createDescriptorPool() {
         const uint32_t totalSets = imageCount_ * framesInFlight_;
         VkDescriptorPoolSize sizes[2]{};
-        // Main resolve set: 5 sampled + 2 storage. RCAS set: 1 sampled + 1
-        // storage. Both families × totalSets, sharing this pool.
+        // Main resolve set: 5 sampled + 2 storage。RCAS set: 1 sampled + 1
+        // storage。Present sets: 3 sampled。所有 set family 都乘 totalSets。
         sizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        sizes[0].descriptorCount = totalSets * (5 + 1);
+        sizes[0].descriptorCount = totalSets * (5 + 1 + 3);
         sizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
         sizes[1].descriptorCount = totalSets * (2 + 1);
 
         VkDescriptorPoolCreateInfo dpci{};
         dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets       = totalSets * 2;// main + rcas
+        dpci.maxSets       = totalSets * 5;// main + rcas + present + presentSharpen + presentInput
         dpci.poolSizeCount = 2;
         dpci.pPoolSizes    = sizes;
         check(vkCreateDescriptorPool(ctx_.device(), &dpci, nullptr, &descPool_),
@@ -330,6 +444,24 @@ namespace threepp::vulkan {
         rcasSets_.resize(totalSets);
         check(vkAllocateDescriptorSets(ctx_.device(), &rai, rcasSets_.data()),
               "vkAllocateDescriptorSets(rcas)");
+
+        std::vector<VkDescriptorSetLayout> playouts(totalSets, presentDsLayout_);
+        VkDescriptorSetAllocateInfo pai{};
+        pai.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+        pai.descriptorPool     = descPool_;
+        pai.descriptorSetCount = totalSets;
+        pai.pSetLayouts        = playouts.data();
+        presentSets_.resize(totalSets);
+        check(vkAllocateDescriptorSets(ctx_.device(), &pai, presentSets_.data()),
+              "vkAllocateDescriptorSets(taa.present)");
+
+        presentSharpenSets_.resize(totalSets);
+        check(vkAllocateDescriptorSets(ctx_.device(), &pai, presentSharpenSets_.data()),
+              "vkAllocateDescriptorSets(taa.presentSharpen)");
+
+        presentInputSets_.resize(totalSets);
+        check(vkAllocateDescriptorSets(ctx_.device(), &pai, presentInputSets_.data()),
+              "vkAllocateDescriptorSets(taa.presentInput)");
     }
 
     void TaaResolve::rewriteDescriptors(const DescriptorWriteInputs& inputs) {
@@ -354,9 +486,9 @@ namespace threepp::vulkan {
                 motionI.imageView   = inputs.gbufMotionPerFrame[f];
                 motionI.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-                VkDescriptorImageInfo swapI{};
-                swapI.imageView   = inputs.swapchainViews[i];
-                swapI.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                VkDescriptorImageInfo presentWriteI{};
+                presentWriteI.imageView   = presentImagesPP_[writeSlot].view;
+                presentWriteI.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
 
                 VkDescriptorImageInfo histWriteI{};
                 histWriteI.imageView   = historyImagesPP_[writeSlot].view;
@@ -388,7 +520,7 @@ namespace threepp::vulkan {
                 w[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
                 w[2].pImageInfo = &motionI;
                 w[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-                w[3].pImageInfo = &swapI;
+                w[3].pImageInfo = &presentWriteI;
                 w[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 w[4].pImageInfo = &histWriteI;
                 w[5].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -397,14 +529,14 @@ namespace threepp::vulkan {
                 w[6].pImageInfo = &idsPrevI;
                 vkUpdateDescriptorSets(ctx_.device(), 7, w, 0, nullptr);
 
-                // RCAS set: this frame's resolved output lives in the history
-                // WRITE slot (writeSlot) → sample it, sharpen, write swapchain.
+                // RCAS set：本帧 resolve 结果在 history WRITE slot
+                // (writeSlot)，采样后锐化，再写内部 present image。
                 VkDescriptorImageInfo rcasIn{};
                 rcasIn.sampler     = sampler_;
                 rcasIn.imageView   = historyImagesPP_[writeSlot].view;
                 rcasIn.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 VkDescriptorImageInfo rcasOut{};
-                rcasOut.imageView   = inputs.swapchainViews[i];
+                rcasOut.imageView   = presentImagesPP_[writeSlot].view;
                 rcasOut.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
                 VkWriteDescriptorSet rw[2]{};
                 rw[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -420,6 +552,33 @@ namespace threepp::vulkan {
                 rw[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
                 rw[1].pImageInfo      = &rcasOut;
                 vkUpdateDescriptorSets(ctx_.device(), 2, rw, 0, nullptr);
+
+                VkDescriptorImageInfo presentIn{};
+                presentIn.sampler     = sampler_;
+                presentIn.imageView   = historyImagesPP_[writeSlot].view;
+                presentIn.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                VkWriteDescriptorSet pw{};
+                pw.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                pw.dstSet          = presentSets_[idx];
+                pw.dstBinding      = 0;
+                pw.descriptorCount = 1;
+                pw.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+                pw.pImageInfo      = &presentIn;
+                vkUpdateDescriptorSets(ctx_.device(), 1, &pw, 0, nullptr);
+
+                VkDescriptorImageInfo presentSharpenIn{};
+                presentSharpenIn.sampler     = sampler_;
+                presentSharpenIn.imageView   = presentImagesPP_[writeSlot].view;
+                presentSharpenIn.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                VkWriteDescriptorSet psw = pw;
+                psw.dstSet     = presentSharpenSets_[idx];
+                psw.pImageInfo = &presentSharpenIn;
+                vkUpdateDescriptorSets(ctx_.device(), 1, &psw, 0, nullptr);
+
+                VkWriteDescriptorSet piw = pw;
+                piw.dstSet     = presentInputSets_[idx];
+                piw.pImageInfo = &inputI;
+                vkUpdateDescriptorSets(ctx_.device(), 1, &piw, 0, nullptr);
             }
         }
     }
@@ -427,6 +586,9 @@ namespace threepp::vulkan {
     void TaaResolve::recordResolve(VkCommandBuffer cb,
                                    uint32_t frame,
                                    uint32_t imageIndex,
+                                   VkImage outputImage,
+                                   VkImageView outputView,
+                                   VkExtent2D outputExtent,
                                    uint32_t inWidth,
                                    uint32_t inHeight,
                                    uint32_t outWidth,
@@ -442,7 +604,7 @@ namespace threepp::vulkan {
                                    uint32_t physInH,
                                    uint32_t physOutW,
                                    uint32_t physOutH) {
-        // Physical (full texture) sizes default to the region sizes → scale 1.
+        // Physical (full texture) sizes default to the dispatch sizes.
         if (physInW == 0)  physInW  = inWidth;
         if (physInH == 0)  physInH  = inHeight;
         if (physOutW == 0) physOutW = outWidth;
@@ -488,7 +650,7 @@ namespace threepp::vulkan {
         const float alpha = historyValid_ ? blendAlpha : 1.0f;
         uint32_t alphaBits;
         std::memcpy(&alphaBits, &alpha, sizeof(alphaBits));
-        // Layout: blendAlpha, output w/h (history + dispatch + writes),
+        // Layout: blendAlpha, output w/h (dispatch + writes),
         // input w/h (the render extent the samples were traced at).
         // Layout mirrors the shader's std430 push block: 7 scalars, 4 bytes
         // of pad, then the column-major mat4 at offset 32.
@@ -496,7 +658,7 @@ namespace threepp::vulkan {
         std::memcpy(&pc[0], &alphaBits, 4);
         const uint32_t dims[4] = {outWidth, outHeight, inWidth, inHeight};
         std::memcpy(&pc[1], dims, 16);
-        const uint32_t ws = sharpen ? 0u : 1u;
+        const uint32_t ws = 0u;
         std::memcpy(&pc[5], &ws, 4);
         pc[6] = dtFrames;
         const uint32_t packedDst = (dstX & 0xFFFFu) | (dstY << 16);
@@ -540,7 +702,149 @@ namespace threepp::vulkan {
             vkCmdDispatch(cb, gx, gy, 1);
         }
 
+        VkMemoryBarrier2 presentReadBar{};
+        presentReadBar.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        presentReadBar.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        presentReadBar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        presentReadBar.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        presentReadBar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+        VkImageMemoryBarrier2 swapToColor{};
+        swapToColor.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        swapToColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        swapToColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        swapToColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        swapToColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        swapToColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapToColor.image = outputImage;
+        swapToColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        swapToColor.subresourceRange.levelCount = 1;
+        swapToColor.subresourceRange.layerCount = 1;
+
+        VkDependencyInfo presentDep{};
+        presentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        presentDep.memoryBarrierCount = 1;
+        presentDep.pMemoryBarriers = &presentReadBar;
+        presentDep.imageMemoryBarrierCount = 1;
+        presentDep.pImageMemoryBarriers = &swapToColor;
+        vkCmdPipelineBarrier2(cb, &presentDep);
+
+        const VkExtent2D presentExtent = outputExtent;
+        const bool fullPresent = dstX == 0 && dstY == 0 &&
+                                 outWidth >= presentExtent.width &&
+                                 outHeight >= presentExtent.height;
+        VkRenderingAttachmentInfo colorAtt{};
+        colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAtt.imageView   = outputView;
+        colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAtt.loadOp      = fullPresent ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                                           : VK_ATTACHMENT_LOAD_OP_LOAD;
+        colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+        VkRenderingInfo ri{};
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.offset = {0, 0};
+        ri.renderArea.extent = presentExtent;
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &colorAtt;
+        vkCmdBeginRendering(cb, &ri);
+
+        VkViewport vp{0.f, 0.f,
+                      static_cast<float>(presentExtent.width),
+                      static_cast<float>(presentExtent.height),
+                      0.f, 1.f};
+        const uint32_t presentWidth = dstX < presentExtent.width
+                                              ? std::min(outWidth, presentExtent.width - dstX)
+                                              : 0u;
+        const uint32_t presentHeight = dstY < presentExtent.height
+                                               ? std::min(outHeight, presentExtent.height - dstY)
+                                               : 0u;
+        VkRect2D sc{{static_cast<int32_t>(dstX), static_cast<int32_t>(dstY)},
+                    {presentWidth, presentHeight}};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipe_);
+        const VkDescriptorSet presentSet = sharpen ? presentSharpenSets_[descIdx]
+                                                   : presentSets_[descIdx];
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                presentPipeLayout_, 0, 1, &presentSet, 0, nullptr);
+        vkCmdSetViewport(cb, 0, 1, &vp);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRendering(cb);
+
         historyValid_ = true;
+    }
+
+    void TaaResolve::recordPresentInput(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
+                                        VkImage outputImage, VkImageView outputView,
+                                        VkExtent2D outputExtent) {
+        const uint32_t descIdx = frame * imageCount_ + imageIndex;
+
+        VkMemoryBarrier2 presentReadBar{};
+        presentReadBar.sType         = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+        presentReadBar.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        presentReadBar.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        presentReadBar.dstStageMask  = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        presentReadBar.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
+
+        VkImageMemoryBarrier2 swapToColor{};
+        swapToColor.sType         = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        swapToColor.srcStageMask  = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        swapToColor.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+        swapToColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+        swapToColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+        swapToColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        swapToColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        swapToColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapToColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        swapToColor.image = outputImage;
+        swapToColor.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        swapToColor.subresourceRange.levelCount = 1;
+        swapToColor.subresourceRange.layerCount = 1;
+
+        VkDependencyInfo presentDep{};
+        presentDep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        presentDep.memoryBarrierCount = 1;
+        presentDep.pMemoryBarriers = &presentReadBar;
+        presentDep.imageMemoryBarrierCount = 1;
+        presentDep.pImageMemoryBarriers = &swapToColor;
+        vkCmdPipelineBarrier2(cb, &presentDep);
+
+        VkRenderingAttachmentInfo colorAtt{};
+        colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+        colorAtt.imageView   = outputView;
+        colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+        colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+
+        const VkExtent2D presentExtent = outputExtent;
+        VkRenderingInfo ri{};
+        ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+        ri.renderArea.offset = {0, 0};
+        ri.renderArea.extent = presentExtent;
+        ri.layerCount = 1;
+        ri.colorAttachmentCount = 1;
+        ri.pColorAttachments = &colorAtt;
+        vkCmdBeginRendering(cb, &ri);
+
+        VkViewport vp{0.f, 0.f,
+                      static_cast<float>(presentExtent.width),
+                      static_cast<float>(presentExtent.height),
+                      0.f, 1.f};
+        VkRect2D sc{{0, 0}, presentExtent};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, presentPipe_);
+        VkDescriptorSet presentSet = presentInputSets_[descIdx];
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                presentPipeLayout_, 0, 1, &presentSet, 0, nullptr);
+        vkCmdSetViewport(cb, 0, 1, &vp);
+        vkCmdSetScissor(cb, 0, 1, &sc);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRendering(cb);
+
+        historyValid_ = false;
     }
 
 }// namespace threepp::vulkan

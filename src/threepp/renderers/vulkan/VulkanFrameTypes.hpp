@@ -9,6 +9,7 @@
 #include "threepp/renderers/vulkan/VulkanResources.hpp"
 
 #include <cstdint>
+#include <vector>
 
 namespace threepp::vulkan {
 
@@ -17,20 +18,42 @@ namespace threepp::vulkan {
     // (recordCommandBuffer's line-draw section). Keyed on raw
     // BufferGeometry*; geomId guards against recycled-pointer aliasing.
     struct LineRec {
+        struct LoopRange {
+            Buffer   index;
+            uint32_t start = 0;
+            uint32_t count = 0;
+            uint32_t indexCount = 0;
+            uint64_t lastTouch = 0;
+        };
+
         Buffer   vertex;
         Buffer   index;// VK_NULL_HANDLE if non-indexed
-        Buffer   color;// VK_NULL_HANDLE if no "color" attribute
+        Buffer   color;// per-vertex color, or white fallback when no "color" attribute
+        Buffer   lineDistance;// VK_NULL_HANDLE if no "lineDistance" attribute
         uint32_t vertexCount     = 0;
         uint32_t indexCount      = 0;
         uint32_t positionVersion = 0;
         uint32_t indexVersion    = 0;
         uint32_t colorVersion    = 0;
+        uint32_t lineDistanceVersion = 0;
+        bool colorIsFallback = false;
         // BufferGeometry::id (monotonic per construction). Detects pointer
         // recycle — a freed geometry's address reused for a new geometry
         // would have fresh version=0 fields that match the stale record,
         // but the id differs.
         unsigned int geomId    = 0;
         uint64_t     lastTouch = 0;// overlay-frame counter; for stale eviction
+        std::vector<LoopRange> loopRanges;
+    };
+
+    struct WireframeRec {
+        Buffer   index;
+        uint32_t indexCount = 0;
+        uint32_t indexVersion = ~0u;
+        uint32_t positionVersion = ~0u;
+        uint32_t attributesVersion = ~0u;
+        unsigned int geomId = 0;
+        uint64_t lastTouch = 0;
     };
 
 }// namespace threepp::vulkan

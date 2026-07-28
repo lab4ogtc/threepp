@@ -34,12 +34,12 @@ namespace threepp::vulkan {
         sci.sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
         sci.magFilter    = VK_FILTER_LINEAR;
         sci.minFilter    = VK_FILTER_LINEAR;
-        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR;
         sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
         sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sci.minLod       = 0.0f;
-        sci.maxLod       = 0.0f;// only mip 0 read during prefilter
+        sci.maxLod       = 32.0f;
         check(vkCreateSampler(ctx_.device(), &sci, nullptr, &srcSampler_),
               "vkCreateSampler(prefilter)");
 
@@ -94,8 +94,7 @@ namespace threepp::vulkan {
         cpci.sType  = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
         cpci.stage  = stage;
         cpci.layout = pipelineLayout_;
-        check(vkCreateComputePipelines(ctx_.device(), ctx_.pipelineCache(),
-                                       1, &cpci, nullptr, &pipeline_),
+        check(ctx_.createComputePipeline(cpci, &pipeline_),
               "vkCreateComputePipelines(prefilter)");
         vkDestroyShaderModule(ctx_.device(), mod, nullptr);
 
@@ -150,6 +149,21 @@ namespace threepp::vulkan {
               "vmaCreateImage(envPmrem)");
         ctx_.setObjectName(out.image, "envPmrem (HDR env prefilter)");
 
+        Image2D source{};
+        source.width     = w;
+        source.height    = h;
+        source.format    = out.format;
+        source.mipLevels = fullMips;
+        VkImageCreateInfo srcIci = ici;
+        srcIci.mipLevels = source.mipLevels;
+        srcIci.usage     = VK_IMAGE_USAGE_SAMPLED_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        check(vmaCreateImage(ctx_.allocator(), &srcIci, &aci,
+                             &source.image, &source.alloc, nullptr),
+              "vmaCreateImage(envPmremSource)");
+        ctx_.setObjectName(source.image, "envPmrem source mip pyramid");
+
         // Staging buffer for mip 0.
         Buffer staging = createBuffer(
                 ctx_.allocator(), ctx_.device(), byteSize,
@@ -178,7 +192,9 @@ namespace threepp::vulkan {
         cbi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         check(vkBeginCommandBuffer(cb, &cbi), "begin one-shot cb(prefilter)");
 
-        // Mip 0: UNDEFINED → TRANSFER_DST for upload.
+        // Upload into a separate source image, then build its box-filtered mip
+        // pyramid. PMREM dispatches sample this immutable chain while writing
+        // the output mips, avoiding read/write feedback.
         {
             VkImageMemoryBarrier br{};
             br.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -186,7 +202,7 @@ namespace threepp::vulkan {
             br.newLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
             br.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             br.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            br.image               = out.image;
+            br.image               = source.image;
             br.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
             br.subresourceRange.baseMipLevel = 0;
             br.subresourceRange.levelCount = 1;
@@ -204,39 +220,141 @@ namespace threepp::vulkan {
         region.imageSubresource.mipLevel = 0;
         region.imageSubresource.layerCount = 1;
         region.imageExtent = {w, h, 1};
-        vkCmdCopyBufferToImage(cb, staging.handle, out.image,
+        vkCmdCopyBufferToImage(cb, staging.handle, source.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-        // Transition: mip 0 (TRANSFER_DST → GENERAL for compute read), mips 1..N-1
-        // (UNDEFINED → GENERAL for compute write). GENERAL is universal so reads
-        // and writes coexist in the same dispatch.
+        int32_t srcMipW = static_cast<int32_t>(w);
+        int32_t srcMipH = static_cast<int32_t>(h);
+        for (uint32_t mip = 1; mip < source.mipLevels; ++mip) {
+            VkImageMemoryBarrier toSrc{};
+            toSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            toSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            toSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSrc.image = source.image;
+            toSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toSrc.subresourceRange.baseMipLevel = mip - 1;
+            toSrc.subresourceRange.levelCount = 1;
+            toSrc.subresourceRange.layerCount = 1;
+            toSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+
+            VkImageMemoryBarrier toDst = toSrc;
+            toDst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            toDst.subresourceRange.baseMipLevel = mip;
+            toDst.srcAccessMask = 0;
+            toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+
+            const VkImageMemoryBarrier barriers[] = {toSrc, toDst};
+            vkCmdPipelineBarrier(cb,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 2, barriers);
+
+            const int32_t dstW = std::max(srcMipW >> 1, 1);
+            const int32_t dstH = std::max(srcMipH >> 1, 1);
+            VkImageBlit blit{};
+            blit.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.srcSubresource.mipLevel = mip - 1;
+            blit.srcSubresource.layerCount = 1;
+            blit.srcOffsets[1] = {srcMipW, srcMipH, 1};
+            blit.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            blit.dstSubresource.mipLevel = mip;
+            blit.dstSubresource.layerCount = 1;
+            blit.dstOffsets[1] = {dstW, dstH, 1};
+            vkCmdBlitImage(cb,
+                           source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                           source.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1, &blit, VK_FILTER_LINEAR);
+            srcMipW = dstW;
+            srcMipH = dstH;
+        }
+
+        // Put the final source mip into the same TRANSFER_SRC layout as the
+        // preceding levels, then copy source mip 0 into the PMREM mirror mip.
         {
-            std::array<VkImageMemoryBarrier, 2> brs{};
-            brs[0].sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            brs[0].oldLayout           = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-            brs[0].newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+            VkImageMemoryBarrier lastToSrc{};
+            lastToSrc.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            lastToSrc.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            lastToSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            lastToSrc.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            lastToSrc.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            lastToSrc.image = source.image;
+            lastToSrc.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            lastToSrc.subresourceRange.baseMipLevel = source.mipLevels - 1;
+            lastToSrc.subresourceRange.levelCount = 1;
+            lastToSrc.subresourceRange.layerCount = 1;
+            lastToSrc.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            lastToSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cb,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 0, 0, nullptr, 0, nullptr, 1, &lastToSrc);
+        }
+        VkImageMemoryBarrier outMip0{};
+        outMip0.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        outMip0.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        outMip0.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        outMip0.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outMip0.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        outMip0.image = out.image;
+        outMip0.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        outMip0.subresourceRange.levelCount = 1;
+        outMip0.subresourceRange.layerCount = 1;
+        outMip0.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        vkCmdPipelineBarrier(cb,
+                             VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             0, 0, nullptr, 0, nullptr, 1, &outMip0);
+
+        VkImageCopy mirrorCopy{};
+        mirrorCopy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        mirrorCopy.srcSubresource.layerCount = 1;
+        mirrorCopy.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        mirrorCopy.dstSubresource.layerCount = 1;
+        mirrorCopy.extent = {w, h, 1};
+        vkCmdCopyImage(cb,
+                       source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                       out.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                       1, &mirrorCopy);
+
+        // Source chain becomes sampled; output mip 0 becomes readable and the
+        // remaining output mips become writable storage images.
+        {
+            std::array<VkImageMemoryBarrier, 3> brs{};
+            brs[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            brs[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            brs[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
             brs[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
             brs[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            brs[0].image               = out.image;
+            brs[0].image = source.image;
             brs[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            brs[0].subresourceRange.baseMipLevel = 0;
-            brs[0].subresourceRange.levelCount = 1;
+            brs[0].subresourceRange.levelCount = source.mipLevels;
             brs[0].subresourceRange.layerCount = 1;
-            brs[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            brs[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
             brs[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
             brs[1] = brs[0];
-            brs[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            brs[1].subresourceRange.baseMipLevel = 1;
-            brs[1].subresourceRange.levelCount = out.mipLevels - 1;
-            brs[1].srcAccessMask = 0;
-            brs[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            brs[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            brs[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            brs[1].image = out.image;
+            brs[1].subresourceRange.levelCount = 1;
+            brs[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 
-            const uint32_t brCount = (out.mipLevels > 1) ? 2u : 1u;
+            brs[2] = brs[1];
+            brs[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            brs[2].subresourceRange.baseMipLevel = 1;
+            brs[2].subresourceRange.levelCount = out.mipLevels - 1;
+            brs[2].srcAccessMask = 0;
+            brs[2].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+
+            const uint32_t count = out.mipLevels > 1 ? 3u : 2u;
             vkCmdPipelineBarrier(cb,
                                  VK_PIPELINE_STAGE_TRANSFER_BIT,
                                  VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                                 0, 0, nullptr, 0, nullptr, brCount, brs.data());
+                                 0, 0, nullptr, 0, nullptr, count, brs.data());
         }
 
         // Full-chain sampling view (used by closest_hit at sample time).
@@ -253,6 +371,12 @@ namespace threepp::vulkan {
             check(vkCreateImageView(ctx_.device(), &vci, nullptr, &out.view),
                   "vkCreateImageView(envPmrem)");
             ctx_.setObjectName(out.view, "envPmrem (HDR env prefilter)");
+
+            vci.image = source.image;
+            vci.subresourceRange.levelCount = source.mipLevels;
+            check(vkCreateImageView(ctx_.device(), &vci, nullptr, &source.view),
+                  "vkCreateImageView(envPmremSource)");
+            ctx_.setObjectName(source.view, "envPmrem source mip pyramid");
         }
 
         // Sampler with LINEAR mip filtering so trilinear blends across mips.
@@ -305,8 +429,8 @@ namespace threepp::vulkan {
 
                 VkDescriptorImageInfo srcInfo{};
                 srcInfo.sampler     = srcSampler_;
-                srcInfo.imageView   = out.view;// full-chain view; sampler reads mip 0
-                srcInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+                srcInfo.imageView   = source.view;
+                srcInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
                 VkDescriptorImageInfo dstInfo{};
                 dstInfo.sampler     = VK_NULL_HANDLE;
@@ -337,7 +461,8 @@ namespace threepp::vulkan {
                 const float r = static_cast<float>(mip) /
                                 static_cast<float>(out.mipLevels - 1);
                 pc.alpha      = r * r;// GGX α = roughness²
-                pc.numSamples = 64u;
+                // Match the GL/WGPU PMREM budget: sharp HDR lobes need more samples.
+                pc.numSamples = r < 0.3f ? 256u : 128u;
                 vkCmdPushConstants(cb, pipelineLayout_,
                                    VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
                 vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -387,6 +512,7 @@ namespace threepp::vulkan {
         vkFreeCommandBuffers(ctx_.device(), cmdPool_, 1, &cb);
 
         destroyBuffer(ctx_.allocator(), staging);
+        destroyImage2D(ctx_.allocator(), ctx_.device(), source);
         for (auto v : mipStorageViews) {
             vkDestroyImageView(ctx_.device(), v, nullptr);
         }

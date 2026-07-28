@@ -2739,7 +2739,7 @@ int main(int argc, char** argv) {
             const auto path = fs::path(PROJECT_FOLDER) / "aaa_caps" / shotPath;
             if (auto* vk = dynamic_cast<VulkanRenderer*>(renderer.get())) vk->writeFramebuffer(path);
             std::cout << "wrote " << path.string() << std::endl;
-            std::exit(0);
+            canvas.close();
         }
     });
 }

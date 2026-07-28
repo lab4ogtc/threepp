@@ -27,7 +27,8 @@ namespace threepp::vulkan {
     Buffer createBuffer(VmaAllocator alloc, VkDevice device,
                         VkDeviceSize size, VkBufferUsageFlags usage,
                         VmaMemoryUsage memoryUsage,
-                        VmaAllocationCreateFlags flags) {
+                        VmaAllocationCreateFlags flags,
+                        VkMemoryPropertyFlags requiredFlags) {
         Buffer b{};
         b.size = size;
 
@@ -40,6 +41,7 @@ namespace threepp::vulkan {
         VmaAllocationCreateInfo aci{};
         aci.usage = memoryUsage;
         aci.flags = flags;
+        aci.requiredFlags = requiredFlags;
 
         check(vmaCreateBuffer(alloc, &bci, &aci, &b.handle, &b.alloc, nullptr),
               "vmaCreateBuffer");

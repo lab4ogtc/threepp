@@ -4,7 +4,7 @@
 //   binding 0: taaInputTex        — current frame, post-denoise (RENDER extent)
 //   binding 1: taaHistoryReadTex  — previous frame's output      (OUTPUT extent)
 //   binding 2: gbufMotionTex      — gbuffer motion vector         (RENDER extent)
-//   binding 3: taaSwapImage       — swapchain output (write)      (OUTPUT extent)
+//   binding 3: taaPresentImage    — optional internal output      (OUTPUT extent)
 //   binding 4: taaHistoryWriteImg — next-frame history (write)    (OUTPUT extent)
 //
 // When the path tracer renders below the swapchain resolution
@@ -31,17 +31,12 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(set = 0, binding = 0) uniform sampler2D taaInputTex;
 layout(set = 0, binding = 1) uniform sampler2D taaHistoryReadTex;
 layout(set = 0, binding = 2) uniform sampler2D gbufMotionTex;
-// No format qualifier: the bound image is VK_FORMAT_B8G8R8A8_UNORM (matches the
-// swapchain channel order) but GLSL has no BGRA8 format qualifier. Writing
-// without a format requires shaderStorageImageWriteWithoutFormat — channel
-// names (r/g/b/a) still map by component, so behaviour is unchanged.
-layout(set = 0, binding = 3) uniform writeonly image2D taaSwapImage;
-// History storage is rgba16f (not rgba8) so the per-frame mix() result is
-// preserved at sub-quantum precision. With rgba8 history the running average
-// re-quantized every frame and locked into uint8 codes, producing visible
-// iso-luminance bands on smooth specular surfaces. Input/swap stay rgba8
-// because denoise.comp writes binding 1 with rgba8 and that target can be
-// either the TAA input image or the BGRA8 swapchain.
+// No format qualifier: the bound image is BGRA8. GLSL has no BGRA8 format
+// qualifier, so writing without a format requires
+// shaderStorageImageWriteWithoutFormat. Channel names still map by component.
+layout(set = 0, binding = 3) uniform writeonly image2D taaPresentImage;
+// Input and history are rgba16f so tone-mapped linear values remain precise
+// until the final sRGB presentation pass; the swapchain alone is rgba8.
 layout(set = 0, binding = 4, rgba16f) uniform writeonly image2D taaHistoryWriteImg;
 // Mesh-ID rejection: bind both the current frame's IDs and the previous
 // frame's. When the reprojected prev pixel sits on a different mesh than
@@ -53,13 +48,12 @@ layout(set = 0, binding = 6) uniform usampler2D gbufIdsPrevTex;
 
 layout(push_constant) uniform Pc {
     float blendAlpha;// base new-sample weight (0.1 = strong AA, slow ghost decay)
-    uint  width;     // PANE (scissor region) output size — dispatch + writes
+    uint  width;     // scissor-region output size — dispatch bounds
     uint  height;
     uint  inWidth;   // PANE (scissor region) input size (path-trace render extent)
     uint  inHeight;
-    uint  writeSwap; // 1 = write the swapchain here; 0 = a downstream RCAS
-                     //     sharpen pass owns the swapchain write (history is
-                     //     still written so it reads the resolved frame).
+    uint  writeSwap; // 1 = also write the internal present image here;
+                     //     0 = only history is written.
     float dtFrames;  // this frame's duration in REFERENCE frames (dt · 90 fps,
                      // host-clamped to [1, 6]; 1 at ≥90 fps). Converts the
                      // per-frame temporal constants below (deviation-streak
@@ -69,19 +63,17 @@ layout(push_constant) uniform Pc {
                      // only one step — leaving one discrete stale band per
                      // ramp frame ("double/triple edge ghosts" behind moving
                      // objects at capped fps).
-    // Split-screen: packed swapchain write offset (dstX | dstY<<16). The pane is
-    // rendered region-sized at the texture ORIGIN; only the swapchain store is
-    // offset to the pane's screen position. 0 = full-frame (no offset). Occupies
-    // the former std430 pad at offset 28, so the mat4 still aligns to offset 32.
+    // Packed swapchain write offset (dstX | dstY<<16). Scissor rendering keeps
+    // full-frame projection; this offset converts local dispatch pixels to
+    // physical swapchain/history coordinates.
     uint  dstOffset;
     // prevVPunjit · currVPunjit⁻¹ — maps current CLIP at the far plane
     // (reversed-Z: z = 0) to previous clip. Supplies SKY pixels their true
     // rotation-induced motion. std430: mat4 aligns to offset 32.
     mat4  skyReproj;
-    // Split-screen: full (physical) texture sizes for UV normalisation. The pane
-    // content lives in [0..inWidth]/[0..width] of these full-size textures, so a
-    // region-UV in [0,1] must be scaled by region/phys before sampling. Default
-    // (phys == region) → scale 1 → identical to the full-frame path.
+    // Full physical texture sizes for UV normalisation. For full-frame rendering
+    // these match width/height and inWidth/inHeight; for scissored writes they
+    // keep sampling in full-frame coordinates.
     uint  physInW;
     uint  physInH;
     uint  physOutW;
@@ -139,10 +131,10 @@ vec3 fxaa(sampler2D tex, vec2 uv, vec2 rcpFrame) {
     const vec3 L = vec3(0.299, 0.587, 0.114);
     const vec3 rgbM = texture(tex, uv).rgb;
     const float lM  = dot(rgbM, L);
-    const float lNW = dot(textureOffset(tex, uv, ivec2(-1, -1)).rgb, L);
-    const float lNE = dot(textureOffset(tex, uv, ivec2( 1, -1)).rgb, L);
-    const float lSW = dot(textureOffset(tex, uv, ivec2(-1,  1)).rgb, L);
-    const float lSE = dot(textureOffset(tex, uv, ivec2( 1,  1)).rgb, L);
+    const float lNW = dot(textureLodOffset(tex, uv, 0.0, ivec2(-1, -1)).rgb, L);
+    const float lNE = dot(textureLodOffset(tex, uv, 0.0, ivec2( 1, -1)).rgb, L);
+    const float lSW = dot(textureLodOffset(tex, uv, 0.0, ivec2(-1,  1)).rgb, L);
+    const float lSE = dot(textureLodOffset(tex, uv, 0.0, ivec2( 1,  1)).rgb, L);
     const float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));
     const float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));
     if (lMax - lMin < max(0.0312, lMax * 0.125)) return rgbM;// no edge → passthrough
@@ -188,19 +180,22 @@ void main() {
     const ivec2 px = ivec2(gl_GlobalInvocationID.xy);
     if (px.x >= int(pc.width) || px.y >= int(pc.height)) return;
 
-    const vec2 sz = vec2(float(pc.width), float(pc.height));
-    const vec2 uv = (vec2(px) + 0.5) / sz;
-
-    // Split-screen: the pane content occupies [0..inWidth]/[0..width] of the
-    // full-size textures, so map the region-UV into that sub-rect for sampling.
-    // (At full-frame, region == phys → scale 1 → unchanged.)
-    const vec2 inScale  = vec2(float(pc.inWidth), float(pc.inHeight)) / vec2(float(pc.physInW), float(pc.physInH));
-    const vec2 outScale = vec2(float(pc.width),   float(pc.height))   / vec2(float(pc.physOutW), float(pc.physOutH));
-    const vec2 uvIn = uv * inScale;// render-extent textures (input, motion, ids)
+    const ivec2 dstBase = ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u));
+    const ivec2 dstPx = px + dstBase;
+    const vec2 uv = (vec2(dstPx) + 0.5) / vec2(float(pc.physOutW), float(pc.physOutH));
+    const vec2 uvIn = uv;// normalized full-frame coords for input, motion, ids
 
     // Current sample — raw (jittered) input. Temporal accumulation over the
     // Halton jitter sequence is the anti-aliasing now (TSR), not FXAA.
     const vec3 curr = texture(taaInputTex, uvIn).rgb;
+
+    // alpha == 1 表示关闭 TAA。局部分屏仍需经过该 pass 完成裁剪呈现，
+    // 但必须严格绕过历史重投影和 antiFlicker 对 alpha 的再次缩放。
+    if (pc.blendAlpha >= 1.0) {
+        if (pc.writeSwap != 0u) imageStore(taaPresentImage, dstPx, vec4(curr, 1.0));
+        imageStore(taaHistoryWriteImg, dstPx, vec4(curr, 0.0));
+        return;
+    }
 
     // Reproject prev frame via gbuffer motion vec. Motion is in GL-NDC delta
     // (Y-up); convert UV → GL-NDC → add motion → back to screen UV.
@@ -230,7 +225,7 @@ void main() {
     //   ids.z = flags  (bit 0 is_water, bit 3 is_skinned)
     const uvec4 currIds = texture(gbufIdsCurrTex, uvIn);
     const uvec4 prevIds = reprojValid
-            ? texture(gbufIdsPrevTex, prevUv * inScale)
+            ? texture(gbufIdsPrevTex, prevUv)
             : uvec4(0u);
     const bool isSkinned = (currIds.z & 8u) != 0u;
     // NO hard mesh-ID disocclusion reject. Under jitter a silhouette pixel's
@@ -270,7 +265,7 @@ void main() {
 
     // Motion in pixels — used by the clip-rate gate below AND the velocity
     // alpha. NDC motion is in [-2, 2] across the screen.
-    const vec2 motionPx = motionGL * 0.5 * vec2(pc.width, pc.height);
+    const vec2 motionPx = motionGL * 0.5 * vec2(pc.physOutW, pc.physOutH);
     const float motionLen = length(motionPx);
 
     // DILATED motion: max |motion| over the 3×3 input neighbourhood. A pixel
@@ -286,7 +281,7 @@ void main() {
             for (int dx = -1; dx <= 1; ++dx) {
                 const vec2 mv = texture(gbufMotionTex, uvIn + vec2(dx, dy) * inTexel).rg;
                 dilatedMotionPx = max(dilatedMotionPx,
-                                      length(mv * 0.5 * vec2(pc.width, pc.height)));
+                                      length(mv * 0.5 * vec2(pc.physOutW, pc.physOutH)));
             }
     }
 
@@ -295,7 +290,7 @@ void main() {
     if (reprojValid && cnt > 0.5) {
         // Catmull-Rom 5-tap (sharper than single bilinear — kills the
         // "everything smears on camera translation" compounding blur).
-        const vec3 histRGB = sampleHistoryCR(prevUv * outScale);
+        const vec3 histRGB = sampleHistoryCR(prevUv);
         // Variance clip in YCoCg. γ widens/tightens the allowed history box:
         // ~1 is a good flicker/ghost balance.
         const vec3  mu    = m1 / cnt;
@@ -336,7 +331,7 @@ void main() {
         // constant wall-clock time: at 30 fps one real frame advances it 3
         // reference frames and the backstop fires immediately, instead of
         // leaving 3 frames × N px of discrete stale bands behind the edge.
-        devStreak = (devK > 2.0) ? min(texture(taaHistoryReadTex, prevUv * outScale).a + pc.dtFrames, 8.0) : 0.0;
+        devStreak = (devK > 2.0) ? min(texture(taaHistoryReadTex, prevUv).a + pc.dtFrames, 8.0) : 0.0;
         // Instant σ-term, gated on DILATED motion: during continuous camera
         // motion the streak's 3-frame ramp re-arms on every freshly-vacated
         // pixel, leaving a steady-state stale rim trailing edges across the
@@ -372,10 +367,13 @@ void main() {
     // YCoCg variance clip + the motion-relaxed antiFlicker below keep this from
     // turning into flicker on a static view (dilatedMotionPx is 0 there).
     const float velocityBump = clamp(dilatedMotionPx / 18.0, 0.0, 0.4);
-    // is_skinned flag (bit 3) is informational; SkinnedMesh now has proper
-    // per-vertex motion vectors via a prev-pose vertex buffer (gbuffer.vert
-    // reads it at attribute 3). The previous force-high-alpha hack is gone —
-    // velocity bump alone now correctly tracks deformation.
+    // Skinned meshes have correct per-vertex motion, but articulated motion
+    // leaves history hanging on high-contrast limbs longer than rigid motion.
+    // Only release extra history when the local neighbourhood is actually
+    // moving, so static skinned meshes keep the same AA stability.
+    const float skinnedMotionBump = (isSkinned && dilatedMotionPx > 0.05)
+            ? clamp(dilatedMotionPx / 36.0, 0.0, 0.18)
+            : 0.0;
     //
     // LUMA ANTI-FLICKER (Karis): where the current (1-spp jittered) sample
     // disagrees strongly with the converged history — i.e. EDGES, especially
@@ -399,16 +397,9 @@ void main() {
     // stability — the behaviour the comments above guard — is unchanged).
     const float motionRelax = clamp(dilatedMotionPx * 0.5, 0.0, 1.0);
     antiFlicker = mix(antiFlicker, 1.0, motionRelax);
-    const float a = clamp((pc.blendAlpha + velocityBump) * antiFlicker, 0.01, 1.0);
+    const float a = clamp((pc.blendAlpha + velocityBump + skinnedMotionBump) * antiFlicker, 0.01, 1.0);
     const vec3 result = reprojValid ? mix(history, curr, a) : curr;
 
-    // When a downstream RCAS pass owns the swapchain write, skip it here but
-    // still write history (RCAS reads the resolved frame from the history slot).
-    // When a downstream RCAS pass owns the swapchain write, skip it here but
-    // still write history (RCAS reads the resolved frame from the history slot).
-    // Swapchain write is offset to the pane's screen position; history stays at
-    // the texture origin (region-local), so next frame reprojects consistently.
-    const ivec2 dstPx = px + ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u));
-    if (pc.writeSwap != 0u) imageStore(taaSwapImage, dstPx, vec4(result, 1.0));
-    imageStore(taaHistoryWriteImg,  px, vec4(result, devStreak));// .a = deviation streak
+    if (pc.writeSwap != 0u) imageStore(taaPresentImage, dstPx, vec4(result, 1.0));
+    imageStore(taaHistoryWriteImg,  dstPx, vec4(result, devStreak));// .a = deviation streak
 }

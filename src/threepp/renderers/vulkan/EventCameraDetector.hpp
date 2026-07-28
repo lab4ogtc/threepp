@@ -124,6 +124,7 @@ namespace threepp::vulkan {
         // Per-ring-slot event stream buffer. 16B header + capacity·sizeof(Event)
         // bytes of payload. Host-visible so readEventStreamInto can read directly.
         std::array<Buffer, kRingSize> eventStreamRing_{};
+        std::array<VkDescriptorSet, kRingSize> descSets_{};
         // Slot we'll WRITE next on record(); we then advance.
         uint32_t writeSlot_ = 0;
 
@@ -131,7 +132,6 @@ namespace threepp::vulkan {
         VkPipelineLayout      pipelineLayout_ = VK_NULL_HANDLE;
         VkPipeline            pipeline_       = VK_NULL_HANDLE;
         VkDescriptorPool      descPool_       = VK_NULL_HANDLE;
-        VkDescriptorSet       descSet_        = VK_NULL_HANDLE;
         // Tracks which scene buffer the descriptor currently points at;
         // rewrite only when the buffer handle changes (resize, etc.).
         VkBuffer              currentSceneBuf_ = VK_NULL_HANDLE;

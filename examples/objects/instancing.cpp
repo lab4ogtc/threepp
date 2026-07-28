@@ -72,7 +72,7 @@ int main() {
 
         ImGui::Begin("Settings");
         ImGui::SliderInt("Amount", &amount, 2, maxAmount);
-        if (ImGui::IsItemEdited()) {
+        if (ImGui::IsItemDeactivatedAfterEdit()) {
             colorMap.clear();
             setupInstancedMesh(*mesh, amount);
         }

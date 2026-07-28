@@ -15,7 +15,7 @@ namespace threepp {
 
     public:
         // Dispatches to the appropriate loader based on file extension.
-        // Supported: .obj, .dae, .gltf, .glb, .stl
+        // Supported: .obj, .dae, .gltf, .glb, .stl, .fbx (when THREEPP_WITH_FBX is enabled)
         [[nodiscard]] std::shared_ptr<Group> load(const std::filesystem::path& path) override;
 
         // Async variant — returns an empty AsyncGroup immediately.

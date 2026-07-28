@@ -149,7 +149,7 @@ namespace {
 }// namespace
 
 int main() {
-    Canvas canvas("Vulkan PT - White Furnace (Env-only)", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - White Furnace (Env-only)", {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     // Raw linear readback: 1.0 ↔ 255, no tone curve, no sRGB encode.

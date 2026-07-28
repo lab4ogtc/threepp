@@ -10,8 +10,10 @@
 
 namespace threepp {
 
-    // ParticleSystem billboard mesh 的材质标记。GL/WGPU 直接编译自定义 ShaderMaterial；
-    // Vulkan 和 Metal 没有通用 GLSL ShaderMaterial 路径，因此通过该名称转入专用粒子渲染路径。
+    /*
+     * ParticleSystem billboard mesh 的材质标记。GL/WGPU 直接编译自定义 ShaderMaterial；
+     * Vulkan 和 Metal 没有通用 GLSL ShaderMaterial 路径，因此通过该名称转入专用粒子渲染路径。
+     */
     inline constexpr const char* kParticleMaterialName = "__threepp_particle__";
 
     class ParticleSystem: public Object3D {

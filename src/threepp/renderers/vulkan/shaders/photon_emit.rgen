@@ -28,12 +28,12 @@ struct PhotonPayload {
     uint  hitValid;
 };
 
-struct DirLight   { vec3 direction; vec3 color; };
-struct PointLight { vec3 position; float range; vec3 color; float decay; };
+struct DirLight   { vec3 direction; vec3 color; uint castShadow; };
+struct PointLight { vec3 position; float range; vec3 color; float decay; uint castShadow; };
 struct SpotLight  {
     vec3  position;  float range;
     vec3  color;     float decay;
-    vec3  direction; float cosAngleOuter; float cosAngleInner;
+    vec3  direction; float cosAngleOuter; float cosAngleInner; uint castShadow;
 };
 struct RectLight  { vec3 position; vec3 halfU; vec3 halfV; vec3 normal; vec3 color; };
 

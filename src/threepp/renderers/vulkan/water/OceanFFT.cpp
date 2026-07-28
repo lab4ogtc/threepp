@@ -204,7 +204,7 @@ namespace threepp::water {
             cpci.layout = layout;
 
             VkPipeline p = VK_NULL_HANDLE;
-            check(vkCreateComputePipelines(ctx.device(), ctx.pipelineCache(), 1, &cpci, nullptr, &p),
+            check(ctx.createComputePipeline(cpci, &p),
                   "vkCreateComputePipelines");
             return p;
         }
@@ -735,15 +735,15 @@ namespace threepp::water {
         pipePermute_ = makeComputePipeline(ctx_, modP, layoutPermute_);
         vkDestroyShaderModule(ctx_.device(), modP, nullptr);
 
-        // ── Pool: enough for 1 twiddle + 4 butterfly (2 horizontal + 2 vertical) +
-        // 2 permute (one per direction) descriptor sets.
+        // ── Pool: enough for 1 twiddle + per-image-pair banks of
+        // 4 butterfly (2 horizontal + 2 vertical) + 2 permute descriptor sets.
         const std::array<VkDescriptorPoolSize, 2> poolSizes{
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 4 * 2 + 2 * 1},
-            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1 + 4 * 1 + 2 * 1},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, kDescriptorBankCount * (4 * 2 + 2 * 1)},
+            VkDescriptorPoolSize{VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1 + kDescriptorBankCount * (4 * 1 + 2 * 1)},
         };
         VkDescriptorPoolCreateInfo dpci{};
         dpci.sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-        dpci.maxSets       = 1 + 4 + 2;
+        dpci.maxSets       = 1 + kDescriptorBankCount * (4 + 2);
         dpci.poolSizeCount = uint32_t(poolSizes.size());
         dpci.pPoolSizes    = poolSizes.data();
         check(vkCreateDescriptorPool(ctx_.device(), &dpci, nullptr, &pool_),
@@ -770,22 +770,25 @@ namespace threepp::water {
         wT.pImageInfo = &tw;
         vkUpdateDescriptorSets(ctx_.device(), 1, &wT, 0, nullptr);
 
-        // Pre-allocate 2 horizontal + 2 vertical butterfly DSes. We bind images
-        // lazily in rebindDescriptorSets when the caller hands us new image pair.
-        dsHorizontal_.resize(2);
+        // Pre-allocate 2 horizontal + 2 vertical butterfly DSes per bank. We
+        // bind images lazily in rebindDescriptorSets when the caller hands us a
+        // new image pair.
         VkDescriptorSetAllocateInfo daiB{};
         daiB.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
         daiB.descriptorPool     = pool_;
         daiB.descriptorSetCount = 1;
         daiB.pSetLayouts        = &dslButterfly_;
-        for (auto& ds : dsHorizontal_) {
-            check(vkAllocateDescriptorSets(ctx_.device(), &daiB, &ds),
-                  "vkAllocateDescriptorSets(butterflyH)");
-        }
-        dsVertical_.resize(2);
-        for (auto& ds : dsVertical_) {
-            check(vkAllocateDescriptorSets(ctx_.device(), &daiB, &ds),
-                  "vkAllocateDescriptorSets(butterflyV)");
+        for (uint32_t bank = 0; bank < kDescriptorBankCount; ++bank) {
+            dsHorizontal_[bank].resize(2);
+            for (auto& ds : dsHorizontal_[bank]) {
+                check(vkAllocateDescriptorSets(ctx_.device(), &daiB, &ds),
+                      "vkAllocateDescriptorSets(butterflyH)");
+            }
+            dsVertical_[bank].resize(2);
+            for (auto& ds : dsVertical_[bank]) {
+                check(vkAllocateDescriptorSets(ctx_.device(), &daiB, &ds),
+                      "vkAllocateDescriptorSets(butterflyV)");
+            }
         }
 
         VkDescriptorSetAllocateInfo daiP{};
@@ -793,9 +796,11 @@ namespace threepp::water {
         daiP.descriptorPool     = pool_;
         daiP.descriptorSetCount = 1;
         daiP.pSetLayouts        = &dslPermute_;
-        for (auto& ds : dsPermute_) {
-            check(vkAllocateDescriptorSets(ctx_.device(), &daiP, &ds),
-                  "vkAllocateDescriptorSets(permute)");
+        for (auto& bankSets : dsPermute_) {
+            for (auto& ds : bankSets) {
+                check(vkAllocateDescriptorSets(ctx_.device(), &daiP, &ds),
+                      "vkAllocateDescriptorSets(permute)");
+            }
         }
     }
 
@@ -813,7 +818,7 @@ namespace threepp::water {
         twiddleComputed_ = true;
     }
 
-    void IFFT::rebindDescriptorSets(OceanImage& a, OceanImage& b) {
+    void IFFT::rebindDescriptorSets(uint32_t bank, OceanImage& a, OceanImage& b) {
         // Two horizontal sets:
         //   [0] reads a, writes b (called when pingPong is true on iter 0)
         //   [1] reads b, writes a
@@ -839,10 +844,10 @@ namespace threepp::water {
             w[2].dstBinding = 2; w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;          w[2].pImageInfo = &write;
             vkUpdateDescriptorSets(ctx_.device(), uint32_t(w.size()), w.data(), 0, nullptr);
         };
-        writeButterfly(dsHorizontal_[0], aSampled, bStorage);
-        writeButterfly(dsHorizontal_[1], bSampled, aStorage);
-        writeButterfly(dsVertical_[0],   aSampled, bStorage);
-        writeButterfly(dsVertical_[1],   bSampled, aStorage);
+        writeButterfly(dsHorizontal_[bank][0], aSampled, bStorage);
+        writeButterfly(dsHorizontal_[bank][1], bSampled, aStorage);
+        writeButterfly(dsVertical_[bank][0],   aSampled, bStorage);
+        writeButterfly(dsVertical_[bank][1],   bSampled, aStorage);
 
         auto writePermute = [&](VkDescriptorSet ds, const VkDescriptorImageInfo& read, const VkDescriptorImageInfo& write) {
             std::array<VkWriteDescriptorSet, 2> w{};
@@ -853,18 +858,36 @@ namespace threepp::water {
         };
         // dsPermute_[0]: read a, write b
         // dsPermute_[1]: read b, write a
-        writePermute(dsPermute_[0], aSampled, bStorage);
-        writePermute(dsPermute_[1], bSampled, aStorage);
+        writePermute(dsPermute_[bank][0], aSampled, bStorage);
+        writePermute(dsPermute_[bank][1], bSampled, aStorage);
 
-        prevInput_   = &a;
-        prevScratch_ = &b;
+        prevInput_[bank]   = &a;
+        prevScratch_[bank] = &b;
     }
 
     void IFFT::recordApply(VkCommandBuffer cb, OceanImage& input, OceanImage& scratch) {
         if (!twiddleComputed_) recordTwiddleOnce(cb);
 
-        if (prevInput_ != &input || prevScratch_ != &scratch) {
-            rebindDescriptorSets(input, scratch);
+        uint32_t bank = kDescriptorBankCount;
+        for (uint32_t i = 0; i < kDescriptorBankCount; ++i) {
+            if (prevInput_[i] == &input && prevScratch_[i] == &scratch) {
+                bank = i;
+                break;
+            }
+        }
+        if (bank == kDescriptorBankCount) {
+            for (uint32_t i = 0; i < kDescriptorBankCount; ++i) {
+                if (prevInput_[i] == nullptr && prevScratch_[i] == nullptr) {
+                    bank = i;
+                    break;
+                }
+            }
+        }
+        if (bank == kDescriptorBankCount) {
+            throw std::runtime_error("OceanFFT: IFFT descriptor bank count exceeded");
+        }
+        if (prevInput_[bank] != &input || prevScratch_[bank] != &scratch) {
+            rebindDescriptorSets(bank, input, scratch);
         }
 
         cmdTransitionToGeneral(cb, input);
@@ -879,7 +902,7 @@ namespace threepp::water {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeHorizontal_);
         for (uint32_t step = 0; step < logSize_; ++step) {
             pingPong = !pingPong;
-            VkDescriptorSet ds = pingPong ? dsHorizontal_[0] : dsHorizontal_[1];
+            VkDescriptorSet ds = pingPong ? dsHorizontal_[bank][0] : dsHorizontal_[bank][1];
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layoutButterfly_,
                                     0, 1, &ds, 0, nullptr);
             const int32_t s = int32_t(step);
@@ -895,7 +918,7 @@ namespace threepp::water {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeVertical_);
         for (uint32_t step = 0; step < logSize_; ++step) {
             pingPong = !pingPong;
-            VkDescriptorSet ds = pingPong ? dsVertical_[0] : dsVertical_[1];
+            VkDescriptorSet ds = pingPong ? dsVertical_[bank][0] : dsVertical_[bank][1];
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layoutButterfly_,
                                     0, 1, &ds, 0, nullptr);
             const int32_t s = int32_t(step);
@@ -913,7 +936,7 @@ namespace threepp::water {
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipePermute_);
         // dsPermute_[0]: read a (=input), write b (=scratch)
         // dsPermute_[1]: read b (=scratch), write a (=input)
-        VkDescriptorSet dsP = resultInScratch ? dsPermute_[1] : dsPermute_[0];
+        VkDescriptorSet dsP = resultInScratch ? dsPermute_[bank][1] : dsPermute_[bank][0];
         vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, layoutPermute_,
                                 0, 1, &dsP, 0, nullptr);
         const uint32_t g = groupCountFor(textureSize_);

@@ -1,15 +1,22 @@
 #include "threepp/renderers/vulkan/OverlayPass.hpp"
 #include "threepp/renderers/vulkan/VulkanContext.hpp"
 #include "threepp/renderers/vulkan/VulkanResources.hpp"
+#include "threepp/renderers/vulkan/VulkanWireframeGeometry.hpp"
 
 #include "threepp/cameras/Camera.hpp"
+#include "threepp/cameras/PerspectiveCamera.hpp"
 #include "threepp/core/InterleavedBufferAttribute.hpp"
 #include "threepp/core/Object3D.hpp"
+#include "threepp/materials/LineDashedMaterial.hpp"
+#include "threepp/materials/MeshStandardMaterial.hpp"
+#include "threepp/materials/ShaderMaterial.hpp"
 #include "threepp/materials/interfaces.hpp"
 #include "threepp/math/Matrix4.hpp"
 #include "threepp/math/Vector3.hpp"
 #include "threepp/objects/Line.hpp"
+#include "threepp/objects/LineLoop.hpp"
 #include "threepp/objects/LineSegments.hpp"
+#include "threepp/objects/InstancedMesh.hpp"
 #include "threepp/objects/Mesh.hpp"
 #include "threepp/objects/Points.hpp"
 #include "threepp/objects/Sprite.hpp"
@@ -19,25 +26,144 @@
 // including in two TUs is safe.
 #include "threepp/renderers/vulkan/shaders/overlay.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_dashed.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_dashed.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_color.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_color.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_instanced.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_point.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_point.vert.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.frag.spv.h"
 #include "threepp/renderers/vulkan/shaders/overlay_sprite.vert.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_depth_texture_mesh.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_textured_mesh.frag.spv.h"
+#include "threepp/renderers/vulkan/shaders/overlay_textured_mesh.vert.spv.h"
 
 #include <algorithm>
 #include <cstring>
 #include <iostream>
+#include <utility>
 
 namespace threepp::vulkan {
+
+namespace {
+
+    VkSamplerAddressMode toVkAddressMode(TextureWrapping wrapping) {
+        switch (wrapping) {
+            case TextureWrapping::Repeat: return VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            case TextureWrapping::MirroredRepeat: return VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT;
+            case TextureWrapping::ClampToEdge:
+            default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        }
+    }
+
+    VkFilter toVkFilter(Filter filter) {
+        switch (filter) {
+            case Filter::Nearest:
+            case Filter::NearestMipmapNearest:
+            case Filter::NearestMipmapLinear:
+                return VK_FILTER_NEAREST;
+            case Filter::Linear:
+            case Filter::LinearMipmapNearest:
+            case Filter::LinearMipmapLinear:
+            default:
+                return VK_FILTER_LINEAR;
+        }
+    }
+
+    void destroyLineLoopRanges(VmaAllocator allocator, std::vector<LineRec::LoopRange>& ranges) {
+        for (auto& range : ranges) {
+            if (range.index.handle != VK_NULL_HANDLE) destroyBuffer(allocator, range.index);
+        }
+        ranges.clear();
+    }
+
+    void destroyWireframeRec(VmaAllocator allocator, WireframeRec& rec) {
+        if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(allocator, rec.index);
+        rec = {};
+    }
+
+    void pruneLineLoopRanges(VmaAllocator allocator, std::vector<LineRec::LoopRange>& ranges, uint64_t cutoff) {
+        for (auto it = ranges.begin(); it != ranges.end();) {
+            if (it->lastTouch < cutoff) {
+                if (it->index.handle != VK_NULL_HANDLE) destroyBuffer(allocator, it->index);
+                it = ranges.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    LineRec::LoopRange* ensureLineLoopRangeUploaded(
+            VulkanContext& ctx,
+            const BufferGeometry& geom,
+            LineRec& rec,
+            const DrawRange& drawRange,
+            uint64_t touch) {
+        const uint32_t sourceCount = (rec.index.handle != VK_NULL_HANDLE) ? rec.indexCount : rec.vertexCount;
+        const uint32_t start = static_cast<uint32_t>(std::max(0, drawRange.start));
+        const uint32_t cap = (sourceCount > start) ? (sourceCount - start) : 0u;
+        const uint32_t count = std::min(cap, static_cast<uint32_t>(std::max(0, drawRange.count)));
+        if (count < 2) return nullptr;
+
+        for (auto& range : rec.loopRanges) {
+            if (range.start == start && range.count == count) {
+                range.lastTouch = touch;
+                return &range;
+            }
+        }
+
+        std::vector<unsigned int> loopIndices;
+        loopIndices.reserve(static_cast<std::size_t>(count) * 2u);
+        if (auto* idxAttr = geom.getIndex()) {
+            const auto& indices = idxAttr->array();
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto a = indices[static_cast<std::size_t>(start + i)];
+                const auto b = indices[static_cast<std::size_t>(start + ((i + 1u) % count))];
+                loopIndices.push_back(a);
+                loopIndices.push_back(b);
+            }
+        } else {
+            for (uint32_t i = 0; i < count; ++i) {
+                loopIndices.push_back(start + i);
+                loopIndices.push_back(start + ((i + 1u) % count));
+            }
+        }
+
+        LineRec::LoopRange range{};
+        range.start = start;
+        range.count = count;
+        range.indexCount = static_cast<uint32_t>(loopIndices.size());
+        range.lastTouch = touch;
+        const VkDeviceSize bytes = loopIndices.size() * sizeof(unsigned int);
+        range.index = createBuffer(
+                ctx.allocator(), ctx.device(), bytes,
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                VMA_MEMORY_USAGE_AUTO,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        void* mapped = nullptr;
+        vmaMapMemory(ctx.allocator(), range.index.alloc, &mapped);
+        std::memcpy(mapped, loopIndices.data(), bytes);
+        vmaUnmapMemory(ctx.allocator(), range.index.alloc);
+        rec.loopRanges.push_back(std::move(range));
+        return &rec.loopRanges.back();
+    }
+
+}// namespace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Construction / destruction
 // ─────────────────────────────────────────────────────────────────────────────
 
 OverlayPass::OverlayPass(VulkanContext& ctx, uint32_t framesInFlight,
-                         SampledImageCreator uploadFn)
-    : ctx_(ctx), framesInFlight_(framesInFlight), uploadFn_(std::move(uploadFn)) {
+                         SampledImageCreator uploadFn,
+                         ExternalImageResolver externalImageFn)
+    : ctx_(ctx),
+      framesInFlight_(framesInFlight),
+      uploadFn_(std::move(uploadFn)),
+      externalImageFn_(std::move(externalImageFn)) {
     spriteDescPools_.resize(framesInFlight_, VK_NULL_HANDLE);
+    overlayDepthImages_.resize(framesInFlight_);
 }
 
 OverlayPass::~OverlayPass() {
@@ -46,15 +172,25 @@ OverlayPass::~OverlayPass() {
     if (spritePipelineLayout_)      vkDestroyPipelineLayout(d, spritePipelineLayout_, nullptr);
     if (orthoLineListPipeline_)     vkDestroyPipeline(d, orthoLineListPipeline_, nullptr);
     if (orthoLineStripPipeline_)    vkDestroyPipeline(d, orthoLineStripPipeline_, nullptr);
+    if (orthoLineDashedListPipeline_) vkDestroyPipeline(d, orthoLineDashedListPipeline_, nullptr);
+    if (orthoLineDashedStripPipeline_) vkDestroyPipeline(d, orthoLineDashedStripPipeline_, nullptr);
+    if (orthoLineColoredListPipeline_) vkDestroyPipeline(d, orthoLineColoredListPipeline_, nullptr);
+    if (orthoLineColoredStripPipeline_) vkDestroyPipeline(d, orthoLineColoredStripPipeline_, nullptr);
     if (orthoMeshPipeline_)         vkDestroyPipeline(d, orthoMeshPipeline_, nullptr);
+    if (orthoMeshColoredPipeline_)  vkDestroyPipeline(d, orthoMeshColoredPipeline_, nullptr);
+    if (orthoMeshInstancedPipeline_) vkDestroyPipeline(d, orthoMeshInstancedPipeline_, nullptr);
     if (orthoMeshTransparentPipeline_) vkDestroyPipeline(d, orthoMeshTransparentPipeline_, nullptr);
+    if (orthoTexturedMeshPipeline_) vkDestroyPipeline(d, orthoTexturedMeshPipeline_, nullptr);
+    if (orthoDepthTextureMeshPipeline_) vkDestroyPipeline(d, orthoDepthTextureMeshPipeline_, nullptr);
     if (orthoPointListPipeline_)    vkDestroyPipeline(d, orthoPointListPipeline_, nullptr);
     if (orthoLinePipelineLayout_)   vkDestroyPipelineLayout(d, orthoLinePipelineLayout_, nullptr);
     if (spriteDescSetLayout_)       vkDestroyDescriptorSetLayout(d, spriteDescSetLayout_, nullptr);
+    for (auto& depth : overlayDepthImages_) destroyImage2D(ctx_.allocator(), d, depth);
     for (auto& pool : spriteDescPools_) {
         if (pool) vkDestroyDescriptorPool(d, pool, nullptr);
     }
     for (auto& [t, rec] : spriteAtlasCache_) {
+        if (!rec.ownsImage) continue;
         destroyImage2D(ctx_.allocator(), d, rec.image);
     }
     spriteAtlasCache_.clear();
@@ -63,12 +199,73 @@ OverlayPass::~OverlayPass() {
         if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
     }
     spriteGeomCache_.clear();
+    for (auto& [g, rec] : texturedMeshGeomCache_) {
+        destroyBuffer(ctx_.allocator(), rec.position);
+        destroyBuffer(ctx_.allocator(), rec.uv);
+        if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
+    }
+    texturedMeshGeomCache_.clear();
+    for (auto& [mesh, rec] : instancedMeshCache_) {
+        if (rec.matrix.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.matrix);
+        if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+    }
+    instancedMeshCache_.clear();
+    for (auto& rec : retiredInstancedBuffers_) destroyBuffer(ctx_.allocator(), rec.buffer);
+    retiredInstancedBuffers_.clear();
     for (auto& [g, rec] : lineGeomCache_) {
         destroyBuffer(ctx_.allocator(), rec.vertex);
         if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
+        destroyLineLoopRanges(ctx_.allocator(), rec.loopRanges);
         if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+        if (rec.lineDistance.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.lineDistance);
     }
     lineGeomCache_.clear();
+    for (auto& [g, rec] : wireframeGeomCache_) {
+        destroyWireframeRec(ctx_.allocator(), rec);
+    }
+    wireframeGeomCache_.clear();
+}
+
+Image2D& OverlayPass::ensureDepthImage(uint32_t frame, uint32_t width, uint32_t height) {
+    auto& depth = overlayDepthImages_.at(frame);
+    if (depth.image != VK_NULL_HANDLE && depth.width == width && depth.height == height) return depth;
+
+    if (depth.image != VK_NULL_HANDLE) {
+        check(vkDeviceWaitIdle(ctx_.device()), "vkDeviceWaitIdle(overlay depth resize)");
+        destroyImage2D(ctx_.allocator(), ctx_.device(), depth);
+    }
+
+    VkImageCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    ici.imageType = VK_IMAGE_TYPE_2D;
+    ici.format = VK_FORMAT_D32_SFLOAT;
+    ici.extent = {width, height, 1};
+    ici.mipLevels = 1;
+    ici.arrayLayers = 1;
+    ici.samples = VK_SAMPLE_COUNT_1_BIT;
+    ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ici.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo aci{};
+    aci.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    check(vmaCreateImage(ctx_.allocator(), &ici, &aci, &depth.image, &depth.alloc, nullptr),
+          "vmaCreateImage(overlay depth)");
+
+    VkImageViewCreateInfo vci{};
+    vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    vci.image = depth.image;
+    vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    vci.format = ici.format;
+    vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    vci.subresourceRange.levelCount = 1;
+    vci.subresourceRange.layerCount = 1;
+    check(vkCreateImageView(ctx_.device(), &vci, nullptr, &depth.view),
+          "vkCreateImageView(overlay depth)");
+    depth.width = width;
+    depth.height = height;
+    depth.format = ici.format;
+    return depth;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -139,11 +336,11 @@ void OverlayPass::createOrthoLinePipelines() {
     ms.sType                = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    // No depth attachment in the ortho overlay pass → depth test off.
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_FALSE;
+    ds.depthTestEnable  = VK_TRUE;
     ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState cbas{};
     cbas.blendEnable    = VK_FALSE;
@@ -161,10 +358,10 @@ void OverlayPass::createOrthoLinePipelines() {
     dyn.pDynamicStates    = dynStates;
 
     if (orthoLinePipelineLayout_ == VK_NULL_HANDLE) {
-        VkPushConstantRange pcRange{};// mat4 mvp (64) + vec4 color (16) = 80
+        VkPushConstantRange pcRange{};// mat4 mvp (64) + vec4 color (16) + vec4 dash (16) = 96
         pcRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
         pcRange.offset     = 0;
-        pcRange.size       = 80;
+        pcRange.size       = 96;
         VkPipelineLayoutCreateInfo plci{};
         plci.sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         plci.pushConstantRangeCount = 1;
@@ -178,7 +375,7 @@ void OverlayPass::createOrthoLinePipelines() {
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat   = VK_FORMAT_UNDEFINED;// color-only pass
+    prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -194,27 +391,163 @@ void OverlayPass::createOrthoLinePipelines() {
     gpci.pColorBlendState    = &cb;
     gpci.pDynamicState       = &dyn;
     gpci.layout              = orthoLinePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &orthoLineListPipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &orthoLineListPipeline_),
           "vkCreateGraphicsPipelines(orthoLineList)");
 
     VkGraphicsPipelineCreateInfo gpciStrip = gpci;
     gpciStrip.pInputAssemblyState = &iaStrip;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciStrip, nullptr,
-                                    &orthoLineStripPipeline_),
+    check(ctx_.createGraphicsPipeline(gpciStrip, &orthoLineStripPipeline_),
           "vkCreateGraphicsPipelines(orthoLineStrip)");
 
+    VkShaderModuleCreateInfo dvsmci{};
+    dvsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    dvsmci.codeSize = sizeof(kOverlayDashedVertSpv);
+    dvsmci.pCode    = kOverlayDashedVertSpv;
+    VkShaderModule dashedVertModule = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &dvsmci, nullptr, &dashedVertModule),
+          "vkCreateShaderModule(ortho overlay_dashed.vert)");
+    VkShaderModuleCreateInfo dfsmci{};
+    dfsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    dfsmci.codeSize = sizeof(kOverlayDashedFragSpv);
+    dfsmci.pCode    = kOverlayDashedFragSpv;
+    VkShaderModule dashedFragModule = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &dfsmci, nullptr, &dashedFragModule),
+          "vkCreateShaderModule(ortho overlay_dashed.frag)");
+
+    VkPipelineShaderStageCreateInfo dashedStages[2] = {stages[0], stages[1]};
+    dashedStages[0].module = dashedVertModule;
+    dashedStages[1].module = dashedFragModule;
+    VkVertexInputBindingDescription dashedVib[2]{};
+    dashedVib[0] = vib;
+    dashedVib[1].binding = 1;
+    dashedVib[1].stride = sizeof(float);
+    dashedVib[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription dashedVia[2]{};
+    dashedVia[0] = via;
+    dashedVia[1].location = 1;
+    dashedVia[1].binding = 1;
+    dashedVia[1].format = VK_FORMAT_R32_SFLOAT;
+    dashedVia[1].offset = 0;
+    VkPipelineVertexInputStateCreateInfo dashedVi = vi;
+    dashedVi.vertexBindingDescriptionCount = 2;
+    dashedVi.pVertexBindingDescriptions = dashedVib;
+    dashedVi.vertexAttributeDescriptionCount = 2;
+    dashedVi.pVertexAttributeDescriptions = dashedVia;
+    VkGraphicsPipelineCreateInfo gpciDashedList = gpci;
+    gpciDashedList.pStages = dashedStages;
+    gpciDashedList.pVertexInputState = &dashedVi;
+    check(ctx_.createGraphicsPipeline(gpciDashedList, &orthoLineDashedListPipeline_),
+          "vkCreateGraphicsPipelines(orthoLineDashedList)");
+    VkGraphicsPipelineCreateInfo gpciDashedStrip = gpciDashedList;
+    gpciDashedStrip.pInputAssemblyState = &iaStrip;
+    check(ctx_.createGraphicsPipeline(gpciDashedStrip, &orthoLineDashedStripPipeline_),
+          "vkCreateGraphicsPipelines(orthoLineDashedStrip)");
+
+    VkShaderModuleCreateInfo cvsmci{};
+    cvsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    cvsmci.codeSize = sizeof(kOverlayColorVertSpv);
+    cvsmci.pCode    = kOverlayColorVertSpv;
+    VkShaderModule colorVertModule = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &cvsmci, nullptr, &colorVertModule),
+          "vkCreateShaderModule(ortho overlay_color.vert)");
+    VkShaderModuleCreateInfo cfsmci{};
+    cfsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    cfsmci.codeSize = sizeof(kOverlayColorFragSpv);
+    cfsmci.pCode    = kOverlayColorFragSpv;
+    VkShaderModule colorFragModule = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &cfsmci, nullptr, &colorFragModule),
+          "vkCreateShaderModule(ortho overlay_color.frag)");
+
+    VkPipelineShaderStageCreateInfo colorStages[2] = {stages[0], stages[1]};
+    colorStages[0].module = colorVertModule;
+    colorStages[1].module = colorFragModule;
+    VkVertexInputBindingDescription colorVib[2]{};
+    colorVib[0] = vib;
+    colorVib[1].binding = 1;
+    colorVib[1].stride = 3 * sizeof(float);
+    colorVib[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription colorVia[2]{};
+    colorVia[0] = via;
+    colorVia[1].location = 1;
+    colorVia[1].binding = 1;
+    colorVia[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+    colorVia[1].offset = 0;
+    VkPipelineVertexInputStateCreateInfo colorVi = vi;
+    colorVi.vertexBindingDescriptionCount = 2;
+    colorVi.pVertexBindingDescriptions = colorVib;
+    colorVi.vertexAttributeDescriptionCount = 2;
+    colorVi.pVertexAttributeDescriptions = colorVia;
+    VkGraphicsPipelineCreateInfo gpciColorList = gpci;
+    gpciColorList.pStages = colorStages;
+    gpciColorList.pVertexInputState = &colorVi;
+    check(ctx_.createGraphicsPipeline(gpciColorList, &orthoLineColoredListPipeline_),
+          "vkCreateGraphicsPipelines(orthoLineColoredList)");
+    VkGraphicsPipelineCreateInfo gpciColorStrip = gpciColorList;
+    gpciColorStrip.pInputAssemblyState = &iaStrip;
+    check(ctx_.createGraphicsPipeline(gpciColorStrip, &orthoLineColoredStripPipeline_),
+          "vkCreateGraphicsPipelines(orthoLineColoredStrip)");
+
     // Identical state to the line pipelines (position-only input,
-    // depth off, CULL_NONE, same layout) but TRIANGLE_LIST topology;
+    // shared depth attachment, CULL_NONE, same layout) but TRIANGLE_LIST topology;
     // the transparent variant adds standard src-alpha blending.
     VkPipelineInputAssemblyStateCreateInfo iaTri = iaList;
     iaTri.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
 
     VkGraphicsPipelineCreateInfo gpciMesh = gpci;
     gpciMesh.pInputAssemblyState = &iaTri;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMesh, nullptr,
-                                    &orthoMeshPipeline_),
+    VkPipelineDepthStencilStateCreateInfo meshDs = ds;
+    meshDs.depthWriteEnable = VK_TRUE;
+    gpciMesh.pDepthStencilState = &meshDs;
+    check(ctx_.createGraphicsPipeline(gpciMesh, &orthoMeshPipeline_),
           "vkCreateGraphicsPipelines(orthoMesh)");
+
+    VkGraphicsPipelineCreateInfo gpciMeshColored = gpciMesh;
+    gpciMeshColored.pStages = colorStages;
+    gpciMeshColored.pVertexInputState = &colorVi;
+    check(ctx_.createGraphicsPipeline(gpciMeshColored, &orthoMeshColoredPipeline_),
+          "vkCreateGraphicsPipelines(orthoMeshColored)");
+
+    VkShaderModuleCreateInfo ivsmci{};
+    ivsmci.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    ivsmci.codeSize = sizeof(kOverlayInstancedVertSpv);
+    ivsmci.pCode = kOverlayInstancedVertSpv;
+    VkShaderModule instancedVertModule = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &ivsmci, nullptr, &instancedVertModule),
+          "vkCreateShaderModule(ortho overlay_instanced.vert)");
+
+    VkPipelineShaderStageCreateInfo instancedStages[2] = {colorStages[0], colorStages[1]};
+    instancedStages[0].module = instancedVertModule;
+    VkVertexInputBindingDescription instancedVib[3]{};
+    instancedVib[0] = vib;
+    instancedVib[1].binding = 1;
+    instancedVib[1].stride = 16 * sizeof(float);
+    instancedVib[1].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    instancedVib[2].binding = 2;
+    instancedVib[2].stride = 3 * sizeof(float);
+    instancedVib[2].inputRate = VK_VERTEX_INPUT_RATE_INSTANCE;
+    VkVertexInputAttributeDescription instancedVia[6]{};
+    instancedVia[0] = via;
+    for (uint32_t column = 0; column < 4; ++column) {
+        auto& attr = instancedVia[column + 1];
+        attr.location = column + 1;
+        attr.binding = 1;
+        attr.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attr.offset = column * 4 * sizeof(float);
+    }
+    instancedVia[5].location = 5;
+    instancedVia[5].binding = 2;
+    instancedVia[5].format = VK_FORMAT_R32G32B32_SFLOAT;
+    instancedVia[5].offset = 0;
+    VkPipelineVertexInputStateCreateInfo instancedVi = vi;
+    instancedVi.vertexBindingDescriptionCount = 3;
+    instancedVi.pVertexBindingDescriptions = instancedVib;
+    instancedVi.vertexAttributeDescriptionCount = 6;
+    instancedVi.pVertexAttributeDescriptions = instancedVia;
+    VkGraphicsPipelineCreateInfo gpciMeshInstanced = gpciMesh;
+    gpciMeshInstanced.pStages = instancedStages;
+    gpciMeshInstanced.pVertexInputState = &instancedVi;
+    check(ctx_.createGraphicsPipeline(gpciMeshInstanced, &orthoMeshInstancedPipeline_),
+          "vkCreateGraphicsPipelines(orthoMeshInstanced)");
 
     VkPipelineColorBlendAttachmentState cbasT = cbas;
     cbasT.blendEnable         = VK_TRUE;
@@ -228,12 +561,17 @@ void OverlayPass::createOrthoLinePipelines() {
     cbT.pAttachments = &cbasT;
     VkGraphicsPipelineCreateInfo gpciMeshT = gpciMesh;
     gpciMeshT.pColorBlendState = &cbT;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpciMeshT, nullptr,
-                                    &orthoMeshTransparentPipeline_),
+    gpciMeshT.pDepthStencilState = &ds;
+    check(ctx_.createGraphicsPipeline(gpciMeshT, &orthoMeshTransparentPipeline_),
           "vkCreateGraphicsPipelines(orthoMeshTransparent)");
 
     vkDestroyShaderModule(ctx_.device(), vertModule, nullptr);
     vkDestroyShaderModule(ctx_.device(), fragModule, nullptr);
+    vkDestroyShaderModule(ctx_.device(), dashedVertModule, nullptr);
+    vkDestroyShaderModule(ctx_.device(), dashedFragModule, nullptr);
+    vkDestroyShaderModule(ctx_.device(), colorVertModule, nullptr);
+    vkDestroyShaderModule(ctx_.device(), colorFragModule, nullptr);
+    vkDestroyShaderModule(ctx_.device(), instancedVertModule, nullptr);
 }
 
 void OverlayPass::createOrthoPointPipeline() {
@@ -304,8 +642,9 @@ void OverlayPass::createOrthoPointPipeline() {
 
     VkPipelineDepthStencilStateCreateInfo ds{};
     ds.sType            = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
-    ds.depthTestEnable  = VK_FALSE;
+    ds.depthTestEnable  = VK_TRUE;
     ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS_OR_EQUAL;
 
     VkPipelineColorBlendAttachmentState cbas{};
     cbas.blendEnable    = VK_FALSE;
@@ -327,7 +666,7 @@ void OverlayPass::createOrthoPointPipeline() {
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFmt;
-    prci.depthAttachmentFormat   = VK_FORMAT_UNDEFINED;
+    prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -343,8 +682,7 @@ void OverlayPass::createOrthoPointPipeline() {
     gpci.pColorBlendState    = &cb;
     gpci.pDynamicState       = &dyn;
     gpci.layout              = orthoLinePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &orthoPointListPipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &orthoPointListPipeline_),
           "vkCreateGraphicsPipelines(orthoPointList)");
 
     vkDestroyShaderModule(ctx_.device(), vertModule, nullptr);
@@ -489,14 +827,15 @@ void OverlayPass::createSpriteOverlayPipeline() {
     dyn.dynamicStateCount = 2;
     dyn.pDynamicStates    = dynStates;
 
-    // Dynamic rendering — color attachment only, no depth attachment.
-    // HUD draws after the existing overlay pass so the swapchain has
+    // HUD keeps depth testing disabled but remains compatible with the shared
+    // depth attachment. It draws after the existing overlay pass so the swapchain has
     // already been transitioned through COLOR_ATTACHMENT_OPTIMAL.
     const VkFormat colorFmt = ctx_.swapchainFormat();
     VkPipelineRenderingCreateInfo prci{};
     prci.sType                   = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     prci.colorAttachmentCount    = 1;
     prci.pColorAttachmentFormats = &colorFmt;
+    prci.depthAttachmentFormat   = VK_FORMAT_D32_SFLOAT;
 
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType               = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -512,12 +851,147 @@ void OverlayPass::createSpriteOverlayPipeline() {
     gpci.pColorBlendState    = &cb;
     gpci.pDynamicState       = &dyn;
     gpci.layout              = spritePipelineLayout_;
-    check(vkCreateGraphicsPipelines(ctx_.device(), ctx_.pipelineCache(), 1, &gpci, nullptr,
-                                    &overlaySpritePipeline_),
+    check(ctx_.createGraphicsPipeline(gpci, &overlaySpritePipeline_),
           "vkCreateGraphicsPipelines(overlaySprite)");
 
     vkDestroyShaderModule(ctx_.device(), vert, nullptr);
     vkDestroyShaderModule(ctx_.device(), frag, nullptr);
+}
+
+void OverlayPass::createTexturedMeshPipeline() {
+    if (orthoTexturedMeshPipeline_ != VK_NULL_HANDLE) return;
+    if (overlaySpritePipeline_ == VK_NULL_HANDLE) createSpriteOverlayPipeline();
+
+    VkShaderModuleCreateInfo vsmci{};
+    vsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    vsmci.codeSize = sizeof(kOverlayTexturedMeshVertSpv);
+    vsmci.pCode    = kOverlayTexturedMeshVertSpv;
+    VkShaderModule vert = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &vsmci, nullptr, &vert),
+          "vkCreateShaderModule(overlay_textured_mesh.vert)");
+    VkShaderModuleCreateInfo fsmci{};
+    fsmci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    fsmci.codeSize = sizeof(kOverlayTexturedMeshFragSpv);
+    fsmci.pCode    = kOverlayTexturedMeshFragSpv;
+    VkShaderModule frag = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &fsmci, nullptr, &frag),
+          "vkCreateShaderModule(overlay_textured_mesh.frag)");
+    fsmci.codeSize = sizeof(kOverlayDepthTextureMeshFragSpv);
+    fsmci.pCode    = kOverlayDepthTextureMeshFragSpv;
+    VkShaderModule depthFrag = VK_NULL_HANDLE;
+    check(vkCreateShaderModule(ctx_.device(), &fsmci, nullptr, &depthFrag),
+          "vkCreateShaderModule(overlay_depth_texture_mesh.frag)");
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert;
+    stages[0].pName  = "main";
+    stages[1].sType  = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = frag;
+    stages[1].pName  = "main";
+
+    VkVertexInputBindingDescription vibs[2]{};
+    vibs[0].binding = 0;
+    vibs[0].stride = 3 * sizeof(float);
+    vibs[0].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    vibs[1].binding = 1;
+    vibs[1].stride = 2 * sizeof(float);
+    vibs[1].inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+    VkVertexInputAttributeDescription vias[2]{};
+    vias[0].location = 0;
+    vias[0].binding = 0;
+    vias[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+    vias[0].offset = 0;
+    vias[1].location = 1;
+    vias[1].binding = 1;
+    vias[1].format = VK_FORMAT_R32G32_SFLOAT;
+    vias[1].offset = 0;
+    VkPipelineVertexInputStateCreateInfo vi{};
+    vi.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+    vi.vertexBindingDescriptionCount = 2;
+    vi.pVertexBindingDescriptions = vibs;
+    vi.vertexAttributeDescriptionCount = 2;
+    vi.pVertexAttributeDescriptions = vias;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{};
+    ia.sType    = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{};
+    vp.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    vp.viewportCount = 1;
+    vp.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{};
+    rs.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode = VK_CULL_MODE_NONE;
+    rs.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{};
+    ms.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{};
+    ds.sType = VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO;
+    ds.depthTestEnable = VK_TRUE;
+    ds.depthWriteEnable = VK_FALSE;
+    ds.depthCompareOp = VK_COMPARE_OP_LESS_OR_EQUAL;
+
+    VkPipelineColorBlendAttachmentState cbas{};
+    cbas.blendEnable = VK_TRUE;
+    cbas.srcColorBlendFactor = VK_BLEND_FACTOR_SRC_ALPHA;
+    cbas.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cbas.colorBlendOp = VK_BLEND_OP_ADD;
+    cbas.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    cbas.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    cbas.alphaBlendOp = VK_BLEND_OP_ADD;
+    cbas.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                          VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{};
+    cb.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    cb.attachmentCount = 1;
+    cb.pAttachments = &cbas;
+
+    VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{};
+    dyn.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates = dynStates;
+
+    const VkFormat colorFmt = ctx_.swapchainFormat();
+    VkPipelineRenderingCreateInfo prci{};
+    prci.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    prci.colorAttachmentCount = 1;
+    prci.pColorAttachmentFormats = &colorFmt;
+    prci.depthAttachmentFormat = VK_FORMAT_D32_SFLOAT;
+
+    VkGraphicsPipelineCreateInfo gpci{};
+    gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpci.pNext = &prci;
+    gpci.stageCount = 2;
+    gpci.pStages = stages;
+    gpci.pVertexInputState = &vi;
+    gpci.pInputAssemblyState = &ia;
+    gpci.pViewportState = &vp;
+    gpci.pRasterizationState = &rs;
+    gpci.pMultisampleState = &ms;
+    gpci.pDepthStencilState = &ds;
+    gpci.pColorBlendState = &cb;
+    gpci.pDynamicState = &dyn;
+    gpci.layout = spritePipelineLayout_;
+    check(ctx_.createGraphicsPipeline(gpci, &orthoTexturedMeshPipeline_),
+          "vkCreateGraphicsPipelines(orthoTexturedMesh)");
+    stages[1].module = depthFrag;
+    check(ctx_.createGraphicsPipeline(gpci, &orthoDepthTextureMeshPipeline_),
+          "vkCreateGraphicsPipelines(orthoDepthTextureMesh)");
+
+    vkDestroyShaderModule(ctx_.device(), vert, nullptr);
+    vkDestroyShaderModule(ctx_.device(), frag, nullptr);
+    vkDestroyShaderModule(ctx_.device(), depthFrag, nullptr);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -528,6 +1002,37 @@ const OverlayPass::SpriteAtlasRec*
 OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
     if (!texSp) return nullptr;
     const Texture* tex = texSp.get();
+
+    if (externalImageFn_) {
+        if (const Image2D* external = externalImageFn_(tex)) {
+            auto it = spriteAtlasCache_.find(tex);
+            if (it != spriteAtlasCache_.end()) {
+                SpriteAtlasRec& rec = it->second;
+                if (rec.ownsImage) {
+                    vkDeviceWaitIdle(ctx_.device());
+                    destroyImage2D(ctx_.allocator(), ctx_.device(), rec.image);
+                }
+                rec.image = *external;
+                rec.textureVersion = tex->version();
+                rec.width = external->width;
+                rec.height = external->height;
+                rec.liveCheck = std::weak_ptr<Texture>(texSp);
+                rec.ownsImage = false;
+                return &rec;
+            }
+
+            SpriteAtlasRec rec{};
+            rec.image = *external;
+            rec.textureVersion = tex->version();
+            rec.width = external->width;
+            rec.height = external->height;
+            rec.liveCheck = std::weak_ptr<Texture>(texSp);
+            rec.ownsImage = false;
+            auto [ins, _] = spriteAtlasCache_.emplace(tex, rec);
+            return &ins->second;
+        }
+    }
+
     Image& img = const_cast<Texture*>(tex)->image();
     const uint32_t w = img.width();
     const uint32_t h = img.height();
@@ -540,11 +1045,14 @@ OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
         const bool stale = rec.liveCheck.expired() ||
                            rec.liveCheck.lock().get() != tex ||
                            rec.textureVersion != curVersion ||
-                           rec.width != w || rec.height != h;
+                           rec.width != w || rec.height != h ||
+                           !rec.ownsImage;
         if (!stale) return &rec;
         // Stale — destroy and re-upload.
-        vkDeviceWaitIdle(ctx_.device());
-        destroyImage2D(ctx_.allocator(), ctx_.device(), rec.image);
+        if (rec.ownsImage) {
+            vkDeviceWaitIdle(ctx_.device());
+            destroyImage2D(ctx_.allocator(), ctx_.device(), rec.image);
+        }
         spriteAtlasCache_.erase(it);
     }
 
@@ -556,31 +1064,146 @@ OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
     const size_t pixels = static_cast<size_t>(w) * h;
     try {
         auto& src = img.data<unsigned char>();
-        if (src.size() == pixels * 4) {
-            rgba.assign(src.begin(), src.end());
-        } else if (src.size() == pixels * 3) {
-            rgba.resize(pixels * 4);
-            for (size_t i = 0; i < pixels; ++i) {
-                rgba[i*4+0] = src[i*3+0];
-                rgba[i*4+1] = src[i*3+1];
-                rgba[i*4+2] = src[i*3+2];
-                rgba[i*4+3] = 255u;
+        if (src.size() % pixels != 0) return nullptr;
+        const int channels = static_cast<int>(src.size() / pixels);
+        if (channels < 1 || channels > 4) return nullptr;
+        rgba.resize(pixels * 4);
+        for (size_t i = 0; i < pixels; ++i) {
+            const auto base = i * static_cast<size_t>(channels);
+            auto r = src[base + 0];
+            auto g = channels >= 2 ? src[base + 1] : r;
+            auto b = channels >= 3 ? src[base + 2] : (channels == 1 ? r : 0);
+            auto a = channels >= 4 ? src[base + 3] : 255u;
+            switch (tex->format) {
+                case Format::Alpha:
+                    r = g = b = 0;
+                    a = src[base + 0];
+                    break;
+                case Format::Luminance:
+                    r = g = b = src[base + 0];
+                    a = 255u;
+                    break;
+                case Format::LuminanceAlpha:
+                    if (channels < 2) return nullptr;
+                    r = g = b = src[base + 0];
+                    a = src[base + 1];
+                    break;
+                case Format::Red:
+                case Format::RedInteger:
+                    r = src[base + 0];
+                    g = b = 0;
+                    a = 255u;
+                    break;
+                case Format::RG:
+                case Format::RGInteger:
+                    if (channels < 2) return nullptr;
+                    r = src[base + 0];
+                    g = src[base + 1];
+                    b = 0;
+                    a = 255u;
+                    break;
+                case Format::BGR:
+                    if (channels < 3) return nullptr;
+                    r = src[base + 2];
+                    g = src[base + 1];
+                    b = src[base + 0];
+                    a = 255u;
+                    break;
+                case Format::BGRA:
+                    if (channels < 4) return nullptr;
+                    r = src[base + 2];
+                    g = src[base + 1];
+                    b = src[base + 0];
+                    a = src[base + 3];
+                    break;
+                default:
+                    break;
             }
-        } else {
-            return nullptr;
+            rgba[i * 4 + 0] = r;
+            rgba[i * 4 + 1] = g;
+            rgba[i * 4 + 2] = b;
+            rgba[i * 4 + 3] = a;
         }
     } catch (const std::bad_variant_access&) {
-        return nullptr;
+        try {
+            auto& src = img.data<float>();
+            if (src.size() % pixels != 0) return nullptr;
+            const int channels = static_cast<int>(src.size() / pixels);
+            if (channels < 1 || channels > 4) return nullptr;
+            auto q = [](float v) {
+                if (!(v == v)) v = 0.f;
+                v = v < 0.f ? 0.f : (v > 1.f ? 1.f : v);
+                return static_cast<unsigned char>(v * 255.f + 0.5f);
+            };
+            rgba.resize(pixels * 4);
+            for (size_t i = 0; i < pixels; ++i) {
+                const auto base = i * static_cast<size_t>(channels);
+                auto r = q(src[base + 0]);
+                auto g = channels >= 2 ? q(src[base + 1]) : r;
+                auto b = channels >= 3 ? q(src[base + 2]) : (channels == 1 ? r : 0);
+                auto a = channels >= 4 ? q(src[base + 3]) : 255u;
+                switch (tex->format) {
+                    case Format::Alpha:
+                        r = g = b = 0;
+                        a = q(src[base + 0]);
+                        break;
+                    case Format::Luminance:
+                        r = g = b = q(src[base + 0]);
+                        a = 255u;
+                        break;
+                    case Format::LuminanceAlpha:
+                        if (channels < 2) return nullptr;
+                        r = g = b = q(src[base + 0]);
+                        a = q(src[base + 1]);
+                        break;
+                    case Format::Red:
+                    case Format::RedInteger:
+                        r = q(src[base + 0]);
+                        g = b = 0;
+                        a = 255u;
+                        break;
+                    case Format::RG:
+                    case Format::RGInteger:
+                        if (channels < 2) return nullptr;
+                        r = q(src[base + 0]);
+                        g = q(src[base + 1]);
+                        b = 0;
+                        a = 255u;
+                        break;
+                    case Format::BGR:
+                        if (channels < 3) return nullptr;
+                        r = q(src[base + 2]);
+                        g = q(src[base + 1]);
+                        b = q(src[base + 0]);
+                        a = 255u;
+                        break;
+                    case Format::BGRA:
+                        if (channels < 4) return nullptr;
+                        r = q(src[base + 2]);
+                        g = q(src[base + 1]);
+                        b = q(src[base + 0]);
+                        a = q(src[base + 3]);
+                        break;
+                    default:
+                        break;
+                }
+                rgba[i * 4 + 0] = r;
+                rgba[i * 4 + 1] = g;
+                rgba[i * 4 + 2] = b;
+                rgba[i * 4 + 3] = a;
+            }
+        } catch (const std::bad_variant_access&) {
+            return nullptr;
+        }
     }
 
     // Match GL/WGPU's colorSpace→format rule (`isSrgb = colorSpace
     // == sRGB`): ONLY an explicitly sRGB-tagged texture gets hardware
     // sRGB decode on sample. Linear AND NoColorSpace are sampled raw.
     // The TextSprite glyph atlas is NoColorSpace but Font::rasterize
-    // bakes LINEAR bytes (color.r*255) into it — so it must be sampled
-    // raw (UNORM), and overlay_sprite.frag applies the linear→sRGB
-    // output encode for the UNORM swapchain. (Was: NoColorSpace fell
-    // to SRGB here → double sRGB decode → dark non-white text.)
+    // bakes LINEAR bytes (color.r*255) into it, so it must be sampled
+    // raw (UNORM). (Was: NoColorSpace fell to SRGB here → double
+    // sRGB decode → dark non-white text.)
     const VkFormat fmt = (tex->colorSpace == ColorSpace::sRGB)
                                  ? VK_FORMAT_R8G8B8A8_SRGB
                                  : VK_FORMAT_R8G8B8A8_UNORM;
@@ -590,9 +1213,9 @@ OverlayPass::ensureSpriteAtlasTexture(const std::shared_ptr<Texture>& texSp) {
     Image2D up = uploadFn_(
             w, h, fmt,
             rgba.data(), rgba.size(),
-            VK_FILTER_LINEAR,
-            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
-            VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            toVkFilter(tex->magFilter),
+            toVkAddressMode(tex->wrapS),
+            toVkAddressMode(tex->wrapT),
             spriteName);
 
     SpriteAtlasRec rec{};
@@ -662,7 +1285,143 @@ OverlayPass::ensureSpriteGeometryUploaded(const BufferGeometry* geom) {
     return &ins->second;
 }
 
-const LineRec*
+const OverlayPass::TexturedMeshGeomRec*
+OverlayPass::ensureTexturedMeshGeometryUploaded(const BufferGeometry* geom) {
+    if (!geom) return nullptr;
+    auto posAttr = geom->getAttribute<float>("position");
+    auto uvAttr = geom->getAttribute<float>("uv");
+    if (!posAttr || !uvAttr || posAttr->count() == 0 || uvAttr->count() == 0) return nullptr;
+
+    const auto* idxAttr = geom->getIndex();
+    const uint32_t posVer = posAttr->version;
+    const uint32_t uvVer = uvAttr->version;
+    const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : 0u;
+
+    auto it = texturedMeshGeomCache_.find(geom);
+    if (it != texturedMeshGeomCache_.end()) {
+        const auto& rec = it->second;
+        if (rec.geomId == geom->id &&
+            rec.positionVersion == posVer &&
+            rec.uvVersion == uvVer &&
+            rec.indexVersion == idxVer) {
+            return &rec;
+        }
+        destroyBuffer(ctx_.allocator(), it->second.position);
+        destroyBuffer(ctx_.allocator(), it->second.uv);
+        if (it->second.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), it->second.index);
+        texturedMeshGeomCache_.erase(it);
+    }
+
+    TexturedMeshGeomRec rec{};
+    rec.vertexCount = static_cast<uint32_t>(std::min(posAttr->count(), uvAttr->count()));
+    rec.geomId = geom->id;
+    rec.positionVersion = posVer;
+    rec.uvVersion = uvVer;
+    rec.indexVersion = idxVer;
+
+    const auto& posArr = posAttr->array();
+    const VkDeviceSize posBytes = posArr.size() * sizeof(float);
+    rec.position = createBuffer(
+            ctx_.allocator(), ctx_.device(), posBytes,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+    void* mapped = nullptr;
+    vmaMapMemory(ctx_.allocator(), rec.position.alloc, &mapped);
+    std::memcpy(mapped, posArr.data(), posBytes);
+    vmaUnmapMemory(ctx_.allocator(), rec.position.alloc);
+
+    const auto& uvArr = uvAttr->array();
+    const VkDeviceSize uvBytes = uvArr.size() * sizeof(float);
+    rec.uv = createBuffer(
+            ctx_.allocator(), ctx_.device(), uvBytes,
+            VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+            VMA_MEMORY_USAGE_AUTO,
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+    vmaMapMemory(ctx_.allocator(), rec.uv.alloc, &mapped);
+    std::memcpy(mapped, uvArr.data(), uvBytes);
+    vmaUnmapMemory(ctx_.allocator(), rec.uv.alloc);
+
+    if (idxAttr && idxAttr->count() > 0) {
+        const auto& indices = idxAttr->array();
+        rec.indexCount = static_cast<uint32_t>(indices.size());
+        const VkDeviceSize ibBytes = indices.size() * sizeof(unsigned int);
+        rec.index = createBuffer(
+                ctx_.allocator(), ctx_.device(), ibBytes,
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                VMA_MEMORY_USAGE_AUTO,
+                VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        vmaMapMemory(ctx_.allocator(), rec.index.alloc, &mapped);
+        std::memcpy(mapped, indices.data(), ibBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.index.alloc);
+    }
+
+    return &texturedMeshGeomCache_.emplace(geom, std::move(rec)).first->second;
+}
+
+const OverlayPass::InstancedMeshRec*
+OverlayPass::ensureInstancedMeshUploaded(const InstancedMesh* mesh) {
+    if (!mesh || mesh->count() == 0) return nullptr;
+    const auto* matrices = mesh->instanceMatrix();
+    const auto* colors = mesh->instanceColor();
+    if (!matrices) return nullptr;
+
+    auto retire = [&](Buffer& buffer) {
+        if (buffer.handle == VK_NULL_HANDLE) return;
+        retiredInstancedBuffers_.push_back({buffer, overlayFrameCounter_});
+        buffer = {};
+    };
+
+    auto& rec = instancedMeshCache_[mesh];
+    if (rec.meshId != 0 && rec.meshId != mesh->id) {
+        retire(rec.matrix);
+        retire(rec.color);
+        rec = {};
+    }
+
+    const auto count = static_cast<uint32_t>(mesh->count());
+    const auto matrixBytes = static_cast<VkDeviceSize>(count) * 16 * sizeof(float);
+    const auto colorBytes = static_cast<VkDeviceSize>(count) * 3 * sizeof(float);
+
+    bool resized = false;
+    auto ensureCapacity = [&](Buffer& buffer, VkDeviceSize bytes) {
+        if (buffer.handle != VK_NULL_HANDLE && buffer.size >= bytes) return;
+        retire(buffer);
+        buffer = createBuffer(ctx_.allocator(), ctx_.device(), bytes,
+                              VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                              VMA_MEMORY_USAGE_AUTO,
+                              VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        resized = true;
+    };
+    ensureCapacity(rec.matrix, matrixBytes);
+    ensureCapacity(rec.color, colorBytes);
+
+    if (resized || rec.matrixVersion != matrices->version) {
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.matrix.alloc, &mapped);
+        std::memcpy(mapped, matrices->array().data(), matrixBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.matrix.alloc);
+    }
+
+    const unsigned int colorVersion = colors ? colors->version : 0u;
+    if (resized || rec.colorVersion != colorVersion) {
+        const std::vector<float> white(colors ? 0u : static_cast<size_t>(count) * 3u, 1.f);
+        const float* source = colors ? colors->array().data() : white.data();
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
+        std::memcpy(mapped, source, colorBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+    }
+
+    rec.matrixVersion = matrices->version;
+    rec.colorVersion = colorVersion;
+    rec.meshId = mesh->id;
+    rec.capacity = std::max(rec.capacity, count);
+    rec.lastTouch = overlayFrameCounter_;
+    return &rec;
+}
+
+LineRec*
 OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
     if (!geom) return nullptr;
     auto posAttr = geom->getAttribute<float>("position");
@@ -672,10 +1431,54 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
     const auto colAttr = geom->hasAttribute("color")
                                  ? geom->getAttribute<float>("color")
                                  : nullptr;
+    const auto distAttr = geom->hasAttribute("lineDistance")
+                                  ? geom->getAttribute<float>("lineDistance")
+                                  : nullptr;
 
     const uint32_t posVer = posAttr->version;
     const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : 0u;
-    const uint32_t colVer = (colAttr && colAttr->count() > 0) ? colAttr->version : 0u;
+    const bool hasColorAttr = colAttr && colAttr->count() > 0;
+    const uint32_t colVer = hasColorAttr ? colAttr->version : 0u;
+    const uint32_t distVer = (distAttr && distAttr->count() > 0) ? distAttr->version : 0u;
+    auto uploadColorBuffer = [&](LineRec& rec) {
+        if (hasColorAttr) {
+            const auto& colArr = colAttr->array();
+            const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
+            if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
+                if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+                rec.color = createBuffer(
+                        ctx_.allocator(), ctx_.device(), cbBytes,
+                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                        VMA_MEMORY_USAGE_AUTO,
+                        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+            }
+            void* mapped = nullptr;
+            vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
+            std::memcpy(mapped, colArr.data(), cbBytes);
+            vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+            rec.colorVersion = colVer;
+            rec.colorIsFallback = false;
+            return;
+        }
+
+        const auto count = static_cast<std::size_t>(posAttr->count()) * 3u;
+        const VkDeviceSize cbBytes = count * sizeof(float);
+        if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
+            if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
+            rec.color = createBuffer(
+                    ctx_.allocator(), ctx_.device(), cbBytes,
+                    VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        }
+        const std::vector<float> white(count, 1.f);
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
+        std::memcpy(mapped, white.data(), cbBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+        rec.colorVersion = 0;
+        rec.colorIsFallback = true;
+    };
 
     auto it = lineGeomCache_.find(geom);
     if (it != lineGeomCache_.end() && it->second.geomId != geom->id) {
@@ -684,7 +1487,9 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
         // (the version fields would otherwise alias — both at 0).
         destroyBuffer(ctx_.allocator(), it->second.vertex);
         if (it->second.index.handle) destroyBuffer(ctx_.allocator(), it->second.index);
+        destroyLineLoopRanges(ctx_.allocator(), it->second.loopRanges);
         if (it->second.color.handle) destroyBuffer(ctx_.allocator(), it->second.color);
+        if (it->second.lineDistance.handle) destroyBuffer(ctx_.allocator(), it->second.lineDistance);
         lineGeomCache_.erase(it);
         it = lineGeomCache_.end();
     }
@@ -693,10 +1498,13 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
         rec.lastTouch = overlayFrameCounter_;
         if (rec.positionVersion == posVer &&
             rec.indexVersion    == idxVer &&
-            rec.colorVersion    == colVer) {
+            rec.colorVersion    == colVer &&
+            rec.colorIsFallback == !hasColorAttr &&
+            rec.lineDistanceVersion == distVer) {
             return &rec;
         }
         // Re-upload paths.
+        destroyLineLoopRanges(ctx_.allocator(), rec.loopRanges);
         const auto& posArr = posAttr->array();
         const VkDeviceSize vbBytes = posArr.size() * sizeof(float);
         if (vbBytes > rec.vertex.size) {
@@ -736,27 +1544,27 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
             rec.indexCount   = 0;
             rec.indexVersion = 0;
         }
+        uploadColorBuffer(rec);
 
-        // Color buffer follows the same in-place / recreate logic.
-        if (colAttr && colAttr->count() > 0) {
-            const auto& colArr = colAttr->array();
-            const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
-            if (rec.color.handle == VK_NULL_HANDLE || cbBytes > rec.color.size) {
-                if (rec.color.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.color);
-                rec.color = createBuffer(
-                        ctx_.allocator(), ctx_.device(), cbBytes,
+        if (distAttr && distAttr->count() > 0) {
+            const auto& distArr = distAttr->array();
+            const VkDeviceSize dbBytes = distArr.size() * sizeof(float);
+            if (rec.lineDistance.handle == VK_NULL_HANDLE || dbBytes > rec.lineDistance.size) {
+                if (rec.lineDistance.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.lineDistance);
+                rec.lineDistance = createBuffer(
+                        ctx_.allocator(), ctx_.device(), dbBytes,
                         VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                         VMA_MEMORY_USAGE_AUTO,
                         VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
             }
-            vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
-            std::memcpy(mapped, colArr.data(), cbBytes);
-            vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
-            rec.colorVersion = colVer;
-        } else if (rec.color.handle != VK_NULL_HANDLE) {
-            destroyBuffer(ctx_.allocator(), rec.color);
-            rec.color        = {};
-            rec.colorVersion = 0;
+            vmaMapMemory(ctx_.allocator(), rec.lineDistance.alloc, &mapped);
+            std::memcpy(mapped, distArr.data(), dbBytes);
+            vmaUnmapMemory(ctx_.allocator(), rec.lineDistance.alloc);
+            rec.lineDistanceVersion = distVer;
+        } else if (rec.lineDistance.handle != VK_NULL_HANDLE) {
+            destroyBuffer(ctx_.allocator(), rec.lineDistance);
+            rec.lineDistance = {};
+            rec.lineDistanceVersion = 0;
         }
         return &rec;
     }
@@ -794,22 +1602,92 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
         std::memcpy(mapped, indices.data(), ibBytes);
         vmaUnmapMemory(ctx_.allocator(), rec.index.alloc);
     }
+    uploadColorBuffer(rec);
 
-    if (colAttr && colAttr->count() > 0) {
-        const auto& colArr = colAttr->array();
-        rec.colorVersion = colVer;
-        const VkDeviceSize cbBytes = colArr.size() * sizeof(float);
-        rec.color = createBuffer(
-                ctx_.allocator(), ctx_.device(), cbBytes,
+    if (distAttr && distAttr->count() > 0) {
+        const auto& distArr = distAttr->array();
+        rec.lineDistanceVersion = distVer;
+        const VkDeviceSize dbBytes = distArr.size() * sizeof(float);
+        rec.lineDistance = createBuffer(
+                ctx_.allocator(), ctx_.device(), dbBytes,
                 VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
                 VMA_MEMORY_USAGE_AUTO,
                 VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
-        vmaMapMemory(ctx_.allocator(), rec.color.alloc, &mapped);
-        std::memcpy(mapped, colArr.data(), cbBytes);
-        vmaUnmapMemory(ctx_.allocator(), rec.color.alloc);
+        vmaMapMemory(ctx_.allocator(), rec.lineDistance.alloc, &mapped);
+        std::memcpy(mapped, distArr.data(), dbBytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.lineDistance.alloc);
     }
 
     return &lineGeomCache_.emplace(geom, std::move(rec)).first->second;
+}
+
+WireframeRec*
+OverlayPass::ensureWireframeGeometryUploaded(const BufferGeometry* geom) {
+    if (!geom || !geom->hasAttribute("position")) return nullptr;
+    const auto* idxAttr = geom->getIndex();
+    const auto* posAttr = geom->getAttribute<float>("position");
+    if ((!idxAttr || idxAttr->count() == 0) && (!posAttr || posAttr->count() < 3)) {
+        return nullptr;
+    }
+
+    const uint32_t idxVer = (idxAttr && idxAttr->count() > 0) ? idxAttr->version : ~0u;
+    const uint32_t posVer = (idxAttr && idxAttr->count() > 0) ? ~0u : (posAttr ? posAttr->version : ~0u);
+    const uint32_t attrVer = geom->attributesVersion();
+
+    auto upload = [&](WireframeRec& rec) {
+        const auto indices = buildWireframeIndices(*geom);
+        rec.indexCount = static_cast<uint32_t>(indices.size());
+        rec.indexVersion = idxVer;
+        rec.positionVersion = posVer;
+        rec.attributesVersion = attrVer;
+        rec.geomId = geom->id;
+        rec.lastTouch = overlayFrameCounter_;
+
+        if (indices.empty()) {
+            if (rec.index.handle != VK_NULL_HANDLE) {
+                destroyBuffer(ctx_.allocator(), rec.index);
+                rec.index = {};
+            }
+            return;
+        }
+
+        const VkDeviceSize bytes = indices.size() * sizeof(unsigned int);
+        if (rec.index.handle == VK_NULL_HANDLE || bytes > rec.index.size) {
+            if (rec.index.handle != VK_NULL_HANDLE) destroyBuffer(ctx_.allocator(), rec.index);
+            rec.index = createBuffer(
+                    ctx_.allocator(), ctx_.device(), bytes,
+                    VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                    VMA_MEMORY_USAGE_AUTO,
+                    VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+        }
+
+        void* mapped = nullptr;
+        vmaMapMemory(ctx_.allocator(), rec.index.alloc, &mapped);
+        std::memcpy(mapped, indices.data(), bytes);
+        vmaUnmapMemory(ctx_.allocator(), rec.index.alloc);
+    };
+
+    auto it = wireframeGeomCache_.find(geom);
+    if (it != wireframeGeomCache_.end() && it->second.geomId != geom->id) {
+        destroyWireframeRec(ctx_.allocator(), it->second);
+        wireframeGeomCache_.erase(it);
+        it = wireframeGeomCache_.end();
+    }
+    if (it != wireframeGeomCache_.end()) {
+        auto& rec = it->second;
+        rec.lastTouch = overlayFrameCounter_;
+        if (rec.indexVersion == idxVer &&
+            rec.positionVersion == posVer &&
+            rec.attributesVersion == attrVer) {
+            return &rec;
+        }
+        upload(rec);
+        return &rec;
+    }
+
+    WireframeRec rec{};
+    upload(rec);
+    return &wireframeGeomCache_.emplace(geom, std::move(rec)).first->second;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -817,9 +1695,14 @@ OverlayPass::ensureLineGeometryUploaded(const BufferGeometry* geom) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex,
-                          Object3D& scene, Camera& camera, bool screenSpaceOnly,
+                         VkImage outputImage, VkImageView outputView, VkExtent2D outputExtent,
+                         Object3D& scene, Camera& camera, bool screenSpaceOnly,
                           uint32_t regionX, uint32_t regionY,
-                          uint32_t regionW, uint32_t regionH) {
+                          uint32_t regionW, uint32_t regionH,
+                          bool regionAsViewport,
+                          VkImageLayout inputLayout,
+                          VkImageLayout outputLayout,
+                          bool linearOutput) {
     // Lazy pipeline setup on first HUD overlay of the program.
     if (overlaySpritePipeline_ == VK_NULL_HANDLE) {
         createSpriteOverlayPipeline();
@@ -846,8 +1729,36 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (it->second.lastTouch < cutoff) {
                 destroyBuffer(ctx_.allocator(), it->second.vertex);
                 if (it->second.index.handle) destroyBuffer(ctx_.allocator(), it->second.index);
+                destroyLineLoopRanges(ctx_.allocator(), it->second.loopRanges);
                 if (it->second.color.handle) destroyBuffer(ctx_.allocator(), it->second.color);
+                if (it->second.lineDistance.handle) destroyBuffer(ctx_.allocator(), it->second.lineDistance);
                 it = lineGeomCache_.erase(it);
+            } else {
+                pruneLineLoopRanges(ctx_.allocator(), it->second.loopRanges, cutoff);
+                ++it;
+            }
+        }
+        for (auto it = wireframeGeomCache_.begin(); it != wireframeGeomCache_.end();) {
+            if (it->second.lastTouch < cutoff) {
+                destroyWireframeRec(ctx_.allocator(), it->second);
+                it = wireframeGeomCache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = instancedMeshCache_.begin(); it != instancedMeshCache_.end();) {
+            if (it->second.lastTouch < cutoff) {
+                if (it->second.matrix.handle) destroyBuffer(ctx_.allocator(), it->second.matrix);
+                if (it->second.color.handle) destroyBuffer(ctx_.allocator(), it->second.color);
+                it = instancedMeshCache_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = retiredInstancedBuffers_.begin(); it != retiredInstancedBuffers_.end();) {
+            if (it->retireFrame < cutoff) {
+                destroyBuffer(ctx_.allocator(), it->buffer);
+                it = retiredInstancedBuffers_.erase(it);
             } else {
                 ++it;
             }
@@ -868,7 +1779,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     // synthesise this from screenAnchor + viewport + position
     // instead of using sp->matrixWorld (which carries the user's
     // 3D placement, irrelevant in screen-space mode).
-    const VkExtent2D extEarly = ctx_.swapchainExtent();
+    const VkExtent2D extEarly = outputExtent;
     struct SpriteDraw {
         Sprite* sprite = nullptr;
         std::shared_ptr<Texture> atlas;
@@ -931,6 +1842,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     struct OrthoLineDraw {
         Line* line = nullptr;
         bool  isSegments = false;
+        bool  isLoop = false;
         Matrix4 world;
     };
     std::vector<OrthoLineDraw> lineDraws;
@@ -943,6 +1855,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             OrthoLineDraw ld;
             ld.line = ln;
             ld.isSegments = (dynamic_cast<LineSegments*>(ln) != nullptr);
+            ld.isLoop = (dynamic_cast<LineLoop*>(ln) != nullptr);
             std::memcpy(ld.world.elements.data(), ln->matrixWorld->elements.data(), 64);
             lineDraws.push_back(ld);
         });
@@ -954,10 +1867,18 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     // (which would wrongly flatten the path-traced 3D scene's meshes).
     struct OrthoMeshDraw {
         Mesh*   mesh = nullptr;
+        InstancedMesh* instanced = nullptr;
         Matrix4 world;
         Color   color{1.f, 1.f, 1.f};
+        std::shared_ptr<Texture> map;
+        bool    depthTexture = false;
+        float   depthNear = 0.1f;
+        float   depthFar = 1000.f;
+        float   flipUv = 0.f;
         float   opacity = 1.f;
         bool    transparent = false;
+        bool    wireframe = false;
+        bool    vertexColors = false;
     };
     std::vector<OrthoMeshDraw> meshDraws;
     if (!screenSpaceOnly) {
@@ -970,8 +1891,36 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             if (!mat) return;
             OrthoMeshDraw md;
             md.mesh = m;
+            md.instanced = dynamic_cast<InstancedMesh*>(m);
             std::memcpy(md.world.elements.data(), m->matrixWorld->elements.data(), 64);
             if (auto* mc = dynamic_cast<MaterialWithColor*>(mat.get())) md.color = mc->color;
+            if (auto* mm = dynamic_cast<MaterialWithMap*>(mat.get()); mm && mm->map && g->hasAttribute("uv")) {
+                md.map = mm->map;
+            }
+            if (auto* sm = dynamic_cast<ShaderMaterial*>(mat.get()); sm && g->hasAttribute("uv")) {
+                auto td = sm->uniforms.find("tDepth");
+                if (td != sm->uniforms.end() && td->second.hasValue()) {
+                    if (auto* tex = std::get_if<Texture*>(&td->second.value())) {
+                        md.map = std::shared_ptr<Texture>(*tex, [](Texture*) {});
+                        md.depthTexture = true;
+                    }
+                }
+                if (auto it = sm->uniforms.find("cameraNear"); it != sm->uniforms.end() && it->second.hasValue()) {
+                    if (auto* v = std::get_if<float>(&it->second.value())) md.depthNear = *v;
+                }
+                if (auto it = sm->uniforms.find("cameraFar"); it != sm->uniforms.end() && it->second.hasValue()) {
+                    if (auto* v = std::get_if<float>(&it->second.value())) md.depthFar = *v;
+                }
+                if (auto it = sm->uniforms.find("flipUv"); it != sm->uniforms.end() && it->second.hasValue()) {
+                    if (auto* v = std::get_if<float>(&it->second.value())) md.flipUv = *v;
+                }
+            }
+            if (auto* mw = dynamic_cast<MaterialWithWireframe*>(mat.get())) md.wireframe = mw->wireframe;
+            // ponytail: 透视叠加暂未上传线框法线；先匹配 Standard 漫反射的 Lambert 能量归一化。
+            if (md.wireframe && dynamic_cast<MeshStandardMaterial*>(mat.get())) {
+                md.color.multiplyScalar(0.318309886f);
+            }
+            md.vertexColors = mat->vertexColors && g->hasAttribute("color");
             md.opacity     = mat->opacity;
             md.transparent = mat->transparent;
             meshDraws.push_back(md);
@@ -979,14 +1928,15 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     }
 
     // Collect Points objects (point clouds). POINT_LIST topology; the push
-    // constant's color.w carries PointsMaterial::size (pixels). Requires a
-    // per-vertex "color" attribute — the point pipeline always reads binding 1.
+    // constant's color.w carries PointsMaterial::size (pixels). Geometries
+    // without a "color" attribute get a white fallback buffer.
     // Same ortho/HUD gating as lines/meshes (never the PT screen-space pass).
     struct OrthoPointDraw {
         Points* points = nullptr;
         Matrix4 world;
         Color   color{1.f, 1.f, 1.f};
         float   size = 3.f;
+        bool    sizeAttenuation = false;
     };
     std::vector<OrthoPointDraw> pointDraws;
     if (!screenSpaceOnly) {
@@ -994,13 +1944,16 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             auto* p = dynamic_cast<Points*>(&o);
             if (!p) return;
             auto g = p->geometry();
-            if (!g || !g->hasAttribute("position") || !g->hasAttribute("color")) return;
+            if (!g || !g->hasAttribute("position")) return;
             OrthoPointDraw pd;
             pd.points = p;
             std::memcpy(pd.world.elements.data(), p->matrixWorld->elements.data(), 64);
             if (auto mat = p->material()) {
                 if (auto* mc = dynamic_cast<MaterialWithColor*>(mat.get())) pd.color = mc->color;
-                if (auto* ms = dynamic_cast<MaterialWithSize*>(mat.get())) pd.size = std::max(1.f, ms->size);
+                if (auto* ms = dynamic_cast<MaterialWithSize*>(mat.get())) {
+                    pd.size = ms->size;
+                    pd.sizeAttenuation = ms->sizeAttenuation && camera.is<PerspectiveCamera>();
+                }
             }
             pointDraws.push_back(pd);
         });
@@ -1014,15 +1967,34 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         draws.resize(kMaxSpritesPerFrame);
     }
 
-    const VkExtent2D ext = ctx_.swapchainExtent();
+    const VkExtent2D ext = outputExtent;
+    auto& depthImage = ensureDepthImage(frame, ext.width, ext.height);
 
-    // Open a fresh dynamic render pass on the swapchain so we can
-    // emit draw commands. The hybrid 3D overlay pass earlier in
-    // recordCommandBuffer leaves the swapchain in GENERAL; we
-    // transition GENERAL → COLOR_ATTACHMENT_OPTIMAL, draw, then
-    // transition back to GENERAL so endFrame's overlay/present
-    // logic sees the layout it expects.
-    const VkImage img = ctx_.swapchainImages()[imageIndex];
+    VkImageMemoryBarrier2 toDepth{};
+    toDepth.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    toDepth.srcStageMask = VK_PIPELINE_STAGE_2_NONE;
+    toDepth.srcAccessMask = VK_ACCESS_2_NONE;
+    toDepth.dstStageMask = VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT |
+                           VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT;
+    toDepth.dstAccessMask = VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+    toDepth.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toDepth.newLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    toDepth.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepth.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toDepth.image = depthImage.image;
+    toDepth.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    toDepth.subresourceRange.levelCount = 1;
+    toDepth.subresourceRange.layerCount = 1;
+    VkDependencyInfo depthDependency{};
+    depthDependency.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    depthDependency.imageMemoryBarrierCount = 1;
+    depthDependency.pImageMemoryBarriers = &toDepth;
+    vkCmdPipelineBarrier2(cb, &depthDependency);
+
+    // 在 swapchain 上开启动态 render pass。Perspective 帧经过 TAA present
+    // 后已经是 COLOR_ATTACHMENT；ortho-only 帧保持旧的 GENERAL 默认值。
+    const VkImage img = outputImage;
     {
         VkImageMemoryBarrier2 toColor{};
         toColor.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -1035,7 +2007,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         toColor.dstStageMask  = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
         toColor.dstAccessMask = VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                 VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
-        toColor.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toColor.oldLayout = inputLayout;
         toColor.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
         toColor.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toColor.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1052,10 +2024,17 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
 
     VkRenderingAttachmentInfo colorAtt{};
     colorAtt.sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
-    colorAtt.imageView   = ctx_.swapchainImageViews()[imageIndex];
+    colorAtt.imageView   = outputView;
     colorAtt.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
     colorAtt.loadOp      = VK_ATTACHMENT_LOAD_OP_LOAD;
     colorAtt.storeOp     = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingAttachmentInfo depthAtt{};
+    depthAtt.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    depthAtt.imageView = depthImage.view;
+    depthAtt.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    depthAtt.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depthAtt.storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
+    depthAtt.clearValue.depthStencil = {1.f, 0};
     VkRenderingInfo ri{};
     ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
     ri.renderArea.offset = {0, 0};
@@ -1063,15 +2042,24 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     ri.layerCount = 1;
     ri.colorAttachmentCount = 1;
     ri.pColorAttachments = &colorAtt;
+    ri.pDepthAttachment = &depthAtt;
     vkCmdBeginRendering(cb, &ri);
 
-    // Split-screen: clip to the region sub-rect (regionW == 0 → full frame).
+    // 默认匹配 GL scissor 语义：viewport 保持整帧，region 只裁剪写入像素。
+    // 显式正交 viewport 渲染会把同一区域也设置为 Vulkan viewport，
+    // 让 NDC 映射到该子矩形内。
     const bool   regionActive = regionW > 0u && regionH > 0u;
     const float  rgx = regionActive ? float(regionX) : 0.f;
     const float  rgy = regionActive ? float(regionY) : 0.f;
     const float  rgw = regionActive ? float(regionW) : float(ext.width);
     const float  rgh = regionActive ? float(regionH) : float(ext.height);
-    VkViewport vp{rgx, rgy, rgw, rgh, 0.f, 1.f};
+    VkViewport vp{
+            regionAsViewport ? rgx : 0.f,
+            regionAsViewport ? rgy : 0.f,
+            regionAsViewport ? rgw : float(ext.width),
+            regionAsViewport ? rgh : float(ext.height),
+            0.f,
+            1.f};
     vkCmdSetViewport(cb, 0, 1, &vp);
     VkRect2D sc{{int32_t(rgx), int32_t(rgy)}, {uint32_t(rgw), uint32_t(rgh)}};
     vkCmdSetScissor(cb, 0, 1, &sc);
@@ -1096,12 +2084,24 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             float mvp[16];
             float color[4];
         };
+
         VkPipeline curMesh = VK_NULL_HANDLE;
         for (const auto& md : meshDraws) {
-            const LineRec* rec = ensureLineGeometryUploaded(md.mesh->geometry().get());
+            if (md.map && !md.wireframe) continue;
+            LineRec* rec = ensureLineGeometryUploaded(md.mesh->geometry().get());
             if (!rec || rec->vertex.handle == VK_NULL_HANDLE) continue;
+            const auto* instanceRec = md.instanced && !md.wireframe
+                                              ? ensureInstancedMeshUploaded(md.instanced)
+                                              : nullptr;
+            if (md.instanced && !md.wireframe && !instanceRec) continue;
 
-            VkPipeline want = md.transparent ? orthoMeshTransparentPipeline_ : orthoMeshPipeline_;
+            VkPipeline want;
+            if (md.wireframe && md.vertexColors) want = orthoLineColoredListPipeline_;
+            else if (md.wireframe)  want = orthoLineListPipeline_;
+            else if (md.instanced)  want = orthoMeshInstancedPipeline_;
+            else if (md.vertexColors) want = orthoMeshColoredPipeline_;
+            else if (md.transparent) want = orthoMeshTransparentPipeline_;
+            else                    want = orthoMeshPipeline_;
             if (want != curMesh) {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
                 curMesh = want;
@@ -1119,14 +2119,135 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);
 
-            VkBuffer     vb[1] = {rec->vertex.handle};
-            VkDeviceSize vo[1] = {0};
-            vkCmdBindVertexBuffers(cb, 0, 1, vb, vo);
+            if (instanceRec) {
+                VkBuffer vb[3] = {rec->vertex.handle, instanceRec->matrix.handle, instanceRec->color.handle};
+                VkDeviceSize vo[3] = {0, 0, 0};
+                vkCmdBindVertexBuffers(cb, 0, 3, vb, vo);
+            } else if (md.vertexColors) {
+                VkBuffer vb[2] = {rec->vertex.handle, rec->color.handle};
+                VkDeviceSize vo[2] = {0, 0};
+                vkCmdBindVertexBuffers(cb, 0, 2, vb, vo);
+            } else {
+                VkBuffer vb = rec->vertex.handle;
+                VkDeviceSize vo = 0;
+                vkCmdBindVertexBuffers(cb, 0, 1, &vb, &vo);
+            }
+            if (md.wireframe) {
+                auto* wrec = ensureWireframeGeometryUploaded(md.mesh->geometry().get());
+                if (!wrec || wrec->index.handle == VK_NULL_HANDLE || wrec->indexCount == 0) continue;
+                vkCmdBindIndexBuffer(cb, wrec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, wrec->indexCount, 1, 0, 0, 0);
+            } else {
+                const auto& range = md.mesh->geometry()->drawRange;
+                const uint32_t start = static_cast<uint32_t>(std::max(0, range.start));
+                const bool indexed = rec->index.handle != VK_NULL_HANDLE;
+                const uint32_t sourceCount = indexed ? rec->indexCount : rec->vertexCount;
+                const uint32_t available = sourceCount > start ? sourceCount - start : 0u;
+                const uint32_t count = std::min(
+                        available, static_cast<uint32_t>(std::max(0, range.count)));
+                const uint32_t instanceCount = md.instanced
+                                                       ? static_cast<uint32_t>(md.instanced->count())
+                                                       : 1u;
+                if (count == 0 || instanceCount == 0) continue;
+                if (indexed) {
+                    vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                    vkCmdDrawIndexed(cb, count, instanceCount, start, 0, 0);
+                } else {
+                    vkCmdDraw(cb, count, instanceCount, start, 0);
+                }
+            }
+        }
+    }
+
+    if (!meshDraws.empty()) {
+        if (orthoTexturedMeshPipeline_ == VK_NULL_HANDLE) createTexturedMeshPipeline();
+        Matrix4 zfix;
+        zfix.set(1.f, 0.f, 0.f, 0.f,
+                 0.f, 1.f, 0.f, 0.f,
+                 0.f, 0.f, 0.5f, 0.5f,
+                 0.f, 0.f, 0.f, 1.f);
+        Matrix4 vpMat;
+        vpMat.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+        Matrix4 cvp;
+        cvp.multiplyMatrices(zfix, vpMat);
+
+        struct TexturedMeshPC {
+            float mvp[16];
+            float color[4];
+        };
+        VkPipeline curTexturedMesh = VK_NULL_HANDLE;
+        for (const auto& md : meshDraws) {
+            if (!md.map || md.wireframe) continue;
+            const auto* atlas = ensureSpriteAtlasTexture(md.map);
+            if (!atlas) continue;
+            const auto* rec = ensureTexturedMeshGeometryUploaded(md.mesh->geometry().get());
+            if (!rec || rec->position.handle == VK_NULL_HANDLE || rec->uv.handle == VK_NULL_HANDLE) continue;
+            const VkPipeline want = md.depthTexture ? orthoDepthTextureMeshPipeline_ : orthoTexturedMeshPipeline_;
+            if (want != curTexturedMesh) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
+                curTexturedMesh = want;
+            }
+
+            VkDescriptorSetAllocateInfo asi{};
+            asi.sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+            asi.descriptorPool     = spriteDescPools_[frame];
+            asi.descriptorSetCount = 1;
+            asi.pSetLayouts        = &spriteDescSetLayout_;
+            VkDescriptorSet set = VK_NULL_HANDLE;
+            if (vkAllocateDescriptorSets(ctx_.device(), &asi, &set) != VK_SUCCESS) continue;
+            VkDescriptorImageInfo dii{};
+            dii.imageView   = atlas->image.view;
+            dii.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            dii.sampler     = atlas->image.sampler;
+            VkWriteDescriptorSet w{};
+            w.sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            w.dstSet          = set;
+            w.dstBinding      = 0;
+            w.descriptorCount = 1;
+            w.descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            w.pImageInfo      = &dii;
+            vkUpdateDescriptorSets(ctx_.device(), 1, &w, 0, nullptr);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    spritePipelineLayout_, 0, 1, &set, 0, nullptr);
+
+            Matrix4 mvp;
+            mvp.multiplyMatrices(cvp, md.world);
+            TexturedMeshPC pc{};
+            std::memcpy(pc.mvp, mvp.elements.data(), 64);
+            if (md.depthTexture) {
+                pc.color[0] = md.depthNear;
+                pc.color[1] = md.depthFar;
+                pc.color[2] = md.flipUv;
+                const bool decodeLinearOutput = linearOutput &&
+                                                (ctx_.swapchainFormat() == VK_FORMAT_B8G8R8A8_SRGB ||
+                                                 ctx_.swapchainFormat() == VK_FORMAT_R8G8B8A8_SRGB);
+                pc.color[3] = decodeLinearOutput ? -md.opacity : md.opacity;
+            } else {
+                pc.color[0] = md.color.r;
+                pc.color[1] = md.color.g;
+                pc.color[2] = md.color.b;
+                pc.color[3] = md.opacity;
+            }
+            vkCmdPushConstants(cb, spritePipelineLayout_,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                               0, sizeof(pc), &pc);
+
+            VkBuffer     vb[2] = {rec->position.handle, rec->uv.handle};
+            VkDeviceSize vo[2] = {0, 0};
+            vkCmdBindVertexBuffers(cb, 0, 2, vb, vo);
+            const auto g = md.mesh->geometry();
+            const auto& dr = g->drawRange;
             if (rec->index.handle != VK_NULL_HANDLE) {
                 vkCmdBindIndexBuffer(cb, rec->index.handle, 0, VK_INDEX_TYPE_UINT32);
-                vkCmdDrawIndexed(cb, rec->indexCount, 1, 0, 0, 0);
+                const uint32_t start = static_cast<uint32_t>(std::max(0, dr.start));
+                const uint32_t cap = (rec->indexCount > start) ? (rec->indexCount - start) : 0u;
+                const uint32_t cnt = std::min(cap, static_cast<uint32_t>(std::max(0, dr.count)));
+                if (cnt > 0) vkCmdDrawIndexed(cb, cnt, 1, start, 0, 0);
             } else {
-                vkCmdDraw(cb, rec->vertexCount, 1, 0, 0);
+                const uint32_t start = static_cast<uint32_t>(std::max(0, dr.start));
+                const uint32_t cap = (rec->vertexCount > start) ? (rec->vertexCount - start) : 0u;
+                const uint32_t cnt = std::min(cap, static_cast<uint32_t>(std::max(0, dr.count)));
+                if (cnt > 0) vkCmdDraw(cb, cnt, 1, start, 0);
             }
         }
     }
@@ -1228,7 +2349,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
     }
 
     // ── Line / LineSegments overlay ─────────────────────────────────
-    // Drawn after the sprites in the same color-only pass, so boxes /
+    // Drawn after the sprites in the same color/depth pass, so boxes /
     // gizmos land on top of any image sprite.
     if (!lineDraws.empty()) {
         if (orthoLineListPipeline_ == VK_NULL_HANDLE) createOrthoLinePipelines();
@@ -1249,21 +2370,39 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         struct LinePC {
             float mvp[16];
             float color[4];
+            float dash[4];
         };
         VkPipeline curLine = VK_NULL_HANDLE;
         for (const auto& ld : lineDraws) {
             auto g = ld.line->geometry();
-            const LineRec* lrec = ensureLineGeometryUploaded(g.get());
+            LineRec* lrec = ensureLineGeometryUploaded(g.get());
             if (!lrec || lrec->vertex.handle == VK_NULL_HANDLE) continue;
 
             Color color(1.f, 1.f, 1.f);
             float opacity = 1.f;
+            auto* dashed = dynamic_cast<LineDashedMaterial*>(ld.line->material().get());
+            bool useVertexColors = false;
             if (auto m = ld.line->material()) {
                 if (auto* mc = dynamic_cast<MaterialWithColor*>(m.get())) color = mc->color;
                 opacity = m->opacity;
+                useVertexColors = m->vertexColors && lrec->color.handle != VK_NULL_HANDLE;
             }
 
-            VkPipeline want = ld.isSegments ? orthoLineListPipeline_ : orthoLineStripPipeline_;
+            const bool useDashed = dashed && lrec->lineDistance.handle != VK_NULL_HANDLE;
+            const auto& dr = g->drawRange;
+            LineRec::LoopRange* loopRange = ld.isLoop
+                                                    ? ensureLineLoopRangeUploaded(ctx_, *g, *lrec, dr, overlayFrameCounter_)
+                                                    : nullptr;
+            const bool drawLoop = loopRange && loopRange->index.handle != VK_NULL_HANDLE && loopRange->indexCount > 0;
+            const bool useListTopology = ld.isSegments || drawLoop;
+            VkPipeline want;
+            if (useDashed) {
+                want = useListTopology ? orthoLineDashedListPipeline_ : orthoLineDashedStripPipeline_;
+            } else if (useVertexColors) {
+                want = useListTopology ? orthoLineColoredListPipeline_ : orthoLineColoredStripPipeline_;
+            } else {
+                want = useListTopology ? orthoLineListPipeline_ : orthoLineStripPipeline_;
+            }
             if (want != curLine) {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, want);
                 curLine = want;
@@ -1277,16 +2416,28 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             pc.color[1] = color.g;
             pc.color[2] = color.b;
             pc.color[3] = opacity;
+            pc.dash[0] = dashed ? dashed->dashSize : 0.f;
+            pc.dash[1] = dashed ? dashed->gapSize : 0.f;
+            pc.dash[2] = dashed ? dashed->scale : 1.f;
             vkCmdPushConstants(cb, orthoLinePipelineLayout_,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
-                               0, sizeof(pc), &pc);
+                               0, useDashed ? sizeof(pc) : 80, &pc);
 
-            VkBuffer     vb[1] = {lrec->vertex.handle};
-            VkDeviceSize vo[1] = {0};
-            vkCmdBindVertexBuffers(cb, 0, 1, vb, vo);
+            if (useDashed || useVertexColors) {
+                VkBuffer second = useDashed ? lrec->lineDistance.handle : lrec->color.handle;
+                VkBuffer     vb[2] = {lrec->vertex.handle, second};
+                VkDeviceSize vo[2] = {0, 0};
+                vkCmdBindVertexBuffers(cb, 0, 2, vb, vo);
+            } else {
+                VkBuffer     vb[1] = {lrec->vertex.handle};
+                VkDeviceSize vo[1] = {0};
+                vkCmdBindVertexBuffers(cb, 0, 1, vb, vo);
+            }
 
-            const auto& dr = g->drawRange;
-            if (lrec->index.handle != VK_NULL_HANDLE) {
+            if (drawLoop) {
+                vkCmdBindIndexBuffer(cb, loopRange->index.handle, 0, VK_INDEX_TYPE_UINT32);
+                vkCmdDrawIndexed(cb, loopRange->indexCount, 1, 0, 0, 0);
+            } else if (lrec->index.handle != VK_NULL_HANDLE) {
                 vkCmdBindIndexBuffer(cb, lrec->index.handle, 0, VK_INDEX_TYPE_UINT32);
                 const uint32_t start = static_cast<uint32_t>(std::max(0, dr.start));
                 const uint32_t cap   = (lrec->indexCount > start) ? (lrec->indexCount - start) : 0u;
@@ -1321,13 +2472,13 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
         struct PointPC {
             float mvp[16];
             float color[4];// .rgb = tint, .w = point size (pixels)
+            float point[4];// .x = sizeAttenuation, .y = viewportHeight * 0.5
         };
         vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, orthoPointListPipeline_);
         for (const auto& pd : pointDraws) {
             auto g = pd.points->geometry();
-            const LineRec* prec = ensureLineGeometryUploaded(g.get());
-            if (!prec || prec->vertex.handle == VK_NULL_HANDLE) continue;
-            if (prec->color.handle == VK_NULL_HANDLE) continue;// pipeline reads binding 1
+            LineRec* prec = ensureLineGeometryUploaded(g.get());
+            if (!prec || prec->vertex.handle == VK_NULL_HANDLE || prec->color.handle == VK_NULL_HANDLE) continue;
 
             Matrix4 mvp;
             mvp.multiplyMatrices(cvp, pd.world);
@@ -1337,6 +2488,8 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
             pc.color[1] = pd.color.g;
             pc.color[2] = pd.color.b;
             pc.color[3] = pd.size;
+            pc.point[0] = pd.sizeAttenuation ? 1.f : 0.f;
+            pc.point[1] = 0.5f * static_cast<float>(ext.height);
             vkCmdPushConstants(cb, orthoLinePipelineLayout_,
                                VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof(pc), &pc);
@@ -1355,7 +2508,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
 
     vkCmdEndRendering(cb);
 
-    // Back to GENERAL for endFrame's overlay/present transition.
+    // 回到调用方要求的 layout，供后续 frame tail 使用。
     {
         VkImageMemoryBarrier2 toGeneral{};
         toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
@@ -1372,7 +2525,7 @@ void OverlayPass::record(VkCommandBuffer cb, uint32_t frame, uint32_t imageIndex
                                   VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT |
                                   VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
         toGeneral.oldLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+        toGeneral.newLayout = outputLayout;
         toGeneral.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toGeneral.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toGeneral.image = img;

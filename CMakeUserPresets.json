@@ -39,12 +39,36 @@
         "VCPKG_MANIFEST_FEATURES": "assimp",
         "THREEPP_WITH_SLANG": "ON"
       }
+    },
+    {
+      "name": "dev-mswin",
+      "inherits":[
+        "dev-base",
+        "windows"
+      ],
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "/utf-8 /DNOMINMAX /DWIN32_LEAN_AND_MEAN",
+        "CMAKE_CXX_FLAGS": "/utf-8 /DNOMINMAX /DWIN32_LEAN_AND_MEAN",
+        "THREEPP_BUILD_EXAMPLES": "ON",
+        "THREEPP_BUILD_EXAMPLE_PROJECTS": "ON",
+        "THREEPP_WITH_FBX": "ON",
+        "THREEPP_WITH_INFERENCE": "ON",
+        "THREEPP_BUILD_TESTS": "ON",
+        "THREEPP_WITH_VULKAN": "ON",
+        "THREEPP_WITH_SLANG": "ON",
+        "VCPKG_MANIFEST_FEATURES": "assimp;vulkan"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "dev-macos",
       "configurePreset": "dev-macos"
+    },
+    {
+      "name": "dev-mswin",
+      "configurePreset": "dev-mswin",
+      "configuration": "Debug"
     }
   ]
 }

@@ -69,7 +69,7 @@ namespace threepp::vulkan {
         void recordDispatch(VkCommandBuffer cb, uint32_t frame,
                             uint32_t width, uint32_t height,
                             uint32_t toneMapping, uint32_t exposureBits,
-                            bool bgIsSolidColor, float bloomIntensity,
+                            bool bgIsSolidColor, bool antialias, float bloomIntensity,
                             float bloomThreshold, float bloomClamp);
 
     private:

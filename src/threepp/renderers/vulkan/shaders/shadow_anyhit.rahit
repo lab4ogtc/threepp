@@ -27,15 +27,21 @@ struct GeometryDesc {
     uint64_t normalAddress;
     uint64_t indexAddress;
     uint64_t uvAddress;
+    uint64_t uv2Address;// unused here, kept for layout match with closest_hit.rchit
     uint64_t foamAddress;// unused here, kept for layout match with closest_hit.rchit
     uint64_t prevVertexAddress;// unused here, kept for layout match
     uint64_t colorAddress;// unused here, kept for layout match with closest_hit.rchit
     uint     indexed;
     uint     _pad;
+    uint64_t materialGroupAddress;
+    uint     materialGroupCount;
+    uint     _materialGroupPad;
 };
 
+layout(buffer_reference, scalar) readonly buffer MaterialGroupBuf { MaterialGroupDesc groups[]; };
+
 // MaterialDesc + kMaxMaterialTextures come from vulkan_shared.h. This shader
-// only reads albedoTexIndex, alphaCutoff, transmission, ior, and uvTransform.
+// only reads alpha texture/cutoff/transmission fields.
 
 layout(set = 0, binding = 3, scalar) readonly buffer GeomDescBuf {
     GeometryDesc geoms[];
@@ -48,8 +54,25 @@ layout(set = 0, binding = 8) uniform sampler2D albedoMaps[kMaxMaterialTextures];
 layout(location = 1) rayPayloadInEXT float shadowVisibility;
 hitAttributeEXT vec2 attribs;
 
+uint resolveMaterialIndex(GeometryDesc gdesc, uint instanceIndex, uint primitiveIndex) {
+    if (gdesc.materialGroupAddress == 0ul || gdesc.materialGroupCount == 0u) {
+        return instanceIndex;
+    }
+    MaterialGroupBuf groupBuf = MaterialGroupBuf(gdesc.materialGroupAddress);
+    for (uint i = 0u; i < gdesc.materialGroupCount; ++i) {
+        const MaterialGroupDesc group = groupBuf.groups[i];
+        if (primitiveIndex >= group.startPrimitive &&
+            primitiveIndex < group.startPrimitive + group.primitiveCount) {
+            return group.materialIndex;
+        }
+    }
+    return instanceIndex;
+}
+
 void main() {
-    const MaterialDesc mdesc = mats[gl_InstanceCustomIndexEXT];
+    const uint instIdx = uint(gl_InstanceCustomIndexEXT);
+    const GeometryDesc gdesc = geoms[instIdx];
+    const MaterialDesc mdesc = mats[resolveMaterialIndex(gdesc, instIdx, uint(gl_PrimitiveID))];
     const bool isBlend  = mdesc.alphaCutoff < 0.0;
     const bool isCutout = mdesc.alphaCutoff > 0.0;
 
@@ -69,9 +92,8 @@ void main() {
         ignoreIntersectionEXT;
     }
 
-    // Alpha-cutout: sample the albedo alpha channel and ignore transparent texels.
-    if (isCutout && mdesc.albedoTexIndex >= 0) {
-        const GeometryDesc gdesc = geoms[gl_InstanceCustomIndexEXT];
+    // Alpha-cutout: sample material alpha and ignore transparent texels.
+    if (isCutout && (mdesc.albedoTexIndex >= 0 || mdesc.alphaTexIndex >= 0)) {
         if (gdesc.uvAddress != 0ul) {
             uvec3 idx;
             if (gdesc.indexed != 0u) {
@@ -90,11 +112,20 @@ void main() {
             const vec2 uv2 = vec2(ub.u[idx.z * 2], ub.u[idx.z * 2 + 1]);
             const float w  = 1.0 - attribs.x - attribs.y;
             const vec2  rawUv = w * uv0 + attribs.x * uv1 + attribs.y * uv2;
-            // Apply uvTransform — must match closest_hit's albedo sample so
-            // foliage shadows align with leaf silhouettes (atlased baseColor).
-            const vec2  uv = (mdesc.uvTransform * vec3(rawUv, 1.0)).xy;
-            const int   ti = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
-            if (texture(albedoMaps[ti], uv).a < mdesc.alphaCutoff) {
+            float alpha = 1.0;
+            if (mdesc.albedoTexIndex >= 0) {
+                // Apply uvTransform — must match closest_hit's albedo sample so
+                // foliage shadows align with leaf silhouettes (atlased baseColor).
+                const vec2 uv = (mdesc.uvTransform * vec3(rawUv, 1.0)).xy;
+                const int ti = clamp(mdesc.albedoTexIndex, 0, int(kMaxMaterialTextures) - 1);
+                alpha *= texture(albedoMaps[ti], uv).a;
+            }
+            if (mdesc.alphaTexIndex >= 0) {
+                const vec2 uv = (mdesc.uvTransformAlpha * vec3(rawUv, 1.0)).xy;
+                const int ti = clamp(mdesc.alphaTexIndex, 0, int(kMaxMaterialTextures) - 1);
+                alpha *= texture(albedoMaps[ti], uv).g;
+            }
+            if (alpha < mdesc.alphaCutoff) {
                 ignoreIntersectionEXT;
             }
         }

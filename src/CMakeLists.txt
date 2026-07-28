@@ -566,8 +566,6 @@ if (THREEPP_WITH_FBX)
 
     list(APPEND sources
             "threepp/loaders/FBXLoader.cpp"
-            "${openfbx_SOURCE_DIR}/src/ofbx.cpp"
-            "${openfbx_SOURCE_DIR}/src/libdeflate.c"
     )
 endif ()
 
@@ -645,6 +643,7 @@ if (THREEPP_WITH_VULKAN)
     list(APPEND privateHeaders
             "threepp/renderers/vulkan/VulkanContext.hpp"
             "threepp/renderers/vulkan/VulkanResources.hpp"
+            "threepp/renderers/vulkan/VulkanRenderTargets.hpp"
             "threepp/renderers/vulkan/LidarScanner.hpp"
             "threepp/renderers/vulkan/PhotonCaustics.hpp"
             "threepp/renderers/vulkan/Denoiser.hpp"
@@ -655,6 +654,8 @@ if (THREEPP_WITH_VULKAN)
             "threepp/renderers/vulkan/GpuTimings.hpp"
             "threepp/renderers/vulkan/OverlayPass.hpp"
             "threepp/renderers/vulkan/VulkanFrameTypes.hpp"
+            "threepp/renderers/vulkan/VulkanWireframeGeometry.hpp"
+            "threepp/renderers/vulkan/VulkanShaderMaterial.hpp"
             "threepp/renderers/vulkan/TaaResolve.hpp"
             "threepp/renderers/vulkan/WaterDisplacePipeline.hpp"
             "threepp/renderers/vulkan/GrassWindPipeline.hpp"
@@ -665,6 +666,7 @@ if (THREEPP_WITH_VULKAN)
             "threepp/helpers/PathTracedLidarSensor.cpp"
             "threepp/renderers/vulkan/VulkanContext.cpp"
             "threepp/renderers/vulkan/VulkanResources.cpp"
+            "threepp/renderers/vulkan/VulkanRenderTargets.cpp"
             "threepp/renderers/vulkan/LidarScanner.cpp"
             "threepp/renderers/vulkan/PhotonCaustics.cpp"
             "threepp/renderers/vulkan/Denoiser.cpp"
@@ -674,6 +676,9 @@ if (THREEPP_WITH_VULKAN)
             "threepp/renderers/vulkan/TetSkinningPipeline.cpp"
             "threepp/renderers/vulkan/GpuTimings.cpp"
             "threepp/renderers/vulkan/OverlayPass.cpp"
+            "threepp/renderers/vulkan/VulkanWireframeGeometry.cpp"
+            "threepp/renderers/wgpu/WgpuShaderTranslator.cpp"
+            "threepp/renderers/vulkan/VulkanShaderMaterial.cpp"
             "threepp/renderers/vulkan/TaaResolve.cpp"
             "threepp/renderers/vulkan/BloomPass.cpp"
             "threepp/renderers/vulkan/DeferredShade.cpp"
@@ -778,6 +783,23 @@ if (THREEPP_WITH_SLANG)
     threepp_configure_slang_runtime(threepp)
 endif ()
 
+if (THREEPP_WITH_PERFETTO)
+    set(THREEPP_PERFETTO_SOURCE "${PROJECT_SOURCE_DIR}/examples/external/perfetto/perfetto.cc")
+    if (NOT EXISTS "${THREEPP_PERFETTO_SOURCE}")
+        message(FATAL_ERROR "THREEPP_WITH_PERFETTO requires ${THREEPP_PERFETTO_SOURCE}")
+    endif ()
+
+    target_sources(threepp PRIVATE "${THREEPP_PERFETTO_SOURCE}")
+    target_compile_definitions(threepp PRIVATE THREEPP_WITH_PERFETTO=1)
+    target_include_directories(threepp SYSTEM PRIVATE "${PROJECT_SOURCE_DIR}/examples/external/perfetto")
+    if (MSVC)
+        set_source_files_properties("${THREEPP_PERFETTO_SOURCE}" PROPERTIES COMPILE_OPTIONS "/bigobj")
+    endif ()
+    if (WIN32)
+        target_link_libraries(threepp PRIVATE ws2_32)
+    endif ()
+endif ()
+
 target_include_directories(threepp
         PUBLIC
         "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>"
@@ -810,7 +832,7 @@ if (THREEPP_WITH_USD)
 endif ()
 
 if (THREEPP_WITH_FBX)
-    target_include_directories(threepp PRIVATE "${openfbx_SOURCE_DIR}/src")
+    target_link_libraries(threepp PRIVATE assimp::assimp)
     target_compile_definitions(threepp PRIVATE THREEPP_WITH_FBX)
 endif ()
 
@@ -868,9 +890,11 @@ if (THREEPP_WITH_WGPU)
             message(STATUS "Wgpu GLSL compat: using glslang package")
             find_package(glslang CONFIG REQUIRED)
 
-            target_sources(threepp PRIVATE
-                "threepp/renderers/wgpu/WgpuShaderTranslator.cpp"
-            )
+            if (NOT THREEPP_WITH_VULKAN)
+                target_sources(threepp PRIVATE
+                    "threepp/renderers/wgpu/WgpuShaderTranslator.cpp"
+                )
+            endif()
             target_link_libraries(threepp PRIVATE
                 glslang::glslang
                 glslang::SPIRV
@@ -905,8 +929,13 @@ endif ()
 
 if (THREEPP_WITH_VULKAN)
     find_package(Vulkan REQUIRED)
+    find_package(glslang CONFIG REQUIRED)
     target_compile_definitions(threepp PRIVATE THREEPP_WITH_VULKAN=1)
     target_link_libraries(threepp PUBLIC Vulkan::Vulkan)
+    target_link_libraries(threepp PRIVATE
+            glslang::glslang
+            glslang::SPIRV
+            glslang::glslang-default-resource-limits)
     message(STATUS "Vulkan SDK: ${Vulkan_VERSION} (${Vulkan_LIBRARY})")
 
     # VMA single-header. SDK installs put it under <SDK>/Include/vma/, while
@@ -1044,6 +1073,12 @@ if (THREEPP_WITH_VULKAN)
         kDeferredShadeCompSpv
         _deferred_shade_spv_h)
     compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/deferred_shade.comp"
+        kDeferredShadeCompPureRasterSpv
+        _deferred_shade_pure_raster_spv_h
+        VARIANT_SUFFIX pure_raster
+        DEFINES THREEPP_PURE_RASTER=1)
+    compile_vulkan_shader(threepp
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/deferred_denoise.comp"
         kDeferredDenoiseCompSpv
         _deferred_denoise_spv_h)
@@ -1117,6 +1152,16 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/gbuffer_indirect.vert"
         kGbufferIndirectVertSpv
         _gbuffer_indirect_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/gbuffer_indirect.vert"
+        kGbufferInstancedVertSpv
+        _gbuffer_instanced_vert_spv_h
+        VARIANT_SUFFIX instanced
+        DEFINES THREEPP_RASTER_INSTANCED=1)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/shadow_depth.vert"
+        kShadowDepthVertSpv
+        _shadow_depth_vert_spv_h)
     # Hybrid raster TAA: post-denoise temporal resolve. Reads taaInput +
     # history + gbufMotion → writes swapchain + new history.
     compile_vulkan_shader(threepp
@@ -1141,6 +1186,26 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay.frag"
         kOverlayFragSpv
         _overlay_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_dashed.vert"
+        kOverlayDashedVertSpv
+        _overlay_dashed_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_dashed.frag"
+        kOverlayDashedFragSpv
+        _overlay_dashed_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_composite.vert"
+        kOverlayCompositeVertSpv
+        _overlay_composite_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_composite.frag"
+        kOverlayCompositeFragSpv
+        _overlay_composite_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/present.frag"
+        kPresentFragSpv
+        _present_frag_spv_h)
     # Overlay depth prepass — writes unjittered depth so the wireframe
     # overlay's depth test compares like-with-like (the main G-buffer
     # depth is jittered for TAA).
@@ -1163,6 +1228,10 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_color.frag"
         kOverlayColorFragSpv
         _overlay_color_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_instanced.vert"
+        kOverlayInstancedVertSpv
+        _overlay_instanced_vert_spv_h)
     # Overlay variant for Points objects — POINT_LIST topology, writes
     # gl_PointSize from the push constant, discards fragments outside
     # a unit-radius disk for round LIDAR-style dots.
@@ -1174,6 +1243,24 @@ if (THREEPP_WITH_VULKAN)
         "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_point.frag"
         kOverlayPointFragSpv
         _overlay_point_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_point_textured.frag"
+        kOverlayPointTexturedFragSpv
+        _overlay_point_textured_frag_spv_h)
+    # 正交 MeshBasicMaterial::map 覆盖层，用于 RenderTarget 小预览这类
+    # 普通网格贴图 HUD。
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_textured_mesh.vert"
+        kOverlayTexturedMeshVertSpv
+        _overlay_textured_mesh_vert_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_textured_mesh.frag"
+        kOverlayTexturedMeshFragSpv
+        _overlay_textured_mesh_frag_spv_h)
+    compile_vulkan_shader(threepp
+        "${CMAKE_CURRENT_SOURCE_DIR}/threepp/renderers/vulkan/shaders/overlay_depth_texture_mesh.frag"
+        kOverlayDepthTextureMeshFragSpv
+        _overlay_depth_texture_mesh_frag_spv_h)
     # HUD sprite (TextSprite + Sprite) — alpha-blended quad with per-sprite
     # combined-image-sampler binding. Walked from the user's HUD scene during
     # the ortho overlay pass, post-PT/TAA, depth disabled.

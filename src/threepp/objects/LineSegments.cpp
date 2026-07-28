@@ -27,7 +27,7 @@ void LineSegments::computeLineDistances() {
     if (geometry_->getIndex() == nullptr) {
 
         const auto positionAttribute = geometry_->getAttribute<float>("position");
-        std::vector<float> lineDistances;
+        std::vector<float> lineDistances(positionAttribute->count(), 0.0f);
 
         for (int i = 0, l = positionAttribute->count(); i < l; i += 2) {
 

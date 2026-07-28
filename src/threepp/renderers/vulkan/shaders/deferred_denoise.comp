@@ -30,7 +30,7 @@ layout(set = 0, binding = 0) uniform CameraUbo {
 } cam;
 layout(set = 0, binding = 3) uniform sampler2D  gbufNormalTex; // xyz=n*0.5+0.5, w=roughness (<0 unlit)
 layout(set = 0, binding = 4) uniform sampler2D  gbufDepthTex;  // x = NDC z [0,1]
-layout(set = 0, binding = 5) uniform usampler2D gbufIdsTex;    // x = instanceId+1 (0 = sky)
+layout(set = 0, binding = 5) uniform usampler2D gbufIdsTex;    // .x = material/surface id + 1, .y = instance id + 1 (0 = sky)
 layout(set = 0, binding = 6) uniform sampler2D  gbufAlbedoTex; // rgb=albedo, a=metalness
 layout(set = 0, binding = 7,  rgba16f) uniform image2D outImage;            // sceneHdr (recombine: read+write)
 layout(set = 0, binding = 16, rgba16f) uniform image2D indirectImage;// accumulated GI (.rgb), histLen (.a); written by the SVGF history feedback
@@ -50,6 +50,9 @@ layout(set = 0, binding = 33, scalar) uniform FogUbo {
     vec3  color;
     float anisotropy;
     float waterSurfaceY;
+    float linearNear;
+    float linearFar;
+    float mode;
 } fog;
 
 layout(push_constant) uniform Pc {
@@ -83,6 +86,11 @@ vec3 fogTransmittance(vec3 a, vec3 b) {
             const float t = ya / (ya - yb);
             d *= (ya < 0.0) ? t : (1.0 - t);
         }
+    }
+    if (fog.mode > 0.5) {
+        const float span = max(fog.linearFar - fog.linearNear, 1e-4);
+        const float f = smoothstep(0.0, 1.0, clamp((d - fog.linearNear) / span, 0.0, 1.0));
+        return vec3(1.0 - f);
     }
     return exp(-fog.sigmaT * d);
 }

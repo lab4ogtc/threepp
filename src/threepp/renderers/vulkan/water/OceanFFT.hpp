@@ -22,9 +22,10 @@
 #include <vk_mem_alloc.h>
 #include <vulkan/vulkan.h>
 
+#include <array>
 #include <cstdint>
-#include <vector>
 #include <memory>
+#include <vector>
 
 namespace threepp::vulkan {
     class VulkanContext;
@@ -195,22 +196,24 @@ namespace threepp::water {
         VkPipeline pipeVertical_   = VK_NULL_HANDLE;
         VkPipeline pipePermute_    = VK_NULL_HANDLE;
 
-        // Per-step descriptor set ring. We need 2*logSize ping-pong
-        // configurations (horizontal then vertical), each binding two
-        // images either as A→B or B→A. The permute pass needs one more.
-        std::vector<VkDescriptorSet> dsHorizontal_; // 2 entries (ping/pong)
-        std::vector<VkDescriptorSet> dsVertical_;   // 2 entries
+        // Per image-pair descriptor set banks. A single IFFT instance can be
+        // recorded more than once in one command buffer (height + displacement),
+        // so descriptor sets must not be rewritten after they have been bound.
+        static constexpr uint32_t kDescriptorBankCount = 2;
+        std::array<std::vector<VkDescriptorSet>, kDescriptorBankCount> dsHorizontal_;
+        std::array<std::vector<VkDescriptorSet>, kDescriptorBankCount> dsVertical_;
         VkDescriptorSet dsTwiddle_ = VK_NULL_HANDLE;
-        VkDescriptorSet dsPermute_[2]{}; // [0]: reads input, writes scratch; [1]: reads scratch, writes input
+        // [0]: reads input, writes scratch; [1]: reads scratch, writes input.
+        std::array<std::array<VkDescriptorSet, 2>, kDescriptorBankCount> dsPermute_{};
 
         bool twiddleComputed_ = false;
-        OceanImage*   prevInput_   = nullptr;
-        OceanImage*   prevScratch_ = nullptr;
+        std::array<OceanImage*, kDescriptorBankCount> prevInput_{};
+        std::array<OceanImage*, kDescriptorBankCount> prevScratch_{};
 
         void createTwiddleImage();
         void createPipelines();
         void recordTwiddleOnce(VkCommandBuffer cb);
-        void rebindDescriptorSets(OceanImage& a, OceanImage& b);
+        void rebindDescriptorSets(uint32_t bank, OceanImage& a, OceanImage& b);
     };
 
     // ─── OceanCascade ──────────────────────────────────────────────────

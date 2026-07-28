@@ -35,16 +35,20 @@
 #define kGatherRadius    0.15
 
 // TLAS instance visibility groups (VkAccelerationStructureInstanceKHR.mask).
-// Opaque + alpha-CUTOUT instances carry kRayMaskOpaque; alpha-BLEND and
+// Opaque + alpha-CUTOUT instances carry kRayMaskOpaque; shadow casters also
+// carry kRayMaskShadow. Alpha-BLEND and
 // transmissive instances (text decals, alpha quads, glass — anything whose
 // MaterialDesc has alphaCutoff < 0 or transmission > 0, except water) carry
 // kRayMaskAlpha INSTEAD. Pure-visibility occlusion queries (env/sky gather,
-// GI bounces, emissive-NEE shadow tests) trace with cullMask = kRayMaskOpaque
+// GI bounces) trace with cullMask = kRayMaskOpaque
 // so a decal's transparent quad never blocks IBL/GI/emissive light — the HW
-// skips those instances entirely, no per-candidate alpha test needed. Every
-// radiance/primary trace keeps cullMask 0xFF and sees both groups.
+// skips those instances entirely, no per-candidate alpha test needed. Shadow
+// rays trace kRayMaskShadow, so Object3D::castShadow can be honored without
+// removing the object from reflections/GI. Every radiance/primary trace keeps
+// cullMask 0xFF and sees all groups.
 #define kRayMaskOpaque 0x01u
 #define kRayMaskAlpha  0x02u
+#define kRayMaskShadow 0x04u
 
 #ifdef __cplusplus
 
@@ -59,23 +63,29 @@ namespace threepp::vulkan_pt {
         float emissive[3];
         float emissiveIntensity;
         int32_t albedoTexIndex;
+        int32_t alphaTexIndex;
         int32_t roughnessTexIndex;
         int32_t metalnessTexIndex;
         int32_t normalTexIndex;
+        int32_t normalMapMode;
         float normalScale[2];
         float alphaCutoff;
         float transmission;
         float ior;
         int32_t transmissionTexIndex;
+        int32_t thicknessTexIndex;
         float clearcoat;
         float clearcoatRoughness;
         int32_t clearcoatTexIndex;
         int32_t clearcoatRoughnessTexIndex;
+        int32_t clearcoatNormalTexIndex;
+        float clearcoatNormalScale[2];
         float attenuationColor[3];
         float attenuationDistance;
         int32_t emissiveTexIndex;
         float specularIntensity;
         float specularColor[3];
+        int32_t specularTexIndex;
         float sheenColor[3];
         float sheenRoughness;
         // Side enum (matches threepp::Side): 0 = Front, 1 = Back, 2 = Double.
@@ -84,19 +94,27 @@ namespace threepp::vulkan_pt {
         int32_t sideMode;
         float uvTransform[9];
         int32_t occlusionTexIndex;
+        int32_t lightTexIndex;
+        float uvTransformAlpha[9];
         float uvTransformNormal[9];
         float uvTransformRoughMetal[9];
         float uvTransformEmissive[9];
         float uvTransformOcclusion[9];
+        float uvTransformLight[9];
+        float uvTransformSpecular[9];
         float uvTransformClearcoat[9];
         float uvTransformClearcoatRough[9];
+        float uvTransformClearcoatNormal[9];
         float uvTransformTransmission[9];
+        float uvTransformThickness[9];
         float iridescence;
         float iridescenceIOR;
         float iridescenceThicknessNm;
         float dispersion;
         float thickness;
         int32_t thinWalled;
+        int32_t envTexIndex;
+        float envMapIntensity;
         // Stable per-Material-asset index, deduplicated by Material* pointer
         // when the matDescs buffer is built (VulkanRenderer.cpp). Adjacent
         // meshes that share one Material C++ object get the SAME value, so
@@ -104,16 +122,45 @@ namespace threepp::vulkan_pt {
         // taps — kills the visible seam at tiled-wall boundaries during
         // camera motion. mesh-asset/material-asset only; not a hash.
         uint32_t materialAssetIdx;
+        float clipPlanes[4][4];
+        uint32_t clipPlaneCount;
+        uint32_t clipIntersection;
+        // 复用 padding：deferred shader 用它保存首个 local clipping plane 下标。
+        uint32_t _clipPad0;
+        int32_t envMapCombine;
+        float aoMapIntensity;
+        float lightMapIntensity;
+        int32_t displacementTexIndex;
+        float displacementScale;
+        float displacementBias;
+        float uvTransformDisplacement[9];
     };
 
     // Catches silent layout drift: if any field is added/removed/reordered
     // above, the size changes and this fires. Update the GLSL `MaterialDesc`
     // mirror below to match before bumping the expected size.
-    static_assert(sizeof(MaterialDesc) == 468,
+    static_assert(sizeof(MaterialDesc) == 824,
                   "MaterialDesc size changed — update the GLSL mirror in this file too.");
+
+    struct MaterialGroupDesc {
+        uint32_t startPrimitive;
+        uint32_t primitiveCount;
+        uint32_t materialIndex;
+        uint32_t _pad;
+    };
+
+    static_assert(sizeof(MaterialGroupDesc) == 16,
+                  "MaterialGroupDesc size changed — update the GLSL mirror in this file too.");
 }
 
 #else  // GLSL
+
+struct MaterialGroupDesc {
+    uint startPrimitive;
+    uint primitiveCount;
+    uint materialIndex;
+    uint _pad;
+};
 
 struct MaterialDesc {
     vec3  albedo;
@@ -122,43 +169,69 @@ struct MaterialDesc {
     vec3  emissive;
     float emissiveIntensity;
     int   albedoTexIndex;
+    int   alphaTexIndex;
     int   roughnessTexIndex;
     int   metalnessTexIndex;
     int   normalTexIndex;
+    int   normalMapMode;
     vec2  normalScale;
     float alphaCutoff;
     float transmission;
     float ior;
     int   transmissionTexIndex;
+    int   thicknessTexIndex;
     float clearcoat;
     float clearcoatRoughness;
     int   clearcoatTexIndex;
     int   clearcoatRoughnessTexIndex;
+    int   clearcoatNormalTexIndex;
+    vec2  clearcoatNormalScale;
     vec3  attenuationColor;
     float attenuationDistance;
     int   emissiveTexIndex;
     float specularIntensity;
     vec3  specularColor;
+    int   specularTexIndex;
     vec3  sheenColor;
     float sheenRoughness;
     // 0 = Front (cull back), 1 = Back (cull front), 2 = Double (no cull).
     int   sideMode;
     mat3  uvTransform;
     int   occlusionTexIndex;
+    int   lightTexIndex;
+    mat3  uvTransformAlpha;
     mat3  uvTransformNormal;
     mat3  uvTransformRoughMetal;
     mat3  uvTransformEmissive;
     mat3  uvTransformOcclusion;
+    mat3  uvTransformLight;
+    mat3  uvTransformSpecular;
     mat3  uvTransformClearcoat;
     mat3  uvTransformClearcoatRough;
+    mat3  uvTransformClearcoatNormal;
     mat3  uvTransformTransmission;
+    mat3  uvTransformThickness;
     float iridescence;
     float iridescenceIOR;
     float iridescenceThicknessNm;
     float dispersion;
     float thickness;
     int   thinWalled;
+    int   envTexIndex;
+    float envMapIntensity;
     uint  materialAssetIdx;
+    vec4  clipPlanes[4];
+    uint  clipPlaneCount;
+    uint  clipIntersection;
+    // 复用 padding：deferred shader 用它保存首个 local clipping plane 下标。
+    uint  _clipPad0;
+    int   envMapCombine;
+    float aoMapIntensity;
+    float lightMapIntensity;
+    int   displacementTexIndex;
+    float displacementScale;
+    float displacementBias;
+    mat3  uvTransformDisplacement;
 };
 
 #endif  // __cplusplus

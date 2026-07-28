@@ -3,10 +3,7 @@
   "name": "threepp",
   "dependencies": [
     "catch2",
-    {
-      "name": "shader-slang",
-      "platform": "osx"
-    }
+    "shader-slang"
   ],
   "features": {
     "external-glfw": {
@@ -19,7 +16,7 @@
       ]
     },
     "assimp": {
-      "description": "Enable assimp model importer in examples",
+      "description": "Enable Assimp model importer and FBX backend",
       "dependencies": [
         "assimp"
       ]

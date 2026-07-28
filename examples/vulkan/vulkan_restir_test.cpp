@@ -380,7 +380,7 @@ namespace {
 int main() {
 
     Canvas canvas("VulkanRenderer — The Jewel Room (ReSTIR test)",
-                  {{"vsync", false}});
+                  {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     renderer.toneMapping = ToneMapping::ACESFilmic;

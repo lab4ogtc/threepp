@@ -21,7 +21,7 @@ layout(set = 0, binding = 1, rgba32f) uniform writeonly image2D dstMip;
 
 layout(push_constant) uniform Pc {
     float alpha;       // GGX α = roughness² for this output mip
-    uint  numSamples;  // typically 64
+    uint  numSamples;  // 256 for sharp lobes, otherwise 128
     uint  _pad0;
     uint  _pad1;
 } pc;
@@ -53,6 +53,12 @@ vec3 importanceSampleGGX(vec2 u, vec3 N, float a) {
     const vec3 T  = normalize(cross(up, N));
     const vec3 B  = cross(N, T);
     return normalize(T * H_local.x + B * H_local.y + N * H_local.z);
+}
+
+float ggxD(float NdotH, float a) {
+    const float a2 = a * a;
+    const float d  = NdotH * NdotH * (a2 - 1.0) + 1.0;
+    return a2 / (PI * d * d);
 }
 
 // Equirect → world direction. Matches closest_hit.rchit's UV convention
@@ -89,6 +95,11 @@ void main() {
 
     vec3  prefiltered = vec3(0.0);
     float totalWeight = 0.0;
+    const vec2  srcSize    = vec2(textureSize(srcEnv, 0));
+    const float saTexel    = 4.0 * PI / (srcSize.x * srcSize.y);
+    const float roughness  = sqrt(pc.alpha);
+    const float roughFloor = roughness * max(log2(srcSize.x) - 4.0, 0.0);
+    const float maxSrcMip  = float(textureQueryLevels(srcEnv) - 1);
     for (uint i = 0u; i < pc.numSamples; ++i) {
         const vec2 xi = hammersley(i, pc.numSamples);
         const vec3 H  = importanceSampleGGX(xi, N, pc.alpha);
@@ -96,7 +107,12 @@ void main() {
         const float NdotL = max(dot(N, L), 0.0);
         if (NdotL > 0.0) {
             const vec2 sUV = uvFromDir(L);
-            prefiltered  += textureLod(srcEnv, sUV, 0.0).rgb * NdotL;
+            const float NdotH   = max(dot(N, H), 0.0);
+            const float pdf     = ggxD(NdotH, pc.alpha) * 0.25 + 1e-4;
+            const float saSample = 1.0 / (float(pc.numSamples) * pdf);
+            const float mip      = clamp(max(0.5 * log2(saSample / saTexel), roughFloor),
+                                         0.0, maxSrcMip);
+            prefiltered  += min(textureLod(srcEnv, sUV, mip).rgb, vec3(50.0)) * NdotL;
             totalWeight  += NdotL;
         }
     }

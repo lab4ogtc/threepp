@@ -2,7 +2,7 @@
 
 // Contrast-Adaptive Sharpening (AMD FidelityFX CAS), run after the TAA
 // resolve. Reads the resolved frame (TAA history-write slot, output extent)
-// and writes the sharpened result to the swapchain. TAA's history blend +
+// and writes the sharpened result to the internal present image. TAA's history blend +
 // Catmull-Rom reconstruction soften the image; this restores high-frequency
 // detail — the standard pairing for any TAA/upscaler.
 //
@@ -10,7 +10,7 @@
 // local 3×3 contrast and headroom — it sharpens edges/detail strongly while
 // backing off near black/white (no clipping) and on flat areas (no noise
 // amplification), with far less ringing than a fixed unsharp. Operates on the
-// LDR sRGB resolve, the perceptually correct space for sharpening.
+// linear LDR resolve; the SRGB swapchain performs the final encode.
 //
 // (Replaces an earlier min/max-clamped unsharp that clamped the center back
 //  to itself at every local extremum — i.e. exactly at the edges it was meant
@@ -19,18 +19,20 @@
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) uniform sampler2D resolvedTex;     // TAA output (output extent)
-layout(set = 0, binding = 1) uniform writeonly image2D swapOut; // swapchain (bgra8, no format)
+layout(set = 0, binding = 1) uniform writeonly image2D presentOut; // bgra8, no format
 
 layout(push_constant) uniform Pc {
-    uint  width;     // PANE (scissor region) size — resolved input is at the origin
+    uint  width;     // scissor-region dispatch size
     uint  height;
     float amount;// sharpness 0..1 (slider); 0 should not dispatch this pass
-    uint  dstOffset;// split-screen: packed swapchain write offset (dstX | dstY<<16)
+    uint  dstOffset;// split-screen: packed output offset (dstX | dstY<<16)
 } pc;
 
 vec3 fetch(ivec2 p) {
+    const ivec2 dstBase = ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u));
+    const ivec2 sz = textureSize(resolvedTex, 0);
     return texelFetch(resolvedTex,
-                      clamp(p, ivec2(0), ivec2(int(pc.width) - 1, int(pc.height) - 1)), 0).rgb;
+                      clamp(p + dstBase, ivec2(0), sz - 1), 0).rgb;
 }
 
 void main() {
@@ -70,6 +72,6 @@ void main() {
     const vec3  w    = amp * peak;
     vec3 res = (e + (b + d + f + h) * w) / (1.0 + 4.0 * w);
 
-    imageStore(swapOut, px + ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u)),
+    imageStore(presentOut, px + ivec2(int(pc.dstOffset & 0xFFFFu), int(pc.dstOffset >> 16u)),
                vec4(clamp(res, 0.0, 1.0), 1.0));
 }

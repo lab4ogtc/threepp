@@ -18,12 +18,18 @@ struct GeometryDesc {
     uint64_t normalAddress;
     uint64_t indexAddress;
     uint64_t uvAddress;
+    uint64_t uv2Address;// unused here, kept for layout match with closest_hit.rchit
     uint64_t foamAddress;// unused here, kept for layout match with closest_hit.rchit
     uint64_t prevVertexAddress;// unused here, kept for layout match
     uint64_t colorAddress;// unused here, kept for layout match with closest_hit.rchit
     uint     indexed;
     uint     _pad;
+    uint64_t materialGroupAddress;
+    uint     materialGroupCount;
+    uint     _materialGroupPad;
 };
+
+layout(buffer_reference, scalar) readonly buffer MaterialGroupBuf { MaterialGroupDesc groups[]; };
 
 // MaterialDesc comes from vulkan_shared.h. This shader only reads albedo,
 // roughness, metalness, transmission, and ior; the rest of the struct is
@@ -45,8 +51,24 @@ struct PhotonPayload {
 layout(location = 2) rayPayloadInEXT PhotonPayload pp;
 hitAttributeEXT vec2 bary;
 
+uint resolveMaterialIndex(GeometryDesc g, uint instanceIndex, uint primitiveIndex) {
+    if (g.materialGroupAddress == 0ul || g.materialGroupCount == 0u) {
+        return instanceIndex;
+    }
+    MaterialGroupBuf groupBuf = MaterialGroupBuf(g.materialGroupAddress);
+    for (uint i = 0u; i < g.materialGroupCount; ++i) {
+        const MaterialGroupDesc group = groupBuf.groups[i];
+        if (primitiveIndex >= group.startPrimitive &&
+            primitiveIndex < group.startPrimitive + group.primitiveCount) {
+            return group.materialIndex;
+        }
+    }
+    return instanceIndex;
+}
+
 void main() {
-    const GeometryDesc g = geoms[gl_InstanceCustomIndexEXT];
+    const uint instIdx = uint(gl_InstanceCustomIndexEXT);
+    const GeometryDesc g = geoms[instIdx];
     uvec3 idx;
     if (g.indexed != 0u) {
         IndexBuf ib = IndexBuf(g.indexAddress);
@@ -71,7 +93,7 @@ void main() {
     // eta = 1/ior (entering) or ior (exiting) accordingly.
     pp.normal = normalize((gl_ObjectToWorldEXT * vec4(localN, 0.0)).xyz);
 
-    const MaterialDesc m = mats[gl_InstanceCustomIndexEXT];
+    const MaterialDesc m = mats[resolveMaterialIndex(g, instIdx, uint(gl_PrimitiveID))];
     pp.roughness    = m.roughness;
     pp.metalness    = m.metalness;
     pp.transmission = m.transmission;

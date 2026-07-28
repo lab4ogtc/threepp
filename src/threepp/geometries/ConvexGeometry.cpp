@@ -68,13 +68,10 @@ ConvexGeometry::ConvexGeometry(const std::vector<Vector3>& _points)
     const auto& facets = pimpl_->facets;
     for (const auto& f : facets) {
         const auto& n = f.normal_;
-        normals.emplace_back(n[0]);
-        normals.emplace_back(n[1]);
-        normals.emplace_back(n[2]);
-
         auto& verts = f.vertices_;
         for (const auto& it : verts) {
             vertices.insert(vertices.end(), it->begin(), it->end());
+            normals.insert(normals.end(), n.begin(), n.end());
         }
     }
 

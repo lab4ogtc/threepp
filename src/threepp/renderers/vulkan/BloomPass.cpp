@@ -137,9 +137,10 @@ namespace threepp::vulkan {
             img = createStorageSampledImage(halfW_, halfH_, "vmaCreateImage(bloom.B)");
     }
 
-    static VkPipeline makeComputePipe(VkDevice d, VkPipelineCache cache, VkPipelineLayout layout,
+    static VkPipeline makeComputePipe(VulkanContext& ctx, VkPipelineLayout layout,
                                       const uint32_t* spv, size_t spvBytes,
                                       const char* label) {
+        const auto d = ctx.device();
         VkShaderModuleCreateInfo smci{};
         smci.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
         smci.codeSize = spvBytes;
@@ -158,7 +159,7 @@ namespace threepp::vulkan {
         cpci.stage  = stage;
         cpci.layout = layout;
         VkPipeline pipe = VK_NULL_HANDLE;
-        check(vkCreateComputePipelines(d, cache, 1, &cpci, nullptr, &pipe), label);
+        check(ctx.createComputePipeline(cpci, &pipe), label);
         vkDestroyShaderModule(d, mod, nullptr);
         return pipe;
     }
@@ -244,11 +245,11 @@ namespace threepp::vulkan {
                   "vkCreatePipelineLayout(composite)");
         }
 
-        downPipe_ = makeComputePipe(d, ctx_.pipelineCache(), bloomPipeLayout_, kBloomDownCompSpv,
+        downPipe_ = makeComputePipe(ctx_, bloomPipeLayout_, kBloomDownCompSpv,
                                     sizeof(kBloomDownCompSpv), "vkCreateComputePipelines(bloom_down)");
-        blurPipe_ = makeComputePipe(d, ctx_.pipelineCache(), bloomPipeLayout_, kBloomBlurCompSpv,
+        blurPipe_ = makeComputePipe(ctx_, bloomPipeLayout_, kBloomBlurCompSpv,
                                     sizeof(kBloomBlurCompSpv), "vkCreateComputePipelines(bloom_blur)");
-        compPipe_ = makeComputePipe(d, ctx_.pipelineCache(), compPipeLayout_, kCompositeCompSpv,
+        compPipe_ = makeComputePipe(ctx_, compPipeLayout_, kCompositeCompSpv,
                                     sizeof(kCompositeCompSpv), "vkCreateComputePipelines(composite)");
     }
 
@@ -342,7 +343,7 @@ namespace threepp::vulkan {
     void BloomPass::recordDispatch(VkCommandBuffer cb, uint32_t frame,
                                    uint32_t width, uint32_t height,
                                    uint32_t toneMapping, uint32_t exposureBits,
-                                   bool bgIsSolidColor, float bloomIntensity,
+                                   bool bgIsSolidColor, bool antialias, float bloomIntensity,
                                    float bloomThreshold, float bloomClamp) {
         auto barrier = [&]() {
             VkMemoryBarrier2 mb{};
@@ -403,7 +404,7 @@ namespace threepp::vulkan {
         uint32_t intensityBits;
         std::memcpy(&intensityBits, &bloomIntensity, sizeof(intensityBits));
         const uint32_t cpc[6] = {toneMapping, exposureBits,
-                                 bgIsSolidColor ? 1u : 0u, intensityBits,
+                                 (bgIsSolidColor ? 1u : 0u) | (antialias ? 2u : 0u), intensityBits,
                                  width, height};
         vkCmdPushConstants(cb, compPipeLayout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(cpc), cpc);
         vkCmdDispatch(cb, (width + 7u) / 8u, (height + 7u) / 8u, 1);

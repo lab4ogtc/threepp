@@ -32,7 +32,7 @@ namespace threepp {
             std::cout << "\n  [2] WebGPU\n  [3] Cross (WGPU rendering, GL display)";
 #endif
 #ifdef THREEPP_WITH_VULKAN
-            std::cout << "\n  [4] Vulkan Path-tracer";
+            std::cout << "\n  [4] Vulkan";
 #endif
 #ifdef THREEPP_WITH_METAL
             std::cout << "\n  [5] Metal";

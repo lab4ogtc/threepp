@@ -126,7 +126,7 @@ int main(int argc, char** argv) {
         else if (std::string(argv[i]) == "--pt") shotPT = true;
     }
 
-    Canvas canvas("Vulkan PT - Fog", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - Fog", {{"vsync", true}});
     VulkanRenderer renderer(canvas);
     renderer.toneMapping = ToneMapping::ACESFilmic;
     renderer.toneMappingExposure = 0.9f;
@@ -237,7 +237,7 @@ int main(int argc, char** argv) {
             const auto path = std::filesystem::path(PROJECT_FOLDER) / "aaa_caps" / shotPath;
             renderer.writeFramebuffer(path);
             std::cout << "wrote " << path.string() << std::endl;
-            std::exit(0);
+            canvas.close();
         }
     });
 

@@ -100,7 +100,7 @@ namespace {
 
 int main() {
 
-    Canvas canvas("Vulkan PT - Denoiser Showcase", {{"vsync", false}});
+    Canvas canvas("Vulkan PT - Denoiser Showcase", {{"vsync", true}});
 
     VulkanRenderer renderer(canvas);
     renderer.outputColorSpace    = ColorSpace::sRGB;

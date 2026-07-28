@@ -178,9 +178,7 @@ namespace threepp::vulkan {
         rci.maxPipelineRayRecursionDepth = 1;
         rci.layout = pipelineLayout_;
 
-        check(ctx_.rt().createRayTracingPipelines(
-                      ctx_.device(), VK_NULL_HANDLE, VK_NULL_HANDLE,
-                      1, &rci, nullptr, &pipeline_),
+        check(ctx_.createRayTracingPipeline(rci, &pipeline_),
               "vkCreateRayTracingPipelinesKHR(lidar)");
 
         vkDestroyShaderModule(ctx_.device(), rgenMod, nullptr);

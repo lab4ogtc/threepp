@@ -862,7 +862,7 @@ int main(int argc, char** argv) {
     const capture::Args capArgs = capture::parseArgs(argc, argv);
     int shotFrame = 0;
 
-    Canvas canvas("Vulkan PT  Ocean", {{"vsync", false}, {"size", WindowSize{1600, 900}}});
+    Canvas canvas("Vulkan PT  Ocean", {{"vsync", true}, {"size", WindowSize{1600, 900}}});
     VulkanRenderer renderer(canvas);
     renderer.setDenoise(true);
     renderer.setRestirDIEnabled(true);
@@ -2707,7 +2707,8 @@ int main(int argc, char** argv) {
             const auto path = std::filesystem::path(PROJECT_FOLDER) / "aaa_caps" / shotPath;
             renderer.writeFramebuffer(path);// creates parent dirs; throws on failure
             std::printf("wrote %s\n", path.string().c_str());
-            std::exit(0);
+            canvas.close();
+            return;
         }
 
         // ── LIDAR scan + visualisation update ─────────────────────────────
